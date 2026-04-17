@@ -1,0 +1,14 @@
+{
+    "title": "Claude",
+    "assistantName": "Claude",
+    "busyText": "Claude is thinking...",
+    "hooksText": "⚙ Cleaning up...",
+    "warmingUpText": "Claude warming up...",
+    "resumingText": "Resuming...",
+    "inputPlaceholder": "Send a message...",
+    "emptyChatMessage": "Send a message to start chatting with Claude.",
+    "notificationTitle": "Claude",
+    "appHeader": "Claude",
+    "sessionLabel": "Claude Session",
+    "modelLabel": "Claude model"
+}

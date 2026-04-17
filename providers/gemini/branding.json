@@ -1,0 +1,15 @@
+{
+    "title": "Gemini",
+    "assistantName": "Gemini",
+    "busyText": "Gemini is thinking...",
+    "hooksText": "Hooks running...",
+    "warmingUpText": "Engine warming up...",
+    "resumingText": "Resuming...",
+    "inputPlaceholder": "Send a message...",
+    "emptyChatMessage": "Send a message to start chatting.",
+    "notificationTitle": "Gemini Assistant",
+    "appHeader": "Gemini",
+    "sessionLabel": "Gemini Session",
+    "modelLabel": "Gemini model",
+    "maxImageDimension": 1568
+}

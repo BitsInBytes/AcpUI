@@ -1,0 +1,65 @@
+.ssl-error-overlay {
+  position: fixed;
+  top: 0; 
+  left: 0; 
+  right: 0; 
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+.ssl-error-modal {
+  background: var(--bg-secondary);
+  padding: 2.5rem;
+  border-radius: 1rem;
+  border: 1px solid var(--border-color);
+  max-width: 500px;
+  text-align: left;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+}
+
+.ssl-error-modal h2 {
+  color: #ef4444;
+  margin-top: 0;
+  margin-bottom: 1rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+}
+
+.ssl-error-modal p {
+  color: var(--text-secondary);
+  margin-bottom: 1.25rem;
+  line-height: 1.6;
+}
+
+.ssl-error-modal ol {
+  color: var(--text-primary);
+  margin-bottom: 2rem;
+  padding-left: 1.5rem;
+}
+
+.ssl-error-modal li {
+  margin-bottom: 0.75rem;
+  line-height: 1.5;
+}
+
+.ssl-auth-button {
+  display: block;
+  background: var(--accent-color);
+  color: white;
+  text-decoration: none;
+  padding: 1rem 1.5rem;
+  border-radius: 0.5rem;
+  text-align: center;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.ssl-auth-button:hover {
+  background-color: var(--accent-hover);
+  transform: translateY(-1px);
+}

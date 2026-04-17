@@ -1,0 +1,20 @@
+{
+    "command": "node",
+    "args": ["<path-to-claude-acp-server>/dist/index.js"],
+    "defaultSubAgentName": "general-assistant",
+    "paths": {
+        "home": "C:\\Users\\<user>\\.claude",
+        "sessions": "C:\\Users\\<user>\\.claude\\projects",
+        "agents": "C:\\Users\\<user>\\.claude\\agents",
+        "attachments": "C:\\Users\\<user>\\.claude\\attachments",
+        "archive": "C:\\Users\\<user>\\.claude\\archive"
+    },
+    "models": {
+        "default": "balanced",
+        "flagship": { "id": "opus", "displayName": "Opus" },
+        "balanced": { "id": "default", "displayName": "Sonnet" },
+        "fast": { "id": "haiku", "displayName": "Haiku" },
+        "titleGeneration": "haiku",
+        "subAgent": "haiku"
+    }
+}

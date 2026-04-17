@@ -1,0 +1,220 @@
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import ToolStep from '../components/ToolStep';
+import type { SystemEvent } from '../types';
+
+vi.mock('react-markdown', () => ({
+  default: ({ children }: any) => <div>{children}</div>
+}));
+vi.mock('remark-gfm', () => ({ default: () => {} }));
+vi.mock('framer-motion', () => ({
+  motion: { div: ({ children, ...props }: any) => <div {...props}>{children}</div> },
+  AnimatePresence: ({ children }: any) => <>{children}</>,
+}));
+
+const makeEvent = (overrides: Partial<SystemEvent> = {}): SystemEvent => ({
+  id: 'tool-1',
+  title: 'Running read_file: src/app.ts',
+  status: 'completed',
+  ...overrides,
+});
+
+const defaultProps = () => ({
+  step: { type: 'tool' as const, event: makeEvent() },
+  isCollapsed: false,
+  onToggle: vi.fn(),
+  onOpenInCanvas: vi.fn(),
+  markdownComponents: {},
+});
+
+describe('ToolStep', () => {
+  it('renders tool title', () => {
+    render(<ToolStep {...defaultProps()} />);
+    expect(screen.getByText('Running read_file: src/app.ts')).toBeInTheDocument();
+  });
+
+  it('shows pulse indicator when status is in_progress', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ status: 'in_progress' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.event-pulse')).toBeInTheDocument();
+  });
+
+  it('shows output when expanded and output exists', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ output: 'file contents here' });
+    render(<ToolStep {...props} />);
+    expect(screen.getByText('file contents here')).toBeInTheDocument();
+  });
+
+  it('hides content when collapsed', () => {
+    const props = defaultProps();
+    props.isCollapsed = true;
+    props.step.event = makeEvent({ output: 'should not appear' });
+    render(<ToolStep {...props} />);
+    expect(screen.queryByText('should not appear')).not.toBeInTheDocument();
+  });
+
+  it('shows canvas button when filePath exists', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ filePath: '/src/app.ts' });
+    const { container } = render(<ToolStep {...props} />);
+    const canvasBtn = container.querySelector('.canvas-hoist-btn');
+    expect(canvasBtn).toBeInTheDocument();
+    fireEvent.click(canvasBtn!);
+    expect(props.onOpenInCanvas).toHaveBeenCalledWith('/src/app.ts');
+  });
+
+  it('shows completed status icon', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ status: 'completed' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.system-event.completed')).toBeInTheDocument();
+    expect(container.querySelector('.event-pulse')).not.toBeInTheDocument();
+  });
+
+  it('shows failed status with error styling', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ status: 'failed', output: 'Error occurred' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.system-event.failed')).toBeInTheDocument();
+    expect(screen.getByText('Error occurred')).toBeInTheDocument();
+  });
+
+  it('renders diff output correctly', () => {
+    const diffText = '--- old\n+++ new\n@@ -1,3 +1,3 @@\n-old line\n+new line\n context';
+    const props = defaultProps();
+    props.step.event = makeEvent({ output: diffText });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.diff-output')).toBeInTheDocument();
+    expect(container.querySelector('.diff-add')).toBeInTheDocument();
+    expect(container.querySelector('.diff-remove')).toBeInTheDocument();
+  });
+
+  it('shows No output when output is undefined and status is failed', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ status: 'failed', output: undefined });
+    props.isCollapsed = false;
+    render(<ToolStep {...props} />);
+    expect(screen.getByText('No output or error details provided.')).toBeInTheDocument();
+  });
+
+  it('clicking header calls onToggle', () => {
+    const props = defaultProps();
+    render(<ToolStep {...props} />);
+    const header = screen.getByText('Running read_file: src/app.ts');
+    fireEvent.click(header);
+    expect(props.onToggle).toHaveBeenCalled();
+  });
+
+  it('renders diff lines with correct classes for + and -', () => {
+    const diffText = '--- old\n+++ new\n-removed line\n+added line';
+    const props = defaultProps();
+    props.step.event = makeEvent({ output: diffText });
+    const { container } = render(<ToolStep {...props} />);
+    const addLines = container.querySelectorAll('.diff-add');
+    const removeLines = container.querySelectorAll('.diff-remove');
+    expect(addLines.length).toBeGreaterThan(0);
+    expect(removeLines.length).toBeGreaterThan(0);
+  });
+});
+
+
+describe('ToolStep - getFilePathFromEvent extraction', () => {
+  it('extracts path from "Running write_file: path" title', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Running write_file: /src/utils/helper.ts' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).toBeInTheDocument();
+  });
+
+  it('extracts path from "Running read_file_parallel: path" title', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Running read_file_parallel: C:\\repos\\file.cs' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).toBeInTheDocument();
+  });
+
+  it('returns undefined for shell commands', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Running shell: ls -la' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();
+  });
+
+  it('returns undefined for list_directory commands', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Running list directory: /src', id: 'list_directory' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();
+  });
+
+  it('returns undefined when path contains ellipsis', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Running replace: D:\\Git\\...\\file.tsx' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();
+  });
+
+  it('extracts path from generic "Running tool_name: path" pattern', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Running some_tool: /tmp/output.json' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).toBeInTheDocument();
+  });
+
+  it('extracts path from title that is just a filename with dot', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'package.json' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).toBeInTheDocument();
+  });
+
+  it('extracts path from output Index: line', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Some tool', output: 'Index: src/main.ts\n===\n+added' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).toBeInTheDocument();
+  });
+
+  it('extracts path from output diff --- line', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Some tool', output: '--- src/app.ts\n+++ src/app.ts\n+line' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).toBeInTheDocument();
+  });
+
+  it('does not extract from output --- old (literal "old")', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ title: 'Some tool', output: '--- old\n+++ new\n+line', filePath: undefined });
+    const { container } = render(<ToolStep {...props} />);
+    // "old" is excluded, but filePath from event.filePath is also undefined
+    // The diff --- line returns "old" which is filtered out
+    expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();
+  });
+
+  it('uses event.filePath when available', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ filePath: '/direct/path.ts', title: 'Running shell: echo hi' });
+    const { container } = render(<ToolStep {...props} />);
+    // shell is excluded before filePath check
+    expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();
+  });
+
+  it('canvas hoist button calls onOpenInCanvas with extracted path', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ filePath: '/src/index.ts' });
+    const { container } = render(<ToolStep {...props} />);
+    const btn = container.querySelector('.canvas-hoist-btn')!;
+    fireEvent.click(btn);
+    expect(props.onOpenInCanvas).toHaveBeenCalledWith('/src/index.ts');
+  });
+
+  it('shows elapsed timer when startTime and endTime are set', () => {
+    const props = defaultProps();
+    const now = Date.now();
+    props.step.event = makeEvent({ startTime: now - 5000, endTime: now });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.tool-timer')).toBeInTheDocument();
+  });
+});

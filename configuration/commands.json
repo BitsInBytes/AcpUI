@@ -1,0 +1,9 @@
+{
+  "commands": [
+    {
+      "name": "/cp",
+      "description": "Commit and push all changes",
+      "prompt": "Commit and push all changes"
+    }
+  ]
+}

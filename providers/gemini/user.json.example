@@ -1,0 +1,20 @@
+{
+    "command": "node",
+    "args": ["<path-to-gemini-cli>/dist/index.js", "--acp", "--model", "gemini-3-flash-preview"],
+    "defaultSubAgentName": "agent-dev",
+    "paths": {
+        "home": "C:\\Users\\<user>\\.gemini",
+        "sessions": "C:\\Users\\<user>\\.gemini\\tmp",
+        "agents": "C:\\Users\\<user>\\.gemini\\agents",
+        "attachments": "C:\\Users\\<user>\\.gemini\\attachments",
+        "archive": "C:\\Users\\<user>\\.gemini\\archive"
+    },
+    "models": {
+        "default": "balanced",
+        "flagship": { "id": "gemini-3-1-pro-preview", "displayName": "Pro" },
+        "balanced": { "id": "gemini-3-1-flash-preview", "displayName": "Flash" },
+        "fast": { "id": "gemini-3-1-flash-light-preview", "displayName": "Light" },
+        "titleGeneration": "gemini-3-1-flash-light-preview",
+        "subAgent": "gemini-3-1-pro-preview"
+    }
+}

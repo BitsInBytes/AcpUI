@@ -1,0 +1,31 @@
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #ef4444; /* Disconnected Red */
+}
+
+.status-dot.connected {
+  background-color: #f59e0b; /* Connected but warming Amber */
+  box-shadow: 0 0 8px #f59e0b;
+  animation: pulse 2s infinite;
+}
+
+.status-dot.ready {
+  background-color: #22c55e; /* Ready Green */
+  box-shadow: 0 0 8px #22c55e;
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.4; }
+  100% { opacity: 1; }
+}

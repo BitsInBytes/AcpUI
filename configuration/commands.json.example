@@ -1,0 +1,14 @@
+{
+  "commands": [
+    {
+      "name": "/cp",
+      "description": "Commit and push all changes",
+      "prompt": "Commit and push all changes"
+    },
+    {
+      "name": "/tf",
+      "description": "Check test failures and fix them",
+      "prompt": "There are test failures, work on fixing them"
+    }
+  ]
+}

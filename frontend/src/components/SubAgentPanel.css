@@ -1,0 +1,109 @@
+.sub-agent-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.sub-agent-card {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 0.85em;
+}
+
+.sub-agent-card.running {
+  border-color: rgba(34, 197, 94, 0.3);
+}
+
+.sub-agent-card.completed {
+  border-color: rgba(255, 255, 255, 0.08);
+  opacity: 0.8;
+}
+
+.sub-agent-card.failed {
+  border-color: rgba(220, 38, 38, 0.3);
+}
+
+.sub-agent-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.sub-agent-prompt {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 0.85em;
+  margin-bottom: 6px;
+}
+
+.sub-agent-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 6px;
+}
+
+.sub-agent-tool {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85em;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.sub-agent-tool.in_progress {
+  color: rgba(234, 179, 8, 0.8);
+}
+
+.sub-agent-response {
+  max-height: 300px;
+  overflow-y: auto;
+  font-size: 0.9em;
+  line-height: 1.5;
+}
+
+.sub-agent-response p {
+  margin: 0.3em 0;
+}
+
+
+.sub-agent-permission {
+  background: rgba(234, 179, 8, 0.1);
+  border: 1px solid rgba(234, 179, 8, 0.3);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+}
+
+.sub-agent-permission-title {
+  font-size: 0.85em;
+  margin-bottom: 6px;
+}
+
+.sub-agent-permission-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.sub-agent-perm-btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.8em;
+}
+
+.sub-agent-perm-btn.allow {
+  background: rgba(34, 197, 94, 0.2);
+  border-color: rgba(34, 197, 94, 0.4);
+}
+
+.sub-agent-perm-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+}

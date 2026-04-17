@@ -1,0 +1,20 @@
+{
+    "command": "kiro-cli",
+    "args": ["acp"],
+    "defaultSubAgentName": "agent-dev",
+    "paths": {
+        "home": "C:\\Users\\<user>\\.kiro",
+        "sessions": "C:\\Users\\<user>\\.kiro\\sessions\\cli",
+        "agents": "C:\\Users\\<user>\\.kiro\\agents",
+        "attachments": "C:\\Users\\<user>\\.kiro\\attachments",
+        "archive": "C:\\Users\\<user>\\.kiro\\archive"
+    },
+    "models": {
+        "default": "balanced",
+        "flagship": { "id": "claude-opus-4-6", "displayName": "Opus" },
+        "balanced": { "id": "claude-sonnet-4-6", "displayName": "Sonnet" },
+        "fast": { "id": "claude-haiku-4-5", "displayName": "Haiku" },
+        "titleGeneration": "claude-haiku-4-5",
+        "subAgent": "claude-sonnet-4-6"
+    }
+}
