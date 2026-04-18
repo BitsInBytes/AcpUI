@@ -1,0 +1,23 @@
+{
+  "command": "gemini",
+  "args": ["--acp"],
+  "apiKey": "YOUR_GEMINI_API_KEY",
+  "defaultSubAgentName": "general-assistant",
+  "paths": {
+    "home": "C:\\Users\\<user>\\.gemini",
+    "sessions": "C:\\Users\\<user>\\.gemini\\tmp",
+    "agents": "C:\\Users\\<user>\\.gemini\\agents",
+    "attachments": "C:\\Users\\<user>\\.gemini\\attachments",
+    "archive": "C:\\Users\\<user>\\.gemini\\archive"
+  },
+  "models": {
+    "default": "gemini-3.1-flash-preview",
+    "quickAccess": [
+        { "id": "gemini-3.1-pro-preview", "displayName": "Pro", "description": "Highest capability" },
+        { "id": "gemini-3.1-flash-preview", "displayName": "Flash", "description": "Balanced everyday work" },
+        { "id": "gemini-3.1-flash-light-preview", "displayName": "Light", "description": "Fastest responses" }
+    ],
+    "titleGeneration": "gemini-3.1-flash-light-preview",
+    "subAgent": "gemini-3.1-flash-preview"
+  }
+}

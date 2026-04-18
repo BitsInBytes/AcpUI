@@ -1,0 +1,15 @@
+{
+    "title": "Kiro",
+    "assistantName": "Kiro",
+    "busyText": "Kiro is busy...",
+    "hooksText": "Hooks running...",
+    "warmingUpText": "Engine warming up...",
+    "resumingText": "Resuming...",
+    "inputPlaceholder": "Send a message...",
+    "emptyChatMessage": "Send a message to start chatting with Kiro.",
+    "notificationTitle": "Kiro",
+    "appHeader": "Kiro",
+    "sessionLabel": "Kiro Session",
+    "modelLabel": "Kiro model",
+    "maxImageDimension": 1568
+}

@@ -1,0 +1,136 @@
+@import './styles/global.css';
+@import './styles/markdown.css';
+
+/* Split Screen Layout for Canvas Mode */
+.app-container.split-screen {
+  display: flex;
+  flex-direction: row;
+}
+
+.app-container.split-screen .main-content {
+  flex: 1;
+  min-width: 400px;
+  border-right: 1px solid var(--border-color);
+}
+
+.canvas-pane-container {
+  flex: 1;
+  min-width: 400px;
+  background-color: var(--bg-primary);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  position: relative;
+  z-index: 10;
+  box-shadow: -4px 0 15px rgba(0, 0, 0, 0.2);
+}
+
+.canvas-placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 1.2rem;
+}
+
+.main-content {
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-width: 0;
+  background-color: var(--bg-primary);
+  position: relative;
+  transition: all 0.3s ease;
+}
+
+.open-sidebar-bubble {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 100;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-left: none;
+  border-radius: 0 0.75rem 0.75rem 0;
+  width: 24px;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.2s ease;
+  padding: 0;
+  box-shadow: 2px 0 10px rgba(0, 0, 0, 0.3);
+}
+
+.open-sidebar-bubble:hover {
+  width: 32px;
+  color: var(--text-primary);
+  background-color: var(--user-msg-bg);
+  border-color: var(--accent-color);
+}
+
+.logs-panel {
+  background-color: #000;
+  border-bottom: 1px solid var(--border-color);
+  max-height: 30vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.logs-header {
+  background-color: #1a1a1a;
+  padding: 0.5rem 1rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.logs-content {
+  flex-grow: 1;
+  padding: 1rem;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 0.8rem;
+  color: #a3e635;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+/* Base structural layout for the chat window */
+.chat-container {
+  flex-grow: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 2rem 1rem 0 1rem;
+  position: relative;
+}
+
+.chat-content {
+  max-width: 1100px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.scroll-spacer {
+  height: 100px;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}

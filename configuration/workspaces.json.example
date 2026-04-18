@@ -1,0 +1,15 @@
+{
+  "workspaces": [
+    {
+      "label": "My Project",
+      "path": "C:\\repos\\my-project",
+      "agent": "default-agent",
+      "pinned": true
+    },
+    {
+      "label": "Another Project",
+      "path": "C:\\repos\\another-project",
+      "agent": "default-agent"
+    }
+  ]
+}

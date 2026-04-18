@@ -1,0 +1,20 @@
+{
+    "name": "Claude",
+    "protocolPrefix": "_anthropic/",
+    "mcpName": "AcpUI",
+    "defaultSystemAgentName": "auto",
+    "supportsAgentSwitching": false,
+    "cliManagedHooks": [],
+    "toolIdPattern": "mcp__{mcpName}__{toolName}",
+    "toolCategories": {
+        "read":  { "category": "file_read",  "isFileOperation": true },
+        "edit":  { "category": "file_edit",  "isFileOperation": true },
+        "write": { "category": "file_write", "isFileOperation": true },
+        "glob":  { "category": "glob",       "isFileOperation": true },
+        "grep":  { "category": "grep" }
+    },
+    "clientInfo": {
+        "name": "claude-code",
+        "version": "2.1.114"
+    }
+}

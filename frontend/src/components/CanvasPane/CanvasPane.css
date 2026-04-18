@@ -1,0 +1,372 @@
+.canvas-pane-container {
+  flex: 1;
+  min-width: 600px;
+  background-color: var(--bg-primary);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  position: relative;
+  z-index: 10;
+  box-shadow: -4px 0 15px rgba(0, 0, 0, 0.2);
+  border-left: 1px solid var(--border-color);
+}
+
+/* Horizontal File Tabs */
+.canvas-file-tabs {
+  display: flex;
+  flex-direction: row;
+  overflow-x: auto;
+  overflow-y: hidden;
+  background-color: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  min-height: 40px;
+  align-items: flex-end;
+}
+
+.canvas-file-tab {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  border-right: 1px solid var(--border-color);
+  background-color: rgba(0, 0, 0, 0.1);
+  transition: all 0.2s ease;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+}
+
+.canvas-file-tab:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+
+.canvas-file-tab.active {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  border-bottom: 2px solid var(--accent-color);
+}
+
+.canvas-file-tab .file-icon {
+  opacity: 0.7;
+}
+
+.canvas-file-tab.active .file-icon {
+  color: var(--accent-color);
+  opacity: 1;
+}
+
+.canvas-file-tab.glow {
+  animation: tabGlow 3s ease-in-out;
+}
+
+@keyframes tabGlow {
+  0% { background-color: rgba(59, 130, 246, 0); box-shadow: inset 0 0 0px rgba(59, 130, 246, 0); }
+  20% { background-color: rgba(59, 130, 246, 0.3); box-shadow: inset 0 0 15px rgba(59, 130, 246, 0.5); }
+  100% { background-color: rgba(59, 130, 246, 0); box-shadow: inset 0 0 0px rgba(59, 130, 246, 0); }
+}
+
+.canvas-tab-close {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  opacity: 0;
+  transition: all 0.2s ease;
+  margin-left: 0.2rem;
+}
+
+.canvas-file-tab:hover .canvas-tab-close {
+  opacity: 0.6;
+}
+
+.canvas-tab-close:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+  opacity: 1 !important;
+  color: var(--text-primary);
+}
+
+.canvas-empty-tabs {
+  padding: 0.6rem 1rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* Main Area */
+.canvas-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.canvas-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  background-color: var(--bg-primary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.canvas-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.canvas-language {
+  font-size: 0.7rem;
+  font-weight: 400;
+  color: var(--text-secondary);
+  background-color: var(--bg-secondary);
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.canvas-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.canvas-btn {
+  background-color: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  padding: 0.4rem 0.8rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.canvas-btn:hover {
+  background-color: var(--user-msg-bg);
+  color: var(--text-primary);
+}
+
+.canvas-btn.primary {
+  background-color: var(--accent-color);
+  color: white;
+  border-color: var(--accent-color);
+}
+
+.canvas-btn.primary:hover {
+  background-color: var(--accent-hover);
+}
+
+.canvas-btn.primary.applied {
+  background-color: var(--success-color);
+  border-color: var(--success-color);
+  color: white;
+  cursor: default;
+}
+
+.canvas-btn.close {
+  padding: 0.4rem 0.6rem;
+}
+
+.canvas-content-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-color: #1e1e1e; /* Like VS Code */
+}
+
+.canvas-markdown-preview {
+  flex: 1;
+  padding: 2rem 3rem;
+  overflow-y: auto;
+  color: #d4d4d4;
+  line-height: 1.6;
+  font-family: var(--font-family);
+  background-color: var(--bg-primary);
+}
+
+.canvas-markdown-preview h1, 
+.canvas-markdown-preview h2, 
+.canvas-markdown-preview h3 {
+  color: white;
+  margin-top: 1.5rem;
+  margin-bottom: 1rem;
+  font-weight: 600;
+}
+
+.canvas-markdown-preview h1 { border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem; font-size: 1.8rem; }
+.canvas-markdown-preview h2 { border-bottom: 1px solid var(--border-color); padding-bottom: 0.3rem; font-size: 1.4rem; }
+
+.canvas-markdown-preview p {
+  margin-bottom: 1rem;
+}
+
+.canvas-markdown-preview ul, 
+.canvas-markdown-preview ol {
+  margin-bottom: 1rem;
+  padding-left: 1.5rem;
+}
+
+.canvas-markdown-preview li {
+  margin-bottom: 0.5rem;
+}
+
+.canvas-markdown-preview code:not(pre code) {
+  background-color: rgba(255, 255, 255, 0.1);
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 0.9em;
+}
+
+.canvas-markdown-preview pre {
+  background-color: #1e1e1e;
+  padding: 1rem;
+  border-radius: 8px;
+  margin-bottom: 1.5rem;
+  overflow-x: auto;
+  border: 1px solid var(--border-color);
+}
+
+.canvas-placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 1.2rem;
+  background-color: var(--bg-primary);
+}
+
+.canvas-file-tab.terminal-tab {
+  background: rgba(88, 166, 255, 0.08);
+  border-right: 1px solid rgba(88, 166, 255, 0.15);
+}
+
+.canvas-file-tab.terminal-tab.active {
+  background: rgba(88, 166, 255, 0.15);
+  border-bottom-color: #58a6ff;
+}
+
+.canvas-terminal-content {
+  flex: 1;
+  min-height: 0;
+  padding: 4px;
+  background: #0d1117;
+}
+
+
+.canvas-btn.active {
+  background: rgba(88, 166, 255, 0.15);
+  color: #58a6ff;
+}
+
+
+.canvas-diff-view {
+  flex: 1;
+  overflow: auto;
+  background: #0d1117;
+  padding: 8px;
+}
+
+.canvas-diff-view .git-diff-view {
+  margin: 0;
+  font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+
+/* Git file list in canvas */
+.canvas-git-panel {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  max-height: 150px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.canvas-git-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  opacity: 0.6;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.canvas-git-count {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 0 5px;
+  font-size: 0.65rem;
+}
+
+.canvas-git-refresh {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.6;
+  padding: 2px;
+}
+
+.canvas-git-refresh:hover { opacity: 1; }
+
+.canvas-git-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 4px 6px;
+}
+
+.canvas-git-file {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: all 0.15s;
+}
+
+.canvas-git-file:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.canvas-git-staged {
+  font-size: 0.6rem;
+  background: rgba(63, 185, 80, 0.2);
+  color: #3fb950;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.git-added { color: #3fb950; }
+.git-modified { color: #d29922; }
+.git-deleted { color: #f85149; }
+.git-untracked { color: #8b949e; }

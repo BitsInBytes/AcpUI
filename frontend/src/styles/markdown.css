@@ -1,0 +1,51 @@
+/*
+ * Shared markdown rendering styles. Applied via the `.markdown-body` class
+ * to any container that renders ReactMarkdown output. This guarantees
+ * consistent list, marker, and spacing behavior across the app — without
+ * relying on user-agent defaults, which can render disc markers as
+ * near-invisible periods at the body font size.
+ */
+
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0.5em 0 1em;
+  padding-left: 1.75em;
+}
+
+.markdown-body ul {
+  list-style-type: disc;
+}
+
+.markdown-body ol {
+  list-style-type: decimal;
+}
+
+.markdown-body ul ul {
+  list-style-type: circle;
+}
+
+.markdown-body ul ul ul {
+  list-style-type: square;
+}
+
+.markdown-body li {
+  margin: 0.25em 0;
+  padding-left: 0.25em;
+}
+
+.markdown-body li::marker {
+  color: var(--accent-color, #3b82f6);
+  font-size: 1.05em;
+}
+
+.markdown-body li > p {
+  margin: 0.25em 0;
+}
+
+.markdown-body li > p:first-child {
+  margin-top: 0;
+}
+
+.markdown-body li > p:last-child {
+  margin-bottom: 0;
+}

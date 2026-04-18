@@ -1,0 +1,22 @@
+{
+    "command": "node",
+    "args": ["<path-to-claude-acp-server>/dist/index.js"],
+    "defaultSubAgentName": "general-assistant",
+    "paths": {
+        "home": "C:\\Users\\<user>\\.claude",
+        "sessions": "C:\\Users\\<user>\\.claude\\projects",
+        "agents": "C:\\Users\\<user>\\.claude\\agents",
+        "attachments": "C:\\Users\\<user>\\.claude\\attachments",
+        "archive": "C:\\Users\\<user>\\.claude\\archive"
+    },
+    "models": {
+        "default": "default",
+        "quickAccess": [
+            { "id": "opus", "displayName": "Opus", "description": "Highest capability" },
+            { "id": "default", "displayName": "Sonnet", "description": "Balanced everyday work" },
+            { "id": "haiku", "displayName": "Haiku", "description": "Fastest responses" }
+        ],
+        "titleGeneration": "haiku",
+        "subAgent": "haiku"
+    }
+}

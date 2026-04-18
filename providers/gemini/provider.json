@@ -1,0 +1,20 @@
+{
+  "name": "Gemini",
+  "protocolPrefix": "_gemini/",
+  "mcpName": "AcpUI",
+  "defaultSystemAgentName": "auto",
+  "supportsAgentSwitching": false,
+  "cliManagedHooks": [],
+  "toolIdPattern": "mcp_{mcpName}_{toolName}",
+  "toolCategories": {
+    "read_file":  { "category": "file_read",  "isFileOperation": true },
+    "write_file": { "category": "file_write", "isFileOperation": true },
+    "edit_file":  { "category": "file_edit",  "isFileOperation": true },
+    "glob":       { "category": "glob",       "isFileOperation": true },
+    "grep":       { "category": "grep" }
+  },
+  "clientInfo": {
+    "name": "AcpUI",
+    "version": "1.0.0"
+  }
+}

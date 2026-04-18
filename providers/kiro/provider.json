@@ -1,0 +1,22 @@
+{
+    "name": "Kiro",
+    "protocolPrefix": "_kiro.dev/",
+    "mcpName": "AcpUI",
+    "defaultSystemAgentName": "kiro_default",
+    "supportsAgentSwitching": true,
+    "cliManagedHooks": ["stop"],
+    "toolIdPattern": "@{mcpName}/{toolName}",
+    "toolCategories": {
+        "bash": { "category": "shell", "isShellCommand": true, "isStreamable": true },
+        "read_file": { "category": "file_read", "isFileOperation": true },
+        "read_file_parallel": { "category": "file_read", "isFileOperation": true },
+        "write_file": { "category": "file_write", "isFileOperation": true },
+        "replace": { "category": "file_edit", "isFileOperation": true },
+        "list_directory": { "category": "glob", "isFileOperation": true },
+        "glob": { "category": "glob", "isFileOperation": true }
+    },
+    "clientInfo": {
+        "name": "AcpUI",
+        "version": "1.0.0"
+    }
+}

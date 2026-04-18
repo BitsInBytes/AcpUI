@@ -1,0 +1,15 @@
+{
+  "defaultProviderId": "provider-a",
+  "providers": [
+    {
+      "id": "provider-a",
+      "path": "./providers/provider-a",
+      "enabled": true
+    },
+    {
+      "id": "provider-b",
+      "path": "./providers/provider-b",
+      "enabled": false
+    }
+  ]
+}
