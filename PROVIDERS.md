@@ -161,3 +161,101 @@ In `parseSessionHistory`, do not simply return a list of messages. Return a `tim
 - `type: "tool"` for actions.
 - `type: "text"` for final responses.
 This allows the UI to render the "thinking" process and tool logs inline with the conversation.
+
+
+---
+
+## 6. Debugging & Protocol Capture
+
+When developing or troubleshooting a provider, you can invoke the ACP daemon directly to inspect the raw JSON-RPC traffic without the backend/frontend in the way.
+
+### Quick Test
+
+Create a Node.js script (e.g., `acp_capture.js`) in the project root:
+
+```javascript
+const { spawn } = require('child_process');
+const fs = require('fs');
+
+const lines = [];
+function log(label) { lines.push('', `=== ${label} ===`); }
+function capture(line) { lines.push(line); }
+
+const proc = spawn('<command>', ['<args>'], {
+  env: { ...process.env, TERM: 'dumb', CI: 'true', FORCE_COLOR: '0' },
+  cwd: process.cwd()
+});
+
+let buf = '';
+proc.stdout.on('data', d => {
+  buf += d.toString();
+  let idx;
+  while ((idx = buf.indexOf('\n')) !== -1) {
+    const line = buf.slice(0, idx).trim();
+    buf = buf.slice(idx + 1);
+    if (line) capture(line);
+  }
+});
+
+function send(json) { proc.stdin.write(json + '\n'); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function run() {
+  log('initialize');
+  send(JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+      clientInfo: { name: 'AcpUI', version: '1.0.0' }
+    }
+  }));
+  await sleep(4000);
+
+  log('session/new');
+  send(JSON.stringify({
+    jsonrpc: '2.0', id: 2, method: 'session/new',
+    params: { cwd: process.cwd(), mcpServers: [] }
+  }));
+  await sleep(8000);
+
+  // Extract session ID from captured output
+  const sidMatch = lines.join('\n').match(/"sessionId"\s*:\s*"([0-9a-f-]{36})"/);
+  const sid = sidMatch?.[1];
+  if (!sid) { console.error('No session ID found'); proc.kill(); process.exit(1); }
+
+  // Add more interactions here: session/prompt, session/set_model, session/load, etc.
+
+  fs.writeFileSync('acp_capture_output.txt', lines.join('\n'), 'utf8');
+  console.log(`Captured ${lines.length} lines`);
+  proc.kill();
+}
+
+run();
+```
+
+Replace `<command>` and `<args>` with the values from your provider's `user.json`.
+
+### What to Capture
+
+For a complete protocol reference, test these interactions in order:
+
+| Step | Method | Purpose |
+|------|--------|---------|
+| 1 | `initialize` | Capabilities, auth, agent info |
+| 2 | `session/new` | Session creation, modes, models, extension notifications |
+| 3 | `session/prompt` with `/agent <name>` | Agent switching mechanism and side effects |
+| 4 | `session/set_model` | Model switching |
+| 5 | `session/prompt` with a simple question | Streaming chunks, metadata, turn completion |
+| 6 | `session/load` | History replay, mode/model preservation |
+
+### What to Look For
+
+- **Extension notifications** — methods prefixed with your `protocolPrefix`. These arrive as notifications (no `id`) between or after responses.
+- **Ordering** — notifications often arrive *before* the response they relate to. Document the sequence.
+- **Unsupported methods** — test methods like `session/set_mode` to see if they work, crash the process, or are silently ignored.
+- **Field differences** — compare what the daemon sends vs what your provider normalizes. Look for PascalCase types, flat string content, non-standard tool output formats.
+
+### Output
+
+Save the formatted results as `ACP_PROTOCOL_SAMPLES.md` in your provider directory. Sanitize any personal data (local paths, custom agent names, session UUIDs) before committing to a public repo.
