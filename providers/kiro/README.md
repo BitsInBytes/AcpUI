@@ -55,9 +55,27 @@ Extension events are sent as JSON-RPC notifications using the `protocolPrefix`. 
 | `commands/available` | `commands` | `commands` |
 | `metadata` | `metadata` | `sessionId`, `contextUsagePercentage` |
 | `compaction/status` | `compaction` | `sessionId`, `status`, `summary` |
+| `agent/switched` | `agent_switched` | `sessionId`, `agentName`, `previousAgentName`, `currentModelId` |
 | `session/update` | `session_update` | (pass-through) |
 
 `metadata` typically arrives just before `end_turn` and carries the context usage percentage displayed in the UI.
+
+## Dynamic Models
+
+Kiro advertises its full model catalog in the `models` object returned from `session/new` and `session/load`:
+
+- `models.currentModelId` is the active real model ID.
+- `models.availableModels[]` contains entries shaped as `{ modelId, name, description }`.
+
+AcpUI normalizes those entries into the shared `{ id, name, description }` contract, persists them with the session, and shows the complete catalog in the session settings Config tab.
+
+The three `user.json` model entries are only quick-access aliases for the chat footer. They must use the exact real model IDs Kiro reports. For current Kiro CLI samples, versioned Claude IDs use dots, not hyphens:
+
+- `claude-opus-4.6`
+- `claude-sonnet-4.6`
+- `claude-haiku-4.5`
+
+Kiro also reports the active model as `model` on `_kiro.dev/agent/switched`. The provider normalizes that field to `currentModelId` so agent changes update the same model state as session creation, session load, and explicit `session/set_model`.
 
 ## Session Files
 

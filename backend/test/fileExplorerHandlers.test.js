@@ -82,4 +82,25 @@ describe('File Explorer Handlers', () => {
     socket.listeners('explorer_list')[0]({ dirPath: 'missing' }, cb);
     expect(cb).toHaveBeenCalledWith({ items: [], error: 'ENOENT' });
   });
+
+  it('explorer_list sorts items of same type alphabetically', async () => {
+    const fs = (await import('fs')).default;
+    fs.readdirSync.mockReturnValueOnce([
+      { name: 'zebra.json', isDirectory: () => false },
+      { name: 'alpha.json', isDirectory: () => false },
+    ]);
+    const cb = vi.fn();
+    socket.listeners('explorer_list')[0]({ dirPath: '' }, cb);
+    const items = cb.mock.calls[0][0].items;
+    expect(items[0].name).toBe('alpha.json');
+    expect(items[1].name).toBe('zebra.json');
+  });
+
+  it('explorer_write handles errors gracefully', async () => {
+    const fs = (await import('fs')).default;
+    fs.writeFileSync.mockImplementationOnce(() => { throw new Error('disk full'); });
+    const cb = vi.fn();
+    socket.listeners('explorer_write')[0]({ filePath: 'settings.json', content: 'x' }, cb);
+    expect(cb).toHaveBeenCalledWith({ error: 'disk full' });
+  });
 });

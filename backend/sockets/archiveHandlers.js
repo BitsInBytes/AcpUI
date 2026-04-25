@@ -51,7 +51,8 @@ export default function registerArchiveHandlers(io, socket) {
 
       fs.writeFileSync(path.join(archiveDir, 'session.json'), JSON.stringify({
         id: session.id, acpSessionId: session.acpSessionId, name: session.name,
-        model: session.model, messages: session.messages, isPinned: session.isPinned
+        model: session.model, currentModelId: session.currentModelId, modelOptions: session.modelOptions,
+        messages: session.messages, isPinned: session.isPinned
       }, null, 2));
 
       await db.deleteSession(uiId);
@@ -124,6 +125,8 @@ export default function registerArchiveHandlers(io, socket) {
         acpSessionId: saved.acpSessionId,
         name: saved.name || folderName,
         model: saved.model || 'flagship',
+        currentModelId: saved.currentModelId,
+        modelOptions: saved.modelOptions,
         messages: saved.messages || [],
         isPinned: false
       });

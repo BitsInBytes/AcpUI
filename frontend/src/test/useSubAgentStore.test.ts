@@ -81,6 +81,39 @@ describe('useSubAgentStore', () => {
     expect(step.output).toBe('file contents');
   });
 
+  it('updateToolStep preserves existing output when none provided', () => {
+    act(() => {
+      useSubAgentStore.getState().addAgent(makeAgent());
+      useSubAgentStore.getState().addToolStep('acp-1', 'tool-1', 'Read file');
+      useSubAgentStore.getState().updateToolStep('acp-1', 'tool-1', 'done', 'initial output');
+      useSubAgentStore.getState().updateToolStep('acp-1', 'tool-1', 'completed');
+    });
+    const step = useSubAgentStore.getState().agents[0].toolSteps[0];
+    expect(step.output).toBe('initial output');
+  });
+
+  it('completeAgent only updates the matching agent', () => {
+    act(() => {
+      useSubAgentStore.getState().addAgent(makeAgent({ acpSessionId: 'acp-1' }));
+      useSubAgentStore.getState().addAgent(makeAgent({ acpSessionId: 'acp-2' }));
+      useSubAgentStore.getState().completeAgent('acp-1');
+    });
+    const agents = useSubAgentStore.getState().agents;
+    expect(agents[0].status).toBe('completed');
+    expect(agents[1].status).toBe('running');
+  });
+
+  it('addToolStep only updates the matching agent', () => {
+    act(() => {
+      useSubAgentStore.getState().addAgent(makeAgent({ acpSessionId: 'acp-1' }));
+      useSubAgentStore.getState().addAgent(makeAgent({ acpSessionId: 'acp-2' }));
+      useSubAgentStore.getState().addToolStep('acp-1', 'tool-1', 'Read file');
+    });
+    const agents = useSubAgentStore.getState().agents;
+    expect(agents[0].toolSteps).toHaveLength(1);
+    expect(agents[1].toolSteps).toHaveLength(0);
+  });
+
   it('setPermission sets permission on agent', () => {
     const perm = { id: 1, sessionId: 's1', options: [{ optionId: 'allow', name: 'Allow', kind: 'allow' }] };
     act(() => {

@@ -36,7 +36,7 @@ interface SystemState {
       balanced?: { id: string; displayName: string };
       fast?: { id: string; displayName: string };
     };
-    defaultModel?: 'fast' | 'balanced' | 'flagship';
+    defaultModel?: string;
     supportsAgentSwitching?: boolean;
     hooksText?: string;
     warmingUpText?: string;

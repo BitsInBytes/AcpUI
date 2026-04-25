@@ -5,6 +5,7 @@ import { getProvider, getProviderModule } from './providerLoader.js';
 import { handleUpdate as _handleUpdate } from './acpUpdateHandler.js';
 import { generateTitle as _generateTitle } from './acpTitleGenerator.js';
 import { applyConfigOptionsChange, normalizeConfigOptions, normalizeRemovedConfigOptionIds } from './configOptions.js';
+import { extractModelState, mergeModelOptions } from './modelOptions.js';
 
 /**
  * Singleton JSON-RPC client wrapping the ACP child process.
@@ -108,6 +109,16 @@ class AcpClient {
             return; // Response handled, don't proceed to intercept/route
           }
 
+          if (
+            payload.method === 'session/update' &&
+            payload.params?.sessionId &&
+            payload.params?.update?.sessionUpdate === 'config_option_update'
+          ) {
+            this.handleModelStateUpdate(payload.params.sessionId, {
+              configOptions: payload.params.update.configOptions
+            });
+          }
+
           // Intercept phase: Let the provider mutate or swallow the payload before routing.
           // Uses the cached this.providerModule (loaded in start()) — getProvider() only
           // returns { config, modulePath } and does NOT expose the module's exported functions.
@@ -195,7 +206,7 @@ class AcpClient {
     writeLog(`[ACP] Setting mode for session ${sessionId} to: ${modeId}`);
     return this.sendRequest('session/set_mode', {
       sessionId,
-      mode: modeId
+      modeId
     });
   }
 
@@ -209,6 +220,14 @@ class AcpClient {
 
   handleProviderExtension(payload) {
     writeLog(`[ACP EXT] ${payload.method}`);
+
+    if (payload.params?.sessionId && (payload.params.currentModelId || payload.params.models || payload.params.modelOptions)) {
+      this.handleModelStateUpdate(payload.params.sessionId, {
+        currentModelId: payload.params.currentModelId,
+        models: payload.params.models,
+        modelOptions: payload.params.modelOptions
+      });
+    }
 
     // Capture dynamic config options (like Effort) in metadata so they aren't lost
     // during the "warming up" phase race condition.
@@ -255,20 +274,46 @@ class AcpClient {
     }
   }
 
+  handleModelStateUpdate(sessionId, source = {}) {
+    const { models: providerModels } = getProvider().config;
+    const modelState = extractModelState(source, providerModels);
+    if (!modelState.currentModelId && modelState.modelOptions.length === 0) return;
+
+    const meta = this.sessionMetadata.get(sessionId) || this.sessionMetadata.get('pending-new');
+    const mergedModelOptions = mergeModelOptions(meta?.modelOptions, modelState.modelOptions);
+    const currentModelId = modelState.currentModelId || meta?.currentModelId || meta?.model || null;
+
+    if (meta) {
+      meta.modelOptions = mergedModelOptions;
+      if (currentModelId) {
+        meta.currentModelId = currentModelId;
+        meta.model = currentModelId;
+      }
+    }
+
+    if (typeof db.saveModelState === 'function') {
+      db.saveModelState(sessionId, {
+        currentModelId,
+        modelOptions: mergedModelOptions
+      }).catch(err =>
+        writeLog(`[DB ERR] Failed to save model state for ${sessionId}: ${err.message}`)
+      );
+    }
+
+    if (this.io) {
+      this.io.emit('session_model_options', {
+        sessionId,
+        currentModelId,
+        modelOptions: mergedModelOptions
+      });
+    }
+  }
+
   async performHandshake() {
     try {
       writeLog('Performing ACP handshake...');
       await new Promise(r => setTimeout(r, 2000));
       const { config: providerConfig } = getProvider();
-      await this.sendRequest('initialize', {
-        protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: true, writeTextFile: true },
-          terminal: true,
-        },
-        clientInfo: providerConfig.clientInfo || { name: 'ACP-UI', version: '1.0.0' }
-      });
-
       const providerModule = await getProviderModule();
       await providerModule.performHandshake(this);
 

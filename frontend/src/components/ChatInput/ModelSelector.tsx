@@ -1,6 +1,7 @@
 import React from 'react';
 import type { ChatSession } from '../../types';
 import { useSystemStore } from '../../store/useSystemStore';
+import { getFooterModelChoices, getModelLabel, isModelChoiceActive } from '../../utils/modelOptions';
 import { Settings } from 'lucide-react';
 import './ModelSelector.css';
 
@@ -8,7 +9,7 @@ interface ModelSelectorProps {
   activeSession: ChatSession | undefined;
   isModelDropdownOpen: boolean;
   setIsModelDropdownOpen: (open: boolean) => void;
-  onModelSelect: (model: 'fast' | 'balanced' | 'flagship') => void;
+  onModelSelect: (model: string) => void;
   modelDropdownRef: React.RefObject<HTMLDivElement | null>;
   getActiveModelQuotaPercent: () => number | null; // Kept for prop compatibility, but unused visually
   disabled: boolean;
@@ -29,16 +30,10 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
 
   if (!activeSession) return null;
 
-  const getModelName = (modelKey: 'fast' | 'balanced' | 'flagship') => {
-    const branding = useSystemStore.getState().branding;
-    if (modelKey === 'flagship') return branding.models?.flagship?.displayName || 'Flagship';
-    if (modelKey === 'balanced') return branding.models?.balanced?.displayName || 'Balanced';
-    if (modelKey === 'fast') return branding.models?.fast?.displayName || 'Fast';
-    return 'Model';
-  };
-
-  const modelName = getModelName(activeSession.model);
+  const brandingModels = useSystemStore.getState().branding.models;
+  const modelName = getModelLabel(activeSession, brandingModels);
   const label = isCompacting ? `${modelName} (Compacting...)` : contextPct !== undefined ? `${modelName} (${Math.round(contextPct)}%)` : modelName;
+  const modelChoices = getFooterModelChoices(activeSession, brandingModels);
 
   return (
     <div className="model-indicator" ref={modelDropdownRef}>
@@ -65,27 +60,17 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
 
       {isModelDropdownOpen && (
         <div className="model-dropdown-menu">
-          <button
-            type="button"
-            className={`model-dropdown-item ${activeSession.model === 'fast' ? 'active' : ''}`}
-            onClick={() => { onModelSelect('fast'); setIsModelDropdownOpen(false); }}
-          >
-            {useSystemStore.getState().branding.models?.fast?.displayName || 'Fast'}
-          </button>
-          <button
-            type="button"
-            className={`model-dropdown-item ${activeSession.model === 'balanced' ? 'active' : ''}`}
-            onClick={() => { onModelSelect('balanced'); setIsModelDropdownOpen(false); }}
-          >
-            {useSystemStore.getState().branding.models?.balanced?.displayName || 'Balanced'}
-          </button>
-          <button
-            type="button"
-            className={`model-dropdown-item ${activeSession.model === 'flagship' ? 'active' : ''}`}
-            onClick={() => { onModelSelect('flagship'); setIsModelDropdownOpen(false); }}
-          >
-            {useSystemStore.getState().branding.models?.flagship?.displayName || 'Flagship'}
-          </button>
+          {modelChoices.map(choice => (
+            <button
+              key={choice.selection}
+              type="button"
+              className={`model-dropdown-item ${isModelChoiceActive(activeSession, choice, brandingModels) ? 'active' : ''}`}
+              onClick={() => { onModelSelect(choice.selection); setIsModelDropdownOpen(false); }}
+              title={choice.description}
+            >
+              {choice.name}
+            </button>
+          ))}
         </div>
       )}
     </div>

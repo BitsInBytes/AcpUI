@@ -4,6 +4,7 @@ import { writeLog } from '../services/logger.js';
 import acpClient from '../services/acpClient.js';
 import { autoSaveTurn } from '../services/sessionManager.js';
 import { getProvider } from '../services/providerLoader.js';
+import { resolveModelSelection } from '../services/modelOptions.js';
 
 import { getAllRunning, removeSubAgentsForParent } from '../mcp/subAgentRegistry.js';
 import { cleanupAcpSession } from '../mcp/acpCleanup.js';
@@ -13,8 +14,8 @@ export default function registerPromptHandlers(io, socket) {
     writeLog(`UI Prompt [${sessionId}] (Model: ${model}): ${typeof prompt === 'string' ? prompt : '(Complex)'}`);
     try {
       const { models: providerModels } = getProvider().config;
-      const modelId = providerModels[model]?.id || providerModels.flagship.id;
       let meta = acpClient.sessionMetadata.get(sessionId);
+      const modelId = resolveModelSelection(model, providerModels, meta?.modelOptions).modelId;
       
       if (!meta) {
         // Session not loaded in this process — tell UI to re-hydrate

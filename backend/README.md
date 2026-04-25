@@ -8,10 +8,12 @@ The backend is strictly provider-agnostic. The `ACP_PROVIDER` env var points to 
 
 - `provider.json` — Protocol identity, MCP configuration, and tool categorization.
 - `branding.json` — UI labels, text strings, and iconography.
-- `user.json` — **REQUIRED.** Deployment contract defining absolute paths, executable settings, and the three mandatory model tiers (**flagship**, **balanced**, **fast**).
+- `user.json` — **REQUIRED.** Deployment contract defining absolute paths, executable settings, and three mandatory quick-access model aliases (**flagship**, **balanced**, **fast**).
 - `index.js` — **REQUIRED.** The logic module implementing the Provider Interface Contract (data normalization, Unified Timeline parsing, and session file operations).
 
-`providerLoader.js` reads the config once at startup. Every service that needs paths, branding, or model IDs calls `getProvider()` or the provider module hooks instead of hardcoding values.
+`providerLoader.js` reads the config once at startup. Every service that needs paths, branding, quick model aliases, or provider hooks calls `getProvider()` instead of hardcoding provider details.
+
+Dynamic model catalogs are discovered per session from ACP responses or model-shaped config options, normalized by `modelOptions.js`, persisted in SQLite, and re-applied with `session/set_model` when a saved chat is loaded. The provider's three quick aliases remain the fallback/default shortcuts, not the complete model list.
 
 Other env vars: `COUNSEL_CONFIG` overrides the path to `configuration/counsel.json` (counsel agent definitions).
 
@@ -27,7 +29,7 @@ sockets/
   sessionHandlers.js     — load_sessions, save_snapshot, delete_session, create_session,
                             get_session_history, rehydrate_session, fork_session,
                             merge_fork, export_session, get_notes, save_notes,
-                            open_in_editor
+                            open_in_editor, set_session_option, set_session_model
   archiveHandlers.js     — archive_session, list_archives, restore_archive, delete_archive
   canvasHandlers.js      — canvas_save, canvas_load, canvas_delete, canvas_apply_to_file,
                             canvas_read_file
@@ -48,6 +50,7 @@ services/
                             drain, permissions, provider extension routing
   acpUpdateHandler.js    — Routes updates; implements "Sticky Metadata" to preserve tool context
   acpTitleGenerator.js   — Auto-generates chat titles via a secondary ACP session using the configured `titleGeneration` model ID
+  modelOptions.js        — Normalizes dynamic ACP model catalogs, currentModelId, and quick alias/raw ID resolution
   hookRunner.js          — Standardized hook system: executes `session_start`, `pre_tool`, `post_tool`, and `stop` scripts
   jsonlParser.js         — Delegates to provider's `parseSessionHistory` to reconstruct the **Unified Timeline**
   sessionManager.js      — autoSaveTurn with 5s delay, permission-aware
@@ -70,7 +73,7 @@ mcp/
   acpCleanup.js          — Deletes ephemeral ACP session files (.jsonl, .json, tasks)
 
 voiceService.js          — whisper-server management and transcription
-database.js              — SQLite (sessions, folders, canvas artifacts, notes, fork metadata)
+database.js              — SQLite (sessions, folders, canvas artifacts, notes, fork metadata, dynamic model state)
 ```
 
 ## ACP Protocol
@@ -80,12 +83,12 @@ Communicates with the CLI daemon using JSON-RPC 2.0 over NDJSON (stdin/stdout):
 | Method | Notes |
 |--------|-------|
 | `initialize` | Handshake with `protocolVersion`, `clientCapabilities`, `clientInfo` from provider |
-| `session/new` | Creates session with `cwd`, `mcpServers` |
-| `session/load` | Resumes session with `mcpServers` |
+| `session/new` | Creates session with `cwd`, `mcpServers`; captures dynamic model catalog and `currentModelId` when advertised |
+| `session/load` | Resumes session with `mcpServers`; captures restored model state and immediately re-applies the DB model if needed |
 | `session/prompt` | `prompt` field; array of ContentBlock |
-| `session/set_model` | Sets model using the **Model ID** (e.g., `gemini-1.5-pro`) from the provider config |
+| `session/set_model` | Sets model using the real **Model ID** from the dynamic catalog or provider quick alias fallback |
 | `session/set_mode` | Sets agent mode |
-| `session/configure` | Sets per-session configuration options |
+| `session/configure` / provider-specific `session/set_config_option` | Sets per-session dynamic configuration options through the provider hook |
 | `session/cancel` | Notification (no response expected) |
 
 Incoming updates arrive as `session/update` notifications with `sessionUpdate` types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `usage_update`, `turn_end`.
@@ -94,7 +97,9 @@ Permission requests arrive as `session/request_permission` with JSON-RPC `id`; r
 
 ## Features
 
-- **Provider system** — all paths, branding, models, and CLI command configured via `ACP_PROVIDER`
+- **Provider system** — all paths, branding, quick model aliases, and CLI command configured via `ACP_PROVIDER`
+- **Dynamic model discovery** — captures provider-advertised model catalogs from ACP responses or model-shaped config options, persists `currentModelId`/`modelOptions`, and emits `session_model_options`
+- **Model re-apply on load** — saved chats restore the DB-selected model immediately during session load instead of waiting for the next prompt
 - **Per-workspace agents** — `create_session` accepts `cwd` and `agent`, switches agent via `/agent` prompt
 - **Session forking** — `fork_session` clones JSONL, JSON, tasks, and attachments at a message index
 - **Cascade delete** — `delete_session` removes child forks and sub-agents (DB records, ACP files, attachments) to prevent orphans
@@ -134,9 +139,17 @@ Extension events from the ACP daemon are forwarded as `provider_extension` socke
 | `*/compaction/status` | Compaction lifecycle events |
 | `*/config_options` | Dynamic per-session configuration controls (e.g., Reasoning Effort) |
 
+## Model State Events
+
+Dynamic model updates are provider-agnostic socket events, not provider extension events.
+
+| Event | Purpose |
+|-------|---------|
+| `session_model_options` | Broadcasts `{ sessionId, currentModelId, modelOptions }` when the ACP advertises or changes model state |
+
 ## Testing
 
 ```bash
-npx vitest run              # 397 tests across 43 files
+npx vitest run              # 464 tests across 44 files
 npx vitest run --coverage
 ```

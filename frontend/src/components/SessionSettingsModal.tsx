@@ -5,6 +5,7 @@ import './SessionSettingsModal.css';
 import { useUIStore, type SettingsTab } from '../store/useUIStore';
 import { useChatStore } from '../store/useChatStore';
 import { useSystemStore } from '../store/useSystemStore';
+import { getFullModelChoices, getFullModelSelectionValue } from '../utils/modelOptions';
 
 const ContextUsageCard: React.FC<{ acpSessionId: string | null | undefined }> = ({ acpSessionId }) => {
   const pct = useSystemStore(state => acpSessionId ? state.contextUsageBySession[acpSessionId] : undefined);
@@ -31,7 +32,7 @@ const SessionSettingsModal: React.FC = () => {
   const { 
     sessions, 
     handleDeleteSession, 
-    handleUpdateModel,
+    handleSessionModelChange,
     handleSetSessionOption
   } = useChatStore();
   
@@ -89,6 +90,10 @@ const SessionSettingsModal: React.FC = () => {
   }, [isOpen, settingsInitialTab]);
 
   if (!session) return null;
+
+  const brandingModels = useSystemStore.getState().branding.models;
+  const modelChoices = getFullModelChoices(session, brandingModels);
+  const selectedModelValue = getFullModelSelectionValue(session, brandingModels);
 
 
   return (
@@ -173,13 +178,15 @@ const SessionSettingsModal: React.FC = () => {
 
                   <div className="model-selector">
                     <select
-                      value={session.model}
-                      onChange={(e) => handleUpdateModel(session.id, e.target.value as 'fast' | 'balanced' | 'flagship')}
+                      value={selectedModelValue}
+                      onChange={(e) => handleSessionModelChange(socket, session.id, e.target.value)}
                       className="model-select"
                     >
-                      <option value="fast">{useSystemStore.getState().branding.models?.fast?.displayName || 'Fast'}</option>
-                      <option value="balanced">{useSystemStore.getState().branding.models?.balanced?.displayName || 'Balanced'}</option>
-                      <option value="flagship">{useSystemStore.getState().branding.models?.flagship?.displayName || 'Flagship'}</option>
+                      {modelChoices.map(choice => (
+                        <option key={choice.id} value={choice.selection} title={choice.description}>
+                          {choice.name}
+                        </option>
+                      ))}
                     </select>
                   </div>
                 </div>

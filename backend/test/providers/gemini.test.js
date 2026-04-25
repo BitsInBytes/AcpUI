@@ -8,6 +8,7 @@ vi.mock('../../services/providerLoader.js', () => ({
   getProvider: () => ({
     config: {
       protocolPrefix: '_google/',
+      clientInfo: { name: 'AcpUI', version: '1.0.0' },
       paths: {
         sessions: '/mock/gemini-tmp',
         attachments: '/mock/attachments',
@@ -74,10 +75,94 @@ describe('Gemini Provider', () => {
   });
 
   describe('performHandshake', () => {
-    it('sends authenticate request', async () => {
+    it('sends both initialize and authenticate', async () => {
       const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
       await gemini.performHandshake(mockClient);
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('initialize', expect.any(Object));
       expect(mockClient.sendRequest).toHaveBeenCalledWith('authenticate', expect.any(Object));
+    });
+
+    it('sends authenticate before initialize resolves (simultaneous in-flight)', async () => {
+      const callOrder = [];
+      let resolveInit;
+
+      const mockClient = {
+        sendRequest: vi.fn().mockImplementation((method) => {
+          callOrder.push(method);
+          if (method === 'initialize') {
+            return new Promise(resolve => { resolveInit = resolve; });
+          }
+          // authenticate is called while initialize is still pending — now unblock it
+          resolveInit({});
+          return Promise.resolve({});
+        })
+      };
+
+      await gemini.performHandshake(mockClient);
+      expect(callOrder).toEqual(['initialize', 'authenticate']);
+    });
+
+    it('sends correct initialize params', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+      await gemini.performHandshake(mockClient);
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('initialize', {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+        clientInfo: { name: 'AcpUI', version: '1.0.0' }
+      });
+    });
+
+    it('uses oauth-personal when no API key env var is set', async () => {
+      delete process.env.GEMINI_CLI_SERVICES_API_KEY;
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+      await gemini.performHandshake(mockClient);
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('authenticate', {
+        methodId: 'oauth-personal'
+      });
+    });
+
+    it('uses gemini-api-key and passes the key when env var is set', async () => {
+      process.env.GEMINI_CLI_SERVICES_API_KEY = 'test-api-key';
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+      await gemini.performHandshake(mockClient);
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('authenticate', {
+        methodId: 'gemini-api-key',
+        _meta: { 'api-key': 'test-api-key' }
+      });
+      delete process.env.GEMINI_CLI_SERVICES_API_KEY;
+    });
+  });
+
+  describe('setConfigOption', () => {
+    it('routes model through session/set_model', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+
+      await gemini.setConfigOption(mockClient, 'sess-1', 'model', 'gemini-3.1-pro-preview');
+
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('session/set_model', {
+        sessionId: 'sess-1',
+        modelId: 'gemini-3.1-pro-preview'
+      });
+    });
+
+    it('routes mode through session/set_mode', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+
+      await gemini.setConfigOption(mockClient, 'sess-1', 'mode', 'autoEdit');
+
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('session/set_mode', {
+        sessionId: 'sess-1',
+        modeId: 'autoEdit'
+      });
+    });
+
+    it('does not call unsupported session/set_config_option', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+
+      const result = await gemini.setConfigOption(mockClient, 'sess-1', 'effort', 'high');
+
+      expect(result).toBeNull();
+      expect(mockClient.sendRequest).not.toHaveBeenCalled();
     });
   });
 

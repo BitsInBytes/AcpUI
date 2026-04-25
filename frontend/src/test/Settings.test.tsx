@@ -11,7 +11,20 @@ describe('App Settings Modal', () => {
     vi.clearAllMocks();
     
     act(() => {
-      useSystemStore.setState({ socket: { emit: vi.fn(), on: vi.fn(), off: vi.fn() } as any, connected: true, isEngineReady: true });
+      useSystemStore.setState({
+        socket: { emit: vi.fn(), on: vi.fn(), off: vi.fn() } as any,
+        connected: true,
+        isEngineReady: true,
+        branding: {
+          ...useSystemStore.getState().branding,
+          models: {
+            default: 'balanced',
+            flagship: { id: 'test-flagship', displayName: 'Flagship' },
+            balanced: { id: 'test-balanced', displayName: 'Balanced' },
+            fast: { id: 'test-fast', displayName: 'Fast' }
+          }
+        }
+      });
       useVoiceStore.setState({
         isRecording: false,
         isProcessingVoice: false,
@@ -52,9 +65,9 @@ describe('App Settings Modal', () => {
   });
 
   it('handles model selection change', async () => {
-    const handleUpdateModel = vi.fn();
+    const handleSessionModelChange = vi.fn();
     await act(async () => {
-      useChatStore.setState({ handleUpdateModel });
+      useChatStore.setState({ handleSessionModelChange });
       useUIStore.setState({ isSettingsOpen: true, settingsSessionId: 's1' });
     });
 
@@ -65,7 +78,7 @@ describe('App Settings Modal', () => {
     const select = screen.getByRole('combobox');
     fireEvent.change(select, { target: { value: 'flagship' } });
 
-    expect(handleUpdateModel).toHaveBeenCalledWith('s1', 'flagship');
+    expect(handleSessionModelChange).toHaveBeenCalledWith(expect.anything(), 's1', 'flagship');
   });
 
   it('handles session deletion with confirmation', async () => {

@@ -136,22 +136,25 @@ export function extractDiffFromToolCall(update, Diff) {
 
 /**
  * Perform Gemini-specific handshake steps.
- * Gemini requires 'authenticate' after 'initialize'.
+ * The Gemini daemon holds the initialize response until after authenticate is received,
+ * so both must be in-flight simultaneously via Promise.all.
  */
 export async function performHandshake(acpClient) {
-  console.log('[GEMINI PROVIDER] Performing authentication...');
-  
-  const authMethodId = process.env.GEMINI_CLI_SERVICES_API_KEY ? 'gemini-api-key' : 'oauth-personal';
-  const authParams = process.env.GEMINI_CLI_SERVICES_API_KEY 
-    ? { _meta: { 'api-key': process.env.GEMINI_CLI_SERVICES_API_KEY } } 
-    : {};
-  
-  await acpClient.sendRequest('authenticate', { 
-    methodId: authMethodId, 
-    ...authParams 
+  const { config } = getProvider();
+
+  const initPromise = acpClient.sendRequest('initialize', {
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+    clientInfo: config.clientInfo || { name: 'AcpUI', version: '1.0.0' }
   });
-  
-  console.log(`[GEMINI PROVIDER] Authentication complete (${authMethodId}).`);
+
+  const authMethodId = process.env.GEMINI_CLI_SERVICES_API_KEY ? 'gemini-api-key' : 'oauth-personal';
+  const authParams = process.env.GEMINI_CLI_SERVICES_API_KEY
+    ? { methodId: authMethodId, _meta: { 'api-key': process.env.GEMINI_CLI_SERVICES_API_KEY } }
+    : { methodId: authMethodId };
+
+  const authPromise = acpClient.sendRequest('authenticate', authParams);
+  await Promise.all([initPromise, authPromise]);
 }
 
 /**
@@ -340,11 +343,22 @@ export async function setInitialAgent(acpClient, sessionId, agent) {
 }
 
 export async function setConfigOption(acpClient, sessionId, optionId, value) {
-  return acpClient.sendRequest('session/set_config_option', {
-    sessionId,
-    configId: optionId,
-    value
-  });
+  if (optionId === 'model') {
+    return acpClient.sendRequest('session/set_model', {
+      sessionId,
+      modelId: value
+    });
+  }
+
+  if (optionId === 'mode') {
+    return acpClient.sendRequest('session/set_mode', {
+      sessionId,
+      modeId: value
+    });
+  }
+
+  // Gemini ACP does not implement session/set_config_option.
+  return null;
 }
 
 export async function parseSessionHistory(filePath, Diff) {

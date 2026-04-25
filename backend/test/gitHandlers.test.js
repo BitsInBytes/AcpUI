@@ -42,6 +42,27 @@ describe('Git Handlers', () => {
     expect(res.files[2]).toEqual({ path: 'untracked.txt', status: 'untracked', staged: false });
   });
 
+  it('git_status returns empty files array when working tree is clean', async () => {
+    const { execSync } = await import('child_process');
+    execSync.mockImplementationOnce(() => 'main\n'); // branch
+    execSync.mockImplementationOnce(() => '');        // status --porcelain (empty)
+    const cb = vi.fn();
+    socket.listeners('git_status')[0]({ cwd: '/tmp/repo' }, cb);
+    expect(cb).toHaveBeenCalledWith({ branch: 'main', files: [] });
+  });
+
+  it('git_status maps deleted and renamed statuses', async () => {
+    const { execSync } = await import('child_process');
+    execSync.mockImplementationOnce(() => 'main\n');                              // branch
+    execSync.mockImplementationOnce(() => 'D  old.js\nR  new.js\n D unstaged.js\n'); // status
+    const cb = vi.fn();
+    socket.listeners('git_status')[0]({ cwd: '/tmp/repo' }, cb);
+    const { files } = cb.mock.calls[0][0];
+    expect(files[0]).toMatchObject({ path: 'old.js', status: 'deleted', staged: true });
+    expect(files[1]).toMatchObject({ path: 'new.js', status: 'renamed', staged: true });
+    expect(files[2]).toMatchObject({ path: 'unstaged.js', status: 'deleted', staged: false });
+  });
+
   it('git_diff returns staged diff', () => {
     const cb = vi.fn();
     socket.listeners('git_diff')[0]({ cwd: '/tmp/repo', filePath: 'src/new.js', staged: true }, cb);
@@ -81,6 +102,34 @@ describe('Git Handlers', () => {
     const cb = vi.fn();
     socket.listeners('git_unstage')[0]({ cwd: '/tmp/repo', filePath: 'src/new.js' }, cb);
     expect(cb).toHaveBeenCalledWith({ success: true });
+  });
+
+  it('git_diff returns (no changes) when diff is empty', async () => {
+    const { execSync } = await import('child_process');
+    execSync.mockImplementation((cmd) => {
+      if (cmd.includes('status --porcelain')) return ' M src/app.js\n';
+      if (cmd.includes('diff')) return '';
+      return '';
+    });
+    const cb = vi.fn();
+    socket.listeners('git_diff')[0]({ cwd: '/tmp/repo', filePath: 'src/app.js', staged: false }, cb);
+    expect(cb).toHaveBeenCalledWith({ diff: '(no changes)' });
+  });
+
+  it('git_diff handles errors', async () => {
+    const { execSync } = await import('child_process');
+    execSync.mockImplementationOnce(() => { throw new Error('diff fail'); });
+    const cb = vi.fn();
+    socket.listeners('git_diff')[0]({ cwd: '/tmp/repo', filePath: 'src/app.js', staged: true }, cb);
+    expect(cb).toHaveBeenCalledWith({ diff: '', error: expect.stringContaining('diff fail') });
+  });
+
+  it('git_unstage handles errors', async () => {
+    const { execSync } = await import('child_process');
+    execSync.mockImplementationOnce(() => { throw new Error('unstage fail'); });
+    const cb = vi.fn();
+    socket.listeners('git_unstage')[0]({ cwd: '/tmp/repo', filePath: 'src/app.js' }, cb);
+    expect(cb).toHaveBeenCalledWith({ error: expect.stringContaining('unstage fail') });
   });
 
   it('git_stage handles errors', async () => {

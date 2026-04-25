@@ -8,6 +8,7 @@ vi.mock('../../services/providerLoader.js', () => ({
   getProvider: () => ({
     config: {
       protocolPrefix: '_kiro.dev/',
+      clientInfo: { name: 'AcpUI', version: '1.0.0' },
       paths: {
         sessions: '/mock/sessions',
         attachments: '/mock/attachments',
@@ -50,6 +51,70 @@ vi.mock('fs', () => ({
 describe('Kiro Provider', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  describe('performHandshake', () => {
+    it('sends initialize with clientInfo from provider config', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+      await kiro.performHandshake(mockClient);
+      expect(mockClient.sendRequest).toHaveBeenCalledOnce();
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('initialize', {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+        clientInfo: { name: 'AcpUI', version: '1.0.0' }
+      });
+    });
+
+    it('does not send authenticate', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+      await kiro.performHandshake(mockClient);
+      expect(mockClient.sendRequest).not.toHaveBeenCalledWith('authenticate', expect.anything());
+    });
+  });
+
+  describe('intercept', () => {
+    it('normalizes agent switch model into currentModelId', () => {
+      const payload = {
+        method: '_kiro.dev/agent/switched',
+        params: {
+          sessionId: 's1',
+          agentName: 'agent-dev',
+          model: 'claude-opus-4.6'
+        }
+      };
+
+      expect(kiro.intercept(payload)).toEqual({
+        method: '_kiro.dev/agent/switched',
+        params: {
+          sessionId: 's1',
+          agentName: 'agent-dev',
+          model: 'claude-opus-4.6',
+          currentModelId: 'claude-opus-4.6'
+        }
+      });
+    });
+  });
+
+  describe('setConfigOption', () => {
+    it('routes model through session/set_model', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+
+      await kiro.setConfigOption(mockClient, 'sess-1', 'model', 'claude-sonnet-4.6');
+
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('session/set_model', {
+        sessionId: 'sess-1',
+        modelId: 'claude-sonnet-4.6'
+      });
+    });
+
+    it('does not call unsupported config or mode methods', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+
+      const result = await kiro.setConfigOption(mockClient, 'sess-1', 'mode', 'kiro_default');
+
+      expect(result).toBeNull();
+      expect(mockClient.sendRequest).not.toHaveBeenCalled();
+    });
   });
 
   describe('normalizeUpdate', () => {
@@ -176,6 +241,26 @@ describe('Kiro Provider', () => {
       const cat = kiro.categorizeToolCall({ toolName: 'read_file' });
       expect(cat.toolCategory).toBe('file_read');
       expect(cat.isFileOperation).toBe(true);
+    });
+  });
+
+  describe('parseExtension', () => {
+    it('parses agent switch notifications with current model state', () => {
+      const parsed = kiro.parseExtension('_kiro.dev/agent/switched', {
+        sessionId: 's1',
+        agentName: 'agent-dev',
+        previousAgentName: 'kiro_default',
+        model: 'claude-sonnet-4.6'
+      });
+
+      expect(parsed).toEqual({
+        type: 'agent_switched',
+        sessionId: 's1',
+        agentName: 'agent-dev',
+        previousAgentName: 'kiro_default',
+        welcomeMessage: undefined,
+        currentModelId: 'claude-sonnet-4.6'
+      });
     });
   });
 

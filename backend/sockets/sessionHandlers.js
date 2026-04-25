@@ -11,7 +11,13 @@ import { parseJsonlSession } from '../services/jsonlParser.js';
 import { cleanupAcpSession } from '../mcp/acpCleanup.js';
 import { runHooks } from '../services/hookRunner.js';
 import { generateForkTitle } from '../services/acpTitleGenerator.js';
-import { mergeConfigOptions } from '../services/configOptions.js';
+import { mergeConfigOptions, normalizeConfigOptions } from '../services/configOptions.js';
+import {
+  extractModelState,
+  mergeModelOptions,
+  modelOptionsFromProviderConfig,
+  resolveModelSelection
+} from '../services/modelOptions.js';
 
 function hasConfigValue(option) {
   return option && Object.prototype.hasOwnProperty.call(option, 'currentValue') && option.currentValue !== undefined;
@@ -30,14 +36,17 @@ function isConfigValueAdvertised(savedOption, advertisedOption) {
 
 async function setProviderConfigOption(providerModule, sessionId, optionId, value) {
   if (typeof providerModule.setConfigOption === 'function') {
-    await providerModule.setConfigOption(acpClient, sessionId, optionId, value);
-    return true;
+    return await providerModule.setConfigOption(acpClient, sessionId, optionId, value);
   }
   if (typeof acpClient.setConfigOption === 'function') {
-    await acpClient.setConfigOption(sessionId, optionId, value);
-    return true;
+    return await acpClient.setConfigOption(sessionId, optionId, value);
   }
-  return false;
+  return null;
+}
+
+function getConfigOptionsFromSetResult(result, optionId, value) {
+  const returnedOptions = normalizeConfigOptions(result?.configOptions);
+  return returnedOptions.length > 0 ? returnedOptions : [{ id: optionId, currentValue: value }];
 }
 
 async function reapplySavedConfigOptions(sessionId, savedOptions, providerModule) {
@@ -52,18 +61,84 @@ async function reapplySavedConfigOptions(sessionId, savedOptions, providerModule
     if (!isConfigValueAdvertised(savedOption, advertisedOption)) continue;
 
     try {
-      const didSet = await setProviderConfigOption(providerModule, sessionId, savedOption.id, savedOption.currentValue);
-      if (!didSet) continue;
+      const result = await setProviderConfigOption(providerModule, sessionId, savedOption.id, savedOption.currentValue);
+      if (result === null) continue;
 
-      const updatedOptions = mergeConfigOptions(meta.configOptions, [{ id: savedOption.id, currentValue: savedOption.currentValue }]);
+      const optionsFromResult = getConfigOptionsFromSetResult(result, savedOption.id, savedOption.currentValue);
+      const updatedOptions = mergeConfigOptions(meta.configOptions, optionsFromResult);
       meta.configOptions = updatedOptions;
       if (typeof db.saveConfigOptions === 'function') {
-        await db.saveConfigOptions(sessionId, [{ id: savedOption.id, currentValue: savedOption.currentValue }]);
+        await db.saveConfigOptions(sessionId, optionsFromResult);
       }
     } catch (err) {
       writeLog(`[OPTION ERR] Failed to reapply ${savedOption.id} for ${sessionId}: ${err.message}`);
     }
   }
+}
+
+async function saveModelState(sessionId, modelState) {
+  if (typeof db.saveModelState === 'function') {
+    await db.saveModelState(sessionId, modelState);
+  }
+}
+
+function getKnownModelOptions(session, meta, providerModels) {
+  return mergeModelOptions(
+    mergeModelOptions(session?.modelOptions, meta?.modelOptions),
+    modelOptionsFromProviderConfig(providerModels)
+  );
+}
+
+function updateSessionModelMetadata(sessionId, modelState = {}) {
+  const meta = acpClient.sessionMetadata.get(sessionId);
+  if (!meta) return modelState;
+
+  const modelOptions = mergeModelOptions(meta.modelOptions, modelState.modelOptions);
+  const currentModelId = modelState.currentModelId || meta.currentModelId || meta.model || null;
+
+  meta.modelOptions = modelOptions;
+  if (currentModelId) {
+    meta.currentModelId = currentModelId;
+    meta.model = currentModelId;
+  }
+
+  return { currentModelId, modelOptions };
+}
+
+async function captureModelState(sessionId, source, providerModels, fallbackSelection) {
+  const extracted = extractModelState(source, providerModels, fallbackSelection);
+  const meta = acpClient.sessionMetadata.get(sessionId);
+  const modelState = {
+    currentModelId: extracted.currentModelId || meta?.currentModelId || meta?.model || null,
+    modelOptions: mergeModelOptions(meta?.modelOptions, extracted.modelOptions)
+  };
+
+  const updated = updateSessionModelMetadata(sessionId, modelState);
+  await saveModelState(sessionId, updated);
+  return updated;
+}
+
+async function setSessionModel(sessionId, selection, providerModels, modelOptions) {
+  const resolved = resolveModelSelection(selection, providerModels, modelOptions);
+  writeLog(`[ACP] Setting session ${sessionId} model to ${resolved.modelKey} (${resolved.modelId})`);
+
+  const result = await acpClient.sendRequest('session/set_model', {
+    sessionId,
+    modelId: resolved.modelId
+  });
+
+  const modelState = await captureModelState(sessionId, result || {}, providerModels, resolved.modelId);
+  const currentModelId = modelState.currentModelId || resolved.modelId;
+  const finalState = updateSessionModelMetadata(sessionId, {
+    ...modelState,
+    currentModelId
+  });
+  await saveModelState(sessionId, finalState);
+
+  return {
+    ...finalState,
+    model: resolved.modelKey
+  };
 }
 
 // Returns MCP server configs in stdio transport format (command + args) because
@@ -257,6 +332,8 @@ export default function registerSessionHandlers(io, socket) {
         folderId: session.folderId,
         forkedFrom: uiId,
         forkPoint: messageIndex,
+        currentModelId: session.currentModelId,
+        modelOptions: session.modelOptions,
       });
 
       // 6. Load the cloned ACP session
@@ -270,11 +347,14 @@ export default function registerSessionHandlers(io, socket) {
 
       // 7. Register ACP metadata so prompts work
       const { models: forkModels } = getProvider().config;
-      const resolvedModelId = forkModels[session.model]?.id || forkModels.flagship.id;
+      const knownModelOptions = getKnownModelOptions(session, null, forkModels);
+      const resolvedModel = resolveModelSelection(session.currentModelId || session.model, forkModels, knownModelOptions);
       const currentProvider = getProvider().config.name;
 
       acpClient.sessionMetadata.set(newAcpId, {
-        model: resolvedModelId, toolCalls: 0, successTools: 0, startTime: Date.now(),
+        model: resolvedModel.modelId, currentModelId: resolvedModel.modelId,
+        modelOptions: knownModelOptions,
+        toolCalls: 0, successTools: 0, startTime: Date.now(),
         usedTokens: 0, totalTokens: 0, promptCount: 0,
         lastResponseBuffer: '', lastThoughtBuffer: '',
         agentName: null, spawnContext: null,
@@ -288,6 +368,8 @@ export default function registerSessionHandlers(io, socket) {
         success: true,
         newUiId,
         newAcpId,
+        currentModelId: meta?.currentModelId,
+        modelOptions: meta?.modelOptions,
         configOptions: meta?.configOptions
       });
 
@@ -308,25 +390,28 @@ export default function registerSessionHandlers(io, socket) {
     }
     try {
       const { models } = getProvider().config;
-      const modelId = models[model] ? model : 'flagship';
-
       const sessionCwd = requestCwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
       const currentProvider = getProvider().config.name;
 
       let result;
+      let dbSession = null;
       let savedConfigOptionsForResume = [];
+      let selectedModelState;
       if (existingAcpId) {
         writeLog(`[ACP] Resuming session: ${existingAcpId}`);
 
-        const dbSession = await db.getSessionByAcpId(existingAcpId);
+        dbSession = await db.getSessionByAcpId(existingAcpId);
         savedConfigOptionsForResume = dbSession?.configOptions || [];
 
         // Ensure metadata is initialized with the current model from DB if we have it
         if (!acpClient.sessionMetadata.has(existingAcpId)) {
           if (dbSession) {
-            const resolvedModelId = models[dbSession.model]?.id || dbSession.model;
+            const knownModelOptions = getKnownModelOptions(dbSession, null, models);
+            const resolvedModel = resolveModelSelection(dbSession.currentModelId || dbSession.model || model, models, knownModelOptions);
             acpClient.sessionMetadata.set(existingAcpId, {
-              model: resolvedModelId, toolCalls: 0, successTools: 0, startTime: Date.now(),
+              model: resolvedModel.modelId, currentModelId: resolvedModel.modelId,
+              modelOptions: knownModelOptions,
+              toolCalls: 0, successTools: 0, startTime: Date.now(),
               usedTokens: 0, totalTokens: 0, promptCount: 0,
               lastResponseBuffer: '', lastThoughtBuffer: '',
               agentName: requestAgent || null, spawnContext: null,
@@ -353,6 +438,16 @@ export default function registerSessionHandlers(io, socket) {
         if (!result.sessionId) result.sessionId = existingAcpId;
         result.reattached = true;
 
+        await captureModelState(result.sessionId, result, models, model || dbSession?.currentModelId || dbSession?.model);
+
+        const knownModelOptions = getKnownModelOptions(dbSession, acpClient.sessionMetadata.get(result.sessionId), models);
+        selectedModelState = await setSessionModel(
+          result.sessionId,
+          model || dbSession?.currentModelId || dbSession?.model,
+          models,
+          knownModelOptions
+        );
+
         const providerModule = await getProviderModule();
         await reapplySavedConfigOptions(result.sessionId, savedConfigOptionsForResume, providerModule);
 
@@ -361,11 +456,15 @@ export default function registerSessionHandlers(io, socket) {
           await providerModule.setInitialAgent(acpClient, result.sessionId, requestAgent);
         }
       } else {
-        writeLog(`[ACP] Creating new session with model: ${modelId}`);
+        const initialModelOptions = modelOptionsFromProviderConfig(models);
+        const requestedModel = resolveModelSelection(model, models, initialModelOptions);
+        writeLog(`[ACP] Creating new session with model: ${requestedModel.modelKey} (${requestedModel.modelId})`);
 
         // Register metadata EARLY so async updates (like config_options) during creation can be captured
         acpClient.sessionMetadata.set('pending-new', {
-          model: models.flagship.id, toolCalls: 0, successTools: 0, startTime: Date.now(),
+          model: requestedModel.modelId, currentModelId: requestedModel.modelId,
+          modelOptions: initialModelOptions,
+          toolCalls: 0, successTools: 0, startTime: Date.now(),
           usedTokens: 0, totalTokens: 0, promptCount: 0,
           lastResponseBuffer: '', lastThoughtBuffer: '',
           agentName: requestAgent || null, spawnContext: null,
@@ -382,21 +481,16 @@ export default function registerSessionHandlers(io, socket) {
         acpClient.sessionMetadata.delete('pending-new');
         acpClient.sessionMetadata.set(result.sessionId, meta);
 
+        await captureModelState(result.sessionId, result, models, requestedModel.modelId);
+
         const providerModule = await getProviderModule();
         await providerModule.setInitialAgent(acpClient, result.sessionId, requestAgent);
+
+        const knownModelOptions = getKnownModelOptions(null, acpClient.sessionMetadata.get(result.sessionId), models);
+        selectedModelState = await setSessionModel(result.sessionId, model || requestedModel.modelId, models, knownModelOptions);
       }
 
-      const resolvedModelId = models[model]?.id || models.flagship.id;
       const finalMeta = acpClient.sessionMetadata.get(result.sessionId);
-      if (finalMeta) finalMeta.model = resolvedModelId;
-
-      // Sync the UI-selected model to the daemon immediately (don't wait for first prompt)
-      if (!existingAcpId) {
-        await acpClient.sendRequest('session/set_model', {
-          sessionId: result.sessionId,
-          modelId: resolvedModelId
-        });
-      }
 
       // Run session_start hooks and capture context before returning
       if (requestAgent) {
@@ -413,6 +507,9 @@ export default function registerSessionHandlers(io, socket) {
         success: true,
         acpSessionId: result.sessionId,
         sessionId: result.sessionId,
+        model: selectedModelState?.model || model,
+        currentModelId: finalMeta?.currentModelId || selectedModelState?.currentModelId,
+        modelOptions: finalMeta?.modelOptions || selectedModelState?.modelOptions,
         configOptions: finalMeta?.configOptions
       });
     } catch (err) {
@@ -534,49 +631,46 @@ export default function registerSessionHandlers(io, socket) {
 
     try {
       const providerModule = await getProviderModule();
-      if (typeof providerModule.setConfigOption === 'function') {
-        await providerModule.setConfigOption(acpClient, session.acpSessionId, optionId, value);
-      } else {
-        await acpClient.setConfigOption(session.acpSessionId, optionId, value);
-      }
+      const result = await setProviderConfigOption(providerModule, session.acpSessionId, optionId, value);
+      if (result === null) return;
 
-      const updatedOptions = mergeConfigOptions(session.configOptions, [{ id: optionId, currentValue: value }]);
+      const optionsFromResult = getConfigOptionsFromSetResult(result, optionId, value);
       const meta = acpClient.sessionMetadata.get(session.acpSessionId);
       if (meta) {
-        meta.configOptions = mergeConfigOptions(meta.configOptions, updatedOptions);
+        meta.configOptions = mergeConfigOptions(meta.configOptions, optionsFromResult);
       }
-      await db.saveConfigOptions(session.acpSessionId, updatedOptions);
+      await db.saveConfigOptions(session.acpSessionId, optionsFromResult);
     } catch (err) {
       writeLog(`[OPTION ERR] ${err.message}`);
     }
   });
 
-  socket.on('set_session_model', async ({ uiId, model }) => {
-    const sessions = await db.getAllSessions();
-    const session = sessions.find(s => s.id === uiId);
+  socket.on('set_session_model', async ({ uiId, model }, callback) => {
+    const session = await db.getSession(uiId);
     if (!session || !session.acpSessionId) return;
 
     try {
       const { models } = getProvider().config;
-      const resolvedModelId = models[model]?.id || models.flagship.id;
-
-      writeLog(`[SESSION] Switching model for ${uiId} (${session.acpSessionId}) to ${model} (${resolvedModelId})`);
-
-      await acpClient.sendRequest('session/set_model', {
-        sessionId: session.acpSessionId,
-        modelId: resolvedModelId
-      });
-
-      // Update metadata and DB
       const meta = acpClient.sessionMetadata.get(session.acpSessionId);
-      if (meta) meta.model = resolvedModelId;
+      const knownModelOptions = getKnownModelOptions(session, meta, models);
+      const selectedModelState = await setSessionModel(session.acpSessionId, model, models, knownModelOptions);
 
-      session.model = model;
+      session.model = selectedModelState.model;
+      session.currentModelId = selectedModelState.currentModelId;
+      session.modelOptions = selectedModelState.modelOptions;
       await db.saveSession(session);
 
       writeLog(`[SESSION] Model switch complete for ${uiId}`);
+      callback?.({
+        success: true,
+        model: selectedModelState.model,
+        currentModelId: selectedModelState.currentModelId,
+        modelOptions: selectedModelState.modelOptions,
+        configOptions: selectedModelState.configOptions
+      });
     } catch (err) {
       writeLog(`[SESSION ERR] Failed to switch model: ${err.message}`);
+      callback?.({ error: err.message });
     }
   });
 }

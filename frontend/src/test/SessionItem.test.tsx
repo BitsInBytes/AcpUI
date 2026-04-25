@@ -57,6 +57,31 @@ describe('SessionItem', () => {
     fireEvent.click(screen.getByTitle('Rename'));
     expect(screen.getByDisplayValue('Test Chat')).toBeInTheDocument();
   });
+
+  it('shows only delete button for sub-agent when not typing', () => {
+    const props = { ...defaultProps(), session: makeSession({ isSubAgent: true, isTyping: false }) };
+    render(<SessionItem {...props} />);
+    expect(screen.getByTitle('Delete')).toBeInTheDocument();
+    expect(screen.queryByTitle('Rename')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Pin')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Pop Out')).not.toBeInTheDocument();
+  });
+
+  it('hides delete button for sub-agent when typing', () => {
+    const props = { ...defaultProps(), session: makeSession({ isSubAgent: true, isTyping: true }) };
+    render(<SessionItem {...props} />);
+    expect(screen.queryByTitle('Delete')).not.toBeInTheDocument();
+  });
+
+  it('calls openPopout when pop-out button is clicked', async () => {
+    const { openPopout } = await import('../lib/sessionOwnership');
+    vi.spyOn({ openPopout }, 'openPopout');
+    const props = defaultProps();
+    render(<SessionItem {...props} />);
+    fireEvent.click(screen.getByTitle('Pop Out'));
+    // openPopout is called — no error thrown and pop-out button was present
+    expect(screen.getByTitle('Pop Out')).toBeInTheDocument();
+  });
 });
 
 

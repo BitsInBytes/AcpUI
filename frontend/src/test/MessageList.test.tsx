@@ -90,4 +90,10 @@ describe('MessageList', () => {
     fireEvent.click(screen.getByTitle('Scroll to bottom'));
     expect(defaultProps.handleBackToBottom).toHaveBeenCalled();
   });
+
+  it('renders null when there is no active session', () => {
+    useChatStore.setState({ sessions: [], activeSessionId: null });
+    const { container } = render(<MessageList {...defaultProps} />);
+    expect(container.firstChild).toBeNull();
+  });
 });

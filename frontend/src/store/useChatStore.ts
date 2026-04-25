@@ -3,7 +3,32 @@ import { Socket } from 'socket.io-client';
 import { useSystemStore } from './useSystemStore';
 import { useStreamStore } from './useStreamStore';
 import { mergeProviderConfigOptions } from '../utils/configOptions';
+import { getModelIdForSelection, normalizeModelOptions } from '../utils/modelOptions';
 import type { ChatSession, Message, Attachment, LoadSessionsResponse, CreateSessionResponse, SessionHistoryResponse, StatsResponse, ForkSessionResponse } from '../types';
+
+function mergeModelOptions(current?: ChatSession['modelOptions'], incoming?: ChatSession['modelOptions']) {
+  const existing = normalizeModelOptions(current);
+  const updates = normalizeModelOptions(incoming);
+  if (updates.length === 0) return existing;
+
+  const byId = new Map(existing.map(option => [option.id, option]));
+  updates.forEach(option => byId.set(option.id, { ...byId.get(option.id), ...option }));
+  return Array.from(byId.values());
+}
+
+function applyModelState(
+  session: ChatSession,
+  state: { model?: string; currentModelId?: string | null; modelOptions?: ChatSession['modelOptions'] }
+): ChatSession {
+  const modelOptions = mergeModelOptions(session.modelOptions, state.modelOptions);
+  const currentModelId = state.currentModelId ?? session.currentModelId ?? getModelIdForSelection(state.model || session.model, useSystemStore.getState().branding.models);
+  return {
+    ...session,
+    ...(state.model ? { model: state.model } : {}),
+    currentModelId,
+    modelOptions
+  };
+}
 
 interface ChatState {
   sessions: ChatSession[];
@@ -29,8 +54,9 @@ interface ChatState {
   handleRenameSession: (socket: Socket | null, id: string, newName: string) => void;
   hydrateSession: (socket: Socket | null, uiId: string) => void;
   fetchStats: (socket: Socket | null, acpSessionId: string) => Promise<StatsResponse>;
-  handleActiveSessionModelChange: (socket: Socket | null, model: 'fast' | 'balanced' | 'flagship') => void;
-  handleUpdateModel: (id: string, model: 'fast' | 'balanced' | 'flagship') => void;
+  handleActiveSessionModelChange: (socket: Socket | null, model: string) => void;
+  handleSessionModelChange: (socket: Socket | null, uiId: string, model: string) => void;
+  handleUpdateModel: (id: string, model: string) => void;
   handleSetSessionOption: (socket: Socket | null, uiId: string, optionId: string, value: unknown) => void;
   handleRestartProcess: (socket: Socket | null) => void;
 
@@ -97,7 +123,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
             if (s.hasNotes) notesMap[s.id] = true;
           });
           set({
-            sessions: res.sessions.map((s: ChatSession) => ({ ...s, isTyping: false, isWarmingUp: false })),
+            sessions: res.sessions.map((s: ChatSession) => applyModelState(
+              { ...s, isTyping: false, isWarmingUp: false },
+              { currentModelId: s.currentModelId, modelOptions: s.modelOptions }
+            )),
             sessionNotes: notesMap
           });
 
@@ -139,6 +168,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const branding = useSystemStore.getState().branding;
     const defaultModel = branding.models?.default || 'flagship';
+    const defaultModelId = getModelIdForSelection(defaultModel, branding.models);
 
     const newSession: ChatSession = {
       id: uiId,
@@ -148,6 +178,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isTyping: false,
       isWarmingUp: true,
       model: defaultModel as ChatSession['model'],
+      currentModelId: defaultModelId || defaultModel,
       cwd: cwd || null,
       provider: branding.assistantName
     };
@@ -169,6 +200,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
               ...s,
               acpSessionId: acpId,
               isWarmingUp: false,
+              model: res.model || s.model,
+              currentModelId: res.currentModelId ?? s.currentModelId,
+              modelOptions: mergeModelOptions(s.modelOptions, res.modelOptions),
               configOptions: mergeProviderConfigOptions(s.configOptions, res.configOptions)
             } : s)
           }));
@@ -222,12 +256,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
               ...s,
               messages: cleanedMessages,
               configOptions: mergeProviderConfigOptions(s.configOptions, fullHistory.configOptions),
-              model: fullHistory.model || s.model
+              model: fullHistory.model || s.model,
+              currentModelId: fullHistory.currentModelId ?? s.currentModelId,
+              modelOptions: mergeModelOptions(s.modelOptions, fullHistory.modelOptions)
             } : s)
           }));
 
           const resumeAgent = useSystemStore.getState().workspaceCwds.find(w => w.path === fullHistory.cwd)?.agent || useSystemStore.getState().workspaceCwds[0]?.agent;
-          socket.emit('create_session', { model: fullHistory.model, existingAcpId: fullHistory.acpSessionId, cwd: fullHistory.cwd, agent: resumeAgent }, (acpRes: CreateSessionResponse) => {
+          socket.emit('create_session', { model: fullHistory.currentModelId || fullHistory.model, existingAcpId: fullHistory.acpSessionId, cwd: fullHistory.cwd, agent: resumeAgent }, (acpRes: CreateSessionResponse) => {
             if (acpRes && acpRes.sessionId) {
               const acpId = acpRes.sessionId;
               set(state => ({
@@ -236,6 +272,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   acpSessionId: acpId,
                   isTyping: false,
                   isWarmingUp: false,
+                  model: acpRes.model || s.model,
+                  currentModelId: acpRes.currentModelId ?? s.currentModelId,
+                  modelOptions: mergeModelOptions(s.modelOptions, acpRes.modelOptions),
                   configOptions: mergeProviderConfigOptions(s.configOptions, acpRes.configOptions)
                 } : s)
               }));
@@ -296,19 +335,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   handleActiveSessionModelChange: (socket, model) => {
-    const { activeSessionId, sessions } = get();
+    const { activeSessionId } = get();
     if (!activeSessionId) return;
-    const updatedSessions = sessions.map(s => s.id === activeSessionId ? { ...s, model } : s);
-    set({ sessions: updatedSessions });
-    
+    get().handleSessionModelChange(socket, activeSessionId, model);
+  },
+
+  handleSessionModelChange: (socket, uiId, model) => {
+    const currentModelId = getModelIdForSelection(model, useSystemStore.getState().branding.models) || model;
+    set(state => ({
+      sessions: state.sessions.map(s => s.id === uiId ? applyModelState(s, { model, currentModelId }) : s)
+    }));
+
     if (socket) {
-      socket.emit('set_session_model', { uiId: activeSessionId, model });
+      socket.emit('set_session_model', { uiId, model }, (res?: CreateSessionResponse) => {
+        if (!res || res.error) return;
+        set(state => ({
+          sessions: state.sessions.map(s => s.id === uiId ? {
+            ...applyModelState(s, {
+              model: res.model || model,
+              currentModelId: res.currentModelId ?? currentModelId,
+              modelOptions: res.modelOptions
+            }),
+            configOptions: mergeProviderConfigOptions(s.configOptions, res.configOptions)
+          } : s)
+        }));
+      });
     }
   },
 
   handleUpdateModel: (id, model) => {
     set(state => ({
-      sessions: state.sessions.map(s => s.id === id ? { ...s, model } : s)
+      sessions: state.sessions.map(s => s.id === id ? applyModelState(s, {
+        model,
+        currentModelId: getModelIdForSelection(model, useSystemStore.getState().branding.models) || model
+      }) : s)
     }));
   },
 
@@ -453,6 +513,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isTyping: false,
         isWarmingUp: false,
         model: original.model,
+        currentModelId: res.currentModelId ?? original.currentModelId,
+        modelOptions: mergeModelOptions(original.modelOptions, res.modelOptions),
         cwd: original.cwd,
         folderId: original.folderId,
         forkedFrom: sessionId,

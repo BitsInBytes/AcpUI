@@ -3,6 +3,7 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import dotenv from 'dotenv';
 import { applyConfigOptionsChange, normalizeConfigOptions, normalizeRemovedConfigOptionIds } from './services/configOptions.js';
+import { normalizeModelOptions } from './services/modelOptions.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,6 +30,8 @@ export function initDb() {
           last_active INTEGER,
           is_pinned INTEGER DEFAULT 0,
           config_options_json TEXT,
+          current_model_id TEXT,
+          model_options_json TEXT,
           provider TEXT
         )
       `);
@@ -36,6 +39,8 @@ export function initDb() {
       // 2. Migrations for sessions table (individual runs, ignoring "already exists" errors)
       db.run(`ALTER TABLE sessions ADD COLUMN is_pinned INTEGER DEFAULT 0`, () => {});
       db.run(`ALTER TABLE sessions ADD COLUMN config_options_json TEXT`, () => {});
+      db.run(`ALTER TABLE sessions ADD COLUMN current_model_id TEXT`, () => {});
+      db.run(`ALTER TABLE sessions ADD COLUMN model_options_json TEXT`, () => {});
       db.run(`ALTER TABLE sessions ADD COLUMN provider TEXT`, () => {});
       db.run(`ALTER TABLE sessions ADD COLUMN cwd TEXT`, () => {});
       db.run(`ALTER TABLE sessions ADD COLUMN folder_id TEXT`, () => {});
@@ -80,16 +85,18 @@ export function initDb() {
 
 // Save or update a session
 export function saveSession(session) {
-  const { id, acpSessionId, name, model, messages, isPinned, cwd, folderId, forkedFrom, forkPoint, isSubAgent, parentAcpSessionId, configOptions, provider } = session;
+  const { id, acpSessionId, name, model, messages, isPinned, cwd, folderId, forkedFrom, forkPoint, isSubAgent, parentAcpSessionId, configOptions, currentModelId, modelOptions, provider } = session;
   const messagesJson = JSON.stringify(messages || []);
   const configOptionsJson = JSON.stringify(configOptions || []);
+  const normalizedModelOptions = normalizeModelOptions(modelOptions);
+  const modelOptionsJson = Array.isArray(modelOptions) ? JSON.stringify(normalizedModelOptions) : null;
   const lastActive = Date.now();
   const pinnedVal = isPinned ? 1 : 0;
 
   return new Promise((resolve, reject) => {
     db.run(`
-      INSERT INTO sessions (ui_id, acp_id, name, model, messages_json, last_active, is_pinned, cwd, folder_id, forked_from, fork_point, is_sub_agent, parent_acp_session_id, config_options_json, provider)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO sessions (ui_id, acp_id, name, model, messages_json, last_active, is_pinned, cwd, folder_id, forked_from, fork_point, is_sub_agent, parent_acp_session_id, config_options_json, current_model_id, model_options_json, provider)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(ui_id) DO UPDATE SET
         acp_id = excluded.acp_id,
         name = excluded.name,
@@ -104,12 +111,27 @@ export function saveSession(session) {
             THEN config_options_json
           ELSE excluded.config_options_json
         END,
+        current_model_id = COALESCE(excluded.current_model_id, current_model_id),
+        model_options_json = CASE
+          WHEN excluded.model_options_json IS NULL OR excluded.model_options_json = '[]'
+            THEN model_options_json
+          ELSE excluded.model_options_json
+        END,
         provider = excluded.provider
-    `, [id, acpSessionId, name, model, messagesJson, lastActive, pinnedVal, cwd || null, folderId || null, forkedFrom || null, forkPoint ?? null, isSubAgent ? 1 : 0, parentAcpSessionId || null, configOptionsJson, provider || null], (err) => {
+    `, [id, acpSessionId, name, model, messagesJson, lastActive, pinnedVal, cwd || null, folderId || null, forkedFrom || null, forkPoint ?? null, isSubAgent ? 1 : 0, parentAcpSessionId || null, configOptionsJson, currentModelId || null, modelOptionsJson, provider || null], (err) => {
       if (err) reject(err);
       else resolve();
     });
   });
+}
+
+function parseJsonArray(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 // Get all session metadata (no heavy messages)
@@ -144,7 +166,9 @@ export function getAllSessions(provider = null) {
         parentAcpSessionId: row.parent_acp_session_id || null,
         hasNotes: row.has_notes === 1,
         provider: row.provider || null,
-        configOptions: JSON.parse(row.config_options_json || '[]'),
+        configOptions: parseJsonArray(row.config_options_json),
+        currentModelId: row.current_model_id || null,
+        modelOptions: normalizeModelOptions(parseJsonArray(row.model_options_json)),
         messages: [] // Lazy loaded
       })));
     });
@@ -171,7 +195,9 @@ export function getSession(uiId) {
         isSubAgent: row.is_sub_agent === 1,
         parentAcpSessionId: row.parent_acp_session_id || null,
         provider: row.provider || null,
-        configOptions: JSON.parse(row.config_options_json || '[]'),
+        configOptions: parseJsonArray(row.config_options_json),
+        currentModelId: row.current_model_id || null,
+        modelOptions: normalizeModelOptions(parseJsonArray(row.model_options_json)),
         messages: JSON.parse(row.messages_json || '[]')
       });
     });
@@ -193,7 +219,9 @@ export function getSessionByAcpId(acpId) {
         cwd: row.cwd || null,
         folderId: row.folder_id || null,
         provider: row.provider || null,
-        configOptions: JSON.parse(row.config_options_json || '[]'),
+        configOptions: parseJsonArray(row.config_options_json),
+        currentModelId: row.current_model_id || null,
+        modelOptions: normalizeModelOptions(parseJsonArray(row.model_options_json)),
         messages: JSON.parse(row.messages_json || '[]')
       });
     });
@@ -379,6 +407,37 @@ export function saveConfigOptions(acpId, configOptions, change = {}) {
         if (err) reject(err);
         else resolve();
       });
+    });
+  });
+}
+
+export function saveModelState(acpId, { currentModelId, modelOptions } = {}) {
+  const normalizedModelOptions = normalizeModelOptions(modelOptions);
+  const hasCurrentModelId = typeof currentModelId === 'string' && currentModelId.trim();
+  const hasModelOptions = normalizedModelOptions.length > 0;
+
+  if (!hasCurrentModelId && !hasModelOptions) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    db.run(`
+      UPDATE sessions
+      SET
+        current_model_id = COALESCE(?, current_model_id),
+        model_options_json = CASE
+          WHEN ? IS NULL THEN model_options_json
+          ELSE ?
+        END
+      WHERE acp_id = ?
+    `, [
+      hasCurrentModelId ? currentModelId : null,
+      hasModelOptions ? JSON.stringify(normalizedModelOptions) : null,
+      hasModelOptions ? JSON.stringify(normalizedModelOptions) : null,
+      acpId
+    ], (err) => {
+      if (err) reject(err);
+      else resolve();
     });
   });
 }

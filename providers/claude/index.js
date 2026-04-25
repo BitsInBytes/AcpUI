@@ -98,13 +98,9 @@ export function extractToolOutput(update) {
   }
   
   let outputArray = update.rawOutput || update.content;
-  if (!outputArray && update._meta?.claudeCode?.toolResponse) {
-    const tr = update._meta.claudeCode.toolResponse;
-    if (Array.isArray(tr)) {
-      outputArray = tr;
-    } else if (typeof tr === 'string') {
-      return tr;
-    }
+  if ((!outputArray || (Array.isArray(outputArray) && outputArray.length === 0)) && update._meta?.claudeCode?.toolResponse) {
+    const toolResponse = extractClaudeToolResponse(update._meta.claudeCode.toolResponse);
+    if (toolResponse) return toolResponse;
   }
 
   if (typeof outputArray === 'string') {
@@ -137,6 +133,28 @@ export function extractToolOutput(update) {
   return undefined;
 }
 
+function extractClaudeToolResponse(toolResponse) {
+  if (!toolResponse) return undefined;
+  if (typeof toolResponse === 'string') return toolResponse;
+
+  if (Array.isArray(toolResponse)) {
+    const result = toolResponse
+      .map(item => extractClaudeToolResponse(item))
+      .filter(Boolean)
+      .join('\n');
+    return result || undefined;
+  }
+
+  if (typeof toolResponse.text === 'string') return toolResponse.text;
+  if (typeof toolResponse.content === 'string') return toolResponse.content;
+  if (toolResponse.file?.content) return toolResponse.file.content;
+  if (Array.isArray(toolResponse.content)) return extractClaudeToolResponse(toolResponse.content);
+  if (toolResponse.content && typeof toolResponse.content === 'object') return extractClaudeToolResponse(toolResponse.content);
+  if (Array.isArray(toolResponse.filenames)) return toolResponse.filenames.join('\n') || undefined;
+
+  return undefined;
+}
+
 /**
  * Extract file path from a Claude tool update.
  */
@@ -153,6 +171,9 @@ export function extractFilePath(update, resolvePath) {
       if (item.path) return resolvePath(item.path);
     }
   }
+
+  const toolResponseFilePath = update._meta?.claudeCode?.toolResponse?.file?.filePath;
+  if (typeof toolResponseFilePath === 'string') return resolvePath(toolResponseFilePath);
 
   // 2. Check locations array (Standard ACP feature)
   if (update.locations && Array.isArray(update.locations)) {
@@ -330,9 +351,9 @@ export function parseExtension(method, params) {
 }
 
 export async function setConfigOption(acpClient, sessionId, optionId, value) {
-  // Verifed methods from Claude ACP source:
-  // - Mode: setSessionMode { sessionId, modeId }
-  // - Model: unstable_setSessionModel { sessionId, modelId }
+  // Verified against Claude ACP:
+  // - Mode: session/set_mode { sessionId, modeId }
+  // - Model: session/set_model { sessionId, modelId } (normally handled by AcpUI's first-class model flow)
   // - Other (Effort): session/set_config_option { sessionId, configId, value }
 
   if (optionId === 'mode') {
@@ -343,18 +364,30 @@ export async function setConfigOption(acpClient, sessionId, optionId, value) {
   }
 
   if (optionId === 'model') {
-    return acpClient.sendRequest('unstable_session/set_model', {
+    return acpClient.sendRequest('session/set_model', {
       sessionId,
       modelId: value
     });
   }
 
   // Effort and other dynamic options use set_config_option
-  return acpClient.sendRequest('session/set_config_option', {
+  const result = await acpClient.sendRequest('session/set_config_option', {
     sessionId,
     configId: optionId,
     value: value
   });
+  return normalizeClaudeConfigResult(result);
+}
+
+function normalizeClaudeConfigResult(result) {
+  if (!Array.isArray(result?.configOptions)) return result;
+
+  return {
+    ...result,
+    configOptions: result.configOptions
+      .filter(option => option?.id !== 'model')
+      .map(option => option.id === 'effort' ? { ...option, kind: 'reasoning_effort' } : option)
+  };
 }
 
 // --- Session File Operations ---
@@ -682,6 +715,10 @@ export async function setInitialAgent(acpClient, sessionId, agent) {
 }
 
 export async function performHandshake(acpClient) {
-  // console.log('performHandshake called');
-  return;
+  const { config } = getProvider();
+  await acpClient.sendRequest('initialize', {
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+    clientInfo: config.clientInfo || { name: 'ACP-UI', version: '1.0.0' }
+  });
 }

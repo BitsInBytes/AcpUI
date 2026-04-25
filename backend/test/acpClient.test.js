@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import acpClient from '../services/acpClient.js';
+import { getProviderModule } from '../services/providerLoader.js';
 import { spawn } from 'child_process';
 import EventEmitter from 'events';
 
@@ -8,7 +9,8 @@ vi.mock('child_process', () => ({
 }));
 
 vi.mock('../database.js', () => ({
-  initDb: vi.fn().mockResolvedValue({})
+  initDb: vi.fn().mockResolvedValue({}),
+  saveModelState: vi.fn().mockResolvedValue({})
 }));
 
 vi.mock('../services/logger.js', () => ({
@@ -24,6 +26,12 @@ vi.mock('../services/providerLoader.js', () => ({
       paths: { sessions: '/tmp/test-sessions', agents: '/tmp/test-agents', attachments: '/tmp/test-attachments' },
       clientInfo: { name: 'TestUI', version: '1.0.0' },
       branding: { assistantName: 'Test' },
+      models: {
+        default: 'balanced',
+        flagship: { id: 'opus', displayName: 'Opus' },
+        balanced: { id: 'default', displayName: 'Sonnet' },
+        fast: { id: 'haiku', displayName: 'Haiku' }
+      },
       }
   }),
   getProviderModule: vi.fn().mockResolvedValue({
@@ -341,6 +349,40 @@ describe('AcpClient Service', () => {
       }));
     });
 
+    it('captures provider extension model state when currentModelId is present', async () => {
+      const db = await import('../database.js');
+      acpClient.sessionMetadata.set('ext-model-session', {
+        model: 'default',
+        currentModelId: 'default',
+        modelOptions: [{ id: 'default', name: 'Sonnet' }]
+      });
+
+      await acpClient.handleProviderExtension({
+        method: '_test.dev/agent/switched',
+        params: {
+          sessionId: 'ext-model-session',
+          agentName: 'agent-dev',
+          currentModelId: 'opus'
+        }
+      });
+
+      const meta = acpClient.sessionMetadata.get('ext-model-session');
+      expect(meta.model).toBe('opus');
+      expect(meta.currentModelId).toBe('opus');
+      expect(db.saveModelState).toHaveBeenCalledWith('ext-model-session', {
+        currentModelId: 'opus',
+        modelOptions: [{ id: 'default', name: 'Sonnet' }]
+      });
+      expect(mockIo.emit).toHaveBeenCalledWith('session_model_options', {
+        sessionId: 'ext-model-session',
+        currentModelId: 'opus',
+        modelOptions: [{ id: 'default', name: 'Sonnet' }]
+      });
+      expect(mockIo.emit).toHaveBeenCalledWith('provider_extension', expect.objectContaining({
+        method: '_test.dev/agent/switched'
+      }));
+    });
+
     it('should send notification without expecting response', async () => {
       await acpClient.sendNotification('session/cancel', { sessionId: 'test' });
       
@@ -484,12 +526,80 @@ describe('AcpClient Service', () => {
     });
   });
 
+  describe('handleModelStateUpdate', () => {
+    it('updates metadata, persists model state, and emits session_model_options', async () => {
+      const db = await import('../database.js');
+      acpClient.sessionMetadata.set('model-session', {
+        model: 'default',
+        currentModelId: 'default',
+        modelOptions: [{ id: 'default', name: 'Old Sonnet' }]
+      });
+
+      acpClient.handleModelStateUpdate('model-session', {
+        configOptions: [{
+          id: 'model',
+          type: 'select',
+          currentValue: 'opus',
+          options: [
+            { value: 'default', name: 'Sonnet' },
+            { value: 'opus', name: 'Opus', description: 'Most capable' }
+          ]
+        }]
+      });
+
+      const meta = acpClient.sessionMetadata.get('model-session');
+      expect(meta.currentModelId).toBe('opus');
+      expect(meta.model).toBe('opus');
+      expect(meta.modelOptions).toEqual([
+        { id: 'default', name: 'Sonnet' },
+        { id: 'opus', name: 'Opus', description: 'Most capable' }
+      ]);
+      expect(db.saveModelState).toHaveBeenCalledWith('model-session', {
+        currentModelId: 'opus',
+        modelOptions: meta.modelOptions
+      });
+      expect(mockIo.emit).toHaveBeenCalledWith('session_model_options', {
+        sessionId: 'model-session',
+        currentModelId: 'opus',
+        modelOptions: meta.modelOptions
+      });
+    });
+
+    it('captures pending-new model state and ignores empty updates', async () => {
+      const db = await import('../database.js');
+      acpClient.sessionMetadata.set('pending-new', { modelOptions: [] });
+
+      acpClient.handleModelStateUpdate('new-session', {
+        models: {
+          currentModelId: 'haiku',
+          availableModels: [{ modelId: 'haiku', name: 'Haiku' }]
+        }
+      });
+
+      expect(acpClient.sessionMetadata.get('pending-new')).toEqual(expect.objectContaining({
+        currentModelId: 'haiku',
+        model: 'haiku',
+        modelOptions: [{ id: 'haiku', name: 'Haiku' }]
+      }));
+      expect(db.saveModelState).toHaveBeenCalledWith('new-session', {
+        currentModelId: 'haiku',
+        modelOptions: [{ id: 'haiku', name: 'Haiku' }]
+      });
+
+      vi.clearAllMocks();
+      acpClient.handleModelStateUpdate('empty-session', {});
+      expect(db.saveModelState).not.toHaveBeenCalled();
+      expect(mockIo.emit).not.toHaveBeenCalledWith('session_model_options', expect.anything());
+    });
+  });
+
   describe('setMode', () => {
     it('should send session/set_mode request', async () => {
         const promise = acpClient.setMode('session-1', 'agent_planner');
         
         expect(mockProcess.stdin.write).toHaveBeenCalledWith(expect.stringContaining('session/set_mode'));
         expect(mockProcess.stdin.write).toHaveBeenCalledWith(expect.stringContaining('agent_planner'));
+        expect(mockProcess.stdin.write).toHaveBeenCalledWith(expect.stringContaining('"modeId":"agent_planner"'));
 
         const requestId = acpClient.requestId - 1;
         acpClient.pendingRequests.get(requestId).resolve({ success: true });
@@ -515,21 +625,14 @@ describe('AcpClient Service', () => {
   });
 
   describe('performHandshake', () => {
-    it('should initialize and NOT send authenticate', async () => {
-      const handshakePromise = acpClient.performHandshake();      
-      // Wait for initialize to be sent
+    it('should delegate to providerModule.performHandshake and complete', async () => {
+      const handshakePromise = acpClient.performHandshake();
+      // Wait for the 2s initial delay inside performHandshake
       await new Promise(r => setTimeout(r, 2050));
-      
-      // initialize
-      const requestId1 = acpClient.requestId - 1;
-      const req1 = acpClient.pendingRequests.get(requestId1);
-      if (req1) req1.resolve({});
-      
       await handshakePromise;
-      
-      // Should only have been called once for 'initialize'
-      expect(mockProcess.stdin.write).toHaveBeenCalledTimes(1);
-      expect(mockProcess.stdin.write).toHaveBeenCalledWith(expect.stringContaining('initialize'));
+
+      // The core no longer writes initialize to stdin — the provider owns the full handshake
+      expect(mockProcess.stdin.write).not.toHaveBeenCalled();
       expect(acpClient.isHandshakeComplete).toBe(true);
     });
   });
@@ -569,13 +672,19 @@ describe('AcpClient Service', () => {
     it('should handle handshake failure', async () => {
       acpClient.isHandshakeComplete = false;
       vi.useFakeTimers();
-      const sendSpy = vi.spyOn(acpClient, 'sendRequest').mockRejectedValue(new Error('fail'));
-      const promise = acpClient.performHandshake();
-      await vi.advanceTimersByTimeAsync(2100);
-      await promise;
-      expect(acpClient.isHandshakeComplete).toBe(false);
-      sendSpy.mockRestore();
-      vi.useRealTimers();
+      try {
+        // Make the provider's performHandshake throw — the core catches it and leaves
+        // isHandshakeComplete as false
+        getProviderModule.mockResolvedValueOnce({
+          performHandshake: vi.fn().mockRejectedValue(new Error('provider init failed'))
+        });
+        const promise = acpClient.performHandshake();
+        await vi.advanceTimersByTimeAsync(2100);
+        await promise;
+        expect(acpClient.isHandshakeComplete).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('should handle beginDraining when already draining', () => {

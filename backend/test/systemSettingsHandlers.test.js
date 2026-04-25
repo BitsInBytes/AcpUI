@@ -79,6 +79,26 @@ describe('systemSettingsHandlers', () => {
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ error: 'fail' }));
   });
 
+  it('save_commands_config errors on invalid JSON', async () => {
+    const callback = vi.fn();
+    await mockSocket.emit('save_commands_config', { content: 'not json' }, callback);
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(String) }));
+  });
+
+  it('get_provider_config falls back to example file when user.json missing', async () => {
+    mockFs.existsSync.mockImplementation((p) => p.includes('.example'));
+    mockFs.readFileSync.mockReturnValue('{"example":true}');
+    const callback = vi.fn();
+    await mockSocket.emit('get_provider_config', callback);
+    expect(callback).toHaveBeenCalledWith({ content: '{"example":true}' });
+  });
+
+  it('save_provider_config errors on invalid JSON', async () => {
+    const callback = vi.fn();
+    await mockSocket.emit('save_provider_config', { content: 'bad json' }, callback);
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(String) }));
+  });
+
   it('handles provider_config and error', async () => {
     mockFs.readFileSync.mockReturnValue('{"name":"P"}');
     const callback = vi.fn();

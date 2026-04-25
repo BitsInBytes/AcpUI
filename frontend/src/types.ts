@@ -9,6 +9,9 @@ export interface CreateSessionResponse {
   sessionId?: string | null;
   acpSessionId?: string | null;
   error?: string;
+  model?: string;
+  currentModelId?: string | null;
+  modelOptions?: ProviderModelOption[];
   configOptions?: ProviderConfigOption[];
 }
 
@@ -16,6 +19,8 @@ export interface ForkSessionResponse {
   success: boolean;
   newUiId?: string;
   newAcpId?: string;
+  currentModelId?: string | null;
+  modelOptions?: ProviderModelOption[];
   configOptions?: ProviderConfigOption[];
   error?: string;
 }
@@ -189,6 +194,12 @@ export interface ProviderConfigOption {
   options?: Array<{ value: string; name: string; description?: string }>;
 }
 
+export interface ProviderModelOption {
+  id: string;
+  name: string;
+  description?: string;
+}
+
 export interface ChatSession {
   id: string;
   acpSessionId: string | null;
@@ -198,7 +209,9 @@ export interface ChatSession {
   isWarmingUp: boolean;
   isPinned?: boolean;
   hasUnreadResponse?: boolean;
-  model: 'fast' | 'balanced' | 'flagship';
+  model: string;
+  currentModelId?: string | null;
+  modelOptions?: ProviderModelOption[];
   cwd?: string | null;
   folderId?: string | null;
   forkedFrom?: string | null;

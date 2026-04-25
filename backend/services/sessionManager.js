@@ -27,6 +27,12 @@ export async function autoSaveTurn(sessionId, acpClient = null) {
       if (meta?.configOptions) {
         session.configOptions = meta.configOptions;
       }
+      if (meta?.currentModelId) {
+        session.currentModelId = meta.currentModelId;
+      }
+      if (meta?.modelOptions) {
+        session.modelOptions = meta.modelOptions;
+      }
       
       // Only save if it's still in a streaming state in the DB
       if (lastMsg.role === 'assistant' && lastMsg.isStreaming) {

@@ -24,6 +24,7 @@ const { mockFs, mockDb, mockAcpClient, mockProviderModule } = vi.hoisted(() => (
         deleteSession: vi.fn().mockResolvedValue(undefined),
         updateSession: vi.fn().mockResolvedValue(undefined),
         saveConfigOptions: vi.fn().mockResolvedValue(undefined),
+        saveModelState: vi.fn().mockResolvedValue(undefined),
         getNotes: vi.fn().mockResolvedValue('some notes'),
         saveNotes: vi.fn().mockResolvedValue(undefined)
     },
@@ -183,6 +184,18 @@ describe('Session Handlers', () => {
     vi.useRealTimers();
   });
 
+  it('merge_fork returns error when parent session not found', async () => {
+    const callback = vi.fn();
+    mockDb.getSession.mockImplementation(id => {
+      if (id === 'f1') return { id: 'f1', acpSessionId: 'acp-f1', forkedFrom: 'p1' };
+      return null; // parent not found
+    });
+    const handler = mockSocket.listeners('merge_fork')[0];
+    await handler({ uiId: 'f1' }, callback);
+    expect(callback).toHaveBeenCalledWith({ error: 'Parent session not found' });
+    expect(mockAcpClient.sendRequest).not.toHaveBeenCalled();
+  });
+
   it('handles save_notes success', async () => {
     const callback = vi.fn();
     const handler = mockSocket.listeners('save_notes')[0];
@@ -244,6 +257,10 @@ describe('Session Handlers', () => {
     const handler = mockSocket.listeners('create_session')[0];
     await handler({ model: 'balanced', existingAcpId: 'acp-resume' }, callback);
     expect(mockAcpClient.sendRequest).toHaveBeenCalledWith('session/load', expect.any(Object));
+    expect(mockAcpClient.sendRequest).toHaveBeenCalledWith('session/set_model', {
+      sessionId: 'acp-resume',
+      modelId: 'test-balanced'
+    });
     expect(mockAcpClient.sendRequest).not.toHaveBeenCalledWith('session/prompt', expect.objectContaining({
       prompt: [{ type: 'text', text: '/context' }]
     }));
@@ -394,7 +411,7 @@ describe('Session Handlers', () => {
 
   it('handles set_session_model', async () => {
     const session = { id: 'ui-1', acpSessionId: 'acp-1', model: 'fast' };
-    mockDb.getAllSessions.mockResolvedValue([session]);
+    mockDb.getSession.mockResolvedValue(session);
     const handler = mockSocket.listeners('set_session_model')[0];
     await handler({ uiId: 'ui-1', model: 'balanced' });
     
@@ -418,5 +435,94 @@ describe('Session Handlers', () => {
     expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('acp-1', expect.arrayContaining([
       expect.objectContaining({ id: 'effort', currentValue: 'high' })
     ]));
+  });
+
+  it('set_session_option merges configOptions returned by provider', async () => {
+    const session = { id: 'ui-1', acpSessionId: 'acp-1', configOptions: [{ id: 'mode', currentValue: 'default' }] };
+    const returnedOptions = [
+      { id: 'mode', currentValue: 'acceptEdits' },
+      { id: 'effort', currentValue: 'max', kind: 'reasoning_effort' }
+    ];
+    mockDb.getAllSessions.mockResolvedValue([session]);
+    mockAcpClient.sessionMetadata.set('acp-1', { configOptions: session.configOptions });
+    mockProviderModule.setConfigOption.mockResolvedValueOnce({ configOptions: returnedOptions });
+
+    const handler = mockSocket.listeners('set_session_option')[0];
+    await handler({ uiId: 'ui-1', optionId: 'effort', value: 'max' });
+
+    expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('acp-1', returnedOptions);
+    expect(mockAcpClient.sessionMetadata.get('acp-1').configOptions).toEqual(returnedOptions);
+  });
+
+  it('set_session_option returns early when session not found', async () => {
+    mockDb.getAllSessions.mockResolvedValue([]);
+    const handler = mockSocket.listeners('set_session_option')[0];
+    await handler({ uiId: 'missing-ui', optionId: 'effort', value: 'high' });
+
+    expect(mockProviderModule.setConfigOption).not.toHaveBeenCalled();
+    expect(mockAcpClient.setConfigOption).not.toHaveBeenCalled();
+  });
+
+  it('set_session_option falls back to acpClient.setConfigOption when provider lacks it', async () => {
+    const { getProviderModule } = await import('../services/providerLoader.js');
+    const session = { id: 'ui-1', acpSessionId: 'acp-1', configOptions: [] };
+    mockDb.getAllSessions.mockResolvedValue([session]);
+    getProviderModule.mockResolvedValueOnce({ ...mockProviderModule, setConfigOption: undefined });
+
+    const handler = mockSocket.listeners('set_session_option')[0];
+    await handler({ uiId: 'ui-1', optionId: 'effort', value: 'low' });
+
+    expect(mockAcpClient.setConfigOption).toHaveBeenCalledWith('acp-1', 'effort', 'low');
+  });
+
+  it('set_session_option updates sessionMetadata when meta exists', async () => {
+    const session = { id: 'ui-1', acpSessionId: 'acp-1', configOptions: [] };
+    mockDb.getAllSessions.mockResolvedValue([session]);
+    mockAcpClient.sessionMetadata.set('acp-1', { configOptions: [] });
+
+    const handler = mockSocket.listeners('set_session_option')[0];
+    await handler({ uiId: 'ui-1', optionId: 'effort', value: 'high' });
+
+    const meta = mockAcpClient.sessionMetadata.get('acp-1');
+    expect(meta.configOptions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'effort', currentValue: 'high' })
+    ]));
+  });
+
+  it('set_session_option logs error when setConfigOption throws', async () => {
+    const { writeLog } = await import('../services/logger.js');
+    const session = { id: 'ui-1', acpSessionId: 'acp-1', configOptions: [] };
+    mockDb.getAllSessions.mockResolvedValue([session]);
+    mockProviderModule.setConfigOption.mockRejectedValueOnce(new Error('option failed'));
+
+    const handler = mockSocket.listeners('set_session_option')[0];
+    await handler({ uiId: 'ui-1', optionId: 'effort', value: 'high' });
+
+    expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('option failed'));
+  });
+
+  it('set_session_model updates metadata when meta exists', async () => {
+    const session = { id: 'ui-1', acpSessionId: 'acp-1', model: 'fast' };
+    mockDb.getSession.mockResolvedValue(session);
+    mockAcpClient.sessionMetadata.set('acp-1', { model: 'test-fast' });
+    mockAcpClient.sendRequest.mockResolvedValue({});
+
+    const handler = mockSocket.listeners('set_session_model')[0];
+    await handler({ uiId: 'ui-1', model: 'balanced' });
+
+    const meta = mockAcpClient.sessionMetadata.get('acp-1');
+    expect(meta.model).toBe('test-balanced');
+  });
+
+  it('set_session_model logs error when sendRequest throws', async () => {
+    const { writeLog } = await import('../services/logger.js');
+    const session = { id: 'ui-1', acpSessionId: 'acp-1', model: 'fast' };
+    mockDb.getSession.mockResolvedValue(session);
+    mockAcpClient.sendRequest.mockRejectedValueOnce(new Error('model switch failed'));
+
+    const handler = mockSocket.listeners('set_session_model')[0];
+    await handler({ uiId: 'ui-1', model: 'balanced' });
+
+    expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('model switch failed'));
   });
 });

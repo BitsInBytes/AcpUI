@@ -163,7 +163,7 @@ describe('useChatStore', () => {
       });
 
       expect(getState().sessions[0].model).toBe('flagship');
-      expect(mockSocket.emit).toHaveBeenCalledWith('set_session_model', { uiId: 's1', model: 'flagship' });
+      expect(mockSocket.emit).toHaveBeenCalledWith('set_session_model', { uiId: 's1', model: 'flagship' }, expect.any(Function));
     });
 
     it('handleSetSessionOption updates session configOptions and emits set_session_option', () => {

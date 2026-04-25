@@ -20,8 +20,8 @@ Spawns an ACP daemon natively on the host OS, parses the JSON-RPC stream into a 
 │  Provider (e.g., providers/my-provider/)    │
 │  - provider.json: Protocol identity         │
 │  - branding.json: UI labels and text        │
-│  - user.json: REQUIRED deployment contract  │
-│  - index.js: REQUIRED logic module          │
+│  - user.json: User defaults                 │
+│  - index.js: Logic module                   │
 └─────────────────────────────────────────────┘
 ```
 

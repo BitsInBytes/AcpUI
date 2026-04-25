@@ -92,7 +92,9 @@ Contains local machine settings. This file is typically git-ignored in productio
     "attachments": "/path/to/files"  // Where uploads are stored
   },
   "models": {
-    // All three tiers are mandatory.
+    // All three tiers are mandatory quick-access aliases.
+    // They are used for footer shortcuts, defaults, title generation, and sub-agent sessions.
+    // They are not the full dynamic model catalog.
     "default": "balanced",           // Default model key
     "flagship": { "id": "high-end", "displayName": "Flagship" },
     "balanced": { "id": "mid-tier", "displayName": "Balanced" },
@@ -104,6 +106,48 @@ Contains local machine settings. This file is typically git-ignored in productio
   }
 }
 ```
+
+### D. Dynamic Model Contract
+
+AcpUI treats model selection as a first-class application contract, not as a provider-specific UI config option.
+
+Providers and ACP daemons can advertise the full per-session model catalog dynamically. The backend normalizes that catalog into:
+
+```jsonc
+{
+  "currentModelId": "provider-real-model-id",
+  "modelOptions": [
+    {
+      "id": "provider-real-model-id",
+      "name": "Provider Display Name",
+      "description": "Optional detail shown in settings"
+    }
+  ]
+}
+```
+
+Supported sources, in priority order:
+
+- `session/new` or `session/load` result: `models.currentModelId` and `models.availableModels`.
+- `session/new` or `session/load` result: top-level `currentModelId` and `modelOptions`.
+- Dynamic config option: a `select` option whose `id`, `category`, or `kind` is `model`, with `currentValue` and `options`.
+- Provider `user.json` quick aliases as fallback catalog entries.
+
+Model option entries may use any of these equivalent input shapes before normalization:
+
+```jsonc
+{ "id": "model-id", "name": "Display Name", "description": "Optional" }
+{ "modelId": "model-id", "displayName": "Display Name" }
+{ "value": "model-id", "name": "Display Name" }
+```
+
+Contract rules:
+
+- `currentModelId` is the source of truth for the selected model. It must be the real provider model ID.
+- The legacy session `model` field may contain a quick alias (`fast`, `balanced`, `flagship`) or a raw model ID for compatibility.
+- `session/set_model` must receive the real model ID, never a UI display name.
+- Providers should emit or normalize model data to this contract and avoid embedding UI-specific model lists.
+- If a provider exposes model as a generic config option, the backend captures it as model state before provider interceptors can hide it from generic config rendering. This prevents duplicate model controls while preserving the catalog.
 
 ---
 
@@ -136,8 +180,8 @@ The provider module must export a specific set of functions. If a feature is not
 
 | Function | Responsibility |
 | :--- | :--- |
-| `performHandshake(client)` | Custom logic after `initialize` (e.g., auth, setting initial options). |
-| `setConfigOption(...)` | Translates UI config changes (like "Reasoning Effort") to native daemon requests. |
+| `performHandshake(client)` | Owns the full initialization sequence. Must call `client.sendRequest('initialize', ...)` and any provider-specific follow-up (e.g., `authenticate`). The provider controls ordering — if the daemon requires two requests in-flight simultaneously before responding to either, send both before awaiting (e.g., `await Promise.all([initPromise, authPromise])`). |
+| `setConfigOption(...)` | Translates UI config changes (like "Reasoning Effort") to native daemon requests. Model selection is not a generic config option; it flows through the dynamic model contract and `session/set_model`. |
 | `getHooksForAgent(...)` | Resolves post-processing hooks from agent definitions. |
 
 ---
@@ -201,6 +245,8 @@ function send(json) { proc.stdin.write(json + '\n'); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function run() {
+  // Some daemons hold the initialize response until a second request (e.g., authenticate)
+  // is received. Send both before awaiting either if that's the case.
   log('initialize');
   send(JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize',
@@ -242,10 +288,10 @@ For a complete protocol reference, test these interactions in order:
 
 | Step | Method | Purpose |
 |------|--------|---------|
-| 1 | `initialize` | Capabilities, auth, agent info |
+| 1 | `initialize` (+ any required auth handshake, e.g. `authenticate`) | Capabilities, auth, agent info. Note whether the daemon responds immediately or only after a paired request. |
 | 2 | `session/new` | Session creation, modes, models, extension notifications |
 | 3 | `session/prompt` with `/agent <name>` | Agent switching mechanism and side effects |
-| 4 | `session/set_model` | Model switching |
+| 4 | `session/set_model` | Model switching with a real model ID from the dynamic catalog |
 | 5 | `session/prompt` with a simple question | Streaming chunks, metadata, turn completion |
 | 6 | `session/load` | History replay, mode/model preservation |
 
@@ -255,6 +301,7 @@ For a complete protocol reference, test these interactions in order:
 - **Ordering** — notifications often arrive *before* the response they relate to. Document the sequence.
 - **Unsupported methods** — test methods like `session/set_mode` to see if they work, crash the process, or are silently ignored.
 - **Field differences** — compare what the daemon sends vs what your provider normalizes. Look for PascalCase types, flat string content, non-standard tool output formats.
+- **Model state** — capture dynamic model catalogs, `currentModelId`, model config option updates, and whether model options change after switching models or sending prompts.
 
 ### Output
 

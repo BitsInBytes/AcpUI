@@ -24,10 +24,23 @@ describe('FileTray', () => {
   it('calls onRemove when remove button is clicked', () => {
     const onRemove = vi.fn();
     const { container } = render(<FileTray attachments={mockAttachments} onRemove={onRemove} />);
-    
+
     const removeButtons = container.querySelectorAll('.file-chip-remove');
     fireEvent.click(removeButtons[0]);
-    
+
     expect(onRemove).toHaveBeenCalledWith(0);
+  });
+
+  it('renders FileText icon for plain text files (not image or code)', () => {
+    const attachments = [{ name: 'notes.txt', size: 512, mimeType: 'text/plain' }];
+    render(<FileTray attachments={attachments} onRemove={vi.fn()} />);
+    expect(screen.getByText('notes.txt')).toBeInTheDocument();
+    expect(screen.getByText('512 B')).toBeInTheDocument();
+  });
+
+  it('formats file size in MB for large files', () => {
+    const attachments = [{ name: 'video.mp4', size: 5 * 1024 * 1024, mimeType: 'video/mp4' }];
+    render(<FileTray attachments={attachments} onRemove={vi.fn()} />);
+    expect(screen.getByText('5.0 MB')).toBeInTheDocument();
   });
 });

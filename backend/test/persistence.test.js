@@ -162,6 +162,55 @@ describe('Backend Persistence (SQLite)', () => {
 
     await db.deleteSession('ui-config-merge');
   });
+
+  it('should persist current model id and discovered model options', async () => {
+    await db.saveSession({
+      id: 'ui-model-state',
+      acpSessionId: 'acp-model-state',
+      name: 'Model State',
+      model: 'balanced',
+      messages: [],
+      currentModelId: 'default',
+      modelOptions: [
+        { id: 'default', name: 'Sonnet' },
+        { id: 'opus', name: 'Opus', description: 'Most capable' }
+      ]
+    });
+
+    let saved = await db.getSession('ui-model-state');
+    expect(saved.currentModelId).toBe('default');
+    expect(saved.modelOptions).toEqual([
+      { id: 'default', name: 'Sonnet' },
+      { id: 'opus', name: 'Opus', description: 'Most capable' }
+    ]);
+
+    await db.saveModelState('acp-model-state', {
+      currentModelId: 'opus',
+      modelOptions: [
+        { id: 'opus', name: 'Opus Updated' },
+        { id: 'haiku', name: 'Haiku' },
+        { id: 'haiku', name: 'Duplicate Haiku' },
+        { name: 'Invalid' }
+      ]
+    });
+
+    saved = await db.getSessionByAcpId('acp-model-state');
+    expect(saved.currentModelId).toBe('opus');
+    expect(saved.modelOptions).toEqual([
+      { id: 'opus', name: 'Opus Updated' },
+      { id: 'haiku', name: 'Haiku' }
+    ]);
+
+    await db.saveModelState('acp-model-state', {});
+    saved = await db.getSession('ui-model-state');
+    expect(saved.currentModelId).toBe('opus');
+    expect(saved.modelOptions).toEqual([
+      { id: 'opus', name: 'Opus Updated' },
+      { id: 'haiku', name: 'Haiku' }
+    ]);
+
+    await db.deleteSession('ui-model-state');
+  });
 });
 
 describe('Backend Persistence - Canvas Artifacts (SQLite)', () => {

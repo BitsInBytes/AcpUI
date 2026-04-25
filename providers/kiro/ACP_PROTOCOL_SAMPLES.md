@@ -364,6 +364,8 @@ Re-emitted again after MCP server initialization (same shape as 3b).
 
 ## 4. session/set_model
 
+Kiro expects the real model ID from `models.availableModels[].modelId`. These IDs are versioned with dots (for example, `claude-sonnet-4.6`), not the older hyphen-only aliases.
+
 **Sent:**
 ```json
 {
@@ -595,7 +597,7 @@ Summary of all `_kiro.dev/` extension methods observed:
 | `_kiro.dev/metadata` | After session/new, after each turn, after session/load | `sessionId`, `contextUsagePercentage`, `turnDurationMs` (optional) |
 | `_kiro.dev/subagent/list_update` | After session/new, after session/load | `subagents[]`, `pendingStages[]` |
 | `_kiro.dev/commands/available` | After session/new, after agent switch, after MCP init, after session/load | `sessionId`, `commands[]`, `prompts[]`, `tools[]`, `mcpServers[]` |
-| `_kiro.dev/agent/switched` | After `/agent` prompt | `sessionId`, `agentName`, `previousAgentName`, `welcomeMessage`, `model` |
+| `_kiro.dev/agent/switched` | After `/agent` prompt | `sessionId`, `agentName`, `previousAgentName`, `welcomeMessage`, `model` (normalized by the provider to `currentModelId`) |
 | `_kiro.dev/mcp/server_initialized` | After MCP server connects | `sessionId`, `serverName` |
 | `_kiro.dev/compaction/status` | During context compaction | `sessionId`, `status.type` ("started"/"completed"), `summary` |
 

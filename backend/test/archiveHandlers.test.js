@@ -90,6 +90,21 @@ describe('archiveHandlers', () => {
 
       expect(callback).toHaveBeenCalledWith({ archives: ['chat1', 'chat2'] });
     });
+
+    it('returns empty archives when archive path does not exist', () => {
+      fs.existsSync.mockReturnValue(false);
+      const callback = vi.fn();
+      mockSocket.listeners('list_archives')[0](callback);
+      expect(callback).toHaveBeenCalledWith({ archives: [] });
+    });
+
+    it('returns empty archives on error', () => {
+      fs.existsSync.mockReturnValue(true);
+      fs.readdirSync.mockImplementation(() => { throw new Error('EACCES'); });
+      const callback = vi.fn();
+      mockSocket.listeners('list_archives')[0](callback);
+      expect(callback).toHaveBeenCalledWith({ archives: [] });
+    });
   });
 
   describe('restore_archive', () => {
@@ -106,6 +121,21 @@ describe('archiveHandlers', () => {
       expect(db.saveSession).toHaveBeenCalledWith(expect.objectContaining({ name: 'Test', acpSessionId: 'acp-1' }));
       expect(callback).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
     });
+
+    it('returns error when session.json not found in archive', async () => {
+      fs.existsSync.mockReturnValue(false);
+      const callback = vi.fn();
+      await mockSocket.listeners('restore_archive')[0]({ folderName: 'missing' }, callback);
+      expect(callback).toHaveBeenCalledWith({ error: expect.stringContaining('session.json not found') });
+    });
+
+    it('returns error when restore throws', async () => {
+      fs.existsSync.mockReturnValue(true);
+      fs.readFileSync.mockImplementation(() => { throw new Error('read failed'); });
+      const callback = vi.fn();
+      await mockSocket.listeners('restore_archive')[0]({ folderName: 'bad' }, callback);
+      expect(callback).toHaveBeenCalledWith({ error: expect.stringContaining('read failed') });
+    });
   });
 
   describe('delete_archive', () => {
@@ -116,6 +146,14 @@ describe('archiveHandlers', () => {
 
       expect(fs.rmSync).toHaveBeenCalledWith(expect.stringContaining('old-chat'), { recursive: true, force: true });
       expect(callback).toHaveBeenCalledWith({ success: true });
+    });
+
+    it('returns error when rmSync throws', () => {
+      fs.existsSync.mockReturnValue(true);
+      fs.rmSync.mockImplementationOnce(() => { throw new Error('permission denied'); });
+      const callback = vi.fn();
+      mockSocket.listeners('delete_archive')[0]({ folderName: 'locked-chat' }, callback);
+      expect(callback).toHaveBeenCalledWith({ error: 'permission denied' });
     });
   });
 
@@ -150,6 +188,13 @@ describe('archiveHandlers', () => {
       expect(db.deleteSession).toHaveBeenCalledWith('child');
       expect(db.deleteSession).toHaveBeenCalledWith('grandchild');
       expect(db.deleteSession).not.toHaveBeenCalledWith('other');
+    });
+
+    it('logs error when getSession throws', async () => {
+      const { writeLog } = await import('../services/logger.js');
+      db.getSession.mockRejectedValueOnce(new Error('DB down'));
+      await mockSocket.listeners('archive_session')[0]({ uiId: 'ui-err' });
+      expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('DB down'));
     });
 
     it('does not call deleteSession for descendants when there are none', async () => {

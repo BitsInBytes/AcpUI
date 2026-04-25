@@ -13,7 +13,25 @@ import { getProvider } from '../../backend/services/providerLoader.js';
  * Low-level filter for the raw JSON-RPC stream from stdout.
  */
 export function intercept(payload) {
-  // Pass-through for Kiro
+  const { config } = getProvider();
+
+  // Kiro reports the active model on agent switch notifications. Normalize that
+  // provider-specific field into AcpUI's dynamic model contract so the backend
+  // can persist and broadcast the actual current model.
+  if (
+    payload.method === `${config.protocolPrefix}agent/switched` &&
+    typeof payload.params?.model === 'string' &&
+    !payload.params.currentModelId
+  ) {
+    return {
+      ...payload,
+      params: {
+        ...payload.params,
+        currentModelId: payload.params.model
+      }
+    };
+  }
+
   return payload;
 }
 
@@ -155,6 +173,15 @@ export function parseExtension(method, params) {
       return { type: 'metadata', sessionId: params.sessionId, contextUsagePercentage: params.contextUsagePercentage };
     case 'compaction/status':
       return { type: 'compaction', sessionId: params.sessionId, status: params.status, summary: params.summary };
+    case 'agent/switched':
+      return {
+        type: 'agent_switched',
+        sessionId: params.sessionId,
+        agentName: params.agentName,
+        previousAgentName: params.previousAgentName,
+        welcomeMessage: params.welcomeMessage,
+        currentModelId: params.currentModelId || params.model || null
+      };
     case 'session/update':
       return { type: 'session_update', ...params };
     default:
@@ -299,13 +326,14 @@ export async function getHooksForAgent(agentName, hookType) {
 }
 
 export async function performHandshake(acpClient) {
-  return;
+  const { config } = getProvider();
+  await acpClient.sendRequest('initialize', {
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+    clientInfo: config.clientInfo || { name: 'ACP-UI', version: '1.0.0' }
+  });
 }
 
-/**
- * Set the initial agent for a new Kiro session.
- * Uses the native session/set_mode API instead of prompt-based switching.
- */
 /**
  * Set the initial agent for a new Kiro session.
  * Kiro uses the /agent slash command (sent as a prompt) to switch agents.
@@ -334,12 +362,16 @@ export async function setInitialAgent(acpClient, sessionId, agent) {
 }
 
 export async function setConfigOption(acpClient, sessionId, optionId, value) {
-  // Use generic fallback
-  return acpClient.sendRequest('session/set_config_option', {
-    sessionId,
-    configId: optionId,
-    value
-  });
+  if (optionId === 'model') {
+    return acpClient.sendRequest('session/set_model', {
+      sessionId,
+      modelId: value
+    });
+  }
+
+  // Kiro does not advertise dynamic config options, and session/set_mode crashes
+  // current kiro-cli versions. Avoid falling through to generic config methods.
+  return null;
 }
 
 // --- Tool Normalization ---

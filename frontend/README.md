@@ -15,7 +15,7 @@ React application providing an IDE-grade chat interface. Runs natively on Window
 
 ```
 store/
-  useChatStore.ts       — Session CRUD, submit, hydrate, initial load
+  useChatStore.ts       — Session CRUD, submit, hydrate, initial load, dynamic model state
   useStreamStore.ts     — Streaming: tokens, thoughts, events, typewriter, processBuffer
   useSystemStore.ts     — Socket, connection state, slash commands, context usage, compaction, branding, inspectConfig
   useUIStore.ts         — Sidebar, modals, settings, model dropdown
@@ -39,7 +39,7 @@ components/
   FolderItem.tsx        — Recursive folder with expand/collapse, rename, drag & drop
   WorkspacePickerModal.tsx — Overflow workspace picker
   ArchiveModal.tsx      — Archive browser with search, restore, delete
-  SessionSettingsModal.tsx — Session info, context usage, model, rehydrate, delete
+  SessionSettingsModal.tsx — Session info, context usage, full dynamic model catalog, rehydrate, delete
   SystemSettingsModal.tsx  — Audio devices, environment variables, Monaco editors for JSON config
   NotesModal.tsx        — Per-session scratch pad with syntax-highlighted markdown preview, no close on outside click
   FileExplorer.tsx      — Full-screen file browser with Monaco editor + markdown preview
@@ -49,7 +49,7 @@ components/
   ChatInput/
     ChatInput.tsx       — Input area, paste handler, voice, file upload, terminal/canvas/auto-scroll/merge-fork pills, context progress bar
     SlashDropdown.tsx   — Slash command autocomplete
-    ModelSelector.tsx   — Model display with context usage %
+    ModelSelector.tsx   — Footer model display with quick-access choices plus the current non-quick model
   ChatHeader/
     ChatHeader.tsx      — Auto-scroll, file explorer, system settings buttons
   CanvasPane/
@@ -62,7 +62,7 @@ components/
     SSLErrorOverlay.tsx — SSL certificate error overlay
 
 hooks/
-  useSocket.ts          — Singleton socket, provider_extension handling, branding handler, custom_commands handler, compaction
+  useSocket.ts          — Singleton socket, provider_extension handling, session_model_options, branding handler, custom_commands handler, compaction
   useChatManager.ts     — Socket event listeners, typewriter loop
   useFileUpload.ts      — File upload via HTTP + paste handler
   useScroll.ts          — Auto-scroll with manual override
@@ -73,6 +73,7 @@ utils/
   extensionRouter.ts    — Pure function routing for provider extension events
   canvasHelpers.ts      — File change detection, path building
   notificationHelper.ts — Notification decision logic
+  modelOptions.ts       — Dynamic model labels, footer quick choices, full settings choices, selection matching
   sessionSwitchHelper.ts — Session switch state computation
   resizeHelper.ts       — Canvas resize width calculation
   timer.ts              — formatDuration + useElapsed hook for live timers
@@ -84,7 +85,8 @@ utils/
 
 - **Unified Timeline** — The primary data contract between backend and frontend. Messages are rendered as a sequence of discrete, chronological steps (thoughts, tool executions, text, and permissions).
 - **Provider-based Branding** — All UI strings, labels, and iconography are sourced dynamically from the backend; the frontend has zero hardcoded provider names.
-- **Mandatory Model Tiers** — The model selector expects three mandatory tiers (**Flagship**, **Balanced**, **Fast**) defined by the provider's `user.json`.
+- **Dynamic Model Catalog + Quick Access** — The session settings Config tab shows the full provider-advertised model catalog. The chat footer keeps the provider's three `user.json` quick aliases (**Flagship**, **Balanced**, **Fast**) and adds the current model when it is outside those aliases.
+- **Current Model Source of Truth** — `currentModelId` is the selected model ID used for display and active-state matching. The legacy `model` field can still hold a quick alias or raw model ID for compatibility.
 - **Provider-Agnostic Routing** — Extension events and custom protocol prefixes are handled via a generic `protocolPrefix`, allowing the frontend to route provider-specific updates without implementation knowledge.
 - **Singleton Socket** — Created at module level, never destroyed by React lifecycle.
 - **Memoized Markdown** — Splits content on `\n\n`, caches completed blocks, only re-parses active block; stable DOM for completed messages prevents re-renders on parent update.
@@ -106,6 +108,6 @@ npx eslint src/     # 0 errors, 0 warnings
 ## Testing
 
 ```bash
-npx vitest run              # 657 tests across 56 files
+npx vitest run              # 645 tests across 57 files
 npx vitest run --coverage   # with coverage report
 ```

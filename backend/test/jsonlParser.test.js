@@ -202,4 +202,17 @@ describe('jsonlParser', () => {
     const msgs = await parseJsonlSession('bad');
     expect(msgs).toBeNull();
   });
+
+  it('returns null and logs when provider lacks parseSessionHistory', async () => {
+    const { writeLog } = await import('../services/logger.js');
+    const original = mockProviderModule.parseSessionHistory;
+    mockProviderModule.parseSessionHistory = null;
+    setJsonl('no-parser', [{ version: 'v1', kind: 'Prompt', data: { message_id: 'p1', content: [] } }]);
+
+    const result = await parseJsonlSession('no-parser');
+
+    expect(result).toBeNull();
+    expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('missing parseSessionHistory'));
+    mockProviderModule.parseSessionHistory = original;
+  });
 });

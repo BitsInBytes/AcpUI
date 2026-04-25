@@ -32,6 +32,15 @@ describe('ChatInput Unit Test', () => {
         socket: {} as any,
         connected: true,
         isEngineReady: true,
+        branding: {
+          ...useSystemStore.getState().branding,
+          models: {
+            default: 'balanced',
+            flagship: { id: 'test-flagship', displayName: 'Flagship' },
+            balanced: { id: 'test-balanced', displayName: 'Balanced' },
+            fast: { id: 'test-fast', displayName: 'Fast' }
+          }
+        },
         slashCommands: [
           { name: '/save', description: 'Save session', meta: {} },
           { name: '/settings', description: 'Open settings', meta: {} },

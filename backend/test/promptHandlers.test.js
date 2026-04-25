@@ -61,6 +61,15 @@ vi.mock('sharp', () => ({
   default: vi.fn()
 }));
 
+vi.mock('../mcp/subAgentRegistry.js', () => ({
+  getAllRunning: vi.fn().mockReturnValue([]),
+  removeSubAgentsForParent: vi.fn()
+}));
+
+vi.mock('../mcp/acpCleanup.js', () => ({
+  cleanupAcpSession: vi.fn()
+}));
+
 describe('Prompt Handlers', () => {
   let mockIo;
   let mockSocket;
@@ -192,6 +201,84 @@ describe('Prompt Handlers', () => {
     handler({ sessionId: 'sess-1' });
 
     expect(mockAcpClient.sendNotification).toHaveBeenCalledWith('session/cancel', { sessionId: 'sess-1' });
+  });
+
+  it('should call and clear _abortSubAgents on cancel', () => {
+    const abortFn = vi.fn();
+    mockAcpClient._abortSubAgents = abortFn;
+
+    const handler = mockSocket.listeners('cancel_prompt')[0];
+    handler({ sessionId: 'sess-1' });
+
+    expect(abortFn).toHaveBeenCalled();
+    expect(mockAcpClient._abortSubAgents).toBeNull();
+  });
+
+  it('should cancel running sub-agents and emit completion on cancel_prompt', async () => {
+    const { getAllRunning, removeSubAgentsForParent } = await import('../mcp/subAgentRegistry.js');
+    const rejectFn = vi.fn();
+    const sub = { acpId: 'sub-acp-1', index: 0 };
+    getAllRunning.mockReturnValue([sub]);
+    mockAcpClient.pendingRequests = new Map([
+      ['req-1', { params: { sessionId: 'sub-acp-1' }, reject: rejectFn }]
+    ]);
+
+    const handler = mockSocket.listeners('cancel_prompt')[0];
+    handler({ sessionId: 'sess-1' });
+
+    expect(mockAcpClient.sendNotification).toHaveBeenCalledWith('session/cancel', { sessionId: 'sub-acp-1' });
+    expect(rejectFn).toHaveBeenCalledWith(expect.any(Error));
+    expect(mockIo.emit).toHaveBeenCalledWith('sub_agent_completed', expect.objectContaining({ acpSessionId: 'sub-acp-1', error: 'Cancelled' }));
+    expect(removeSubAgentsForParent).toHaveBeenCalledWith(null);
+  });
+
+  it('should forward permission response to acpClient', () => {
+    const handler = mockSocket.listeners('respond_permission')[0];
+    handler({ id: 'req-1', optionId: 'allow', toolCallId: 't1', sessionId: 'sess-1' });
+
+    expect(mockAcpClient.respondToPermission).toHaveBeenCalledWith('req-1', 'allow');
+  });
+
+  it('should spread array prompt parts directly into acpPromptParts', async () => {
+    const parts = [{ type: 'text', text: 'part one' }, { type: 'text', text: 'part two' }];
+    mockAcpClient.sessionMetadata.set('sess-arr', { model: 'test-balanced', promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '' });
+    mockAcpClient.sendRequest.mockResolvedValue({ success: true });
+
+    const handler = mockSocket.listeners('prompt')[0];
+    await handler({ uiId: 'ui-arr', sessionId: 'sess-arr', prompt: parts, model: 'balanced' });
+
+    expect(mockAcpClient.sendRequest).toHaveBeenCalledWith('session/prompt', expect.objectContaining({
+      prompt: expect.arrayContaining([{ type: 'text', text: 'part one' }, { type: 'text', text: 'part two' }])
+    }));
+  });
+
+  it('should prepend spawnContext on first prompt and clear it', async () => {
+    mockAcpClient.sessionMetadata.set('sess-spawn', {
+      model: 'test-balanced', promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '',
+      spawnContext: 'You are a sub-agent. Do X.'
+    });
+    mockAcpClient.sendRequest.mockResolvedValue({ success: true });
+
+    const handler = mockSocket.listeners('prompt')[0];
+    await handler({ uiId: 'ui-spawn', sessionId: 'sess-spawn', prompt: 'hello', model: 'balanced' });
+
+    const sentPrompt = mockAcpClient.sendRequest.mock.calls[0][1].prompt;
+    expect(sentPrompt[0]).toEqual({ type: 'text', text: 'You are a sub-agent. Do X.' });
+
+    const meta = mockAcpClient.sessionMetadata.get('sess-spawn');
+    expect(meta.spawnContext).toBeNull();
+  });
+
+  it('should delete from statsCaptures and not emit error token when error occurs during stats capture', async () => {
+    mockAcpClient.sessionMetadata.set('sess-stats', { model: 'test-balanced', promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '' });
+    mockAcpClient.sendRequest.mockRejectedValue(new Error('timeout'));
+    mockAcpClient.statsCaptures.set('sess-stats', {});
+
+    const handler = mockSocket.listeners('prompt')[0];
+    await handler({ uiId: 'ui-stats', sessionId: 'sess-stats', prompt: 'hi', model: 'balanced' });
+
+    expect(mockAcpClient.statsCaptures.has('sess-stats')).toBe(false);
+    expect(mockIo.emit).not.toHaveBeenCalledWith('token', expect.anything());
   });
 
   it('should reject prompts to sessions not loaded in current process', async () => {

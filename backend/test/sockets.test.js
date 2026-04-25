@@ -27,6 +27,7 @@ const { mockFs, mockDb, mockAcpClient, mockProviderModule } = vi.hoisted(() => (
         deleteSession: vi.fn().mockResolvedValue(undefined),
         updateSession: vi.fn().mockResolvedValue(undefined),
         saveConfigOptions: vi.fn().mockResolvedValue(undefined),
+        saveModelState: vi.fn().mockResolvedValue(undefined),
         getNotes: vi.fn().mockResolvedValue(''),
         saveNotes: vi.fn().mockResolvedValue(undefined)
     },
@@ -145,6 +146,10 @@ describe('Socket Handlers', () => {
         const handler = mockSocket.listeners('create_session')[0];
         await handler({ existingAcpId: 'acp-existing' }, callback);
         expect(mockAcpClient.sendRequest).toHaveBeenCalledWith('session/load', expect.anything());
+        expect(mockAcpClient.sendRequest).toHaveBeenCalledWith('session/set_model', {
+          sessionId: 'acp-existing',
+          modelId: 'test-balanced'
+        });
         expect(mockAcpClient.sendRequest).not.toHaveBeenCalledWith('session/prompt', expect.objectContaining({
           prompt: [{ type: 'text', text: '/context' }]
         }));

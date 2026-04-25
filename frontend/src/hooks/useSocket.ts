@@ -2,7 +2,7 @@ import { useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { useSystemStore } from '../store/useSystemStore';
 import { useVoiceStore } from '../store/useVoiceStore';
-import type { WorkspaceCwd } from '../types';
+import type { ProviderModelOption, WorkspaceCwd } from '../types';
 import { useChatStore } from '../store/useChatStore';
 import { useStreamStore } from '../store/useStreamStore';
 import { routeExtension } from '../utils/extensionRouter';
@@ -62,6 +62,16 @@ function getOrCreateSocket(): Socket {
       const providerCmds = useSystemStore.getState().slashCommands.filter(c => !c.meta?.local);
       useSystemStore.getState().setSlashCommands([...localCmds, ...providerCmds]);
     }
+  });
+  _socket.on('session_model_options', (data: { sessionId: string; currentModelId?: string | null; modelOptions?: ProviderModelOption[] }) => {
+    useChatStore.setState(state => ({
+      sessions: state.sessions.map(s => s.acpSessionId === data.sessionId ? {
+        ...s,
+        model: data.currentModelId || s.model,
+        currentModelId: data.currentModelId ?? s.currentModelId,
+        modelOptions: data.modelOptions && data.modelOptions.length > 0 ? data.modelOptions : s.modelOptions
+      } : s)
+    }));
   });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   _socket.on('provider_extension', (data: { method: string; params: any }) => {

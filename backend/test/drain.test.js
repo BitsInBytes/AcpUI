@@ -104,14 +104,39 @@ describe('AcpClient Drain Logic', () => {
 
   it('should process chunks normally when not draining', async () => {
     const sessionId = 'test-session';
-    
+
     const update = {
       sessionUpdate: 'agent_message_chunk',
       content: { text: 'Real message' }
     };
-    
+
     await acpClient.handleUpdate(sessionId, update);
-    
+
     expect(mockIo.emit).toHaveBeenCalledWith('token', { sessionId, text: 'Real message' });
+  });
+
+  it('should clear existing timer when beginDraining is called again for same session', () => {
+    const sessionId = 'test-session';
+
+    acpClient.beginDraining(sessionId);
+    acpClient.waitForDrainToFinish(sessionId, 1000); // starts a timer
+
+    const stateBefore = acpClient.drainingSessions.get(sessionId);
+    expect(stateBefore.timer).not.toBeNull();
+
+    acpClient.beginDraining(sessionId); // should clearTimeout the existing timer
+
+    const stateAfter = acpClient.drainingSessions.get(sessionId);
+    expect(stateAfter.chunkCount).toBe(0);
+    expect(stateAfter.timer).toBeNull();
+  });
+
+  it('should resolve immediately when session is not draining', async () => {
+    const sessionId = 'not-draining-session';
+
+    const promise = acpClient.waitForDrainToFinish(sessionId);
+    await promise; // must resolve without timer advancement
+
+    expect(acpClient.drainingSessions.has(sessionId)).toBe(false);
   });
 });

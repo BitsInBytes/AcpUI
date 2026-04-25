@@ -9,6 +9,7 @@ vi.mock('../../services/providerLoader.js', () => ({
     config: {
       protocolPrefix: '_anthropic/',
       mcpName: 'AcpUI',
+      clientInfo: { name: 'claude-code', version: '2.1.114' },
       toolCategories: {
         read: { category: 'file_read', isFileOperation: true },
         edit: { category: 'file_edit', isFileOperation: true }
@@ -51,6 +52,25 @@ vi.mock('fs', () => ({
 describe('Claude Provider', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  describe('performHandshake', () => {
+    it('sends initialize with clientInfo from provider config', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+      await claude.performHandshake(mockClient);
+      expect(mockClient.sendRequest).toHaveBeenCalledOnce();
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('initialize', {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+        clientInfo: { name: 'claude-code', version: '2.1.114' }
+      });
+    });
+
+    it('does not send authenticate', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+      await claude.performHandshake(mockClient);
+      expect(mockClient.sendRequest).not.toHaveBeenCalledWith('authenticate', expect.anything());
+    });
   });
 
   describe('intercept', () => {
@@ -147,6 +167,36 @@ describe('Claude Provider', () => {
       const update = { _meta: { claudeCode: { toolResponse: [{ type: 'text', text: 'Meta Output' }] } } };
       expect(claude.extractToolOutput(update)).toBe('Meta Output');
     });
+
+    it('extracts object-shaped Claude toolResponse file content', () => {
+      const update = {
+        _meta: {
+          claudeCode: {
+            toolResponse: {
+              type: 'text',
+              file: {
+                filePath: '/tmp/package.json',
+                content: '{ "name": "backend" }'
+              }
+            }
+          }
+        }
+      };
+      expect(claude.extractToolOutput(update)).toBe('{ "name": "backend" }');
+    });
+
+    it('extracts filename lists from Claude toolResponse', () => {
+      const update = {
+        _meta: {
+          claudeCode: {
+            toolResponse: {
+              filenames: ['a.txt', 'b.txt']
+            }
+          }
+        }
+      };
+      expect(claude.extractToolOutput(update)).toBe('a.txt\nb.txt');
+    });
   });
 
   describe('extractFilePath', () => {
@@ -160,6 +210,53 @@ describe('Claude Provider', () => {
     it('extracts from arguments.file_path', () => {
       const update = { kind: 'read', toolCallId: 'read', arguments: { file_path: 'foo.txt' } };
       expect(claude.extractFilePath(update, resolve)).toBe('/root/foo.txt');
+    });
+
+    it('extracts from object-shaped Claude toolResponse file path', () => {
+      const update = {
+        _meta: {
+          claudeCode: {
+            toolResponse: {
+              file: { filePath: 'meta-file.txt', content: 'text' }
+            }
+          }
+        }
+      };
+      expect(claude.extractFilePath(update, resolve)).toBe('/root/meta-file.txt');
+    });
+  });
+
+  describe('setConfigOption', () => {
+    it('uses session/set_model for model config fallbacks', async () => {
+      const mockClient = { sendRequest: vi.fn().mockResolvedValue({}) };
+      await claude.setConfigOption(mockClient, 'sess-1', 'model', 'default');
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('session/set_model', {
+        sessionId: 'sess-1',
+        modelId: 'default'
+      });
+    });
+
+    it('normalizes returned config options for effort changes', async () => {
+      const mockClient = {
+        sendRequest: vi.fn().mockResolvedValue({
+          configOptions: [
+            { id: 'model', currentValue: 'default' },
+            { id: 'effort', currentValue: 'max' },
+            { id: 'mode', currentValue: 'acceptEdits' }
+          ]
+        })
+      };
+
+      const result = await claude.setConfigOption(mockClient, 'sess-1', 'effort', 'max');
+      expect(mockClient.sendRequest).toHaveBeenCalledWith('session/set_config_option', {
+        sessionId: 'sess-1',
+        configId: 'effort',
+        value: 'max'
+      });
+      expect(result.configOptions).toEqual([
+        { id: 'effort', currentValue: 'max', kind: 'reasoning_effort' },
+        { id: 'mode', currentValue: 'acceptEdits' }
+      ]);
     });
   });
 
