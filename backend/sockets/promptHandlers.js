@@ -187,7 +187,7 @@ export default function registerPromptHandlers(io, socket) {
         }
       }
       io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: sub.acpId, index: sub.index, error: 'Cancelled' });
-      cleanupAcpSession(sub.acpId, resolvedProviderId);
+      cleanupAcpSession(sub.acpId, resolvedProviderId, 'sub-agent-cancel');
       acpClient.sessionMetadata.delete(sub.acpId);
     }
     removeSubAgentsForParent(sessionId, resolvedProviderId); // clear all

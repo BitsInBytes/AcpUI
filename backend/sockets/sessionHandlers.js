@@ -70,9 +70,13 @@ export default function registerSessionHandlers(io, socket) {
   socket.on('load_sessions', async (...args) => {
     const callback = args.pop();
     const payload = args[0] || {};
-    const provider = getProvider(payload.providerId || null);
-    const providerId = provider.id;
-    const providerAliases = [provider.config.name, provider.config.branding?.assistantName].filter(alias => alias && alias !== providerId);
+    let providerId = null;
+    let providerAliases = [];
+    if (payload.providerId) {
+      const provider = getProvider(payload.providerId);
+      providerId = provider.id;
+      providerAliases = [provider.config.name, provider.config.branding?.assistantName].filter(alias => alias && alias !== providerId);
+    }
     try {
       const allSessions = await db.getAllSessions(providerId, { providerAliases });
       const emptyNewChats = allSessions.filter(s => s.name === 'New Chat');
@@ -147,7 +151,7 @@ export default function registerSessionHandlers(io, socket) {
       if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
 
       if (session.acpSessionId) {
-        await cleanupAcpSession(session.acpSessionId, pid);
+        await cleanupAcpSession(session.acpSessionId, pid, 'user-delete-main');
       }
 
       await db.deleteSession(uiId);
@@ -162,7 +166,7 @@ export default function registerSessionHandlers(io, socket) {
       for (const child of descendants) {
         const cpid = child.provider || pid;
         if (child.acpSessionId) {
-          await cleanupAcpSession(child.acpSessionId, cpid);
+          await cleanupAcpSession(child.acpSessionId, cpid, 'user-delete-child');
         }
         const childAttach = path.join(getAttachmentsRoot(cpid), child.id);
         if (fs.existsSync(childAttach)) fs.rmSync(childAttach, { recursive: true, force: true });
@@ -256,6 +260,7 @@ export default function registerSessionHandlers(io, socket) {
       const provider = getProvider(resolvedProviderId);
       const { models } = provider.config;
       const sessionCwd = requestCwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
+      writeLog(`[SESSION] create_session CWD: ${sessionCwd} (requestCwd=${requestCwd}, DEFAULT_WORKSPACE_CWD=${process.env.DEFAULT_WORKSPACE_CWD})`);
       const providerModule = await getProviderModule(resolvedProviderId);
       const sessionParams = providerModule.buildSessionParams(requestAgent);
 
@@ -377,7 +382,6 @@ export default function registerSessionHandlers(io, socket) {
       if (!parentSession?.acpSessionId) return callback?.({ error: 'Parent session not found' });
       const pid = forkSession.provider || getProvider().id;
       const acpClient = providerRuntimeManager.getClient(pid);
-      const providerModule = await getProviderModule(pid);
 
       acpClient.stream.statsCaptures.set(forkSession.acpSessionId, { buffer: '' });
       await acpClient.transport.sendRequest('session/prompt', {
@@ -386,7 +390,7 @@ export default function registerSessionHandlers(io, socket) {
       });
       const summary = acpClient.stream.statsCaptures.get(forkSession.acpSessionId)?.buffer?.trim() || '(No summary generated)';
       acpClient.stream.statsCaptures.delete(forkSession.acpSessionId);
-      providerModule.deleteSessionFiles(forkSession.acpSessionId);
+      await cleanupAcpSession(forkSession.acpSessionId, pid, 'fork-merge');
       await db.deleteSession(uiId);
       callback?.({ success: true, parentUiId: forkSession.forkedFrom });
 

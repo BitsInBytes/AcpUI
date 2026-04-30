@@ -68,9 +68,10 @@ interface SystemState {
   setDeletePermanent: (val: boolean) => void;
   setNotificationSettings: (sound: boolean, desktop: boolean) => void;
   setCustomCommands: (commands: { name: string; description: string; prompt?: string | null }[]) => void;
+  getBranding: (providerId?: string | null) => SystemState['branding'];
 }
 
-export const useSystemStore = create<SystemState>((set) => ({
+export const useSystemStore = create<SystemState>((set, get) => ({
   socket: null,
   connected: false,
   isEngineReady: false,
@@ -172,6 +173,13 @@ export const useSystemStore = create<SystemState>((set) => ({
   setCompacting: (sessionId, compacting) => set(state => ({ compactingBySession: { ...state.compactingBySession, [sessionId]: compacting } })),
   setWorkspaceCwds: (cwds) => set({ workspaceCwds: cwds }),
   setDeletePermanent: (val) => set({ deletePermanent: val }),
-  setNotificationSettings: (sound, desktop) => set({ notificationSound: sound, notificationDesktop: desktop }),
+  setNotificationSettings: (sound: boolean, desktop: boolean) => set({ notificationSound: sound, notificationDesktop: desktop }),
   setCustomCommands: (commands) => set({ customCommands: commands }),
-}));
+  getBranding: (providerId) => {
+    const state = get();
+    if (providerId && state.providersById[providerId]) {
+      return state.providersById[providerId].branding;
+    }
+    return state.branding;
+  },
+  }));

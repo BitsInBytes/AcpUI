@@ -34,7 +34,14 @@ const ChatInput: React.FC = () => {
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
   const activeProvider = activeSession?.provider || useSystemStore.getState().activeProviderId;
-  const slashCommands = (activeProvider ? slashCommandsByProviderId[activeProvider] : null) || globalSlashCommands;
+  const providerCommands = activeProvider ? slashCommandsByProviderId[activeProvider] : null;
+  const slashCommands = useMemo(() => {
+    const base = providerCommands || globalSlashCommands;
+    const custom = globalSlashCommands.filter(c => c.meta?.local);
+    if (custom.length === 0) return base;
+    const seen = new Set(custom.map(c => c.name));
+    return [...custom, ...base.filter(c => !seen.has(c.name))];
+  }, [providerCommands, globalSlashCommands]);
 
   const {
     isModelDropdownOpen,

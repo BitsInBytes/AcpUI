@@ -75,7 +75,7 @@ const SessionSettingsModal: React.FC = () => {
 
   const handleDelete = () => {
     if (!session) return;
-    handleDeleteSession(socket, session.id);
+    handleDeleteSession(socket, session.id, true);
     onClose();
   };
 

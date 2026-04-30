@@ -27,10 +27,19 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
 }) => {
   const contextPct = useSystemStore(state => activeSession?.acpSessionId ? state.contextUsageBySession[activeSession.acpSessionId] : undefined);
   const isCompacting = useSystemStore(state => activeSession?.acpSessionId ? state.compactingBySession[activeSession.acpSessionId] : false);
+  // Subscribe directly to the session's provider branding in providersById so the
+  // component re-renders whenever provider branding is updated (e.g. after the
+  // 'providers' socket event arrives), instead of relying on the stable getBranding
+  // function reference which never triggers a Zustand re-render on its own.
+  const brandingModels = useSystemStore(state => {
+    const providerId = activeSession?.provider;
+    if (providerId && state.providersById[providerId]) {
+      return state.providersById[providerId].branding?.models;
+    }
+    return state.branding?.models;
+  });
 
   if (!activeSession) return null;
-
-  const brandingModels = useSystemStore.getState().branding.models;
   const modelName = getModelLabel(activeSession, brandingModels);
   const label = isCompacting ? `${modelName} (Compacting...)` : contextPct !== undefined ? `${modelName} (${Math.round(contextPct)}%)` : modelName;
   const modelChoices = getFooterModelChoices(activeSession, brandingModels);

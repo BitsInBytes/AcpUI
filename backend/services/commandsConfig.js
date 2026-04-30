@@ -11,13 +11,19 @@ export function loadCommands() {
 
   const configPath = path.resolve(__dirname, '..', '..', process.env.COMMANDS_CONFIG || 'commands.json');
 
+  if (!fs.existsSync(configPath)) {
+    writeLog(`[CONFIG] No commands config found at ${configPath} (skipping custom commands)`);
+    cached = [];
+    return cached;
+  }
+
   try {
     const data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     cached = (data.commands || []).filter(c => c.name && c.description);
     writeLog(`[CONFIG] Loaded ${cached.length} custom command(s) from ${configPath}`);
     return cached;
   } catch (err) {
-    writeLog(`[CONFIG] No commands config at ${configPath}: ${err.message}`);
+    writeLog(`[CONFIG] ERROR: Failed to parse commands config at ${configPath}: ${err.message}`);
     cached = [];
     return cached;
   }

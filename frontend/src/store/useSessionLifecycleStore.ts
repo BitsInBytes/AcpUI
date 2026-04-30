@@ -45,7 +45,7 @@ interface SessionLifecycleState {
   
   handleNewChat: (socket: Socket | null, forcedId?: string, cwd?: string, agent?: string) => void;
   handleSessionSelect: (socket: Socket | null, uiId: string) => void;
-  handleDeleteSession: (socket: Socket | null, uiId: string) => void;
+  handleDeleteSession: (socket: Socket | null, uiId: string, forcePermanent?: boolean) => void;
   handleTogglePin: (socket: Socket | null, id: string) => void;
   handleRenameSession: (socket: Socket | null, id: string, newName: string) => void;
   hydrateSession: (socket: Socket | null, uiId: string) => void;
@@ -273,10 +273,10 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
     attemptHydrate();
   },
 
-  handleDeleteSession: (socket, uiId) => {
+  handleDeleteSession: (socket, uiId, forcePermanent = false) => {
     const session = get().sessions.find(s => s.id === uiId);
     if (socket && session) {
-      if (useSystemStore.getState().deletePermanent) {
+      if (forcePermanent || useSystemStore.getState().deletePermanent) {
         socket.emit('delete_session', { providerId: session.provider, uiId });
       } else {
         socket.emit('archive_session', { providerId: session.provider, uiId });

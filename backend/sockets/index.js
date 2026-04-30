@@ -76,7 +76,7 @@ export default function registerSocketHandlers(io) {
       socket.emit('branding', provider.branding);
     }
     socket.emit('sidebar_settings', {
-      deletePermanent: process.env.SIDEBAR_DELETE_PERMANENT === 'true',
+      deletePermanent: String(process.env.SIDEBAR_DELETE_PERMANENT || '').trim().toLowerCase() === 'true',
       notificationSound: process.env.NOTIFICATION_SOUND !== 'false',
       notificationDesktop: process.env.NOTIFICATION_DESKTOP === 'true',
     });

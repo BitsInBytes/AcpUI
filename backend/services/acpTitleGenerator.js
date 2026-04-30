@@ -40,7 +40,7 @@ export async function generateTitle(acpClient, sessionId, meta) {
     // Clean up all traces of the ephemeral session — statsCapture, metadata, and ACP-side resources
     acpClient.stream.statsCaptures.delete(titleSessionId);
     acpClient.sessionMetadata.delete(titleSessionId);
-    cleanupAcpSession(titleSessionId, acpClient.providerId);
+    cleanupAcpSession(titleSessionId, acpClient.providerId, 'title-generation');
 
     if (title && title.length > 0 && title.length < 100) {
       const uiSession = await db.getSessionByAcpId(providerId, sessionId);
@@ -92,7 +92,7 @@ export async function generateForkTitle(acpClient, uiId, messages, forkPoint) {
     const title = acpClient.stream.statsCaptures.get(titleSessionId)?.buffer?.trim();
     acpClient.stream.statsCaptures.delete(titleSessionId);
     acpClient.sessionMetadata.delete(titleSessionId);
-    cleanupAcpSession(titleSessionId, acpClient.providerId);
+    cleanupAcpSession(titleSessionId, acpClient.providerId, 'fork-title-generation');
 
 
     if (title && title.length > 0 && title.length < 100) {

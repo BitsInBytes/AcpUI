@@ -108,23 +108,38 @@ export function extractFilePath(update, resolvePath) {
 }
 
 /**
- * Extract diff content from a Gemini tool_call.
+ * Extract output from a Gemini tool_call start event.
+ *
+ * Called before normalizeTool runs, so update.toolName is not yet set.
+ * We use update.kind (ACP ToolKind) instead to identify operation type.
+ *
+ * Returns:
+ *   - A unified diff string for search-replace edits (diff content in update.content)
+ *   - Raw file content for write/create operations (content in update.arguments)
+ *   - undefined when no output should be shown at tool start
  */
 export function extractDiffFromToolCall(update, Diff) {
-  // Only generate diffs for tools that are intended to be "edits".
-  // Pure "write" or "create" tools should show the full content.
-  const toolName = update.toolName || '';
-  const isEdit = /edit|replace|patch/i.test(toolName);
-  if (!isEdit) return undefined;
+  const kind = update.kind || '';
 
-  if (update.content && Array.isArray(update.content)) {
+  // 1. Edit with diff blocks (e.g. search-replace) — generate a unified diff
+  if (kind === 'edit' && update.content && Array.isArray(update.content)) {
     for (const item of update.content) {
       if (item.type === 'diff') {
-        // Return raw unified diff or generate one via Diff library
         return Diff.createPatch(item.path || update.toolCallId || 'file', item.oldText || '', item.newText || '', 'old', 'new');
       }
     }
   }
+
+  // 2. Write/create operation — return raw content for syntax highlighting.
+  //    args.content is only present for write-type tools (not reads or searches).
+  let args = update.arguments || update.rawInput;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { args = null; }
+  }
+  if (args?.content && typeof args.content === 'string') {
+    return args.content;
+  }
+
   return undefined;
 }
 
@@ -332,7 +347,7 @@ function findSessionDir(sessionsRoot, acpId) {
       }
     }
   } catch (err) {
-    // ignore scan errors
+    // ignore — fall through to sessionsRoot
   }
   return sessionsRoot;
 }
@@ -354,10 +369,13 @@ function getExactSessionFile(sessionDir, acpId, extension) {
 export function getSessionPaths(acpId) {
   const { config } = getProvider();
   const dir = findSessionDir(config.paths.sessions, acpId);
-  
+
+  const jsonlPath = getExactSessionFile(dir, acpId, '.jsonl');
+  const jsonPath = getExactSessionFile(dir, acpId, '.json');
+
   return {
-    jsonl: getExactSessionFile(dir, acpId, '.jsonl'),
-    json: getExactSessionFile(dir, acpId, '.json'),
+    jsonl: jsonlPath,
+    json: jsonPath,
     tasksDir: path.join(dir, acpId),
   };
 }
@@ -589,22 +607,22 @@ export async function parseSessionHistory(filePath, Diff) {
             // Extract tool output from the recorded result
             let output = extractToolResultText(toolCall);
 
-            // For write/edit operations without stored output, generate a diff
-            // from the args if old/new text is present
+            // Fall back to reconstructing output from args when the CLI didn't
+            // record a result (common for write/edit operations).
             if (!output) {
-              const isEdit = /write|edit|replace|patch/i.test(toolCall.name || '');
-              if (isEdit && args.old_string && args.new_string) {
+              if (args.old_string && args.new_string) {
+                // True search-replace edit → show as a diff
                 output = Diff.createPatch(
                   args.path || args.file_path || 'file',
                   args.old_string, args.new_string, 'old', 'new'
                 );
-              } else if (isEdit && args.content) {
-                output = Diff.createPatch(
-                  args.path || args.file_path || 'file',
-                  '', args.content, 'old', 'new'
-                );
+              } else if (args.content) {
+                // Write/create → show raw content so the frontend can syntax-highlight it
+                output = args.content;
               }
             }
+
+            const filePath = args.path || args.file_path || args.filePath || undefined;
 
             timeline.push({
               type: 'tool',
@@ -612,6 +630,7 @@ export async function parseSessionHistory(filePath, Diff) {
               event: {
                 id: toolCall.id,
                 title,
+                filePath,
                 status: toolCall.status === 'error' ? 'failed' : 'completed',
                 output: output || null,
               },

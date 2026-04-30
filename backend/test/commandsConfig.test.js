@@ -1,12 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { mockReadFileSync } = vi.hoisted(() => ({
+const { mockReadFileSync, mockExistsSync } = vi.hoisted(() => ({
   mockReadFileSync: vi.fn(),
+  mockExistsSync: vi.fn(() => true),
 }));
 
 vi.mock('fs', () => ({
-  default: { readFileSync: mockReadFileSync },
+  default: { 
+    readFileSync: mockReadFileSync,
+    existsSync: mockExistsSync
+  },
   readFileSync: mockReadFileSync,
+  existsSync: mockExistsSync
 }));
 
 vi.mock('../services/logger.js', () => ({ writeLog: vi.fn() }));

@@ -266,3 +266,179 @@ describe('ModelSelector', () => {
     expect(onOpenSettings).toHaveBeenCalled();
   });
 });
+
+// ─── Multi-provider tests ──────────────────────────────────────────────────────
+// Verifies that the footer reads quick-access models from the session's own
+// provider (via providersById) rather than always using the default provider's
+// global branding. This guards against the reactivity gap where getBranding()
+// was subscribed as a stable fn reference and would silently stay on default-
+// provider models when providersById was updated after first render.
+
+describe('ModelSelector — multi-provider branding', () => {
+  const DEFAULT_QUICK_ACCESS = [
+    { id: 'test-default-flagship', displayName: 'Default Flagship', description: 'Default best' },
+    { id: 'test-default-balanced', displayName: 'Default Balanced', description: 'Default everyday' },
+  ];
+
+  const ALT_QUICK_ACCESS = [
+    { id: 'test-alt-turbo', displayName: 'Alt Turbo', description: 'Alt fast' },
+    { id: 'test-alt-standard', displayName: 'Alt Standard', description: 'Alt everyday' },
+  ];
+
+  const altSession = {
+    id: 'session-alt',
+    acpSessionId: 'acp-alt',
+    name: 'Alt Session',
+    messages: [],
+    model: 'test-alt-standard',
+    currentModelId: 'test-alt-standard',
+    modelOptions: [],
+    isTyping: false,
+    isWarmingUp: false,
+    provider: 'test-alt-provider',
+  } as any;
+
+  const modelDropdownRef = { current: null } as React.RefObject<HTMLDivElement | null>;
+
+  function altProps(overrides = {}) {
+    return {
+      activeSession: altSession,
+      isModelDropdownOpen: false,
+      setIsModelDropdownOpen: vi.fn(),
+      onModelSelect: vi.fn(),
+      modelDropdownRef,
+      getActiveModelQuotaPercent: () => null,
+      disabled: false,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    act(() => {
+      useSystemStore.setState({
+        branding: {
+          ...useSystemStore.getState().branding,
+          models: {
+            default: 'test-default-balanced',
+            quickAccess: DEFAULT_QUICK_ACCESS,
+          },
+        },
+        providersById: {
+          'test-default-provider': {
+            providerId: 'test-default-provider',
+            label: 'Default Provider',
+            branding: {
+              providerId: 'test-default-provider',
+              assistantName: 'Default',
+              busyText: 'Working...',
+              emptyChatMessage: '',
+              notificationTitle: '',
+              appHeader: '',
+              sessionLabel: '',
+              modelLabel: '',
+              models: {
+                default: 'test-default-balanced',
+                quickAccess: DEFAULT_QUICK_ACCESS,
+              },
+            },
+          },
+          'test-alt-provider': {
+            providerId: 'test-alt-provider',
+            label: 'Alt Provider',
+            branding: {
+              providerId: 'test-alt-provider',
+              assistantName: 'Alt',
+              busyText: 'Thinking...',
+              emptyChatMessage: '',
+              notificationTitle: '',
+              appHeader: '',
+              sessionLabel: '',
+              modelLabel: '',
+              models: {
+                default: 'test-alt-standard',
+                quickAccess: ALT_QUICK_ACCESS,
+              },
+            },
+          },
+        },
+        contextUsageBySession: {},
+        compactingBySession: {},
+      });
+    });
+  });
+
+  it('shows the alt-provider quick-access models (not the default provider models) for a session owned by alt-provider', () => {
+    render(<ModelSelector {...altProps({ isModelDropdownOpen: true })} />);
+
+    // Alt provider dropdown item names must be present
+    const itemNames = Array.from(document.querySelectorAll('.model-dropdown-item-name')).map(el => el.textContent);
+    expect(itemNames).toContain('Alt Turbo');
+    expect(itemNames).toContain('Alt Standard');
+
+    // Default provider models must NOT appear anywhere
+    expect(screen.queryByText('Default Flagship')).not.toBeInTheDocument();
+    expect(screen.queryByText('Default Balanced')).not.toBeInTheDocument();
+  });
+
+  it('marks the alt-provider active model as active in the dropdown', () => {
+    // currentModelId = 'test-alt-standard'
+    render(<ModelSelector {...altProps({ isModelDropdownOpen: true })} />);
+    const items = document.querySelectorAll('.model-dropdown-item');
+    const standardItem = Array.from(items).find(el =>
+      el.querySelector('.model-dropdown-item-name')?.textContent === 'Alt Standard'
+    );
+    expect(standardItem).toHaveClass('active');
+    const turboItem = Array.from(items).find(el =>
+      el.querySelector('.model-dropdown-item-name')?.textContent === 'Alt Turbo'
+    );
+    expect(turboItem).not.toHaveClass('active');
+  });
+
+  it('reactively updates to show alt-provider models when providersById is populated after initial render', () => {
+    // Simulate the race condition: start with empty providersById (as on first render)
+    // then populate it and verify the component picks up the correct branding.
+    act(() => {
+      useSystemStore.setState({ providersById: {} });
+    });
+
+    const { rerender } = render(<ModelSelector {...altProps({ isModelDropdownOpen: true })} />);
+
+    // With empty providersById the component falls back to global branding; alt models absent
+    expect(screen.queryByText('Alt Turbo')).not.toBeInTheDocument();
+
+    // Now populate providersById (simulates providers socket event arriving)
+    act(() => {
+      useSystemStore.setState({
+        providersById: {
+          'test-alt-provider': {
+            providerId: 'test-alt-provider',
+            label: 'Alt Provider',
+            branding: {
+              providerId: 'test-alt-provider',
+              assistantName: 'Alt',
+              busyText: 'Thinking...',
+              emptyChatMessage: '',
+              notificationTitle: '',
+              appHeader: '',
+              sessionLabel: '',
+              modelLabel: '',
+              models: {
+                default: 'test-alt-standard',
+                quickAccess: ALT_QUICK_ACCESS,
+              },
+            },
+          },
+        },
+      });
+    });
+
+    // Force a re-render with the same props so Zustand's subscription kicks in
+    rerender(<ModelSelector {...altProps({ isModelDropdownOpen: true })} />);
+
+    // Alt provider models now visible in the dropdown
+    const itemNames = Array.from(document.querySelectorAll('.model-dropdown-item-name')).map(el => el.textContent);
+    expect(itemNames).toContain('Alt Turbo');
+    expect(itemNames).toContain('Alt Standard');
+  });
+});
