@@ -337,7 +337,7 @@ describe('Claude Provider', () => {
         '5h_utilization': 0.03,
         '5h_status': 'allowed',
         '5h_reset': 1777157400,
-        '5h_resets_at': '2026-04-18T22:50:00.000Z',
+        '5h_resets_at': '2026-04-25T22:50:00.000Z',
         '7d_utilization': 0.5,
         overage_utilization: 0,
         unified_status: 'allowed',

@@ -105,7 +105,7 @@ describe('App Settings Modal', () => {
     const confirmBtn = screen.getByText('Yes, Delete');
     fireEvent.click(confirmBtn);
 
-    expect(handleDeleteSession).toHaveBeenCalledWith(expect.anything(), 's1');
+    expect(handleDeleteSession).toHaveBeenCalledWith(expect.anything(), 's1', true);
     expect(setSettingsOpen).toHaveBeenCalledWith(false);
   });
 

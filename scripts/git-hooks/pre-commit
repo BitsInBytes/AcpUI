@@ -1,0 +1,49 @@
+#!/bin/sh
+
+# ACP UI Pre-Commit Hook
+# Enforces:
+# 1. Zero lint errors/warnings
+# 2. All unit tests pass
+# 3. Coverage meets or exceeds thresholds
+
+echo "🔍 Starting pre-commit quality checks..."
+
+# --- Backend Checks ---
+echo "📦 Checking Backend..."
+cd backend || exit 1
+
+echo "  > Running Lint..."
+# We use --max-warnings 0 to ensure zero warnings
+npx eslint . --max-warnings 0 || {
+  echo "❌ Backend Lint Failed (errors or warnings found)"
+  exit 1
+}
+
+echo "  > Running Tests & Coverage..."
+npx vitest run --coverage || {
+  echo "❌ Backend Tests or Coverage Thresholds Failed"
+  exit 1
+}
+
+cd ..
+
+# --- Frontend Checks ---
+echo "💻 Checking Frontend..."
+cd frontend || exit 1
+
+echo "  > Running Lint..."
+npx eslint . --max-warnings 0 || {
+  echo "❌ Frontend Lint Failed (errors or warnings found)"
+  exit 1
+}
+
+echo "  > Running Tests & Coverage..."
+npx vitest run --coverage || {
+  echo "❌ Frontend Tests or Coverage Thresholds Failed"
+  exit 1
+}
+
+cd ..
+
+echo "✅ All quality checks passed. Proceeding with commit..."
+exit 0
