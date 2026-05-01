@@ -62,9 +62,13 @@ export function createToolHandlers(io) {
   const tools = {};
 
   tools.ux_invoke_shell = async ({ command, cwd, providerId }) => {
-    
+
     const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
     const maxLines = getMaxShellResultLines();
+    // Unique ID for this specific shell invocation — lets the frontend route
+    // tool_output_stream chunks to the correct ToolStep when multiple shells
+    // run in parallel (without it, a single shared buffer causes output mixing).
+    const shellId = `shell-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
 
     return new Promise((resolve) => {
@@ -85,7 +89,7 @@ export function createToolHandlers(io) {
       });
 
       const emitToolOutput = (chunk) => {
-        if (io) io.emit('tool_output_stream', { providerId, chunk, maxLines });
+        if (io) io.emit('tool_output_stream', { providerId, chunk, maxLines, shellId });
       };
 
       emitToolOutput(`$ ${command}\n`);
@@ -124,6 +128,23 @@ export function createToolHandlers(io) {
   // then fall through resolveModelSelection's chain (models.default → first quickAccess item).
   const modelId = resolveModelSelection(model || models.subAgent, models, quickModelOptions).modelId;
   const resolvedModelKey = modelId;
+
+    // Unique ID for this specific invocation — threads through sub_agent_started events
+    // so the frontend can correlate each agent with the ToolStep that spawned it.
+    const invocationId = `inv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    // Resolve parentUiId up front (before the 1-second stagger) so sub_agents_starting
+    // can be emitted immediately, allowing the UI to clear old agent state right away.
+    let parentUiId = null;
+    if (acpClient.lastSubAgentParentAcpId) {
+      const parentSession = await db.getSessionByAcpId(providerId, acpClient.lastSubAgentParentAcpId);
+      if (parentSession) parentUiId = parentSession.id;
+    }
+
+    // Emit immediately — before the 1-second stagger — so the frontend clears stale
+    // sub-agent panels without waiting for the first sub_agent_started event.
+    io.emit('sub_agents_starting', { invocationId, parentUiId, providerId, count: requests.length });
+
     let _aborted = false;
     const abortCallbacks = [];
     const onAbort = (cb) => abortCallbacks.push(cb);
@@ -155,11 +176,6 @@ export function createToolHandlers(io) {
             const uiId = `sub-${subAcpId}`;
             registerSubAgent(providerId, subAcpId, null, req.prompt, agentName);
 
-            let parentUiId = null;
-            if (acpClient.lastSubAgentParentAcpId) {
-              const parentSession = await db.getSessionByAcpId(providerId, acpClient.lastSubAgentParentAcpId);
-              if (parentSession) parentUiId = parentSession.id;
-            }
             await db.saveSession({
               id: uiId, acpSessionId: subAcpId,
               name: req.name || `Agent ${i + 1}: ${req.prompt.slice(0, 50)}`,
@@ -189,6 +205,7 @@ export function createToolHandlers(io) {
               acpSessionId: subAcpId, uiId, parentUiId, index: i,
               name: req.name || `Agent ${i + 1}`,
               prompt: req.prompt, agent: agentName, model: resolvedModelKey,
+              invocationId,
             });
 
             if (agentName !== getProvider(providerId).config.defaultSystemAgentName) {

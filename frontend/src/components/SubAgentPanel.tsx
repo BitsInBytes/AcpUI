@@ -4,16 +4,25 @@ import { useSystemStore } from '../store/useSystemStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import './SubAgentPanel.css';
 
+interface SubAgentPanelProps {
+  /** The invocationId from the parent ux_invoke_subagents ToolStep's SystemEvent.
+   *  Filters the store to only the agents spawned by that specific tool call,
+   *  ensuring historical turns each show their own batch of agents. */
+  invocationId?: string;
+}
+
 /**
  * Displays sub-agent tool steps and permission prompts only — no streaming text.
  * Embedded inside the parent's ux_invoke_subagents ToolStep when expanded.
- * Agents are filtered to those whose parentSessionId matches the active chat.
+ * Agents are filtered by invocationId so each ToolStep shows only its own agents.
  */
-const SubAgentPanel: React.FC = () => {
+const SubAgentPanel: React.FC<SubAgentPanelProps> = ({ invocationId }) => {
   const allAgents = useSubAgentStore(state => state.agents);
   const activeSession = useSessionLifecycleStore(state => state.sessions.find(s => s.id === state.activeSessionId));
   const socket = useSystemStore(state => state.socket);
-  const agents = allAgents.filter(a => a.parentSessionId === activeSession?.acpSessionId);
+  // Filter by invocationId so historical turns show their own agents, not the latest batch.
+  // If invocationId is undefined (e.g., old data before this fix), show nothing.
+  const agents = invocationId ? allAgents.filter(a => a.invocationId === invocationId) : [];
 
   if (agents.length === 0) return null;
 

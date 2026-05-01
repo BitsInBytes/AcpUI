@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Copy, Check, Archive, Layout } from 'lucide-react';
@@ -87,6 +87,7 @@ const CodeBlock = ({ language, value }: { language: string; value: string }) => 
 
 const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId }) => {
   const [localCollapsed, setLocalCollapsed] = useState<Record<number, boolean>>({});
+  const manuallyToggled = useRef<Set<number>>(new Set());
   const { role, timeline, isStreaming } = message || {};
 
   useEffect(() => {
@@ -95,6 +96,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId }) => {
 
     if (!isStreaming) {
       timeline.forEach((step, idx) => {
+        if (manuallyToggled.current.has(idx)) return;
         if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
         else if (step.type === 'tool') updates[idx] = true;
         else if (step.type === 'thought') updates[idx] = true;
@@ -107,6 +109,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId }) => {
       const last3Thoughts = thoughtIndices.slice(-3);
 
       timeline.forEach((step, idx) => {
+        if (manuallyToggled.current.has(idx)) return;
         if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
         else if (step.type === 'tool') updates[idx] = !last3Tools.includes(idx);
         else if (step.type === 'thought') updates[idx] = !last3Thoughts.includes(idx);
@@ -163,10 +166,13 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId }) => {
       isStreaming={isStreaming}
       timeline={timeline}
       localCollapsed={localCollapsed}
-      toggleCollapse={(idx) => setLocalCollapsed(prev => {
-        const current = prev[idx] ?? timeline?.[idx]?.isCollapsed ?? false;
-        return { ...prev, [idx]: !current };
-      })}
+      toggleCollapse={(idx) => {
+        manuallyToggled.current.add(idx);
+        setLocalCollapsed(prev => {
+          const current = prev[idx] ?? timeline?.[idx]?.isCollapsed ?? false;
+          return { ...prev, [idx]: !current };
+        });
+      }}
       markdownComponents={markdownComponents}
     />
   );

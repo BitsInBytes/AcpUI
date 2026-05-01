@@ -12,6 +12,13 @@ vi.mock('framer-motion', () => ({
   AnimatePresence: ({ children }: any) => <>{children}</>,
 }));
 
+// Mock SubAgentPanel to capture props passed by ToolStep
+vi.mock('../components/SubAgentPanel', () => ({
+  default: ({ invocationId }: { invocationId?: string }) => (
+    <div data-testid="sub-agent-panel" data-invocation-id={invocationId ?? ''} />
+  ),
+}));
+
 const makeEvent = (overrides: Partial<SystemEvent> = {}): SystemEvent => ({
   id: 'tool-1',
   title: 'Running read_file: src/app.ts',
@@ -122,6 +129,31 @@ describe('ToolStep', () => {
     const header = screen.getByText('Running read_file: src/app.ts');
     fireEvent.click(header);
     expect(props.onToggle).toHaveBeenCalled();
+  });
+
+  it('passes invocationId to SubAgentPanel for ux_invoke_subagents', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ toolName: 'ux_invoke_subagents', invocationId: 'inv-test-42' });
+    render(<ToolStep {...props} />);
+    const panel = screen.getByTestId('sub-agent-panel');
+    expect(panel).toBeInTheDocument();
+    expect(panel.getAttribute('data-invocation-id')).toBe('inv-test-42');
+  });
+
+  it('passes invocationId to SubAgentPanel for ux_invoke_counsel', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ toolName: 'ux_invoke_counsel', invocationId: 'inv-counsel-7' });
+    render(<ToolStep {...props} />);
+    const panel = screen.getByTestId('sub-agent-panel');
+    expect(panel).toBeInTheDocument();
+    expect(panel.getAttribute('data-invocation-id')).toBe('inv-counsel-7');
+  });
+
+  it('does not render SubAgentPanel for regular tool calls', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ toolName: 'read_file' });
+    render(<ToolStep {...props} />);
+    expect(screen.queryByTestId('sub-agent-panel')).not.toBeInTheDocument();
   });
 
   it('renders diff lines with correct classes for + and -', () => {

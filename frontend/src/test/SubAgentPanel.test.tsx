@@ -10,6 +10,7 @@ const makeAgent = (overrides: Partial<SubAgentEntry> = {}): SubAgentEntry => ({
   providerId: 'provider-a',
   acpSessionId: 'acp-1',
   parentSessionId: 'parent-1',
+  invocationId: 'inv-test-1',
   index: 0,
   name: 'Research',
   prompt: 'Do research',
@@ -33,8 +34,38 @@ describe('SubAgentPanel', () => {
   });
 
   it('renders nothing when no agents', () => {
+    const { container } = render(<SubAgentPanel invocationId="inv-test-1" />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders nothing when invocationId is undefined', () => {
+    act(() => {
+      useSubAgentStore.setState({ agents: [makeAgent()] });
+    });
     const { container } = render(<SubAgentPanel />);
     expect(container.firstChild).toBeNull();
+  });
+
+  it('renders nothing when invocationId does not match any agent', () => {
+    act(() => {
+      useSubAgentStore.setState({ agents: [makeAgent({ invocationId: 'inv-other' })] });
+    });
+    const { container } = render(<SubAgentPanel invocationId="inv-test-1" />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders only agents matching the invocationId', () => {
+    act(() => {
+      useSubAgentStore.setState({
+        agents: [
+          makeAgent({ invocationId: 'inv-test-1', name: 'Research' }),
+          makeAgent({ acpSessionId: 'acp-other', invocationId: 'inv-other', name: 'OtherAgent', index: 0 }),
+        ],
+      });
+    });
+    render(<SubAgentPanel invocationId="inv-test-1" />);
+    expect(screen.getByText(/Research/)).toBeInTheDocument();
+    expect(screen.queryByText(/OtherAgent/)).not.toBeInTheDocument();
   });
 
   it('renders agent cards with status and name', () => {
@@ -46,7 +77,7 @@ describe('SubAgentPanel', () => {
         ],
       });
     });
-    render(<SubAgentPanel />);
+    render(<SubAgentPanel invocationId="inv-test-1" />);
     expect(screen.getByText(/Research/)).toBeInTheDocument();
     expect(screen.getByText(/Implement/)).toBeInTheDocument();
     expect(screen.getByText('🟢')).toBeInTheDocument();
@@ -64,7 +95,7 @@ describe('SubAgentPanel', () => {
         })],
       });
     });
-    render(<SubAgentPanel />);
+    render(<SubAgentPanel invocationId="inv-test-1" />);
     expect(screen.getByText('Read file')).toBeInTheDocument();
     expect(screen.getByText('Write file')).toBeInTheDocument();
     expect(screen.getByText('⏳')).toBeInTheDocument();
@@ -87,7 +118,7 @@ describe('SubAgentPanel', () => {
         })],
       });
     });
-    render(<SubAgentPanel />);
+    render(<SubAgentPanel invocationId="inv-test-1" />);
     expect(screen.getByText(/Execute shell/)).toBeInTheDocument();
     expect(screen.getByText('Allow')).toBeInTheDocument();
     expect(screen.getByText('Deny')).toBeInTheDocument();

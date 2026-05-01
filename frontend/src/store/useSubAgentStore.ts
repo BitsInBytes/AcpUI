@@ -15,6 +15,10 @@ export interface SubAgentEntry {
   providerId: string;
   acpSessionId: string;
   parentSessionId: string;
+  /** Unique ID for the specific ux_invoke_subagents call that spawned this agent.
+   *  Correlates agents to the ToolStep that owns them, enabling per-invocation
+   *  filtering so historical turns each show their own agents. */
+  invocationId: string;
   index: number;
   name: string;
   prompt: string;

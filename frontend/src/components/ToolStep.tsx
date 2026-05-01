@@ -127,9 +127,11 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
                 </div>
               </div>
             )}
-            {/* SubAgentPanel renders inline for tools that spawn sub-agents */}
+            {/* SubAgentPanel renders inline for tools that spawn sub-agents.
+                invocationId is stamped onto the SystemEvent by the sub_agents_starting handler
+                so this ToolStep always shows its own specific batch of agents. */}
             {(step.event.toolName === 'ux_invoke_subagents' || step.event.toolName === 'ux_invoke_counsel') && (
-              <SubAgentPanel />
+              <SubAgentPanel invocationId={step.event.invocationId} />
             )}
           </motion.div>
         )}

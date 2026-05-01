@@ -173,12 +173,43 @@ describe('mcpServer', () => {
 
         const result = await promise;
         expect(result.content[0].text).toBe('one\ntwo\nthree');
-        expect(mockIo.emit).toHaveBeenCalledWith('tool_output_stream', { chunk: '$ many-lines\n', maxLines: 2 });
-        expect(mockIo.emit).toHaveBeenCalledWith('tool_output_stream', { chunk: 'one\ntwo\nthree\n', maxLines: 2 });
+        // All tool_output_stream events for this invocation carry the same shellId
+        expect(mockIo.emit).toHaveBeenCalledWith('tool_output_stream', expect.objectContaining({ chunk: '$ many-lines\n', maxLines: 2 }));
+        expect(mockIo.emit).toHaveBeenCalledWith('tool_output_stream', expect.objectContaining({ chunk: 'one\ntwo\nthree\n', maxLines: 2 }));
+        // Verify shellId is present and consistent across all emits for this invocation
+        const shellEmits = mockIo.emit.mock.calls.filter(c => c[0] === 'tool_output_stream');
+        const shellIds = shellEmits.map(c => c[1].shellId);
+        expect(shellIds.every(id => typeof id === 'string' && id.startsWith('shell-'))).toBe(true);
+        expect(new Set(shellIds).size).toBe(1); // all same shellId within one invocation
       } finally {
         if (previous === undefined) delete process.env.MAX_SHELL_RESULT_LINES;
         else process.env.MAX_SHELL_RESULT_LINES = previous;
       }
+    });
+
+    it('uses distinct shellIds for concurrent shell invocations', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const mockProc1 = { onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() };
+      const mockProc2 = { onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() };
+      mockPty.spawn.mockReturnValueOnce(mockProc1).mockReturnValueOnce(mockProc2);
+
+      // Start both shells concurrently (don't await)
+      const p1 = handlers.ux_invoke_shell({ command: 'shell-a' });
+      const p2 = handlers.ux_invoke_shell({ command: 'shell-b' });
+
+      mockProc1.onData.mock.calls[0][0]('output-a');
+      mockProc2.onData.mock.calls[0][0]('output-b');
+      mockProc1.onExit.mock.calls[0][0]({ exitCode: 0 });
+      mockProc2.onExit.mock.calls[0][0]({ exitCode: 0 });
+      await Promise.all([p1, p2]);
+
+      const shellEmits = mockIo.emit.mock.calls.filter(c => c[0] === 'tool_output_stream');
+      const shellIds = [...new Set(shellEmits.map(c => c[1].shellId))];
+      // Two separate invocations must produce two distinct shellIds
+      expect(shellIds).toHaveLength(2);
+      expect(shellIds[0]).toMatch(/^shell-/);
+      expect(shellIds[1]).toMatch(/^shell-/);
+      expect(shellIds[0]).not.toBe(shellIds[1]);
     });
 
     it('handles shell command error', async () => {
@@ -223,6 +254,53 @@ describe('mcpServer', () => {
       });
 
       expect(result.content[0].text).toContain('Sub response');
+    });
+
+    it('emits sub_agents_starting immediately with invocationId before stagger', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'starting-event-sub';
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        if (method === 'session/prompt') return {};
+        return {};
+      });
+
+      vi.useFakeTimers();
+      const promise = handlers.ux_invoke_subagents({
+        requests: [{ name: 'Agent A', prompt: 'Work', agent: 'dev' }, { name: 'Agent B', prompt: 'Work too', agent: 'dev' }]
+      });
+
+      // sub_agents_starting must be emitted synchronously / before any timers fire
+      expect(mockIo.emit).toHaveBeenCalledWith('sub_agents_starting', expect.objectContaining({
+        invocationId: expect.stringMatching(/^inv-/),
+        count: 2,
+      }));
+
+      await vi.runAllTimersAsync();
+      await promise;
+      vi.useRealTimers();
+    });
+
+    it('includes invocationId in sub_agent_started events', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'inv-id-sub';
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        if (method === 'session/prompt') return {};
+        return {};
+      });
+
+      await runInvokeSubAgents(handlers, {
+        requests: [{ name: 'Agent 1', prompt: 'Do thing', agent: 'dev' }]
+      });
+
+      const startingCall = mockIo.emit.mock.calls.find(c => c[0] === 'sub_agents_starting');
+      const startedCall = mockIo.emit.mock.calls.find(c => c[0] === 'sub_agent_started');
+      expect(startingCall).toBeDefined();
+      expect(startedCall).toBeDefined();
+      // invocationId must match between sub_agents_starting and sub_agent_started
+      expect(startedCall[1].invocationId).toBe(startingCall[1].invocationId);
+      expect(startedCall[1].invocationId).toMatch(/^inv-/);
     });
 
     it('handles creation errors and aborts', async () => {

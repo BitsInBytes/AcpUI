@@ -15,6 +15,7 @@ describe('useSubAgentStore (Pure Logic)', () => {
             providerId: 'p1',
             acpSessionId: 'a1',
             parentSessionId: 'parent-1',
+            invocationId: 'inv-test-1',
             index: 0,
             name: 'Sub 1',
             prompt: '...',

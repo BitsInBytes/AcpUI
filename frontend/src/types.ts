@@ -185,6 +185,14 @@ export interface SystemEvent {
   _fallbackOutput?: string;
   startTime?: number;
   endTime?: number;
+  /** Set by the sub_agents_starting event handler to correlate this ux_invoke_subagents
+   *  ToolStep with the specific batch of sub-agents it spawned. Enables per-invocation
+   *  filtering in SubAgentPanel so historical turns show their own agents. */
+  invocationId?: string;
+  /** Stamped on the first tool_output_stream chunk for this shell invocation. Correlates
+   *  streaming output to the correct ToolStep when multiple shells run in parallel,
+   *  preventing the shared-buffer output-mixing bug. */
+  shellId?: string;
 }
 
 export interface PermissionOption {
