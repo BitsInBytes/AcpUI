@@ -33,6 +33,7 @@ const ChatInput: React.FC = () => {
   const { handleSubmit, handleCancel } = useChatStore();
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
+  const branding = useSystemStore(state => state.getBranding(activeSession?.provider));
   const activeProvider = activeSession?.provider || useSystemStore.getState().activeProviderId;
   const providerCommands = activeProvider ? slashCommandsByProviderId[activeProvider] : null;
   const slashCommands = useMemo(() => {
@@ -234,7 +235,7 @@ const ChatInput: React.FC = () => {
               value={input}
               onChange={(e) => setInput(activeSession?.id || '', e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={activeSession?.isTyping ? (activeProvider ? useSystemStore.getState().providersById[activeProvider]?.branding?.busyText : useSystemStore.getState().branding.busyText) : activeSession?.isHooksRunning ? ((activeProvider ? useSystemStore.getState().providersById[activeProvider]?.branding?.hooksText : useSystemStore.getState().branding.hooksText) || '⚙ Cleaning up...') : !isEngineReady ? ((activeProvider ? useSystemStore.getState().providersById[activeProvider]?.branding?.warmingUpText : useSystemStore.getState().branding.warmingUpText) || 'Engine warming up...') : activeSession?.isWarmingUp ? ((activeProvider ? useSystemStore.getState().providersById[activeProvider]?.branding?.resumingText : useSystemStore.getState().branding.resumingText) || 'Resuming...') : ((activeProvider ? useSystemStore.getState().providersById[activeProvider]?.branding?.inputPlaceholder : useSystemStore.getState().branding.inputPlaceholder) || 'Send a message...')}
+              placeholder={activeSession?.isTyping ? branding.busyText : activeSession?.isHooksRunning ? (branding.hooksText || '⚙ Cleaning up...') : !isEngineReady ? (branding.warmingUpText || 'Engine warming up...') : activeSession?.isWarmingUp ? (branding.resumingText || 'Resuming...') : (branding.inputPlaceholder || 'Send a message...')}
               disabled={isDisabled}
               rows={1}
             />

@@ -21,7 +21,8 @@ function applyModelState(
 ): ChatSession {
   const modelOptions = mergeModelOptions(session.modelOptions, state.modelOptions);
   const sysState = useSystemStore.getState();
-  const providerModels = sysState.providersById[session.provider || sysState.activeProviderId || '']?.branding?.models || sysState.branding.models;
+  const branding = sysState.getBranding(session.provider);
+  const providerModels = branding.models;
   const currentModelId = state.currentModelId ?? session.currentModelId ?? getModelIdForSelection(state.model || session.model, providerModels);
   return {
     ...session,
@@ -139,7 +140,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
 
     const sysState = useSystemStore.getState();
     const providerId = sysState.activeProviderId || sysState.defaultProviderId || sysState.branding.providerId || sysState.branding.assistantName;
-    const branding = sysState.providersById[providerId]?.branding || sysState.branding;
+    const branding = sysState.getBranding(providerId);
     const defaultModel = getDefaultModelSelection(branding.models);
     const defaultModelId = getModelIdForSelection(defaultModel, branding.models);
 

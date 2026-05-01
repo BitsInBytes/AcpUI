@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { FolderOpen, X } from 'lucide-react';
 import type { WorkspaceCwd } from '../types';
 import { useSystemStore } from '../store/useSystemStore';
+import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 
 interface WorkspacePickerModalProps {
   workspaces: WorkspaceCwd[];
@@ -11,6 +12,11 @@ interface WorkspacePickerModalProps {
 
 const WorkspacePickerModal: React.FC<WorkspacePickerModalProps> = ({ workspaces, onSelect, onClose }) => {
   const [search, setSearch] = useState('');
+  const activeSessionId = useSessionLifecycleStore(state => state.activeSessionId);
+  const sessions = useSessionLifecycleStore(state => state.sessions);
+  const activeSession = sessions.find(s => s.id === activeSessionId);
+  const getBranding = useSystemStore(state => state.getBranding);
+
   const filtered = search
     ? workspaces.filter(w => w.label.toLowerCase().includes(search.toLowerCase()) || w.path.toLowerCase().includes(search.toLowerCase()))
     : workspaces;
@@ -36,16 +42,19 @@ const WorkspacePickerModal: React.FC<WorkspacePickerModalProps> = ({ workspaces,
           </div>
           {filtered.length === 0 ? (
             <p className="archive-empty">No workspaces found.</p>
-          ) : filtered.map(w => (
-            <div key={w.path} className="archive-item workspace-item" onClick={() => { onSelect(w); onClose(); }}>
-              <div className="archive-item-info">
-                <FolderOpen size={14} />
-                <span className="workspace-label">{w.label}</span>
-                <div className="workspace-path">{w.path}</div>
+          ) : filtered.map(w => {
+            const branding = getBranding(w.agent ? activeSession?.provider : null);
+            return (
+              <div key={w.path} className="archive-item workspace-item" onClick={() => { onSelect(w); onClose(); }}>
+                <div className="archive-item-info">
+                  <FolderOpen size={14} />
+                  <span className="workspace-label">{w.label}</span>
+                  <div className="workspace-path">{w.path}</div>
+                  {branding?.supportsAgentSwitching && w.agent && <span className="workspace-agent">{w.agent}</span>}
                 </div>
-                {useSystemStore.getState().branding.supportsAgentSwitching && w.agent && <span className="workspace-agent">{w.agent}</span>}
-                </div>
-          ))}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>

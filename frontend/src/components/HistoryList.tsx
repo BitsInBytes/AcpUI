@@ -5,9 +5,10 @@ import type { Message } from '../types';
 interface HistoryListProps {
   messages: Message[];
   acpSessionId?: string | null;
+  providerId?: string | null;
 }
 
-const HistoryList: React.FC<HistoryListProps> = memo(({ messages, acpSessionId }) => {
+const HistoryList: React.FC<HistoryListProps> = memo(({ messages, acpSessionId, providerId }) => {
   return (
     <div className="messages">
       {messages.map((msg) => (
@@ -15,6 +16,7 @@ const HistoryList: React.FC<HistoryListProps> = memo(({ messages, acpSessionId }
           key={msg.id} 
           message={msg}
           acpSessionId={acpSessionId}
+          providerId={providerId}
         />
       ))}
     </div>

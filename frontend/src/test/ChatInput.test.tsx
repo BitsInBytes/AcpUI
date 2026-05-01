@@ -171,4 +171,38 @@ describe('ChatInput Unit Test', () => {
     render(<ChatInput />);
     expect(screen.getByTitle('Stop generating')).toBeInTheDocument();
   });
+
+  it('uses provider-specific input placeholder when session has a provider', () => {
+    act(() => {
+      useSystemStore.setState(state => ({
+        providersById: {
+          ...state.providersById,
+          'test-provider': {
+            providerId: 'test-provider',
+            label: 'Test Provider',
+            default: false,
+            ready: true,
+            branding: {
+              providerId: 'test-provider',
+              assistantName: 'Assistant',
+              busyText: 'Working...',
+              emptyChatMessage: 'Send a message to start.',
+              notificationTitle: 'ACP UI',
+              appHeader: 'ACP UI',
+              sessionLabel: 'Session',
+              modelLabel: 'Model',
+              inputPlaceholder: 'Provider-specific placeholder...',
+            },
+          },
+        },
+      }));
+      useSessionLifecycleStore.setState({
+        sessions: [{ id: 's1', name: 'Test', messages: [], model: 'test-balanced', isTyping: false, isWarmingUp: false, acpSessionId: null, provider: 'test-provider' }] as any,
+        activeSessionId: 's1',
+      });
+    });
+
+    render(<ChatInput />);
+    expect(screen.getByPlaceholderText('Provider-specific placeholder...')).toBeInTheDocument();
+  });
 });

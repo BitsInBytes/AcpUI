@@ -26,8 +26,9 @@ const MessageList: React.FC<MessageListProps> = ({
   const { visibleCount, incrementVisibleCount } = useUIStore();
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
-  if (!activeSession) return null;
+  const branding = useSystemStore(state => state.getBranding(activeSession?.provider));
 
+  if (!activeSession) return null;
   const slicedMessages = activeSession.messages ? activeSession.messages.slice(-visibleCount) : [];
   const hasMoreMessages = (activeSession.messages?.length || 0) > visibleCount;
 
@@ -46,7 +47,7 @@ const MessageList: React.FC<MessageListProps> = ({
                 <History size={48} className="empty-icon" />
               </div>
               <h2>New Conversation</h2>
-              <p>{useSystemStore.getState().branding.emptyChatMessage}</p>
+              <p>{branding.emptyChatMessage}</p>
             </div>
           ) : (
             <>
@@ -59,6 +60,7 @@ const MessageList: React.FC<MessageListProps> = ({
               <HistoryList 
                 messages={slicedMessages} 
                 acpSessionId={activeSession.acpSessionId}
+                providerId={activeSession.provider}
               />
             </>
           )}

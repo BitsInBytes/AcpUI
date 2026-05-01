@@ -15,6 +15,7 @@ import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 interface AssistantMessageProps {
   message: Message;
   acpSessionId?: string | null;
+  providerId?: string | null;
   isStreaming?: boolean;
   timeline?: TimelineStep[];
   localCollapsed: Record<number, boolean>;
@@ -47,11 +48,12 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
 };
 
 const AssistantMessage: React.FC<AssistantMessageProps> = ({
-  message, acpSessionId, isStreaming, timeline, localCollapsed, toggleCollapse, markdownComponents  
+  message, acpSessionId, providerId, isStreaming, timeline, localCollapsed, toggleCollapse, markdownComponents  
 }) => {
   const [copied, setCopied] = useState(false);
   const [forking, setForking] = useState(false);
   const socket = useSystemStore(state => state.socket);
+  const branding = useSystemStore(state => state.getBranding(providerId));
   
   const activeSessionId = useSessionLifecycleStore(state => state.activeSessionId);
   const handleRespondPermission = useChatStore(state => state.handleRespondPermission);
@@ -109,7 +111,7 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
     <div className={`message-wrapper assistant ${isStreaming ? 'streaming' : ''} ${isArchived ? 'archived' : ''}`}>
       <div className="message">
         <div className="message-role-wrapper">
-          <div className="message-role">{useSystemStore.getState().branding.assistantName}</div>    
+          <div className="message-role">{branding.assistantName}</div>    
           {!isArchived && !isStreaming && (
             <div style={{ display: 'flex', gap: '2px' }}>
               <button className="copy-btn" onClick={handleCopyAll} title="Copy full response">      

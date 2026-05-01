@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import MessageList from '../components/MessageList/MessageList';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useUIStore } from '../store/useUIStore';
+import { useSystemStore } from '../store/useSystemStore';
 
 describe('MessageList', () => {
   const mockActiveSession = {
@@ -88,5 +89,38 @@ describe('MessageList', () => {
     useSessionLifecycleStore.setState({ sessions: [], activeSessionId: null });
     const { container } = render(<MessageList {...defaultProps} />);
     expect(container.firstChild).toBeNull();
+  });
+
+  it('renders empty state with provider-specific branding message', () => {
+    act(() => {
+      useSystemStore.setState(state => ({
+        providersById: {
+          ...state.providersById,
+          'test-provider': {
+            providerId: 'test-provider',
+            label: 'Test Provider',
+            default: false,
+            ready: true,
+            branding: {
+              providerId: 'test-provider',
+              assistantName: 'Assistant',
+              busyText: 'Working...',
+              emptyChatMessage: 'Provider-specific start message',
+              notificationTitle: 'ACP UI',
+              appHeader: 'ACP UI',
+              sessionLabel: 'Session',
+              modelLabel: 'Model',
+            },
+          },
+        },
+      }));
+      useSessionLifecycleStore.setState({
+        sessions: [{ ...mockActiveSession, messages: [], provider: 'test-provider' }] as any,
+        activeSessionId: '1',
+      });
+    });
+
+    render(<MessageList {...defaultProps} />);
+    expect(screen.getByText('Provider-specific start message')).toBeInTheDocument();
   });
 });

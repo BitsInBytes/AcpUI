@@ -102,6 +102,41 @@ describe('SessionSettingsModal', () => {
     expect(container.innerHTML).toBe('');
   });
 
+  it('uses provider-specific session and model labels', () => {
+    act(() => {
+      useSystemStore.setState(state => ({
+        providersById: {
+          ...state.providersById,
+          'test-provider': {
+            providerId: 'test-provider',
+            label: 'Test Provider',
+            default: false,
+            ready: true,
+            branding: {
+              providerId: 'test-provider',
+              assistantName: 'Assistant',
+              busyText: 'Working...',
+              emptyChatMessage: 'Send a message to start.',
+              notificationTitle: 'ACP UI',
+              appHeader: 'ACP UI',
+              sessionLabel: 'Provider Session',
+              modelLabel: 'Provider Model Tier',
+            },
+          },
+        },
+      }));
+      useSessionLifecycleStore.setState({
+        sessions: [{ ...mockSession, provider: 'test-provider' }],
+      } as any);
+    });
+
+    render(<SessionSettingsModal />);
+    expect(screen.getByText('Provider Session')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Config'));
+    expect(screen.getByText(/Provider Model Tier/)).toBeInTheDocument();
+  });
+
   it('export action button is disabled when path is empty', () => {
     const { container } = render(<SessionSettingsModal />);
     fireEvent.click(screen.getByText('Export'));

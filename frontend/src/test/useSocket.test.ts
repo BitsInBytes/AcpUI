@@ -84,9 +84,10 @@ describe('useSocket hook', () => {
       setProviderStatus: vi.fn(),
       setCompacting: vi.fn(),
       setSocket: vi.fn(),
-      branding: { title: 'Test Title' },
+      branding: { title: 'Test Title', protocolPrefix: '_provider/' },
       providersById: {},
       slashCommands: [],
+      getBranding: vi.fn(() => systemStoreState.branding),
     };
 
     (useSystemStore as any).mockImplementation((selector: any) => selector(systemStoreState));

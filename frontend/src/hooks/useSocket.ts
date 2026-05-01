@@ -90,9 +90,8 @@ function getOrCreateSocket(): Socket {
     // (e.g. "_provider/listCommands") and returns typed action objects.
     const p = data.params || {};
     const providerId = (data as { providerId?: string }).providerId || p.providerId || p.status?.providerId;
-    const state = useSystemStore.getState();
-    const providerBranding = providerId ? state.providersById[providerId]?.branding : null;
-    const ext = providerBranding?.protocolPrefix || state.branding.protocolPrefix || '_provider/';
+    const providerBranding = useSystemStore.getState().getBranding(providerId);
+    const ext = providerBranding?.protocolPrefix || '_provider/';
     const result = routeExtension(data.method, p, ext, [], useSystemStore.getState().customCommands);
     if (!result) return;
 

@@ -14,6 +14,7 @@ const ChatHeader: React.FC = () => {
   const { connected, isEngineReady } = useSystemStore();
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
+  const branding = useSystemStore(state => state.getBranding(activeSession?.provider));
   const activeSessionName = activeSession?.name;
   const isPopout = new URLSearchParams(window.location.search).has('popout');
 
@@ -37,7 +38,7 @@ const ChatHeader: React.FC = () => {
             {activeSessionName ? (
               <span className="header-session-name">{activeSessionName}{cwdLabel && <span className="header-cwd-label"> ({cwdLabel})</span>}</span>
             ) : (
-              <span className="header-mobile-fallback">{useSystemStore.getState().branding.appHeader}</span>
+              <span className="header-mobile-fallback">{branding.appHeader}</span>
             )}
           </h1>
         </div>

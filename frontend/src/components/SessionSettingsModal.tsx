@@ -82,16 +82,19 @@ const SessionSettingsModal: React.FC = () => {
 
   useEffect(() => {
     if (isOpen) {
+      /* eslint-disable react-hooks/set-state-in-effect */
       setShowConfirmDelete(false);
       setActiveTab(settingsInitialTab);
       setRehydrateStatus('idle');
       setRehydrateMsg('');
+      /* eslint-enable react-hooks/set-state-in-effect */
     }
   }, [isOpen, settingsInitialTab]);
 
-  if (!session) return null;
+  const branding = useSystemStore(state => state.getBranding(session?.provider));
 
-  const brandingModels = useSystemStore.getState().branding.models;
+  if (!session) return null;
+  const brandingModels = branding.models;
   const modelChoices = getFullModelChoices(session, brandingModels);
   const selectedModelValue = getFullModelSelectionValue(session, brandingModels);
 
@@ -141,7 +144,7 @@ const SessionSettingsModal: React.FC = () => {
                         <span className="info-value code">{session.acpSessionId || 'Not initialized'}</span>
                       </div>
                       <div className="system-info-item">
-                        <span className="info-label">{useSystemStore.getState().branding.sessionLabel}</span>
+                        <span className="info-label">{branding.sessionLabel}</span>
                         <span className="info-value code">ACP ID: {session.acpSessionId || '...'}</span>
                       </div>
                       <div className="system-info-item">
@@ -174,7 +177,7 @@ const SessionSettingsModal: React.FC = () => {
                     <Database size={16} />
                     <h3>Model Selection</h3>
                   </div>
-                  <p className="section-desc">Select which {useSystemStore.getState().branding.modelLabel} to use for this session.</p>
+                  <p className="section-desc">Select which {branding.modelLabel} to use for this session.</p>
 
                   <div className="model-selector">
                     <select

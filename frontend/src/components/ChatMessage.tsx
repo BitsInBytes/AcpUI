@@ -14,6 +14,7 @@ import AssistantMessage from './AssistantMessage';
 interface ChatMessageProps {
   message: Message;
   acpSessionId?: string | null;
+  providerId?: string | null;
 }
 
 const copyToClipboard = async (text: string): Promise<boolean> => {
@@ -85,7 +86,7 @@ const CodeBlock = ({ language, value }: { language: string; value: string }) => 
   );
 };
 
-const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId }) => {
+const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, providerId }) => {
   const [localCollapsed, setLocalCollapsed] = useState<Record<number, boolean>>({});
   const manuallyToggled = useRef<Set<number>>(new Set());
   const { role, timeline, isStreaming } = message || {};
@@ -163,6 +164,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId }) => {
     <AssistantMessage
       message={message}
       acpSessionId={acpSessionId}
+      providerId={providerId}
       isStreaming={isStreaming}
       timeline={timeline}
       localCollapsed={localCollapsed}
