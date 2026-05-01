@@ -53,22 +53,38 @@ describe('Sidebar', () => {
     expect(sessionOne).toHaveClass('typing');
   });
 
-  it('glows the provider header only while a session is typing', () => {
+  it('renders a typing session outside the provider content when collapsed', () => {
     act(() => {
       useUIStore.setState({ expandedProviderId: 'other-provider' });
       useSessionLifecycleStore.setState({ sessions: [{ ...mockSessions[0], isTyping: true, isWarmingUp: false }, mockSessions[1]], });
     });
-    render(<Sidebar />);
-    expect(screen.getByText('Default')).toHaveClass('glow');
+    const { container } = render(<Sidebar />);
+    const collapsedRunning = container.querySelector('.collapsed-running');
+    expect(collapsedRunning).toBeInTheDocument();
+    expect(collapsedRunning).toHaveTextContent('Chat One');
+    expect(collapsedRunning).not.toHaveTextContent('Chat Two');
   });
 
-  it('does not glow the provider header while a session is only resuming', () => {
+  it('does not render running sessions outside when only resuming', () => {
     act(() => {
       useUIStore.setState({ expandedProviderId: 'other-provider' });
       useSessionLifecycleStore.setState({ sessions: [{ ...mockSessions[0], isTyping: false, isWarmingUp: true }, mockSessions[1]], });
     });
-    render(<Sidebar />);
-    expect(screen.getByText('Default')).not.toHaveClass('glow');
+    const { container } = render(<Sidebar />);
+    const collapsedRunning = container.querySelector('.collapsed-running');
+    expect(collapsedRunning).not.toBeInTheDocument();
+  });
+
+  it('renders an unread session outside the provider content when collapsed', () => {
+    act(() => {
+      useUIStore.setState({ expandedProviderId: 'other-provider' });
+      useSessionLifecycleStore.setState({ sessions: [{ ...mockSessions[0], hasUnreadResponse: true }, mockSessions[1]], });
+    });
+    const { container } = render(<Sidebar />);
+    const collapsedRunning = container.querySelector('.collapsed-running');
+    expect(collapsedRunning).toBeInTheDocument();
+    expect(collapsedRunning).toHaveTextContent('Chat One');
+    expect(collapsedRunning).not.toHaveTextContent('Chat Two');
   });
 
   it('marks a collapsed provider header as unread when one of its chats has an unread response', () => {

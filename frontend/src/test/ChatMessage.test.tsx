@@ -1,5 +1,5 @@
 import { useChatStore } from '../store/useChatStore';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ChatMessage from '../components/ChatMessage';
 import type { Message, TimelineStep } from '../types';
@@ -581,3 +581,88 @@ describe('ChatMessage - additional coverage', () => {
     expect(screen.getByText('Allow')).toBeInTheDocument();
   });
 });
+
+describe('ChatMessage - Collapse Fix (Regression)', () => {
+  it('respects manual toggle during timeline updates while streaming', async () => {
+    const initialTimeline: TimelineStep[] = [
+      { type: 'thought', content: 'thinking 1', isCollapsed: true },
+      { type: 'thought', content: 'thinking 2', isCollapsed: false }
+    ];
+
+    const message: Message = {
+      id: 'msg-1',
+      role: 'assistant',
+      content: '',
+      isStreaming: true,
+      timeline: initialTimeline
+    };
+
+    const { rerender } = render(<ChatMessage message={message} />);
+
+    // Initially, step 0 is collapsed (content not visible), step 1 is open
+    expect(screen.queryByText('thinking 1')).not.toBeInTheDocument();
+    expect(screen.getByText('thinking 2')).toBeInTheDocument();
+
+    // Manually toggle step 0 to expand it
+    fireEvent.click(screen.getAllByText('Thinking Process')[0]);
+    expect(screen.getByText('thinking 1')).toBeInTheDocument();
+
+    // Simulate a timeline update (streaming continues)
+    const updatedTimeline: TimelineStep[] = [
+      { type: 'thought', content: 'thinking 1', isCollapsed: true },
+      { type: 'thought', content: 'thinking 2', isCollapsed: true },
+      { type: 'thought', content: 'thinking 3', isCollapsed: false }
+    ];
+
+    const updatedMessage: Message = {
+      ...message,
+      timeline: updatedTimeline
+    };
+
+    rerender(<ChatMessage message={updatedMessage} />);
+
+    // Step 0 should STAY expanded because it was manually toggled, 
+    // even though the incoming store data says isCollapsed: true
+    expect(screen.getByText('thinking 1')).toBeInTheDocument();
+    
+    // Step 1 should be collapsed as per the store update (it wasn't manually toggled)
+    await waitFor(() => expect(screen.queryByText('thinking 2')).not.toBeInTheDocument());
+    
+    // Step 2 should be open as it's the new active step
+    expect(screen.getByText('thinking 3')).toBeInTheDocument();
+  });
+
+  it('respects manual toggle after streaming stops', async () => {
+    const timeline: TimelineStep[] = [
+      { type: 'thought', content: 'thinking 1', isCollapsed: true },
+      { type: 'text', content: 'final response' }
+    ];
+
+    const message: Message = {
+      id: 'msg-1',
+      role: 'assistant',
+      content: 'final response',
+      isStreaming: true,
+      timeline: timeline
+    };
+
+    const { rerender } = render(<ChatMessage message={message} />);
+
+    // Manually expand the thought bubble
+    fireEvent.click(screen.getByText('Thinking Process'));
+    expect(screen.getByText('thinking 1')).toBeInTheDocument();
+
+    // Stop streaming
+    const stoppedMessage: Message = {
+      ...message,
+      isStreaming: false
+    };
+
+    rerender(<ChatMessage message={stoppedMessage} />);
+
+    // It should STILL be expanded, even though the default for non-streaming is to collapse thoughts
+    expect(screen.getByText('thinking 1')).toBeInTheDocument();
+  });
+});
+
+

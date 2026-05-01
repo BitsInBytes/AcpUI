@@ -331,7 +331,6 @@ const Sidebar: React.FC = () => {
           const hasUnreadResponse = !isExpanded && !isTyping && allPSessions.some(s => s.hasUnreadResponse);
 
           let headerClass = 'provider-stack-header';
-          if (isTyping && !isExpanded) headerClass += ' glow';
           if (hasUnreadResponse) headerClass += ' unread';
 
           return (
@@ -342,6 +341,26 @@ const Sidebar: React.FC = () => {
               >
                 {p.branding?.title || p.label || p.providerId}
               </div>
+
+              {!isExpanded && (isTyping || hasUnreadResponse) && (
+                <div className="provider-stack-content collapsed-running">
+                  <div className="provider-stack-sessions">
+                    {allPSessions.filter(s => s.isTyping || s.hasUnreadResponse).map(session => (
+                      <div key={session.id}>
+                        <SessionItem
+                          session={session}
+                          isActive={session.id === activeSessionId}
+                          onSelect={() => handleSelect(session.id)}
+                          onRename={(newName) => handleRenameSession(socket, session.id, newName)}
+                          onTogglePin={() => handleTogglePin(socket, session.id)}
+                          onArchive={() => handleRemoveSession(session.id)}
+                          onSettings={() => setSettingsOpen(true, session.id)}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {isExpanded && (
                 <div className="provider-stack-content">
