@@ -73,21 +73,23 @@ export function useChatManager(
     const flushShellBuffer = (shellId: string) => {
       const entry = shellBuffers.get(shellId);
       if (!entry || !entry.buffer) return false;
-      const activeId = useSessionLifecycleStore.getState().activeSessionId;
-      if (!activeId) return false;
-      const session = useSessionLifecycleStore.getState().sessions.find(s => s.id === activeId);
-      if (!session) return false;
-      const lastMsg = session.messages[session.messages.length - 1];
-      if (!lastMsg || lastMsg.role !== 'assistant' || !lastMsg.timeline) return false;
-      // Only flush if the target ToolStep (matched by shellId) is still in-progress
-      if (!lastMsg.timeline.some(e => e.type === 'tool' && e.event.shellId === shellId && e.event.status === 'in_progress')) return false;
+      let flushed = false;
       const chunk = entry.buffer;
-      entry.buffer = '';
-      useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => {
-          if (s.id !== activeId) return s;
+
+      useSessionLifecycleStore.setState(state => {
+        let globalFlushed = false;
+        const newSessions = state.sessions.map(s => {
+          if (globalFlushed) return s;
           const msgs = [...s.messages];
           const msg = msgs[msgs.length - 1];
           if (!msg || msg.role !== 'assistant' || !msg.timeline) return s;
+
+          // Only flush if the target ToolStep (matched by shellId) is still in-progress in this session
+          if (!msg.timeline.some(e => e.type === 'tool' && e.event.shellId === shellId && e.event.status === 'in_progress')) return s;
+
+          globalFlushed = true;
+          flushed = true;
+
           const timeline = msg.timeline.map(e =>
             e.type === 'tool' && e.event.shellId === shellId
               ? { ...e, event: { ...e.event, output: trimShellOutputLines((e.event.output || '') + chunk, entry.maxLines) } }
@@ -95,34 +97,43 @@ export function useChatManager(
           );
           msgs[msgs.length - 1] = { ...msg, timeline };
           return { ...s, messages: msgs };
-        }) }));
-      return true;
+        });
+        return globalFlushed ? { sessions: newSessions } : state;
+      });
+
+      if (flushed) {
+        entry.buffer = '';
+      }
+      return flushed;
     };
 
     // Stamp shellId onto the first unclaimed in-progress ux_invoke_shell ToolStep
-    // in the active session. Called on the first chunk for a new shellId — by then
-    // the PTY has started and produced output (50ms+ after tool_start), so the
-    // ToolStep is guaranteed to be flushed out of the stream queue into the store.
+    // across any session. Called on the first chunk for a new shellId.
     const claimShellToolStep = (shellId: string) => {
-      const activeId = useSessionLifecycleStore.getState().activeSessionId;
-      if (!activeId) return;
-      useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => {
-          if (s.id !== activeId) return s;
+      useSessionLifecycleStore.setState(state => {
+        let globalClaimed = false;
+        const newSessions = state.sessions.map(s => {
+          if (globalClaimed) return s;
           const msgs = [...s.messages];
           const lastMsg = msgs[msgs.length - 1];
           if (!lastMsg || lastMsg.role !== 'assistant' || !lastMsg.timeline) return s;
-          let claimed = false;
+          
+          let localClaimed = false;
           const timeline = lastMsg.timeline.map(e => {
-            if (!claimed && e.type === 'tool' && e.event.status === 'in_progress' && e.event.toolName === 'ux_invoke_shell' && !e.event.shellId) {
-              claimed = true;
+            if (!localClaimed && e.type === 'tool' && e.event.status === 'in_progress' && e.event.toolName === 'ux_invoke_shell' && !e.event.shellId) {
+              localClaimed = true;
+              globalClaimed = true;
               return { ...e, event: { ...e.event, shellId } };
             }
             return e;
           });
-          if (!claimed) return s;
+          
+          if (!localClaimed) return s;
           msgs[msgs.length - 1] = { ...lastMsg, timeline };
           return { ...s, messages: msgs };
-        }) }));
+        });
+        return globalClaimed ? { sessions: newSessions } : state;
+      });
     };
 
     // Legacy fallback buffer for tool_output_stream events without a shellId

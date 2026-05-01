@@ -101,6 +101,50 @@ describe('useChatManager hook', () => {
     vi.useRealTimers();
   });
 
+  it('handles "tool_output_stream" for a background session', async () => {
+    vi.useFakeTimers();
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's2', // Currently viewing s2
+        sessions: [
+          {
+            id: 's1', // Background session running the shell
+            messages: [{
+              role: 'assistant',
+              timeline: [{
+                type: 'tool',
+                event: { status: 'in_progress', toolName: 'ux_invoke_shell', output: '' }
+              }]
+            }]
+          } as any,
+          {
+            id: 's2', // Active session doing nothing
+            messages: []
+          } as any
+        ]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'tool_output_stream')[1];
+
+    act(() => {
+      handler({ chunk: 'Background ', shellId: 'shell-bg-1' });
+      handler({ chunk: 'Output', shellId: 'shell-bg-1' });
+    });
+
+    act(() => { vi.advanceTimersByTime(100); });
+
+    const sessions = useSessionLifecycleStore.getState().sessions;
+    const toolStep = (sessions[0].messages[0] as any).timeline[0];
+    // shellId should be stamped on the ToolStep in s1 even though s2 is active
+    expect(toolStep.event.shellId).toBe('shell-bg-1');
+    // output should contain the concatenated chunks
+    expect(toolStep.event.output).toContain('Background Output');
+
+    vi.useRealTimers();
+  });
+
   it('handles "tool_output_stream" without shellId — legacy fallback writes to in-progress step', async () => {
     vi.useFakeTimers();
     act(() => {
