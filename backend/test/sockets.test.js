@@ -54,6 +54,10 @@ const { mockFs, mockDb, mockAcpClient, mockProviderModule } = vi.hoisted(() => (
     mockProviderModule: {
         intercept: (p) => p,
         normalizeUpdate: (u) => u,
+        normalizeModelState: (s) => s,
+        normalizeConfigOptions: (u) => u,
+        prepareAcpEnvironment: async (env) => env,
+        emitCachedContext: vi.fn().mockReturnValue(false),
         extractToolOutput: vi.fn(),
         extractFilePath: vi.fn(),
         extractDiffFromToolCall: vi.fn(),

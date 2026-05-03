@@ -204,6 +204,10 @@ Extension events are sent as JSON-RPC notifications using the `protocolPrefix`. 
 
 `metadata` typically arrives just before `end_turn` and carries the context usage percentage displayed in the UI.
 
+### Context Usage Persistence
+
+Kiro context usage is cached in `{paths.home or ~/.kiro}\acp_session_context.json` whenever a metadata extension includes `contextUsagePercentage`. On backend restart or hot-session reuse, AcpUI calls `emitCachedContext(sessionId)` after the session ID is known so the footer and session settings show the last context percentage before another prompt is sent.
+
 ## Dynamic Models
 
 Kiro advertises its full model catalog in the `models` object returned from `session/new` and `session/load`:
@@ -267,4 +271,4 @@ The `matcher` field filters which tool calls trigger a `post_tool` hook by match
 
 Configuration is split across `provider.json` (protocol identity), `branding.json` (UI labels), and `user.json` (local machine settings).
 
-See the [PROVIDERS.md](../../PROVIDERS.md) in the project root for the full schema specification.
+See the [Provider System feature doc](<../../documents/[Feature Doc] - Provider System.md>) for the full schema specification.

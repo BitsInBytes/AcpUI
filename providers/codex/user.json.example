@@ -1,0 +1,26 @@
+{
+  "command": "codex-acp",
+  "args": [],
+  "authMethod": "auto",
+  "fetchQuotaStatus": true,
+  "refreshQuotaOAuth": true,
+  "quotaStatusIntervalMs": 30000,
+  "defaultSubAgentName": "general-assistant",
+  "paths": {
+    "home": "%USERPROFILE%\\.codex",
+    "sessions": "%USERPROFILE%\\.codex\\sessions",
+    "agents": "%USERPROFILE%\\.codex\\agents",
+    "attachments": "%USERPROFILE%\\.codex\\attachments",
+    "archive": "%USERPROFILE%\\.codex\\archive"
+  },
+    "models": {
+        "default": "GPT-5.5",
+        "quickAccess": [
+            { "id": "GPT-5.5", "displayName": "GPT 5.5", "description": "Highest capability" },
+            { "id": "gpt-5.3-codex", "displayName": "GPT 5.3 Codex", "description": "Balanced everyday work" },
+            { "id": "GPT-5.4-Mini", "displayName": "GPT 5.4 Mini", "description": "Fastest responses" }
+        ],
+        "titleGeneration": "GPT-5.4-Mini",
+        "subAgent": "GPT-5.4-Mini"
+    }
+}

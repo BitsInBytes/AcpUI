@@ -25,7 +25,7 @@ Spawns an ACP daemon natively on the host OS, parses the JSON-RPC stream into a 
 └─────────────────────────────────────────────┘
 ```
 
-The backend supports multiple concurrent providers configured via `configuration/providers.json` (or the `ACP_PROVIDERS_CONFIG` env var). Each provider defines its own ACP command, models, branding, extension protocol, and file paths. See [PROVIDERS.md](PROVIDERS.md) for full documentation.
+The backend supports multiple concurrent providers configured via `configuration/providers.json` (or the `ACP_PROVIDERS_CONFIG` env var). Each provider defines its own ACP command, models, branding, extension protocol, and file paths. See the [Provider System feature doc](<documents/[Feature Doc] - Provider System.md>) for full documentation.
 
 ### Backend Orchestration
 
@@ -72,7 +72,7 @@ Example `providers.json`:
   "defaultProviderId": "provider-a",
   "providers": [
     { "id": "provider-a", "path": "providers/provider-a", "label": "Provider A" },
-    { "id": "provider-b", "path": "providers/provider-b", "label": "Provider B" }
+    { "id": "codex", "path": "providers/codex", "label": "Codex", "enabled": false }
   ]
 }
 ```
@@ -234,7 +234,9 @@ The MCP server name that exposes these tools is defined in the provider's `provi
 - **Compaction** — `/compact` locks prompt, shows summary, saves to DB
 - **Auto title generation** — generates chat titles after first response
 - **Desktop notifications** — Windows toast notifications when background chats complete
-- **Image attachments** — drag & drop images with compression, thumbnails in message bubbles
+- **File & image attachments** — drag & drop files/images; automatic JPEG compression (quality 85, max dimension 1568px); per-session storage
+- **Model quick-select** — footer dropdown with provider-configured model choices; shows context usage %
+- **Voice input** — microphone recording with local speech-to-text via whisper.cpp (requires whisper-server setup)
 - **Session export** — export chat sessions
 - **Permission system** — ACP-compliant permission request/response with approve/deny buttons
 
@@ -250,6 +252,7 @@ The MCP server name that exposes these tools is defined in the provider's `provi
 - **Session archive** — archive/restore sessions, or permanent delete (configurable)
 - **Sidebar folders** — nested folders with drag & drop, persisted expand/collapse
 - **Scratch pad notes** — per-session markdown notes with raw/rendered tabs
+- **Pop-out chat** — detach chat sessions into separate browser windows for side-by-side comparison (BroadcastChannel-coordinated ownership)
 - **Empty state on load** — no chat auto-selected; starts with empty state until user picks or creates a session
 
 ### System Settings
@@ -286,7 +289,7 @@ Total: 1,263 tests.
 
 The application is fully provider-agnostic. All branding, models, paths, and extension protocols are defined in a provider directory. To use a different ACP backend, add it to `configuration/providers.json`.
 
-See [PROVIDERS.md](PROVIDERS.md) for the complete provider system documentation, including the JSON schema, module interface, and step-by-step guide for creating new providers.
+See the [Provider System feature doc](<documents/[Feature Doc] - Provider System.md>) for the complete provider system documentation, including the JSON schema, module interface, and step-by-step guide for creating new providers.
 
 ## Troubleshooting
 

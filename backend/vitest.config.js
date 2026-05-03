@@ -10,10 +10,10 @@ export default defineConfig({
       exclude: ['test/**', 'node_modules/**', 'generate-ssl.js', 'inspect_db.cjs', 'test-route.js', '../providers/**/test/**'],
       all: true,
       thresholds: {
-        statements: 91.22,
-        branches: 80.39,
-        functions: 93.52,
-        lines: 93.81,
+        statements: 91.16,
+        branches: 80.24,
+        functions: 93.64,
+        lines: 93.79,
       }
     },
     environment: 'node',

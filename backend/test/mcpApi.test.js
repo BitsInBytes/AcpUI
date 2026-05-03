@@ -44,6 +44,20 @@ describe('MCP API Routes', () => {
     }));
   });
 
+  it('GET /tools describes ux_invoke_shell as the required non-interactive shell replacement', () => {
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'get', '/tools');
+    const res = { json: vi.fn() };
+    route.route.stack[0].handle({}, res, vi.fn());
+
+    const tools = res.json.mock.calls[0][0].tools;
+    const shellTool = tools.find(tool => tool.name === 'ux_invoke_shell');
+
+    expect(shellTool.description).toContain('Always use this tool for shell commands');
+    expect(shellTool.description).toContain('never use system shell, bash, or powershell tools');
+    expect(shellTool.description).toContain('git --no-pager diff');
+  });
+
   it('POST /tool-call returns 404 for unknown tool', async () => {
     const router = createMcpApiRoutes(io, acpClient);
     const route = getRoute(router, 'post', '/tool-call');

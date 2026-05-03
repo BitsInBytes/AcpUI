@@ -77,6 +77,25 @@ describe('Kiro Provider', () => {
       const env = { KEEP: '1' };
       await expect(kiro.prepareAcpEnvironment(env)).resolves.toBe(env);
     });
+
+    it('emits persisted context for a loaded session on request', async () => {
+      const emitProviderExtension = vi.fn();
+      fs.existsSync.mockImplementation(filePath => String(filePath).endsWith('acp_session_context.json'));
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) {
+          return JSON.stringify({ 'kiro-session-1': 37.25 });
+        }
+        return '';
+      });
+
+      await kiro.prepareAcpEnvironment({ KEEP: '1' }, { emitProviderExtension });
+
+      expect(kiro.emitCachedContext('kiro-session-1')).toBe(true);
+      expect(emitProviderExtension).toHaveBeenCalledWith('_kiro.dev/metadata', {
+        sessionId: 'kiro-session-1',
+        contextUsagePercentage: 37.25
+      });
+    });
   });
 
   describe('intercept', () => {
@@ -136,6 +155,14 @@ describe('Kiro Provider', () => {
       const normalized = kiro.normalizeUpdate(update);
       expect(normalized.content).toEqual({ text: 'hello' });
       expect(normalized._originalContent).toBe('hello');
+    });
+  });
+
+  describe('normalizeConfigOptions', () => {
+    it('explicitly passes config options through unchanged', () => {
+      const options = [{ id: 'mode', currentValue: 'default' }];
+      expect(kiro.normalizeConfigOptions(options)).toBe(options);
+      expect(kiro.normalizeConfigOptions(null)).toEqual([]);
     });
   });
 

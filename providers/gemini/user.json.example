@@ -2,6 +2,7 @@
   "command": "gemini",
   "args": ["--acp"],
   "apiKey": "YOUR_GEMINI_API_KEY",
+  "fetchQuotaStatus": false,
   "defaultSubAgentName": "general-assistant",
   "paths": {
     "home": "C:\\Users\\<user>\\.gemini",

@@ -84,8 +84,23 @@ export function useChatManager(
           const msg = msgs[msgs.length - 1];
           if (!msg || msg.role !== 'assistant' || !msg.timeline) return s;
 
+          let hasClaimed = msg.timeline.some(e => e.type === 'tool' && e.event.shellId === shellId && e.event.status === 'in_progress');
+          
+          if (!hasClaimed) {
+            // Lazy claim: if the tool_start event arrived after the first tool_output_stream chunk
+            const unclaimedIndex = msg.timeline.findIndex(e => e.type === 'tool' && e.event.status === 'in_progress' && e.event.toolName === 'ux_invoke_shell' && !e.event.shellId);
+            if (unclaimedIndex !== -1) {
+              msg.timeline = [...msg.timeline];
+              const step = msg.timeline[unclaimedIndex];
+              if (step.type === 'tool') {
+                msg.timeline[unclaimedIndex] = { ...step, event: { ...step.event, shellId } };
+                hasClaimed = true;
+              }
+            }
+          }
+
           // Only flush if the target ToolStep (matched by shellId) is still in-progress in this session
-          if (!msg.timeline.some(e => e.type === 'tool' && e.event.shellId === shellId && e.event.status === 'in_progress')) return s;
+          if (!hasClaimed) return s;
 
           globalFlushed = true;
           flushed = true;

@@ -15,6 +15,7 @@ const { mockProviderModule } = vi.hoisted(() => ({
         extractDiffFromToolCall: vi.fn(),
         normalizeTool: vi.fn(e => e),
         categorizeToolCall: vi.fn(),
+        normalizeConfigOptions: vi.fn(options => Array.isArray(options) ? options : []),
         parseExtension: vi.fn()
     }
 }));
@@ -67,6 +68,7 @@ describe('acpUpdateHandler', () => {
     client.sessionMetadata.set(sid, { toolCalls: 0, usedTokens: 0 });
     mockProviderModule.normalizeUpdate.mockImplementation(u => u);
     mockProviderModule.normalizeTool.mockImplementation(e => e);
+    mockProviderModule.normalizeConfigOptions.mockImplementation(options => Array.isArray(options) ? options : []);
   });
 
   it('delegates normalization to provider', async () => {

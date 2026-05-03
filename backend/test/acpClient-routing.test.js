@@ -28,7 +28,21 @@ vi.mock('../services/providerStatusMemory.js', () => ({ rememberProviderStatusEx
 
 vi.mock('../services/providerLoader.js', () => ({
   getProvider: () => ({ config: { protocolPrefix: 'test/', executable: { command: 'n', args: [], env: {} }, paths: {}, models: {} } }),
-  getProviderModule: vi.fn().mockResolvedValue({ performHandshake: async () => {}, normalizeUpdate: u => u }),
+  getProviderModule: vi.fn().mockResolvedValue({
+    intercept: p => p,
+    normalizeUpdate: u => u,
+    normalizeConfigOptions: options => Array.isArray(options) ? options : [],
+    extractToolOutput: () => undefined,
+    extractFilePath: () => undefined,
+    extractDiffFromToolCall: () => undefined,
+    normalizeTool: e => e,
+    categorizeToolCall: () => null,
+    parseExtension: () => null,
+    prepareAcpEnvironment: async env => env,
+    performHandshake: async () => {},
+    normalizeModelState: state => state,
+    emitCachedContext: () => false
+  }),
   runWithProvider: vi.fn((_p, fn) => fn())
 }));
 

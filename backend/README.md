@@ -19,6 +19,7 @@ Each provider directory (e.g., `./providers/my-provider`) contains:
 
 - **Background Auto-Load** — Sequentially warms up all pinned chats into memory immediately after a successful ACP handshake.
 - **Hot-Resume Optimization** — Exposes memory-resident metadata to the UI to skip redundant `session/load` RPC calls during session switching.
+- **Cached Context Replay** — Calls provider `emitCachedContext(sessionId)` hooks after explicit loads, hot-session reuse, and pinned-session warmup so context usage appears before the next prompt.
 - **Exponential Back-off** — Automatically manages daemon restarts with increasing delays (2s, 4s, 8s, 16s, 30s) to prevent resource thrashing during persistent provider failures.
 - **Handshake Mutex** — Protects the bootstrap lifecycle from race conditions during simultaneous socket connections or manual refreshes.
 - **LAN Security** — Hardened CORS origin validation that permits access from local network IPs (192.168.x.x, etc.) while blocking public traffic.

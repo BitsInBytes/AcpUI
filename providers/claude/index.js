@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { getProvider } from '../../backend/services/providerLoader.js';
 import { getLatestClaudeQuota, startClaudeQuotaProxy } from './quotaProxy.js';
@@ -7,12 +8,95 @@ import { getLatestClaudeQuota, startClaudeQuotaProxy } from './quotaProxy.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Cache for context usage percentage
+let _emitProviderExtension = null;
+let _writeLog = null;
+let _sessionContextCache = new Map(); // sessionId -> contextUsagePercentage
+let _contextStateFile = null; // Path to persist context state
+let _sessionsWithInitialEmit = new Set(); // Track which sessions we've already emitted initial context for
+
+function _emitCachedContext(sessionId, config) {
+  if (!sessionId || _sessionsWithInitialEmit.has(sessionId)) return false;
+  _sessionsWithInitialEmit.add(sessionId);
+  const persistedPercent = _sessionContextCache.get(sessionId);
+  if (persistedPercent !== undefined && _emitProviderExtension) {
+    _emitProviderExtension(`${config.protocolPrefix}metadata`, {
+      sessionId,
+      contextUsagePercentage: persistedPercent
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Loads context usage state from disk on startup.
+ */
+function _loadContextState() {
+  try {
+    if (!_contextStateFile) return;
+    if (!fs.existsSync(_contextStateFile)) return;
+
+    const data = JSON.parse(fs.readFileSync(_contextStateFile, 'utf8'));
+    if (data && typeof data === 'object') {
+      _sessionContextCache = new Map(Object.entries(data));
+    }
+  } catch (err) {
+    _writeLog?.(`[CLAUDE CONTEXT STATE] Failed to load: ${err.message}`);
+  }
+}
+
+/**
+ * Saves context usage state to disk for persistence (atomic write).
+ */
+function _saveContextState() {
+  try {
+    if (!_contextStateFile) return;
+
+    const dir = path.dirname(_contextStateFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const data = {};
+    for (const [sessionId, percent] of _sessionContextCache.entries()) {
+      data[sessionId] = percent;
+    }
+
+    const tempFile = `${_contextStateFile}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tempFile, _contextStateFile);
+  } catch (err) {
+    _writeLog?.(`[CLAUDE CONTEXT STATE] Failed to save: ${err.message}`);
+  }
+}
+
 /**
  * Intercept raw messages from the Claude process and translate them into 
  * standardized ACP protocol messages.
  */
 export function intercept(payload) {
   // console.log('intercept called', payload);
+  const { config } = getProvider();
+  const sessionId = payload?.params?.sessionId || payload?.result?.sessionId;
+
+  if (sessionId) {
+    _emitCachedContext(sessionId, config);
+  }
+
+  // Handle Claude's usage_update to cache context usage
+  if (
+    payload.method === 'session/update' &&
+    payload.params?.update?.sessionUpdate === 'usage_update' &&
+    payload.params?.sessionId
+  ) {
+    const update = payload.params.update;
+    if (typeof update.used === 'number' && typeof update.size === 'number' && update.size > 0) {
+      const percent = Math.min(100, (update.used / update.size) * 100);
+      _sessionContextCache.set(payload.params.sessionId, percent);
+      _saveContextState();
+    }
+  }
 
   // Handle Claude's dynamic config options (Effort, Mode, etc.)
   if (
@@ -21,10 +105,7 @@ export function intercept(payload) {
     payload.params?.update?.configOptions
   ) {
     const { config } = getProvider();
-    // Filter out 'model' since we have a dedicated UI for it
-    const options = payload.params.update.configOptions
-      .filter(o => o.id !== 'model')
-      .map(o => o.id === 'effort' ? { ...o, kind: 'reasoning_effort' } : o);
+    const options = normalizeConfigOptions(payload.params.update.configOptions);
 
     // Claude can emit model-only updates after prompts or session loads. After the
     // dedicated model option is filtered out, that must not clear saved effort data.
@@ -67,11 +148,28 @@ export function intercept(payload) {
   return payload;
 }
 
+export function emitCachedContext(sessionId) {
+  const { config } = getProvider();
+  return _emitCachedContext(sessionId, config);
+}
+
+export function normalizeModelState(modelState) {
+  return modelState;
+}
+
 /**
  * Normalize a Claude update to standard ACP format.
  */
 export function normalizeUpdate(update) {
   return update;
+}
+
+export function normalizeConfigOptions(options) {
+  return Array.isArray(options)
+    ? options
+        .filter(option => option?.id !== 'model')
+        .map(option => option.id === 'effort' ? { ...option, kind: 'reasoning_effort' } : option)
+    : [];
 }
 
 /**
@@ -146,12 +244,18 @@ function extractClaudeToolResponse(toolResponse) {
     return result || undefined;
   }
 
+  if (typeof toolResponse.message === 'string') return toolResponse.message;
+  if (typeof toolResponse.summary === 'string') return toolResponse.summary;
   if (typeof toolResponse.text === 'string') return toolResponse.text;
   if (typeof toolResponse.content === 'string') return toolResponse.content;
   if (toolResponse.file?.content) return toolResponse.file.content;
   if (Array.isArray(toolResponse.content)) return extractClaudeToolResponse(toolResponse.content);
   if (toolResponse.content && typeof toolResponse.content === 'object') return extractClaudeToolResponse(toolResponse.content);
-  if (Array.isArray(toolResponse.filenames)) return toolResponse.filenames.join('\n') || undefined;
+  if (Array.isArray(toolResponse.filenames)) {
+    const count = toolResponse.filenames.length;
+    const list = toolResponse.filenames.join('\n');
+    return count > 0 ? `(${count} files found)\n${list}` : '(no files found)';
+  }
 
   return undefined;
 }
@@ -353,11 +457,19 @@ export function parseExtension(method, params) {
 }
 
 export async function prepareAcpEnvironment(env, context = {}) {
+  _emitProviderExtension = context.emitProviderExtension || _emitProviderExtension;
+  _writeLog = context.writeLog || _writeLog;
+
+  // Initialize context persistence
+  const { config } = getProvider();
+  const homePath = config.paths?.home || path.join(os.homedir(), '.claude');
+  _contextStateFile = path.join(homePath, 'acp_session_context.json');
+  _loadContextState();
+
   if (env.CLAUDE_QUOTA_PROXY === 'false' || env.CLAUDE_QUOTA_PROXY_ENABLED === 'false') {
     return env;
   }
 
-  const { config } = getProvider();
   let proxy;
   try {
     proxy = await startClaudeQuotaProxy({
@@ -554,9 +666,7 @@ function normalizeClaudeConfigResult(result) {
 
   return {
     ...result,
-    configOptions: result.configOptions
-      .filter(option => option?.id !== 'model')
-      .map(option => option.id === 'effort' ? { ...option, kind: 'reasoning_effort' } : option)
+    configOptions: normalizeConfigOptions(result.configOptions)
   };
 }
 

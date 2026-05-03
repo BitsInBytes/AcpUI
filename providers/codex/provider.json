@@ -1,0 +1,27 @@
+{
+  "name": "Codex",
+  "protocolPrefix": "_codex/",
+  "mcpName": "AcpUI",
+  "defaultSystemAgentName": "auto",
+  "supportsAgentSwitching": false,
+  "cliManagedHooks": [],
+  "toolIdPattern": "{mcpName}/{toolName}",
+  "toolCategories": {
+    "shell": { "category": "shell", "isShellCommand": true, "isStreamable": true },
+    "execute": { "category": "shell", "isShellCommand": true, "isStreamable": true },
+    "read_file": { "category": "file_read", "isFileOperation": true },
+    "edit_file": { "category": "file_edit", "isFileOperation": true },
+    "write_file": { "category": "file_write", "isFileOperation": true },
+    "search": { "category": "grep" },
+    "web_search": { "category": "web_search" },
+    "fetch": { "category": "fetch" },
+    "think": { "category": "think" },
+    "ux_invoke_shell": { "category": "shell", "isShellCommand": true, "isStreamable": true },
+    "ux_invoke_subagents": { "category": "subagent" },
+    "ux_invoke_counsel": { "category": "subagent" }
+  },
+  "clientInfo": {
+    "name": "AcpUI",
+    "version": "1.0.0"
+  }
+}

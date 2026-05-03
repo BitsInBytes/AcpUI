@@ -110,14 +110,12 @@ export class AcpClient {
 
       // Suppress ANSI escape codes — stdout must be clean JSON lines for parsing
       let childEnv = { ...process.env, TERM: 'dumb', CI: 'true', FORCE_COLOR: '0', DEBUG: '1' };
-      if (typeof this.providerModule.prepareAcpEnvironment === 'function') {
-        childEnv = await this.providerModule.prepareAcpEnvironment(childEnv, {
-          providerConfig: config,
-          io: this.io,
-          writeLog,
-          emitProviderExtension: (method, params) => this.handleProviderExtension({ providerId, method, params })
-        }) || childEnv;
-      }
+    childEnv = await this.providerModule.prepareAcpEnvironment(childEnv, {
+      providerConfig: config,
+      io: this.io,
+      writeLog,
+      emitProviderExtension: (method, params) => this.handleProviderExtension({ providerId, method, params })
+    }) || childEnv;
 
       this.acpProcess = spawn(shell, args, {
         cwd: process.env.DEFAULT_WORKSPACE_CWD || process.env.USERPROFILE || process.cwd(),
@@ -228,7 +226,7 @@ export class AcpClient {
     // Intercept phase: let the provider mutate or swallow the payload before routing.
     // Uses the cached this.providerModule (loaded in start()) — getProvider() only
     // returns { config, modulePath } and does NOT expose the module's exported functions.
-    const processedPayload = this.providerModule?.intercept ? this.providerModule.intercept(payload) : payload;
+    const processedPayload = this.providerModule.intercept(payload);
 
     // If interceptor returns null, the message is swallowed/ignored by the provider
     if (!processedPayload) return;
@@ -346,11 +344,14 @@ export class AcpClient {
   handleModelStateUpdate(sessionId, source = {}) {
     const providerId = this.getProviderId();
     const { models: providerModels } = getProvider(providerId).config;
-    const modelState = extractModelState(source, providerModels);
+    const rawModelState = extractModelState(source, providerModels);
+    const modelState = this.providerModule.normalizeModelState(rawModelState, source);
     if (!modelState.currentModelId && modelState.modelOptions.length === 0) return;
 
     const meta = this.sessionMetadata.get(sessionId) || this.sessionMetadata.get('pending-new');
-    const mergedModelOptions = mergeModelOptions(meta?.modelOptions, modelState.modelOptions);
+    const mergedModelOptions = modelState.replaceModelOptions
+      ? modelState.modelOptions
+      : mergeModelOptions(meta?.modelOptions, modelState.modelOptions);
     const currentModelId = modelState.currentModelId || meta?.currentModelId || meta?.model || null;
 
     if (meta) {

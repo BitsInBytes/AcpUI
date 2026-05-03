@@ -230,6 +230,10 @@ See [ACP_PROTOCOL_SAMPLES.md](./ACP_PROTOCOL_SAMPLES.md) for captured Claude ACP
 | Provider status | Quota windows are captured from Anthropic response headers and rendered through AcpUI's generic provider status UI. |
 | Tool metadata | AcpUI applies sticky metadata so delayed tool updates keep useful filenames and generated code. |
 
+### Context Usage Persistence
+
+Claude context usage is cached in `{paths.home or ~/.claude}\acp_session_context.json` when `usage_update` events arrive. On backend restart or hot-session reuse, AcpUI calls `emitCachedContext(sessionId)` after the session ID is known so the footer and session settings show the last context percentage before another prompt is sent.
+
 ## Operational Notes
 
 Provider status appears after the first Claude request that returns Anthropic rate-limit headers. Loading AcpUI without starting or resuming a chat may not show quota data because no Anthropic response has passed through the proxy yet.

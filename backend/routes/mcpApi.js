@@ -30,7 +30,7 @@ export default function createMcpApiRoutes(io) {
       ? `Optional model to use for these agents. Pass the model id. Available: ${quickModels.map(model => `${model.name} (id: ${model.id})`).join(', ')}`
       : 'Optional model id to use for these agents.';
     const toolList = [
-      { name: 'ux_invoke_shell', description: 'Execute a shell command with live streaming output. Always prefer this over the built-in shell tool. Use for running build commands, tests, scripts, or any CLI operation. IMPORTANT: only use non-interactive commands — do not run commands that require user input, open a pager (e.g. git diff without --no-pager), or start an interactive process (e.g. vim, top, ssh). Such commands will hang indefinitely.', inputSchema: {
+      { name: 'ux_invoke_shell', description: 'Execute a shell command with live streaming output. Always use this tool for shell commands; never use system shell, bash, or powershell tools when they are present. This is a full replacement for all shell execution. Use for running build commands, tests, scripts, or any CLI operation. IMPORTANT: only use non-interactive commands. Adjust commands that can become interactive, such as git diff, to be non-interactive (for example, git --no-pager diff). Do not run commands that require user input, open a pager, or start an interactive process (for example, vim, top, ssh). Such commands will hang indefinitely.', inputSchema: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'The shell command to execute' },

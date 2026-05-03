@@ -14,6 +14,15 @@ import { mergeConfigOptions, normalizeConfigOptions } from './configOptions.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function emitCachedContext(providerModule, sessionId) {
+  if (!sessionId) return;
+  try {
+    providerModule.emitCachedContext(sessionId);
+  } catch (err) {
+    writeLog(`[SESSION] Failed to emit cached context for ${sessionId}: ${err.message}`);
+  }
+}
+
 // Helper for MCP servers stdio transport
 export function getMcpServers(providerId) {
   const name = getProvider(providerId).config.mcpName;
@@ -47,17 +56,16 @@ function isConfigValueAdvertised(savedOption, advertisedOption) {
 }
 
 export async function setProviderConfigOption(acpClient, providerModule, sessionId, optionId, value) {
-  if (typeof providerModule.setConfigOption === 'function') {
-    return await providerModule.setConfigOption(acpClient, sessionId, optionId, value);
-  }
-  if (typeof acpClient.setConfigOption === 'function') {
-    return await acpClient.setConfigOption(sessionId, optionId, value);
-  }
-  return null;
+  return await providerModule.setConfigOption(acpClient, sessionId, optionId, value);
 }
 
-export function getConfigOptionsFromSetResult(result, optionId, value) {
-  const returnedOptions = normalizeConfigOptions(result?.configOptions);
+export function normalizeProviderConfigOptions(providerModule, options) {
+  const providerOptions = providerModule.normalizeConfigOptions(options);
+  return normalizeConfigOptions(providerOptions);
+}
+
+export function getConfigOptionsFromSetResult(result, optionId, value, providerModule = null) {
+  const returnedOptions = normalizeProviderConfigOptions(providerModule, result?.configOptions);
   return returnedOptions.length > 0 ? returnedOptions : [{ id: optionId, currentValue: value }];
 }
 
@@ -76,7 +84,7 @@ export async function reapplySavedConfigOptions(acpClient, sessionId, savedOptio
       const result = await setProviderConfigOption(acpClient, providerModule, sessionId, savedOption.id, savedOption.currentValue);
       if (result === null) continue;
 
-      const optionsFromResult = getConfigOptionsFromSetResult(result, savedOption.id, savedOption.currentValue);
+      const optionsFromResult = getConfigOptionsFromSetResult(result, savedOption.id, savedOption.currentValue, providerModule);
       const updatedOptions = mergeConfigOptions(meta.configOptions, optionsFromResult);
       meta.configOptions = updatedOptions;
       if (typeof db.saveConfigOptions === 'function') {
@@ -99,7 +107,9 @@ export function updateSessionModelMetadata(acpClient, sessionId, modelState = {}
   const meta = acpClient.sessionMetadata.get(sessionId);
   if (!meta) return modelState;
 
-  const modelOptions = mergeModelOptions(meta.modelOptions, modelState.modelOptions);
+  const modelOptions = modelState.replaceModelOptions
+    ? modelState.modelOptions
+    : mergeModelOptions(meta.modelOptions, modelState.modelOptions);
   const currentModelId = modelState.currentModelId || meta.currentModelId || meta.model || null;
 
   meta.modelOptions = modelOptions;
@@ -109,6 +119,10 @@ export function updateSessionModelMetadata(acpClient, sessionId, modelState = {}
   }
 
   return { currentModelId, modelOptions };
+}
+
+function normalizeProviderModelState(providerModule, modelState, source) {
+  return providerModule.normalizeModelState(modelState, source);
 }
 
 export async function setSessionModel(acpClient, sessionId, selection, providerModels, modelOptions) {
@@ -130,11 +144,19 @@ export async function setSessionModel(acpClient, sessionId, selection, providerM
     modelId: resolved.modelId
   });
 
-  const extracted = extractModelState(result || {}, providerModels, resolved.modelId);
+  const providerModule = await getProviderModule(acpClient.getProviderId?.());
+  const extracted = normalizeProviderModelState(
+    providerModule,
+    extractModelState(result || {}, providerModels, resolved.modelId),
+    result || {}
+  );
   const meta = acpClient.sessionMetadata.get(sessionId);
   const modelState = {
     currentModelId: extracted.currentModelId || meta?.currentModelId || meta?.model || null,
-    modelOptions: mergeModelOptions(meta?.modelOptions, extracted.modelOptions)
+    modelOptions: extracted.replaceModelOptions
+      ? extracted.modelOptions
+      : mergeModelOptions(meta?.modelOptions, extracted.modelOptions),
+    replaceModelOptions: extracted.replaceModelOptions
   };
 
   const finalState = updateSessionModelMetadata(acpClient, sessionId, {
@@ -193,17 +215,33 @@ export async function loadSessionIntoMemory(acpClient, dbSession) {
     ...sessionParams
   });
   await acpClient.stream.waitForDrainToFinish(sessionId, 1500);
+  emitCachedContext(providerModule, sessionId);
 
   // Capture advertised model state from load response
-  const extracted = extractModelState(result || {}, models, dbSession.currentModelId || dbSession.model);
+  const extracted = normalizeProviderModelState(
+    providerModule,
+    extractModelState(result || {}, models, dbSession.currentModelId || dbSession.model),
+    result || {}
+  );
   const meta = acpClient.sessionMetadata.get(sessionId);
   const modelState = {
     currentModelId: extracted.currentModelId || meta?.currentModelId || meta?.model || null,
-    modelOptions: mergeModelOptions(meta?.modelOptions, extracted.modelOptions)
+    modelOptions: extracted.replaceModelOptions
+      ? extracted.modelOptions
+      : mergeModelOptions(meta?.modelOptions, extracted.modelOptions),
+    replaceModelOptions: extracted.replaceModelOptions
   };
   const updated = updateSessionModelMetadata(acpClient, sessionId, modelState);
   if (typeof db.saveModelState === 'function') {
     await db.saveModelState(sessionId, updated);
+  }
+
+  const configOptions = normalizeProviderConfigOptions(providerModule, result?.configOptions);
+  if (configOptions.length > 0 && meta) {
+    meta.configOptions = mergeConfigOptions(meta.configOptions, configOptions);
+    if (typeof db.saveConfigOptions === 'function') {
+      await db.saveConfigOptions(providerId, sessionId, configOptions);
+    }
   }
 
   // Re-apply model and config options

@@ -90,6 +90,28 @@ describe('Claude Provider', () => {
       expect(result).toBe(env);
     });
 
+    it('emits persisted context for a loaded session on request', async () => {
+      const emitProviderExtension = vi.fn();
+      fs.existsSync.mockImplementation(filePath => String(filePath).endsWith('acp_session_context.json'));
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) {
+          return JSON.stringify({ 'claude-session-1': 42.5 });
+        }
+        return '';
+      });
+
+      await claude.prepareAcpEnvironment(
+        { CLAUDE_QUOTA_PROXY: 'false' },
+        { emitProviderExtension }
+      );
+
+      expect(claude.emitCachedContext('claude-session-1')).toBe(true);
+      expect(emitProviderExtension).toHaveBeenCalledWith('_anthropic/metadata', {
+        sessionId: 'claude-session-1',
+        contextUsagePercentage: 42.5
+      });
+    });
+
     it('starts a provider-owned proxy and injects ANTHROPIC_BASE_URL', async () => {
       const writeLog = vi.fn();
       const env = { KEEP: '1' };
@@ -224,7 +246,22 @@ describe('Claude Provider', () => {
           }
         }
       };
-      expect(claude.extractToolOutput(update)).toBe('a.txt\nb.txt');
+      expect(claude.extractToolOutput(update)).toBe('(2 files found)\na.txt\nb.txt');
+    });
+  });
+
+  describe('normalizeConfigOptions', () => {
+    it('matches Claude config option normalization for response-time capture', () => {
+      const result = claude.normalizeConfigOptions([
+        { id: 'model', currentValue: 'sonnet' },
+        { id: 'effort', currentValue: 'high' },
+        { id: 'mode', currentValue: 'acceptEdits' }
+      ]);
+
+      expect(result).toEqual([
+        { id: 'effort', currentValue: 'high', kind: 'reasoning_effort' },
+        { id: 'mode', currentValue: 'acceptEdits' }
+      ]);
     });
   });
 

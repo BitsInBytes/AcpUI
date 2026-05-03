@@ -39,7 +39,10 @@ vi.mock('../services/providerLoader.js', () => ({
   getProviderModule: vi.fn().mockResolvedValue({
     performHandshake: async () => {},
     normalizeUpdate: (u) => u,
-    intercept: vi.fn(u => u)
+    intercept: vi.fn(u => u),
+    normalizeModelState: (s) => s,
+    prepareAcpEnvironment: async (env) => env,
+    emitCachedContext: () => false,
   }),
   runWithProvider: vi.fn((_p, fn) => fn())
 }));

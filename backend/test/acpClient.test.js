@@ -48,6 +48,10 @@ vi.mock('../services/providerLoader.js', () => ({
   getProviderModule: vi.fn().mockResolvedValue({
     performHandshake: async () => {},
     normalizeUpdate: (u) => u,
+    normalizeModelState: (s) => s,
+    prepareAcpEnvironment: async (env) => env,
+    emitCachedContext: () => false,
+    intercept: (p) => p,
   }),
   runWithProvider: vi.fn((_p, fn) => fn())
 }));
@@ -186,7 +190,12 @@ describe('AcpClient Service', () => {
       localClient.io = mockIo;
       
       getProviderModule.mockResolvedValueOnce({
-        performHandshake: () => { throw new Error('handshake failed'); }
+        performHandshake: () => { throw new Error('handshake failed'); },
+        normalizeUpdate: (u) => u,
+        normalizeModelState: (s) => s,
+        prepareAcpEnvironment: async (env) => env,
+        emitCachedContext: () => false,
+        intercept: (p) => p,
       });
 
       await localClient.start();

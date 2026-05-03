@@ -25,12 +25,11 @@ export async function handleUpdate(acpClient, sessionId, update) {
   // 1. Normalize the update object
   // If the provider module exists, we delegate normalization to it. This handles
   // non-standard data formats before they reach the generic logic.
-  update = typeof providerModule.normalizeUpdate === 'function'
-    ? providerModule.normalizeUpdate(update)
-    : update;
+  update = providerModule.normalizeUpdate(update);
 
   if (update.sessionUpdate === 'config_option_update') {
-    const incomingOptions = normalizeConfigOptions(update.configOptions);
+    const providerOptions = providerModule.normalizeConfigOptions(update.configOptions);
+    const incomingOptions = normalizeConfigOptions(providerOptions);
     const replace = update.replace === true || update.mode === 'replace';
     const removeOptionIds = normalizeRemovedConfigOptionIds(update.removeOptionIds);
 
@@ -98,9 +97,7 @@ export async function handleUpdate(acpClient, sessionId, update) {
 
   const getFilePathFromUpdate = (u) => {
     // 1. Prioritize provider-specific extraction (handles custom schemas/relative paths)
-    return typeof providerModule.extractFilePath === 'function'
-      ? providerModule.extractFilePath(u, resolvePath)
-      : undefined;
+    return providerModule.extractFilePath(u, resolvePath);
   };
 
   if (update.sessionUpdate === 'agent_message_chunk') {
@@ -160,21 +157,15 @@ export async function handleUpdate(acpClient, sessionId, update) {
     const filePath = getFilePathFromUpdate(update);
 
     // Extract diff/content from tool_call (certain providers send diffs here for validation)
-    const toolOutput = typeof providerModule.extractDiffFromToolCall === 'function'
-      ? providerModule.extractDiffFromToolCall(update, Diff)
-      : undefined;
+    const toolOutput = providerModule.extractDiffFromToolCall(update, Diff);
 
     let eventToEmit = { providerId, sessionId, type: 'tool_start', id: update.toolCallId, title: titleStr, filePath, output: toolOutput };
 
     // Step 1: Normalize format (provider-specific structure → standard fields)
-    eventToEmit = typeof providerModule.normalizeTool === 'function'
-      ? providerModule.normalizeTool(eventToEmit, update)
-      : eventToEmit;
+    eventToEmit = providerModule.normalizeTool(eventToEmit, update);
 
     // Step 2: Categorize (provider maps its own tools to a category — UI tools are the frontend's concern)
-    const category = typeof providerModule.categorizeToolCall === 'function'
-      ? providerModule.categorizeToolCall(eventToEmit)
-      : null;
+    const category = providerModule.categorizeToolCall(eventToEmit);
     if (category) eventToEmit = { ...eventToEmit, ...category };
 
     acpClient.io.to('session:' + sessionId).emit('system_event', eventToEmit);
@@ -204,9 +195,7 @@ export async function handleUpdate(acpClient, sessionId, update) {
 
     let filePath = getFilePathFromUpdate(update);
     // Prefer provider's output extractor (handles non-standard formats)
-    let toolOutput = typeof providerModule.extractToolOutput === 'function'
-      ? providerModule.extractToolOutput(update)
-      : undefined;
+    let toolOutput = providerModule.extractToolOutput(update);
 
     // Standard ACP fallback: content[] array
     if (toolOutput === undefined && update.content && Array.isArray(update.content) && update.content.length > 0) {
@@ -249,12 +238,8 @@ export async function handleUpdate(acpClient, sessionId, update) {
     };
     
     // Normalize and categorize again so the UI receives the same metadata
-    endEvent = typeof providerModule.normalizeTool === 'function'
-      ? providerModule.normalizeTool(endEvent, update)
-      : endEvent;
-    const category = typeof providerModule.categorizeToolCall === 'function'
-      ? providerModule.categorizeToolCall(endEvent)
-      : null;
+    endEvent = providerModule.normalizeTool(endEvent, update);
+    const category = providerModule.categorizeToolCall(endEvent);
     if (category) endEvent = { ...endEvent, ...category };
 
     // Final safety: if normalization resulted in a generic title but we have a cached better one, use it
@@ -262,9 +247,7 @@ export async function handleUpdate(acpClient, sessionId, update) {
        const cachedTitle = meta.toolData?.get(update.toolCallId)?.title;
        if (cachedTitle && cachedTitle.length > endEvent.title.length) {
           // Re-normalize with the better title
-          endEvent = typeof providerModule.normalizeTool === 'function'
-            ? providerModule.normalizeTool({ ...endEvent, title: cachedTitle }, update)
-            : { ...endEvent, title: cachedTitle };
+          endEvent = providerModule.normalizeTool({ ...endEvent, title: cachedTitle }, update);
        }
     }
 

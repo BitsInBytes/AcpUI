@@ -164,10 +164,13 @@ Register the provider in AcpUI's `configuration/providers.json`:
 ## Runtime Flow
 
 1. AcpUI loads `provider.json` and `user.json`.
-2. AcpUI calls `prepareAcpEnvironment()` to inject `GEMINI_API_KEY` into the subprocess environment.
+2. AcpUI calls `prepareAcpEnvironment()`:
+   - Does **not** inject `GEMINI_API_KEY` (this would destroy OAuth tokens)
+   - If OAuth is enabled (`fetchQuotaStatus: true`), starts background quota fetching immediately
 3. AcpUI spawns `node <path_to_gemini_cli_dist> --acp` (or `gemini --acp`).
 4. The provider sends `initialize` and `authenticate` in parallel to the daemon.
 5. The provider extracts standardised timelines and parses the `.jsonl` files stored in `~/.gemini/tmp`.
+6. Quota status appears in the Provider Status panel **immediately** (if enabled), even before the first prompt.
 
 ## Session Files
 
@@ -181,19 +184,54 @@ The `<shortId>` is the **first 8 characters** of the session UUID (e.g. `a1b2c3d
 
 > **Common mistake:** Using the last UUID segment (`.split('-').pop()`) gives you the 12-character tail and will never match any file. Use `.split('-')[0]` instead.
 
-## Authentication
+## Authentication & Quota Status
 
-Gemini ACP requires explicit authentication via `gemini-api-key`. Set the `apiKey` field in `user.json`:
+Gemini ACP requires explicit authentication. You have two options, which affect what features are available:
 
+### Option 1: API Key (Standard)
+Set the `apiKey` field in `user.json`:
 ```json
 {
   "apiKey": "YOUR_GEMINI_API_KEY"
 }
 ```
+The key is passed exclusively via the `authenticate` ACP request (`_meta.api-key`). It is **not** injected as a `GEMINI_API_KEY` environment variable into the Gemini CLI process — doing so would cause the CLI to persist the key to `~/.gemini/settings.json` at startup, permanently overwriting any previously configured OAuth method.
 
-The key is passed exclusively via the `authenticate` ACP request (`_meta.api-key`). It is **not** injected as a `GEMINI_API_KEY` environment variable into the Gemini CLI process — doing so would cause the CLI to persist the key to `~/.gemini/settings.json` at startup, permanently overwriting any previously configured auth method (e.g. OAuth).
+**Note:** If you use an API key, the Quota Status feature (showing remaining API limits in the UI) is **not available**, as it requires an OAuth token to query Google's Cloud Code APIs.
 
-If `apiKey` is omitted, the Gemini CLI falls back to credentials it saved from a previous interactive `gemini` session (`~/.gemini/`). This works on a machine where the user has already authenticated, but will fail silently on a fresh machine.
+### Option 2: OAuth (Advanced — Enables Quota Status)
+If you omit the `apiKey` field, the Gemini CLI falls back to credentials it saved from a previous interactive `gemini login` session (`~/.gemini/oauth_creds.json`). 
+
+If you use this method, you can opt-in to seeing your live API quota directly in the AcpUI Provider Status panel by setting `fetchQuotaStatus` to `true`:
+```json
+{
+  "fetchQuotaStatus": true
+}
+```
+
+When enabled, the provider:
+
+1. **Derives the OAuth client ID** at runtime from the `azp` field of the JWT `id_token` in `~/.gemini/oauth_creds.json`. This ensures AcpUI automatically adapts if the Gemini CLI updates its OAuth credentials, with no code changes required.
+
+2. **Discovers your internal Google Cloud project ID** via the `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` endpoint. Free-tier users without a Cloud project will see quota checks skipped gracefully.
+
+3. **Manages token refresh reactively** (on 401 responses). The provider reads the current token, attempts the quota request, and only refreshes the token if it receives a 401 Unauthorized response. It then re-reads from disk (another process may have refreshed it), retries, and if still 401, calls the Google OAuth token endpoint to refresh and save new credentials.
+
+4. **Polls the quota API** every 30 seconds and immediately after each prompt completes (`end_turn`).
+
+5. **Shows quota status immediately** — the Provider Status panel displays usage data as soon as AcpUI starts, even before the first chat message. Status updates with each refresh cycle.
+
+The Gemini quota system tracks usage based on the **model type** used (e.g., Flash, Pro, Light) over a **24-hour rolling period**. The UI displays the usage percentage and exact reset time for each model tier.
+
+## Context Usage Percentage
+
+AcpUI accurately displays the percentage of the context window you have used in the footer next to the model selector.
+
+Because the Gemini CLI natively emits erratic `usage_update` events during streaming (which can cause the UI to temporarily display wildly inflated numbers like 1300%), the AcpUI provider actively swallows those intermediate chunks. Instead, it precisely calculates the true context usage at the end of the turn using the final `input_tokens` count against the model's hardcoded 1M token context window.
+
+### Context Usage Persistence
+
+Gemini context usage is cached in `~/.gemini/acp_session_tokens.json` when turns complete. On backend restart or hot-session reuse, AcpUI calls the provider's `emitCachedContext(sessionId)` hook after the session ID is known so the footer and session settings can show the last context percentage before another prompt is sent.
 
 ## Implementation Notes
 

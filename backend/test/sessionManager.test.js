@@ -52,6 +52,9 @@ describe('sessionManager', () => {
       getProvider.mockReturnValue({ config: { models: {} } });
       getProviderModule.mockResolvedValue({ 
         buildSessionParams: () => ({}),
+        normalizeModelState: vi.fn(state => state),
+        normalizeConfigOptions: vi.fn(options => Array.isArray(options) ? options : []),
+        emitCachedContext: vi.fn(),
         setConfigOption: vi.fn()
       });
 
@@ -77,9 +80,18 @@ describe('sessionManager', () => {
       const dbSession = { id: 's1', acpSessionId: 'a1', configOptions: [], model: 'm1' };
 
       getProvider.mockReturnValue({ config: { models: {}, mcpName: 'mcp' } });
-      getProviderModule.mockResolvedValue({ 
+      const providerModule = {
         buildSessionParams: () => ({}),
+        normalizeModelState: vi.fn(state => ({
+          ...state,
+          currentModelId: state.currentModelId ? `${state.currentModelId}-normalized` : state.currentModelId
+        })),
+        normalizeConfigOptions: vi.fn(options => Array.isArray(options) ? options : []),
+        emitCachedContext: vi.fn(),
         setConfigOption: vi.fn()
+      };
+      getProviderModule.mockResolvedValue({ 
+        ...providerModule
       });
 
       await sessionManager.loadSessionIntoMemory(acpClient, dbSession);
@@ -87,6 +99,11 @@ describe('sessionManager', () => {
       expect(acpClient.sessionMetadata.set).toHaveBeenCalledWith('a1', expect.any(Object));
       expect(acpClient.stream.beginDraining).toHaveBeenCalledWith('a1');
       expect(acpClient.transport.sendRequest).toHaveBeenCalledWith('session/load', expect.objectContaining({ sessionId: 'a1' }));
+      expect(providerModule.emitCachedContext).toHaveBeenCalledWith('a1');
+      expect(providerModule.normalizeModelState).toHaveBeenCalledWith(
+        expect.objectContaining({ currentModelId: 'm1' }),
+        expect.objectContaining({ currentModelId: 'm1' })
+      );
       expect(db.saveModelState).toHaveBeenCalled();
     });
   });

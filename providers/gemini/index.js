@@ -1,13 +1,165 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { getProvider } from '../../backend/services/providerLoader.js';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Cache for arguments to reconstruct outputs that Gemini CLI drops
+const toolArgCache = new Map();
+
+// Context % and Quota % State
+let _emitProviderExtension = null;
+let _writeLog = null;
+let _lastSessionId = null;
+let _sessionContextInfo = new Map(); // sessionId -> { percent, inputTokens, ... }
+let _quotaProjectId = null;
+let _sessionQuotaInfo = new Map();
+let _quotaFetchInFlight = false;
+let _quotaPollTimer = null;
+let _latestQuotaStatus = null;
+let _activePromptCount = 0; // Only poll quota while prompts are in-flight
+let _inFlightSessions = new Set(); // Track which sessions have active prompts
+
+// Token accumulation tracking (not from quota API, but from actual turn results)
+let _accumulatedTokensBySession = new Map(); // sessionId -> { inputTokens, outputTokens, lastUpdated }
+let _tokenStateFile = null; // Path to persist token state
+let _sessionsWithInitialEmit = new Set(); // Track which sessions we've already emitted initial context for
+
+const CONTEXT_WINDOWS = {
+  'gemma-4-31b-it':       256_000,
+  'gemma-4-26b-a4b-it':   256_000,
+  'gemini-3.1-pro-preview': 1_048_576,
+  'gemini-3-flash-preview': 1_048_576,
+};
+const DEFAULT_CONTEXT_WINDOW = 1_048_576;
+
+function _emitCachedContext(sessionId) {
+  if (!sessionId || _sessionsWithInitialEmit.has(sessionId)) return false;
+  _sessionsWithInitialEmit.add(sessionId);
+  const persisted = _accumulatedTokensBySession.get(sessionId);
+  if (!persisted || !_emitProviderExtension) return false;
+
+  const { config } = getProvider();
+  const model = persisted.model || 'gemini-3-flash-preview';
+  const windowSize = CONTEXT_WINDOWS[model] ?? DEFAULT_CONTEXT_WINDOW;
+  const percent = Math.min(100, (persisted.inputTokens / windowSize) * 100);
+  _emitProviderExtension(`${config.protocolPrefix}metadata`, {
+    sessionId,
+    contextUsagePercentage: percent
+  });
+  return true;
+}
+
+export function emitCachedContext(sessionId) {
+  return _emitCachedContext(sessionId);
+}
+
+export function normalizeModelState(modelState) {
+  return modelState;
+}
+
 /**
- * Intercept raw messages from the Gemini process and translate them into 
+ * Intercept raw messages from the Gemini process and translate them into
  * standardized ACP protocol messages.
  */
 export function intercept(payload) {
-  // Pass through by default. The Gemini CLI mostly emits standard ACP events.
+
+  try {
+    const { config } = getProvider();
+
+    // 1. Handle Notifications & Updates
+    if (payload?.method === 'session/update' || payload?.method === 'session/notification') {
+      const sessionId = payload.params?.sessionId;
+      const update = payload.params?.update;
+
+      if (sessionId) {
+        _lastSessionId = sessionId;
+
+        // On first detection of a session, emit persisted context % if available
+        _emitCachedContext(sessionId);
+
+        // Track active prompts: increment on first message chunk of a new turn
+        if (!_inFlightSessions.has(sessionId) &&
+            (update?.sessionUpdate === 'agent_message_chunk' ||
+             update?.sessionUpdate === 'user_message_chunk' ||
+             update?.sessionUpdate === 'tool_call')) {
+          _inFlightSessions.add(sessionId);
+          _activePromptCount++;
+          _ensureQuotaPolling();
+        }
+      }
+
+      // Log usage_update events to understand the token flow
+      if (update?.sessionUpdate === 'usage_update') {
+        return null;
+      }
+
+      if (update?.sessionUpdate === 'tool_call') {
+        if (update.toolCallId && (update.arguments || update.rawInput)) {
+          toolArgCache.set(update.toolCallId, update.arguments || update.rawInput);
+        }
+      }
+    }
+
+    // 2. Handle Final Response Results (Turn Completion)
+    if (payload?.result?.stopReason) {
+      const sessionId = payload.result.sessionId || _lastSessionId;
+
+
+      // Remove from in-flight sessions and decrement counter
+      if (sessionId && _inFlightSessions.has(sessionId)) {
+        _inFlightSessions.delete(sessionId);
+        if (_activePromptCount > 0) {
+          _activePromptCount--;
+        }
+        if (_activePromptCount === 0) {
+          _stopQuotaPolling();
+        }
+      }
+
+      if (payload.result?._meta?.quota && sessionId) {
+        const quota = payload.result._meta.quota;
+
+
+        // The API returns CUMULATIVE token counts for the session, not per-turn deltas
+        // Use the value directly - don't accumulate
+        const inputTokens = quota.token_count?.input_tokens ?? 0;
+        const outputTokens = quota.token_count?.output_tokens ?? 0;
+        const model = quota.model_usage?.[0]?.model ?? '';
+
+        // Store the cumulative value for this session
+        const accum = { inputTokens, outputTokens, lastUpdated: new Date().toISOString() };
+        _accumulatedTokensBySession.set(sessionId, accum);
+
+
+        // Save to disk for persistence across session switches
+        _saveTokenState();
+
+        const windowSize = CONTEXT_WINDOWS[model] ?? DEFAULT_CONTEXT_WINDOW;
+        const percent = (inputTokens / windowSize) * 100;
+
+        // Clamp to 100% max (safety check in case of API anomalies)
+        const clampedPercent = Math.min(100, percent);
+
+
+        if (_emitProviderExtension) {
+          _sessionContextInfo.set(sessionId, { percent: clampedPercent, inputTokens, windowSize, model });
+          _emitProviderExtension(`${config.protocolPrefix}metadata`, {
+            sessionId,
+            contextUsagePercentage: clampedPercent
+          });
+        }
+
+        // Trigger quota refresh on completion
+        if (payload.result.stopReason === 'end_turn' && _quotaProjectId) {
+           _fetchAndEmitQuota(sessionId, config.paths.home, { emitInitial: true });
+        }
+      }
+    }
+  } catch (err) {}
+
   return payload;
 }
 
@@ -15,7 +167,40 @@ export function intercept(payload) {
  * Normalize a Gemini update to standard ACP format.
  */
 export function normalizeUpdate(update) {
+  const isMessage = update.sessionUpdate === 'agent_message_chunk';
+  const isThought = update.sessionUpdate === 'agent_thought_chunk';
+  
+  if ((isMessage || isThought) && update.content) {
+    // 1. Handle standard object shape: { type: 'text', text: "..." }
+    if (typeof update.content.text === 'string') {
+      update.content.text = stripReminder(update.content.text);
+    } 
+    // 2. Handle array of parts (Gemini standard shape in some contexts)
+    else if (Array.isArray(update.content)) {
+      update.content.forEach(part => {
+        if (part && typeof part.text === 'string') {
+          part.text = stripReminder(part.text);
+        }
+      });
+    }
+    // 3. Handle raw string (if daemon deviates)
+    else if (typeof update.content === 'string') {
+      update.content = stripReminder(update.content);
+    }
+  }
   return update;
+}
+
+export function normalizeConfigOptions(options) {
+  return Array.isArray(options) ? options : [];
+}
+
+/**
+ * Strip out the system-reminder tag and its contents from a string.
+ */
+export function stripReminder(str) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/<system-reminder(?: [^>]*)?>[\s\S]*?<\/system-reminder>/gi, '');
 }
 
 /**
@@ -29,6 +214,36 @@ export function normalizeUpdate(update) {
  * handle them here first so the provider controls the exact rendering.
  */
 export function extractToolOutput(update) {
+  // Fix for Gemini read_file returning only a summary string instead of file contents
+  if (update.status === 'completed' && update.toolCallId?.startsWith('read_file')) {
+    let filePath = update.locations?.[0]?.path;
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        let content = fs.readFileSync(filePath, 'utf-8');
+        
+        let raw = update.result ?? update.rawOutput ?? update.content;
+        let summary = '';
+        if (Array.isArray(raw)) {
+           summary = raw.map(c => c.type === 'content' ? c.content?.text : '').join('');
+        } else if (typeof raw === 'string') {
+           summary = raw;
+        } else if (raw?.content && Array.isArray(raw.content)) {
+           summary = raw.content.map(c => c.type === 'content' ? c.content?.text : '').join('');
+        }
+        
+        const lineMatch = summary.match(/Read lines (\d+)-(\d+)/i);
+        if (lineMatch) {
+          const start = Math.max(0, parseInt(lineMatch[1], 10) - 1);
+          const end = parseInt(lineMatch[2], 10);
+          content = content.split('\n').slice(start, end).join('\n');
+        }
+        
+        // Strip out the system-reminder tag and its contents
+        return stripReminder(content);
+      } catch (e) {}
+    }
+  }
+
   // 1. Prioritize result field (where read_file output lives)
   // Gemini result can be a PartListUnion OR an object { content: PartListUnion }
   let raw = update.result ?? update.rawOutput ?? update.content;
@@ -45,24 +260,87 @@ export function extractToolOutput(update) {
         if (c.text && typeof c.text === 'string') return c.text;
         if (c.type === 'content' && c.content?.type === 'text') return c.content.text;
         if (c.type === 'diff') {
-          // Returning empty string for 'diff' type blocks because the backend
-          // will generate the real diff via extractDiffFromToolCall or the standard fallback.
-          // This prevents the "--- file +++ file" header from showing up twice in the UI.
-          return '';
+          const oldText = c.oldText || '';
+          const newText = c.newText || '';
+          const isWriteFile = update.toolCallId && update.toolCallId.startsWith('write_file');
+          
+          if (isWriteFile || (!oldText && newText)) {
+            // Pure addition or full overwrite -> return raw text so frontend syntax-highlights it
+            return newText;
+          }
+          
+          // Returning null for true diff blocks so they are filtered out from parts.
+          // This allows extractToolOutput to return undefined,
+          // ensuring the backend generates the real diff via its standard fallback.
+          return null;
         }
         return null;
       })
       .filter(c => c !== null);
 
-    if (parts.length > 0) return parts.join('\n');
+    if (parts.length > 0) return stripReminder(parts.join('\n'));
   }
 
   // 3. If it's a plain string
-  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'string') return stripReminder(raw);
 
   // 4. Check resultDisplay (pre-formatted by some versions of the CLI)
   if (update.resultDisplay && typeof update.resultDisplay === 'string') {
-    return update.resultDisplay;
+    return stripReminder(update.resultDisplay);
+  }
+
+  // 5. Fallback for structured objects (like list_directory or grep_search)
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    if (typeof raw.message === 'string') return stripReminder(raw.message);
+    if (typeof raw.summary === 'string') return stripReminder(raw.summary);
+    return JSON.stringify(raw, null, 2);
+  }
+
+  // 6. Fix for Gemini list_directory returning no output
+  if (update.status === 'completed' && update.toolCallId?.startsWith('list_directory')) {
+    if (!raw || (Array.isArray(raw) && raw.length === 0)) {
+       const argsRaw = toolArgCache.get(update.toolCallId) || {};
+       const args = typeof argsRaw === 'string' ? JSON.parse(argsRaw || '{}') : argsRaw;
+       let dirPath = args?.dir_path || args?.path || '';
+       
+       if (!dirPath && update.title) {
+          const rawTitle = update.title.replace(/^['"]|['"]$/g, '').trim();
+          dirPath = rawTitle.startsWith('Listing Directory:') ? rawTitle.slice(18).trim() : rawTitle;
+       }
+       
+       if (dirPath) {
+          let fullPath;
+          const candidates = [
+             process.env.DEFAULT_WORKSPACE_CWD,
+             process.cwd(),
+             path.resolve(process.cwd(), '..')
+          ].filter(Boolean);
+          
+          for (const c of candidates) {
+              const p = path.resolve(c, dirPath);
+              try {
+                  if (fs.existsSync(p) && fs.statSync(p).isDirectory()) {
+                      fullPath = p;
+                      break;
+                  }
+              } catch(e) {}
+          }
+          
+          if (fullPath) {
+             try {
+                const files = fs.readdirSync(fullPath);
+                return files.length > 0 ? files.join('\n') : '(empty directory)';
+             } catch(e) {}
+          }
+       }
+    }
+  }
+  
+  // 7. Fix for empty search outputs
+  if (update.status === 'completed' && (!raw || (Array.isArray(raw) && raw.length === 0))) {
+     if (update.toolCallId?.startsWith('grep_search') || update.toolCallId?.startsWith('glob')) {
+         return 'No matches found.';
+     }
   }
 
   return undefined;
@@ -100,7 +378,7 @@ export function extractFilePath(update, resolvePath) {
   }
   
   if (args) {
-    const p = args.path || args.file_path || args.filePath || args.target;
+    const p = args.path || args.file_path || args.filePath || args.target || args.dir_path;
     if (p && typeof p === 'string') return resolvePath(p);
   }
 
@@ -119,13 +397,19 @@ export function extractFilePath(update, resolvePath) {
  *   - undefined when no output should be shown at tool start
  */
 export function extractDiffFromToolCall(update, Diff) {
-  const kind = update.kind || '';
+  const isWriteFile = update.toolCallId && update.toolCallId.startsWith('write_file');
 
-  // 1. Edit with diff blocks (e.g. search-replace) — generate a unified diff
-  if (kind === 'edit' && update.content && Array.isArray(update.content)) {
+  // 1. Edit with diff blocks (e.g. search-replace, write_file)
+  if (update.content && Array.isArray(update.content)) {
     for (const item of update.content) {
       if (item.type === 'diff') {
-        return Diff.createPatch(item.path || update.toolCallId || 'file', item.oldText || '', item.newText || '', 'old', 'new');
+        const oldText = item.oldText || '';
+        const newText = item.newText || '';
+        if (isWriteFile || (!oldText && newText)) {
+          // Pure addition -> return raw text
+          return newText;
+        }
+        return Diff.createPatch(item.path || update.toolCallId || 'file', oldText, newText, 'old', 'new');
       }
     }
   }
@@ -189,19 +473,22 @@ export function normalizeTool(event, update) {
   let toolName = event.toolName || '';
 
   // Handle MCP tool identifiers in ID or Title
-  if (!toolName) {
-    if (rawId.includes('ux_invoke_subagents') || title.toLowerCase().includes('invoke sub agents') || title.toLowerCase() === 'ux_invoke_subagents') {
-      toolName = 'ux_invoke_subagents';
-    } else if (rawId.includes('ux_invoke_counsel') || title.toLowerCase() === 'ux_invoke_counsel') {
-      toolName = 'ux_invoke_counsel';
-    } else if (rawId.includes('ux_invoke_shell') || title.toLowerCase().startsWith('running:')) {
-      toolName = 'ux_invoke_shell';
-    }
+  if (rawId.includes('ux_invoke_subagents') || title.toLowerCase().includes('invoke sub agents') || title.toLowerCase() === 'ux_invoke_subagents') {
+    toolName = 'ux_invoke_subagents';
+  } else if (rawId.includes('ux_invoke_counsel') || title.toLowerCase() === 'ux_invoke_counsel') {
+    toolName = 'ux_invoke_counsel';
+  } else if (rawId.includes('ux_invoke_shell') || title.toLowerCase().startsWith('running:')) {
+    toolName = 'ux_invoke_shell';
   }
 
-  // Fallback to ACP Kind mapping if still not identified
+  // Fallback to ACP Kind mapping or ID extraction if still not identified
   if (!toolName) {
-    toolName = KIND_TO_TOOL_NAME[kind] || kind || '';
+    if (kind && KIND_TO_TOOL_NAME[kind]) {
+      toolName = KIND_TO_TOOL_NAME[kind];
+    } else {
+      toolName = rawId.replace(/-\d+-\d+$/, '');
+      if (!toolName) toolName = kind || '';
+    }
   }
 
   // 2. Finalize Title
@@ -212,6 +499,30 @@ export function normalizeTool(event, update) {
     title = 'Invoke Counsel';
   } else if (toolName === 'ux_invoke_shell') {
     title = 'Invoke Shell';
+  } else if (toolName === 'replace' || toolName === 'edit_file' || rawId.startsWith('replace')) {
+    if (title.includes('=>') || title.length > 50) {
+      title = 'Editing';
+    }
+  } else if (toolName === 'read_file' || rawId.startsWith('read_file')) {
+    if (!title.toLowerCase().includes('read')) {
+      title = 'Reading';
+    }
+  } else if (toolName === 'write_file' || rawId.startsWith('write_file')) {
+    if (!title.toLowerCase().includes('writ')) {
+      title = 'Writing';
+    }
+  } else if (toolName === 'list_directory' || rawId.startsWith('list_directory')) {
+    if (!title.toLowerCase().includes('list')) {
+      title = `Listing Directory: ${title}`;
+    }
+  } else if (toolName === 'glob' || rawId.startsWith('glob')) {
+    if (!title.toLowerCase().includes('search')) {
+      title = `Searching for: ${title}`;
+    }
+  } else if (toolName === 'grep_search' || rawId.startsWith('grep_search')) {
+    if (!title.toLowerCase().includes('search')) {
+      title = `Searching: ${title}`;
+    }
   }
 
   // If the title looks like a raw snake_case tool name or is missing, synthesize a pretty one
@@ -220,6 +531,11 @@ export function normalizeTool(event, update) {
     if (nameToUse) {
       title = nameToUse.replace(/_/g, ' ').replace(/^\w/, c => c.toUpperCase());
     }
+  }
+
+  // Ensure filePath is visible in the title
+  if (event.filePath && title && !title.toLowerCase().includes(path.basename(event.filePath).toLowerCase())) {
+    title += `: ${path.basename(event.filePath)}`;
   }
 
   return { ...event, toolName, title };
@@ -236,6 +552,8 @@ export function categorizeToolCall(event) {
   // ACP standard tools should be categorized dynamically by the provider
   if (toolName === 'ux_invoke_subagents' || toolName === 'ux_invoke_counsel') {
     return { toolCategory: 'sub_agent', isFileOperation: false };
+  } else if (toolName === 'ux_invoke_shell') {
+    return { toolCategory: 'shell', isShellCommand: true, isFileOperation: false };
   }
 
   const metadata = (config.toolCategories || {})[toolName];
@@ -260,6 +578,9 @@ export function parseExtension(method, params) {
     case 'metadata':
       result = { type: 'metadata', sessionId: params.sessionId, contextUsagePercentage: params.contextUsagePercentage };
       break;
+    case 'provider/status':
+      result = { type: 'provider_status', status: params.status };
+      break;
     default:
       result = { type: 'unknown', method, params };
   }
@@ -277,10 +598,33 @@ function resolveApiKey() {
 }
 
 export async function prepareAcpEnvironment(env, context = {}) {
+
+  _emitProviderExtension = context.emitProviderExtension;
+  _writeLog = context.writeLog;
+
   // Do NOT inject the API key as GEMINI_API_KEY into the subprocess environment.
   // If the CLI sees that env var at startup it persists it to ~/.gemini/settings.json,
   // permanently overwriting any previously configured auth method (e.g. OAuth).
   // The key is passed exclusively via the ACP authenticate request (see performHandshake).
+
+  const { config } = getProvider();
+  const apiKey = resolveApiKey();
+
+  // Initialize token state persistence
+  try {
+    const homePath = config.paths?.home || process.env.HOME || process.env.USERPROFILE;
+    _tokenStateFile = path.join(homePath, '.gemini', 'acp_session_tokens.json');
+    _loadTokenState();
+  } catch (err) {
+    _writeLog?.(`[GEMINI TOKEN STATE] Init error: ${err.message}`);
+  }
+
+  if (!apiKey && config.fetchQuotaStatus) {
+    _startQuotaFetching(config.paths.home).catch(err =>
+      _writeLog?.(`[GEMINI QUOTA] Init failed: ${err.message}`)
+    );
+  }
+
   return env;
 }
 
@@ -301,6 +645,10 @@ export async function setConfigOption(acpClient, sessionId, optionId, value) {
 
   // Gemini doesn't fully support arbitrary set_config_option yet, return empty
   return null;
+}
+
+export async function setInitialAgent(_acpClient, _sessionId, _agent) {
+  return;
 }
 
 // --- Session File Operations ---
@@ -380,6 +728,21 @@ export function getSessionPaths(acpId) {
   };
 }
 
+export function getSessionDir() {
+  const { config } = getProvider();
+  return config.paths.sessions;
+}
+
+export function getAttachmentsDir() {
+  const { config } = getProvider();
+  return config.paths.attachments;
+}
+
+export function getAgentsDir() {
+  const { config } = getProvider();
+  return config.paths.agents;
+}
+
 export function cloneSession(oldAcpId, newAcpId, pruneAtTurn) {
   const oldPaths = getSessionPaths(oldAcpId);
   if (!oldPaths.jsonl && !oldPaths.json) return;
@@ -435,6 +798,15 @@ export function deleteSessionFiles(acpId) {
   const paths = getSessionPaths(acpId);
   if (paths.jsonl && fs.existsSync(paths.jsonl)) fs.unlinkSync(paths.jsonl);
   if (paths.json && fs.existsSync(paths.json)) fs.unlinkSync(paths.json);
+
+  // Also clear token accumulation and emit tracking for this session
+  if (_accumulatedTokensBySession.has(acpId)) {
+    _accumulatedTokensBySession.delete(acpId);
+    _saveTokenState();
+  }
+  if (_sessionsWithInitialEmit.has(acpId)) {
+    _sessionsWithInitialEmit.delete(acpId);
+  }
   if (paths.tasksDir && fs.existsSync(paths.tasksDir)) fs.rmSync(paths.tasksDir, { recursive: true, force: true });
 }
 
@@ -474,10 +846,11 @@ export function archiveSessionFiles(acpId, archiveDir) {
  * (Types from @google/genai: Part = { text?: string } | { inlineData: ... } | ...)
  */
 function extractTextFromContent(content) {
-  if (!content) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
+  let text = '';
+  if (!content) text = '';
+  else if (typeof content === 'string') text = content;
+  else if (Array.isArray(content)) {
+    text = content
       .map(p => {
         if (typeof p === 'string') return p;
         if (p && typeof p === 'object' && typeof p.text === 'string') return p.text;
@@ -486,7 +859,7 @@ function extractTextFromContent(content) {
       .filter(Boolean)
       .join('');
   }
-  return '';
+  return stripReminder(text);
 }
 
 /**
@@ -499,7 +872,7 @@ function extractTextFromContent(content) {
 function extractToolResultText(toolCall) {
   // Prefer pre-formatted display string if available
   if (toolCall.resultDisplay && typeof toolCall.resultDisplay === 'string') {
-    return toolCall.resultDisplay;
+    return stripReminder(toolCall.resultDisplay);
   }
   // Fall back to extracting text from the raw result parts
   return extractTextFromContent(toolCall.result) || undefined;
@@ -731,4 +1104,385 @@ export async function performHandshake(acpClient) {
       });
 
   await Promise.all([initPromise, authPromise]);
+}
+
+// --- Quota Fetching (OAuth Only) ---
+
+// OAuth client secret for token refresh calls.
+//
+// WHY THIS IS SAFE TO HARDCODE:
+// This is an "installed application" OAuth client. Google explicitly permits
+// embedding both the client ID and secret in source code for this app type:
+//   https://developers.google.com/identity/protocols/oauth2#installed
+// "The process results in a client ID and, in some cases, a client secret,
+//  which you embed in the source code of your application. (In this context,
+//  the client secret is obviously not treated as a secret.)"
+//
+// SOURCE: Taken directly from the Gemini CLI's own OAuth module:
+//   packages/core/src/code_assist/oauth2.ts  (OAUTH_CLIENT_SECRET, line 75)
+// If the Gemini CLI rotates this value, update it here to match.
+const OAUTH_CLIENT_SECRET = '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';
+
+function _extractClientId(homePath) {
+  try {
+    const credsPath = path.join(homePath, 'oauth_creds.json');
+    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+    if (!creds.id_token) return null;
+    const payload = JSON.parse(
+      Buffer.from(creds.id_token.split('.')[1], 'base64url').toString('utf8')
+    );
+    return payload.azp || null;
+  } catch {
+    return null;
+  }
+}
+
+function _readTokenFromDisk(homePath) {
+  try {
+    const credsPath = path.join(homePath, 'oauth_creds.json');
+    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+    return creds.access_token || null;
+  } catch {
+    return null;
+  }
+}
+
+async function _requestQuota(token) {
+  const res = await fetch('https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ project: _quotaProjectId })
+  });
+
+  return {
+    ok: res.ok,
+    status: res.status,
+    json: () => res.json()
+  };
+}
+
+async function _refreshAndSaveToken(homePath) {
+  const clientId = _extractClientId(homePath);
+  if (!clientId) {
+    _writeLog?.('[GEMINI QUOTA] Could not derive client_id from oauth_creds.json — skipping refresh');
+    return null;
+  }
+
+  const credsPath = path.join(homePath, 'oauth_creds.json');
+  let creds;
+  try {
+    creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+  } catch {
+    return null;
+  }
+
+  if (!creds.refresh_token) return null;
+
+  try {
+    const res = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: creds.refresh_token,
+        client_id: clientId,
+        client_secret: OAUTH_CLIENT_SECRET
+      })
+    });
+
+    if (!res.ok) {
+      _writeLog?.(`[GEMINI QUOTA] Token refresh failed: ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    creds.access_token = data.access_token;
+    if (data.expires_in) {
+      creds.expiry_date = Date.now() + data.expires_in * 1000;
+    }
+    if (data.refresh_token) {
+      creds.refresh_token = data.refresh_token;
+    }
+    fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2), 'utf8');
+    return data.access_token;
+  } catch (e) {
+    _writeLog?.(`[GEMINI QUOTA] Token refresh error: ${e.message}`);
+    return null;
+  }
+}
+
+export function stopQuotaFetching() {
+  _stopQuotaPolling();
+  _activePromptCount = 0;
+  _inFlightSessions.clear();
+}
+
+function _stopQuotaPolling() {
+  if (_quotaPollTimer) {
+    clearInterval(_quotaPollTimer);
+    _quotaPollTimer = null;
+  }
+}
+
+function _ensureQuotaPolling() {
+  if (_quotaPollTimer || _activePromptCount === 0) return;
+
+  const { config } = getProvider();
+  const intervalMs = Number(config.quotaStatusIntervalMs || 30_000);
+  if (intervalMs <= 0) return;
+
+
+  _quotaPollTimer = setInterval(() => {
+    _fetchAndEmitQuota(_lastSessionId || 'poll', config.paths.home, { emitInitial: true })
+      .catch(err => _writeLog?.(`[GEMINI QUOTA] Poll failed: ${err.message}`));
+  }, intervalMs);
+  _quotaPollTimer.unref?.();
+}
+
+async function _startQuotaFetching(homePath) {
+  stopQuotaFetching();
+  try {
+    const { config } = getProvider();
+    const token = _readTokenFromDisk(homePath);
+    if (!token) return;
+
+    // Discover cloudaicompanionProject ID (required for quota calls)
+    const loadRes = await fetch('https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        metadata: {
+          ideName: 'IDE_UNSPECIFIED',
+          pluginType: 'GEMINI',
+          ideVersion: '1.0.0',
+          platform: 'PLATFORM_UNSPECIFIED',
+          updateChannel: 'stable'
+        }
+      })
+    });
+
+    if (!loadRes.ok) {
+      throw new Error(`loadCodeAssist returned ${loadRes.status}`);
+    }
+
+    const loadData = await loadRes.json();
+    if (!loadData.cloudaicompanionProject) {
+      _writeLog?.('[GEMINI QUOTA] No project found (Free Tier). Skipping quota checks.');
+      return;
+    }
+
+    _quotaProjectId = loadData.cloudaicompanionProject;
+    _writeLog?.(`[GEMINI QUOTA] Discovered Project ID: ${_quotaProjectId}`);
+
+    // Emit immediately — mirrors Codex emitInitial: true
+    await _fetchAndEmitQuota(_lastSessionId || 'init', homePath, { emitInitial: true });
+
+    // Polling will start automatically when the first prompt is sent (_ensureQuotaPolling)
+    // and stop when the last prompt completes (_stopQuotaPolling)
+  } catch (err) {
+    _writeLog?.(`[GEMINI QUOTA] Init failed: ${err.message}`);
+  }
+}
+
+async function _fetchAndEmitQuota(sessionId, homePath, options = {}) {
+  if (!_quotaProjectId || _quotaFetchInFlight) return;
+
+  _quotaFetchInFlight = true;
+  try {
+    let token = _readTokenFromDisk(homePath);
+    if (!token) return;
+
+    let res = await _requestQuota(token);
+
+    if (res.status === 401) {
+      // Re-read from disk first (another process may have refreshed it)
+      token = _readTokenFromDisk(homePath);
+      res = await _requestQuota(token);
+
+      if (res.status === 401) {
+        // Only now do we refresh and save new creds
+        token = await _refreshAndSaveToken(homePath);
+        if (!token) return;
+        res = await _requestQuota(token);
+      }
+    }
+
+    if (!res.ok) return;
+
+    const data = await res.json();
+    if (data.buckets && Array.isArray(data.buckets)) {
+      _sessionQuotaInfo.set('global', data.buckets);
+      const status = _buildStatus();
+      _latestQuotaStatus = status;
+      if (_emitProviderExtension && (sessionId !== 'init' || options.emitInitial)) {
+        _emitStatus(sessionId);
+      }
+    }
+  } catch (e) {
+    // Ignore transient network errors
+  } finally {
+    _quotaFetchInFlight = false;
+  }
+}
+
+function _buildStatus() {
+  const buckets = _sessionQuotaInfo.get('global') || [];
+  const { config } = getProvider();
+
+  const groupedBuckets = new Map();
+
+  for (const bucket of buckets) {
+    if (!bucket.modelId || bucket.remainingFraction === undefined) continue;
+
+    // Convert remaining fraction to usage fraction
+    const usageFraction = Math.max(0, 1 - bucket.remainingFraction);
+    
+    // Determine friendly label
+    let label = bucket.modelId;
+    if (bucket.modelId.includes('pro')) {
+      label = 'Pro';
+    } else if (bucket.modelId.includes('flash-8b') || bucket.modelId.includes('light') || bucket.modelId.includes('lite')) {
+      label = 'Light';
+    } else if (bucket.modelId.includes('flash')) {
+      label = 'Flash';
+    }
+
+    // Keep the most restrictive (highest usage) bucket for each label
+    const existing = groupedBuckets.get(label);
+    if (!existing || usageFraction > existing.usageFraction) {
+      groupedBuckets.set(label, {
+        ...bucket,
+        label,
+        usageFraction
+      });
+    }
+  }
+
+  const items = [];
+  const detailsItems = [];
+
+  // Sort labels: Pro first, then Flash, then Light, then others
+  const sortedLabels = Array.from(groupedBuckets.keys()).sort((a, b) => {
+    const priority = { 'Pro': 1, 'Flash': 2, 'Light': 3 };
+    const pA = priority[a] || 99;
+    const pB = priority[b] || 99;
+    if (pA !== pB) return pA - pB;
+    return a.localeCompare(b);
+  });
+
+  for (const label of sortedLabels) {
+    const bucket = groupedBuckets.get(label);
+    const usageFraction = bucket.usageFraction;
+    
+    // Determine tone based on usage
+    let tone = 'info';
+    if (usageFraction >= 0.9) tone = 'danger';
+    else if (usageFraction >= 0.7) tone = 'warning';
+    
+    // Format reset time
+    let resetText = '';
+    if (bucket.resetTime) {
+       const date = new Date(bucket.resetTime);
+       if (!Number.isNaN(date.getTime())) {
+          resetText = date.toLocaleString([], {
+             month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+          });
+       }
+    }
+    
+    const item = {
+      id: bucket.modelId,
+      label: label,
+      value: `${Math.round(usageFraction * 100)}%`,
+      detail: resetText ? `Resets ${resetText}` : undefined,
+      tone,
+      progress: { value: usageFraction }
+    };
+    
+    detailsItems.push(item);
+    
+    // Add both Pro and Flash to summary bars in side panel
+    if (label === 'Pro' || label === 'Flash') {
+       items.push({ ...item, id: `summary-${label.toLowerCase()}` });
+    }
+  }
+
+  return {
+    providerId: 'gemini',
+    title: 'Gemini',
+    updatedAt: new Date().toISOString(),
+    summary: {
+      title: 'Usage',
+      items: items
+    },
+    sections: detailsItems.length > 0 ? [{
+      id: 'limits',
+      title: 'Usage Windows',
+      items: detailsItems
+    }] : []
+  };
+}
+
+function _emitStatus(sessionId) {
+  if (!_emitProviderExtension || !_latestQuotaStatus) return;
+  const { config } = getProvider();
+  _emitProviderExtension(`${config.protocolPrefix}provider/status`, {
+    status: _latestQuotaStatus
+  });
+}
+
+/**
+ * Loads token accumulation state from disk on startup.
+ * This ensures context % is preserved when switching between sessions.
+ */
+function _loadTokenState() {
+  try {
+    if (!_tokenStateFile) return;
+    if (!fs.existsSync(_tokenStateFile)) return;
+
+    const data = JSON.parse(fs.readFileSync(_tokenStateFile, 'utf8'));
+    if (data && typeof data === 'object') {
+      _accumulatedTokensBySession = new Map(Object.entries(data));
+    }
+  } catch (err) {
+    _writeLog?.(`[GEMINI TOKEN STATE] Failed to load: ${err.message}`);
+  }
+}
+
+/**
+ * Saves token accumulation state to disk for persistence (atomic write).
+ * Uses temp file + rename pattern to avoid corruption from concurrent writes or crashes.
+ */
+function _saveTokenState() {
+  try {
+    if (!_tokenStateFile) return;
+
+    // Ensure directory exists
+    const dir = path.dirname(_tokenStateFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    // Convert Map to object for JSON serialization
+    const data = {};
+    for (const [sessionId, accum] of _accumulatedTokensBySession.entries()) {
+      data[sessionId] = accum;
+    }
+
+    // Write to temp file first, then atomically rename
+    // This prevents corruption if:
+    // - Multiple sessions write simultaneously
+    // - Process crashes mid-write
+    const tempFile = _tokenStateFile + '.tmp';
+    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tempFile, _tokenStateFile);
+  } catch (err) {
+    _writeLog?.(`[GEMINI TOKEN STATE] Failed to save: ${err.message}`);
+  }
 }

@@ -7,13 +7,102 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { getProvider } from '../../backend/services/providerLoader.js';
+
+// Cache for context usage percentage
+let _emitProviderExtension = null;
+let _writeLog = null;
+let _sessionContextCache = new Map(); // sessionId -> contextUsagePercentage
+let _contextStateFile = null; // Path to persist context state
+let _sessionsWithInitialEmit = new Set(); // Track which sessions we've already emitted initial context for
+
+function _emitCachedContext(sessionId, config) {
+  if (!sessionId || _sessionsWithInitialEmit.has(sessionId)) return false;
+  _sessionsWithInitialEmit.add(sessionId);
+  const persistedPercent = _sessionContextCache.get(sessionId);
+  if (persistedPercent !== undefined && _emitProviderExtension) {
+    _emitProviderExtension(`${config.protocolPrefix || '_kiro.dev/'}metadata`, {
+      sessionId,
+      contextUsagePercentage: persistedPercent
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Loads context usage state from disk on startup.
+ */
+function _loadContextState() {
+  try {
+    if (!_contextStateFile) return;
+    if (!fs.existsSync(_contextStateFile)) return;
+
+    const data = JSON.parse(fs.readFileSync(_contextStateFile, 'utf8'));
+    if (data && typeof data === 'object') {
+      _sessionContextCache = new Map(Object.entries(data));
+    }
+  } catch (err) {
+    _writeLog?.(`[KIRO CONTEXT STATE] Failed to load: ${err.message}`);
+  }
+}
+
+/**
+ * Saves context usage state to disk for persistence (atomic write).
+ */
+function _saveContextState() {
+  try {
+    if (!_contextStateFile) return;
+
+    const dir = path.dirname(_contextStateFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const data = {};
+    for (const [sessionId, percent] of _sessionContextCache.entries()) {
+      data[sessionId] = percent;
+    }
+
+    const tempFile = `${_contextStateFile}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tempFile, _contextStateFile);
+  } catch (err) {
+    _writeLog?.(`[KIRO CONTEXT STATE] Failed to save: ${err.message}`);
+  }
+}
+
+function expandPath(value) {
+  if (!value || typeof value !== 'string') return '';
+  const home = os.homedir() || process.env.USERPROFILE || process.env.HOME || '';
+  const expanded = value
+    .replace(/^~(?=$|[\\/])/, home)
+    .replace(/%USERPROFILE%/gi, process.env.USERPROFILE || home)
+    .replace(/\$HOME/g, process.env.HOME || home);
+  return path.resolve(expanded);
+}
 
 /**
  * Low-level filter for the raw JSON-RPC stream from stdout.
  */
 export function intercept(payload) {
   const { config } = getProvider();
+  const sessionId = payload?.params?.sessionId || payload?.result?.sessionId;
+
+  if (sessionId) {
+    _emitCachedContext(sessionId, config);
+  }
+
+  // Handle Kiro's metadata extension to cache context usage
+  if (
+    payload.method === `${config.protocolPrefix || '_kiro.dev/'}metadata` &&
+    payload.params?.sessionId &&
+    typeof payload.params?.contextUsagePercentage === 'number'
+  ) {
+    _sessionContextCache.set(payload.params.sessionId, payload.params.contextUsagePercentage);
+    _saveContextState();
+  }
 
   // Kiro reports the active model on agent switch notifications. Normalize that
   // provider-specific field into AcpUI's dynamic model contract so the backend
@@ -33,6 +122,15 @@ export function intercept(payload) {
   }
 
   return payload;
+}
+
+export function emitCachedContext(sessionId) {
+  const { config } = getProvider();
+  return _emitCachedContext(sessionId, config);
+}
+
+export function normalizeModelState(modelState) {
+  return modelState;
 }
 
 // --- Data Normalization ---
@@ -58,6 +156,10 @@ export function normalizeUpdate(update) {
   }
 
   return update;
+}
+
+export function normalizeConfigOptions(options) {
+  return Array.isArray(options) ? options : [];
 }
 
 /**
@@ -311,7 +413,16 @@ const KIRO_HOOK_MAP = {
   stop: 'stop',
 };
 
-export async function prepareAcpEnvironment(env) {
+export async function prepareAcpEnvironment(env, context = {}) {
+  const { config } = getProvider();
+  _emitProviderExtension = context.emitProviderExtension || _emitProviderExtension;
+  _writeLog = context.writeLog || _writeLog;
+
+  // Initialize context persistence
+  const homePath = expandPath(config.paths?.home || path.join(os.homedir(), '.kiro'));
+  _contextStateFile = path.join(homePath, 'acp_session_context.json');
+  _loadContextState();
+
   return env;
 }
 

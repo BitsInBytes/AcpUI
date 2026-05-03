@@ -1,0 +1,15 @@
+{
+  "title": "Codex",
+  "assistantName": "Codex",
+  "busyText": "Codex is thinking...",
+  "hooksText": "Hooks running...",
+  "warmingUpText": "Codex warming up...",
+  "resumingText": "Resuming...",
+  "inputPlaceholder": "Send a message...",
+  "emptyChatMessage": "Send a message to start chatting with Codex.",
+  "notificationTitle": "Codex",
+  "appHeader": "Codex",
+  "sessionLabel": "Codex Session",
+  "modelLabel": "Codex model",
+  "maxImageDimension": 1568
+}

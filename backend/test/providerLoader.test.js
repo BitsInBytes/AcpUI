@@ -186,12 +186,14 @@ describe('providerLoader', () => {
 
     expect(mod.intercept(payload)).toBe(payload);
     expect(mod.normalizeUpdate(payload)).toBe(payload);
+    expect(mod.normalizeModelState(payload)).toBe(payload);
     expect(mod.extractToolOutput()).toBeUndefined();
     expect(mod.extractFilePath()).toBeUndefined();
     expect(mod.extractDiffFromToolCall()).toBeUndefined();
     expect(mod.normalizeTool(event)).toBe(event);
     expect(mod.categorizeToolCall()).toBeNull();
     expect(mod.parseExtension()).toBeNull();
+    expect(mod.emitCachedContext()).toBe(false);
     await expect(mod.prepareAcpEnvironment(payload)).resolves.toBe(payload);
     await expect(mod.performHandshake()).resolves.toBeUndefined();
     await expect(mod.setInitialAgent()).resolves.toBeUndefined();
@@ -201,6 +203,7 @@ describe('providerLoader', () => {
     expect(mod.archiveSessionFiles()).toBeUndefined();
     expect(mod.restoreSessionFiles()).toBeUndefined();
     expect(mod.deleteSessionFiles()).toBeUndefined();
+    await expect(mod.parseSessionHistory()).resolves.toBeNull();
     expect(mod.getSessionDir()).toBe('');
     expect(mod.getAttachmentsDir()).toBe('');
     expect(mod.getAgentsDir()).toBe('');

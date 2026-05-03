@@ -14,15 +14,10 @@ export async function parseJsonlSession(acpSessionId, providerId = null) {
 
   if (!fs.existsSync(filePath)) return null;
 
-  if (typeof providerModule.parseSessionHistory === 'function') {
-    try {
-      return await providerModule.parseSessionHistory(filePath, Diff);
-    } catch (err) {
-      writeLog(`[JSONL ERR] Provider failed to parse ${filePath}: ${err.message}`);
-      return null;
-    }
+  try {
+    return await providerModule.parseSessionHistory(filePath, Diff);
+  } catch (err) {
+    writeLog(`[JSONL ERR] Provider failed to parse ${filePath}: ${err.message}`);
+    return null;
   }
-
-  writeLog(`[JSONL ERR] Provider missing parseSessionHistory implementation for ${filePath}`);
-  return null;
 }

@@ -58,7 +58,10 @@ const { mockFs, mockDb, mockAcpClient, mockProviderModule } = vi.hoisted(() => (
         extractDiffFromToolCall: vi.fn(),
         normalizeTool: (e) => e,
         categorizeToolCall: vi.fn(),
+        normalizeModelState: vi.fn((state) => state),
+        normalizeConfigOptions: vi.fn((options) => Array.isArray(options) ? options : []),
         parseExtension: vi.fn(),
+        emitCachedContext: vi.fn(),
         performHandshake: async () => {},
         setInitialAgent: async () => {},
         setConfigOption: vi.fn().mockResolvedValue({}),
@@ -129,6 +132,7 @@ describe('Session Handlers', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockProviderModule.normalizeModelState.mockImplementation((state) => state);
     mockAcpClient.sessionMetadata.clear();
     mockIo = new EventEmitter();
     mockIo.emit = vi.fn();
@@ -200,6 +204,116 @@ describe('Session Handlers', () => {
     const handler = mockSocket.listeners('create_session')[0];
     await handler({ providerId: 'provider-a', model: 'test-flagship' }, callback);
     expect(mockAcpClient.transport.sendRequest).toHaveBeenCalledWith('session/new', expect.any(Object));
+  });
+
+  it('captures normalized config options returned by session/new', async () => {
+    const callback = vi.fn();
+    mockProviderModule.normalizeConfigOptions.mockImplementationOnce((options) =>
+      options.filter(option => option.id !== 'model').map(option =>
+        option.id === 'reasoning_effort' ? { ...option, kind: 'reasoning_effort' } : option
+      )
+    );
+    mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+      if (method === 'session/new') {
+        return {
+          sessionId: 'acp-new',
+          configOptions: [
+            { id: 'model', currentValue: 'test-balanced' },
+            { id: 'reasoning_effort', currentValue: 'medium' }
+          ]
+        };
+      }
+      return {};
+    });
+
+    const handler = mockSocket.listeners('create_session')[0];
+    await handler({ providerId: 'provider-a', model: 'test-flagship' }, callback);
+
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+      success: true,
+      configOptions: [expect.objectContaining({ id: 'reasoning_effort', kind: 'reasoning_effort' })]
+    }));
+    expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('provider-a', 'acp-new', [
+      expect.objectContaining({ id: 'reasoning_effort', currentValue: 'medium' })
+    ]);
+  });
+
+  it('uses provider model-state normalization when creating a session', async () => {
+    const callback = vi.fn();
+    mockProviderModule.normalizeModelState.mockImplementationOnce((state) => ({
+      ...state,
+      currentModelId: 'base-model',
+      modelOptions: [{ id: 'base-model', name: 'Base Model' }]
+    }));
+    mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+      if (method === 'session/new') {
+        return {
+          sessionId: 'acp-new',
+          models: {
+            currentModelId: 'base-model/high',
+            availableModels: [{ id: 'base-model/high', name: 'Base Model High' }]
+          }
+        };
+      }
+      return {};
+    });
+
+    const handler = mockSocket.listeners('create_session')[0];
+    await handler({ providerId: 'provider-a', model: 'test-flagship' }, callback);
+
+    expect(mockProviderModule.normalizeModelState).toHaveBeenCalledWith(
+      expect.objectContaining({ currentModelId: 'base-model/high' }),
+      expect.objectContaining({ sessionId: 'acp-new' })
+    );
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+      success: true,
+      modelOptions: expect.arrayContaining([expect.objectContaining({ id: 'base-model' })])
+    }));
+  });
+
+  it('replaces stale model options when provider requests replacement', async () => {
+    const callback = vi.fn();
+    mockProviderModule.normalizeModelState.mockImplementationOnce((state) => ({
+      ...state,
+      currentModelId: 'base-model',
+      modelOptions: [{ id: 'base-model', name: 'Base Model' }],
+      replaceModelOptions: true
+    }));
+    mockAcpClient.sessionMetadata.set('pending-new', {
+      model: 'base-model/high',
+      currentModelId: 'base-model/high',
+      modelOptions: [{ id: 'base-model/high', name: 'Base Model High' }],
+      toolCalls: 0,
+      successTools: 0,
+      startTime: Date.now(),
+      usedTokens: 0,
+      totalTokens: 0,
+      promptCount: 0,
+      lastResponseBuffer: '',
+      lastThoughtBuffer: '',
+      provider: 'provider-a'
+    });
+    mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+      if (method === 'session/new') {
+        return {
+          sessionId: 'acp-new',
+          models: {
+            currentModelId: 'base-model/high',
+            availableModels: [{ id: 'base-model/high', name: 'Base Model High' }]
+          }
+        };
+      }
+      return {};
+    });
+
+    const handler = mockSocket.listeners('create_session')[0];
+    await handler({ providerId: 'provider-a', model: 'base-model/high' }, callback);
+
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+      modelOptions: expect.arrayContaining([expect.objectContaining({ id: 'base-model' })])
+    }));
+    const modelOptions = callback.mock.calls[0][0].modelOptions;
+    expect(modelOptions.some(option => option.id === 'base-model/high')).toBe(false);
   });
 
   it('handles merge_fork', async () => {
@@ -546,17 +660,16 @@ describe('Session Handlers', () => {
     expect(mockAcpClient.setConfigOption).not.toHaveBeenCalled();
   });
 
-  it('set_session_option falls back to acpClient.setConfigOption when provider lacks it', async () => {
-    const { getProviderModule } = await import('../services/providerLoader.js');
+  it('set_session_option routes through provider contract setConfigOption', async () => {
     const session = { id: 'ui-1', acpSessionId: 'acp-1', configOptions: [], provider: 'provider-a' };
     mockDb.getAllSessions.mockResolvedValue([session]);
     mockAcpClient.sessionMetadata.set('acp-1', { configOptions: [] });
-    getProviderModule.mockResolvedValueOnce({ ...mockProviderModule, setConfigOption: undefined });
 
     const handler = mockSocket.listeners('set_session_option')[0];
     await handler({ uiId: 'ui-1', optionId: 'effort', value: 'low' });
 
-    expect(mockAcpClient.setConfigOption).toHaveBeenCalledWith('acp-1', 'effort', 'low');
+    expect(mockProviderModule.setConfigOption).toHaveBeenCalledWith(mockAcpClient, 'acp-1', 'effort', 'low');
+    expect(mockAcpClient.setConfigOption).not.toHaveBeenCalled();
   });
 
   it('set_session_option updates sessionMetadata when meta exists', async () => {
@@ -626,6 +739,7 @@ describe('Session Handlers', () => {
     await handler({ providerId: 'provider-a', model: 'test-balanced', existingAcpId }, callback);
     
     expect(mockAcpClient.transport.sendRequest).not.toHaveBeenCalledWith('session/load', expect.anything());
+    expect(mockProviderModule.emitCachedContext).toHaveBeenCalledWith(existingAcpId);
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ 
       success: true,
       sessionId: existingAcpId 
@@ -648,6 +762,7 @@ describe('Session Handlers', () => {
     await handler({ providerId: 'provider-a', model: 'test-balanced', existingAcpId }, callback);
     
     expect(mockAcpClient.transport.sendRequest).toHaveBeenCalledWith('session/load', expect.anything());
+    expect(mockProviderModule.emitCachedContext).toHaveBeenCalledWith(existingAcpId);
     expect(mockAcpClient.sessionMetadata.has(existingAcpId)).toBe(true);
   });
 });
