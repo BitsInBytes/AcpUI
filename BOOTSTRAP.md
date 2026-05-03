@@ -10,8 +10,8 @@ You are reading it now. This file defines rules, standards, and the documentatio
 ### Step 2: Load Core Architecture Docs
 After reading this file, the agent **must** load and parse the following files to establish a complete understanding of the system:
 - `README.md` (Root) — High-level overview.
-- `backend/README.md` — Backend architecture and service map.
-- `frontend/README.md` — Frontend architecture and store map.
+- `documents/[Feature Doc] - Backend Architecture.md` — Backend architecture and service map.
+- `documents/[Feature Doc] - Frontend Architecture.md` — Frontend architecture and store map.
 
 ### Step 3: Load Relevant Feature Docs
 Based on the task at hand, load the appropriate Feature Docs from `documents/[Feature Doc] - *.md` using the index in Section 5 of this document.
@@ -62,6 +62,8 @@ Start with these when beginning any backend or frontend work. They provide the f
 - **[Feature Doc] - Session Archiving.md** — Soft-delete system moving inactive sessions to archive while preserving complete state. Covers cascade deletion of descendants, archive folder structure, session.json metadata, provider-specific archiving methods, merge-only restore (new IDs, never replace), and permanent deletion. Load this when implementing retention policies, debugging restore issues, or extending archive behavior.
 - **[Feature Doc] - Session Forking.md** — Full fork and merge lifecycle: fork creation flow, ACP session cloning, DB schema, sidebar hierarchy rendering, merge-back flow (summary capture, parent injection), cascade deletion, and title generation. Load this when implementing fork features, debugging fork/merge issues, or extending fork behavior.
 - **[Feature Doc] - Pop Out Chat.md** — Detached window feature for side-by-side chat viewing. Covers BroadcastChannel-based session ownership coordination, window initialization, session state isolation, and cleanup on close. Load this when implementing pop-out features, debugging window synchronization issues, or extending multi-window support.
+- **[Feature Doc] - Chat Header.md** — Top-level chat status and control bar. Covers provider/session title resolution, connection indicator rendering, pop-out mode control gating, and UI store toggles for sidebar/explorer/settings. Load this when implementing header controls, debugging missing/incorrect header titles, or investigating pop-out header behavior.
+- **[Feature Doc] - Auto-scroll System.md** — Chat viewport stickiness and manual override behavior. Covers `useScroll` lifecycle, `isAutoScrollDisabled` persistence, `ResizeObserver` pinning, back-to-bottom controls, and stream-driven scroll triggers. Load this when debugging scroll regressions, changing auto-scroll UX, or extending message viewport behavior.
 - **[Feature Doc] - Chat Input and Prompt Area.md** — Footer input component with file attachments, image compression, model quick-select, and slash command autocomplete. Covers textarea auto-height, clipboard paste handling, HTTP file upload with multer, sharp image compression (JPEG quality 85), model selection UI, and context usage display. Load this when implementing input features, debugging attachments/uploads, or extending model selection.
 - **[Feature Doc] - File Explorer.md** — Full-screen file browser modal triggered from the ChatHeader. Covers tree lazy-loading, Monaco editor with syntax highlighting, markdown preview toggle, auto-save with debounce, dirty state tracking, and backend safePath security validation. Load this when implementing file browser features, debugging explorer issues, or extending the code editor.
 - **[Feature Doc] - System Settings Modal.md** — Five-tab configuration hub for audio devices, environment variables, workspace definitions, custom commands, and provider-specific settings. Covers socket-callback pattern, dual JSON validation, immediate runtime updates via `process.env`, and multi-provider config isolation. Load this when adding new config tabs, debugging config persistence, or extending the Monaco editor integration.
@@ -211,10 +213,13 @@ All Feature Docs must follow `documents/FEATURE_DOC_TEMPLATE.md`:
 
 1. **Run linting** — `cd backend && npm run lint` and `cd frontend && npm run lint`. Zero errors, zero warnings.
 2. **Run tests** — Backend: `cd backend && npx vitest run`. Frontend: `cd frontend && npx vitest run`.
+   - **If tests fail or coverage is below threshold**, immediately report this to the user. Do NOT attempt to commit or bypass checks.
 3. **Run frontend build** — `cd frontend && npm run build`. Must succeed with no errors.
 4. **Update documentation** — Every code change must have a corresponding documentation update (Section 3, Rule 1).
 5. **Update BOOTSTRAP.md if needed** — If you created a new system, add it to Section 2 with a description and link.
-6. **Do NOT commit** — Only commit when explicitly instructed. Preparation (staging files) is allowed; actual commits are not.
+6. **Commit Policy** — Only commit when explicitly instructed to do so. Preparation (staging files) is allowed; actual commits are not.
+   - **Never use `--no-verify`** — This flag bypasses pre-commit hooks. It must never be used unless the user explicitly instructs you to do so.
+   - **Do not force commits** — If unit tests are failing or coverage is below the configured threshold, do NOT attempt to commit. Instead, report the failures to the user immediately.
 
 ### 7.4 Handling Tasks with Conflicting Instructions
 
@@ -240,7 +245,7 @@ If a user instruction conflicts with the rules in this BOOTSTRAP:
 | **Create Feature Docs** | Create a Feature Doc for every new system using the template | When creating a new feature or major architecture change |
 | **Test Everything** | Write tests, run linting, build frontend | Before declaring task complete |
 | **Follow Gotchas** | Read the Feature Doc's gotchas section before implementing | When implementing a feature for the first time |
-| **No Git Commits** | Prepare code and stage files, but do NOT commit without instruction | Anytime you finish work |
+| **No Git Commits** | Prepare code and stage files, but do NOT commit without instruction. Never use `--no-verify`. Report test failures before committing. | Anytime you finish work |
 | **Provider Isolation** | Load provider-specific docs when working on providers | When working on provider code |
 | **Documentation Matches Code** | If code and docs conflict, update the docs | Every task |
 

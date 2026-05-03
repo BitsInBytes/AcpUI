@@ -37,8 +37,9 @@ export function getMaxShellResultLines(env = process.env) {
  * Returns the stdio MCP server config for passing in session/new mcpServers array.
  * The ACP spawns this as a child process and communicates via stdin/stdout.
  */
-export function getMcpServers() {
-  const name = getProvider().config.mcpName;
+export function getMcpServers(providerId = null) {
+  const provider = getProvider(providerId);
+  const name = provider.config.mcpName;
   if (!name) return [];
   const proxyPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'stdio-proxy.js');
   return [{
@@ -46,6 +47,7 @@ export function getMcpServers() {
     command: 'node',
     args: [proxyPath],
     env: [
+      { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ]
@@ -120,7 +122,8 @@ export function createToolHandlers(io) {
 
   writeLog(`[SUB-AGENT] Spawning ${requests.length} sub-agent(s)`);
   const provider = getProvider(providerId);
-  const acpClient = providerRuntimeManager.getClient(providerId);
+  const resolvedProviderId = provider.id;
+  const acpClient = providerRuntimeManager.getClient(resolvedProviderId);
   if (!acpClient) return { content: [{ type: 'text', text: 'Error: Sub-agent system not available' }] };
   const models = provider.config.models || {};
   const quickModelOptions = modelOptionsFromProviderConfig(models);
@@ -137,13 +140,13 @@ export function createToolHandlers(io) {
     // can be emitted immediately, allowing the UI to clear old agent state right away.
     let parentUiId = null;
     if (acpClient.lastSubAgentParentAcpId) {
-      const parentSession = await db.getSessionByAcpId(providerId, acpClient.lastSubAgentParentAcpId);
+      const parentSession = await db.getSessionByAcpId(resolvedProviderId, acpClient.lastSubAgentParentAcpId);
       if (parentSession) parentUiId = parentSession.id;
     }
 
     // Emit immediately — before the 1-second stagger — so the frontend clears stale
     // sub-agent panels without waiting for the first sub_agent_started event.
-    io.emit('sub_agents_starting', { invocationId, parentUiId, providerId, count: requests.length });
+    io.emit('sub_agents_starting', { invocationId, parentUiId, providerId: resolvedProviderId, count: requests.length });
 
     let _aborted = false;
     const abortCallbacks = [];
@@ -162,19 +165,19 @@ export function createToolHandlers(io) {
     const setupPromises = requests.map((req, i) => {
       return new Promise(resolve => {
         setTimeout(async () => {
-          const agentName = req.agent || getProvider(providerId).config.defaultSubAgentName;
+          const agentName = req.agent || provider.config.defaultSubAgentName;
           if (!agentName) { resolve({ subAcpId: null, index: i, req, error: 'No agent configured' }); return; }
           const cwd = req.cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
 
           try {
-            const providerModule = await getProviderModule();
+            const providerModule = await getProviderModule(resolvedProviderId);
             const sessionParams = providerModule.buildSessionParams(agentName);
-            const result = await sendWithTimeout('session/new', { cwd, mcpServers: getMcpServers(), ...sessionParams }, 30000);
+            const result = await sendWithTimeout('session/new', { cwd, mcpServers: getMcpServers(resolvedProviderId), ...sessionParams }, 30000);
             const subAcpId = result.sessionId;
             writeLog(`[SUB-AGENT ${i}] Created session ${subAcpId} (agent: ${agentName})`);
 
             const uiId = `sub-${subAcpId}`;
-            registerSubAgent(providerId, subAcpId, null, req.prompt, agentName);
+            registerSubAgent(resolvedProviderId, subAcpId, null, req.prompt, agentName);
 
             await db.saveSession({
               id: uiId, acpSessionId: subAcpId,
@@ -183,7 +186,7 @@ export function createToolHandlers(io) {
               isSubAgent: true, forkedFrom: parentUiId,
               currentModelId: modelId || null,
               modelOptions: quickModelOptions,
-              provider: providerId,
+              provider: resolvedProviderId,
             });
 
             if (modelId) {
@@ -201,14 +204,14 @@ export function createToolHandlers(io) {
             const sockets = await io.fetchSockets();
             for (const s of sockets) s.join(`session:${subAcpId}`);
             io.emit('sub_agent_started', {
-              providerId,
+              providerId: resolvedProviderId,
               acpSessionId: subAcpId, uiId, parentUiId, index: i,
               name: req.name || `Agent ${i + 1}`,
               prompt: req.prompt, agent: agentName, model: resolvedModelKey,
               invocationId,
             });
 
-            if (agentName !== getProvider(providerId).config.defaultSystemAgentName) {
+            if (agentName !== provider.config.defaultSystemAgentName) {
               await providerModule.setInitialAgent(acpClient, subAcpId, agentName);
             }
 
@@ -216,7 +219,7 @@ export function createToolHandlers(io) {
           } catch (err) {
             writeLog(`[SUB-AGENT ${i}] Setup error: ${err.message}`);
             failSubAgent(`sub-${i}`);
-            io.emit('sub_agent_completed', { providerId, acpSessionId: `sub-${i}`, index: i, error: err.message });
+            io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: `sub-${i}`, index: i, error: err.message });
             resolve({ subAcpId: null, index: i, req, error: err.message });
           }
         }, i * 1000); // 1 second stagger
@@ -235,15 +238,15 @@ export function createToolHandlers(io) {
         const meta = acpClient.sessionMetadata.get(s.subAcpId);
         const response = meta?.lastResponseBuffer?.trim() || '(no response)';
         completeSubAgent(s.subAcpId);
-        io.emit('sub_agent_completed', { providerId, acpSessionId: s.subAcpId, index: s.index });
+        io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: s.subAcpId, index: s.index });
         writeLog(`[SUB-AGENT ${s.index}] Completed: ${s.subAcpId}`);
-        cleanupAcpSession(s.subAcpId, providerId);
+        cleanupAcpSession(s.subAcpId, resolvedProviderId);
         acpClient.sessionMetadata.delete(s.subAcpId);
         return { index: s.index, response, error: null };
       } catch (err) {
         writeLog(`[SUB-AGENT ${s.index}] Error: ${err.message}`);
         failSubAgent(s.subAcpId);
-        io.emit('sub_agent_completed', { providerId, acpSessionId: s.subAcpId, index: s.index, error: err.message });
+        io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: s.subAcpId, index: s.index, error: err.message });
         return { index: s.index, response: null, error: err.message };
       }
     }));

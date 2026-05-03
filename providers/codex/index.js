@@ -5,7 +5,6 @@ import { getProvider } from '../../backend/services/providerLoader.js';
 
 const MODEL_OPTION_IDS = new Set(['model']);
 const REASONING_OPTION_IDS = new Set(['reasoning_effort', 'effort']);
-const MODEL_EFFORT_SUFFIXES = new Set(['minimal', 'low', 'medium', 'high']);
 const COMMAND_AUTH_METHODS = new Set(['chatgpt', 'codex-api-key', 'openai-api-key']);
 const DEFAULT_QUOTA_ENDPOINT = 'https://chatgpt.com/backend-api/wham/usage';
 const REFRESH_TOKEN_ENDPOINT = 'https://auth.openai.com/oauth/token';
@@ -133,39 +132,52 @@ function normalizeSelectOptions(options) {
     .filter(Boolean);
 }
 
-function splitModelEffortId(id) {
-  if (typeof id !== 'string') return { modelId: id, effort: null };
-  const slashIndex = id.lastIndexOf('/');
-  if (slashIndex <= 0 || slashIndex === id.length - 1) return { modelId: id, effort: null };
+function extractModelOptionsFromConfig(configOptions) {
+  if (!Array.isArray(configOptions)) return [];
+  const modelOption = configOptions.find(option =>
+    option &&
+    option.id === 'model' &&
+    option.type === 'select' &&
+    Array.isArray(option.options)
+  );
+  if (!modelOption) return [];
 
-  const suffix = id.slice(slashIndex + 1);
-  if (!MODEL_EFFORT_SUFFIXES.has(suffix)) return { modelId: id, effort: null };
-  return { modelId: id.slice(0, slashIndex), effort: suffix };
+  const seen = new Set();
+  const normalized = [];
+  for (const option of normalizeSelectOptions(modelOption.options)) {
+    const id = typeof option?.value === 'string' ? option.value.trim() : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    normalized.push({
+      id,
+      name: option.name || id,
+      ...(option.description ? { description: option.description } : {})
+    });
+  }
+  return normalized;
 }
 
-function stripModelEffortName(name, effort) {
-  if (typeof name !== 'string' || !effort) return name;
-  return name
-    .replace(new RegExp(`\\s*\\(${effort}\\)\\s*$`, 'i'), '')
-    .replace(new RegExp(`\\s*-\\s*${effort}\\s*$`, 'i'), '')
-    .trim() || name;
-}
-
-export function normalizeModelState(modelState = {}) {
+export function normalizeModelState(modelState = {}, source = {}) {
   const normalizedOptions = [];
   const seen = new Set();
-  for (const option of Array.isArray(modelState.modelOptions) ? modelState.modelOptions : []) {
-    const { modelId, effort } = splitModelEffortId(option.id);
+  const candidateOptions = [
+    ...(Array.isArray(modelState.modelOptions) ? modelState.modelOptions : []),
+    ...extractModelOptionsFromConfig(source?.configOptions)
+  ];
+  for (const option of candidateOptions) {
+    const modelId = typeof option?.id === 'string' ? option.id.trim() : '';
     if (!modelId || seen.has(modelId)) continue;
     seen.add(modelId);
     normalizedOptions.push({
       ...option,
       id: modelId,
-      name: stripModelEffortName(option.name, effort)
+      name: option.name || option.displayName || modelId
     });
   }
 
-  const { modelId: currentModelId } = splitModelEffortId(modelState.currentModelId);
+  const currentModelId = typeof modelState.currentModelId === 'string'
+    ? modelState.currentModelId.trim()
+    : modelState.currentModelId;
   return {
     ...modelState,
     currentModelId,
@@ -229,15 +241,15 @@ export function intercept(payload) {
       }
     }
 
-    // Track active prompts to only poll while chats are in progress
+    // Track active prompts to only poll while chats are in progress.
+    // Increment once per submitted prompt (user_message), not on every response
+    // chunk — agent_message_chunk fires many times per turn and would ratchet
+    // _activePromptCount above 1, so stopReason could never bring it back to 0.
     const isUpdate = payload?.method === 'session/update';
     const update = payload?.params?.update;
-    const isFirstMessage = isUpdate && sessionId && (
-      update?.sessionUpdate === 'user_message' ||
-      update?.sessionUpdate === 'agent_message' ||
-      update?.sessionUpdate === 'agent_message_chunk'
-    );
-    if (isFirstMessage) {
+    const isUserMessage = isUpdate && sessionId &&
+      update?.sessionUpdate === 'user_message';
+    if (isUserMessage) {
       _activePromptCount++;
       _ensureQuotaPolling();
     }
@@ -278,12 +290,19 @@ export function intercept(payload) {
     payload.params?.update?.sessionUpdate === 'config_option_update'
   ) {
     const { config } = getProvider();
-    const options = normalizeConfigOptions(payload.params.update.configOptions);
+    const configOptions = payload.params.update.configOptions;
+    const options = normalizeConfigOptions(configOptions);
+    const modelOptions = extractModelOptionsFromConfig(configOptions);
     const removeOptionIds = Array.isArray(payload.params.update.removeOptionIds)
       ? payload.params.update.removeOptionIds.filter(id => !MODEL_OPTION_IDS.has(id))
       : undefined;
+    const shouldReplaceOptions = options.length > 0 || Boolean(removeOptionIds?.length);
 
-    if (options.length === 0 && (!removeOptionIds || removeOptionIds.length === 0)) {
+    if (
+      options.length === 0 &&
+      modelOptions.length === 0 &&
+      (!removeOptionIds || removeOptionIds.length === 0)
+    ) {
       return null;
     }
 
@@ -293,8 +312,22 @@ export function intercept(payload) {
       params: {
         sessionId: payload.params.sessionId,
         options,
-        replace: true,
+        replace: shouldReplaceOptions,
+        ...(modelOptions.length > 0 ? { modelOptions } : {}),
         ...(removeOptionIds ? { removeOptionIds } : {})
+      }
+    };
+  }
+
+  // Codex wraps the user-facing error detail in error.data.message while the top-level
+  // error.message is the generic JSON-RPC sentinel (e.g. "Internal error"). Promote
+  // data.message so the real cause surfaces in logs and in the UI error box.
+  if (payload?.error?.data?.message) {
+    return {
+      ...payload,
+      error: {
+        ...payload.error,
+        message: payload.error.data.message
       }
     };
   }
@@ -406,6 +439,12 @@ function findPathInRaw(rawValue) {
     if (typeof candidate === 'string' && candidate.trim()) return candidate;
   }
 
+  if (Array.isArray(raw.locations)) {
+    for (const location of raw.locations) {
+      if (typeof location?.path === 'string' && location.path.trim()) return location.path;
+    }
+  }
+
   const changes = raw.changes || raw.file_changes || raw.fileChanges;
   if (isObject(changes)) {
     const firstPath = Object.keys(changes).find(Boolean);
@@ -476,13 +515,17 @@ export function extractDiffFromToolCall(update, Diff) {
 
 function normalizeToolName(name) {
   if (!name || typeof name !== 'string') return '';
-  return name
+  const normalized = name
     .replace(/^mcp__[^_]+__/, '')
     .replace(/^Tool:\s*/i, '')
     .split('/')
     .pop()
     .trim()
     .toLowerCase();
+
+  if (normalized === 'shell_command') return 'shell';
+  if (normalized === 'apply_patch') return 'edit_file';
+  return normalized;
 }
 
 function toolNameFromTitle(title) {
@@ -500,7 +543,14 @@ function toolNameFromTitle(title) {
 function commandFromRaw(rawValue) {
   const raw = parseMaybeJson(rawValue);
   if (!isObject(raw)) return '';
-  const value = raw.command || raw.cmd || raw.parsed_cmd || raw.parsedCmd || raw.argv;
+  const rawArgs = raw.invocation?.arguments || raw.arguments || raw.args || {};
+  const parsedArgs = parseMaybeJson(rawArgs);
+  const value = raw.command
+    || raw.cmd
+    || raw.parsed_cmd
+    || raw.parsedCmd
+    || raw.argv
+    || (isObject(parsedArgs) ? parsedArgs.command : undefined);
   if (Array.isArray(value)) return value.join(' ');
   if (typeof value === 'string') return value;
   return '';
@@ -510,10 +560,12 @@ function invocationFromRaw(rawValue) {
   const raw = parseMaybeJson(rawValue);
   if (!isObject(raw)) return {};
   const invocation = raw.invocation || raw;
+  const rawArgs = invocation.arguments || invocation.args || raw.arguments || raw.args || {};
+  const parsedArgs = parseMaybeJson(rawArgs);
   return {
     server: invocation.server,
     tool: invocation.tool || invocation.name,
-    arguments: invocation.arguments || invocation.args || raw.arguments || raw.args || {}
+    arguments: isObject(parsedArgs) ? parsedArgs : {}
   };
 }
 
@@ -1034,6 +1086,44 @@ function isUserBoundary(record, preferEventUser) {
     record.payload?.role === 'user';
 }
 
+function getRecordTurnId(record) {
+  if (!record || typeof record !== 'object') return null;
+  if (record.type === 'turn_context') return record.payload?.turn_id || null;
+  if (record.type === 'event_msg') return record.payload?.turn_id || null;
+  if (record.type === 'response_item') return record.payload?.turn_id || record.turn_id || null;
+  return record.payload?.turn_id || record.turn_id || null;
+}
+
+function buildTurnMetadata(records) {
+  const turnStartIndexes = new Map();
+  const recordTurnIds = new Array(records.length).fill(null);
+  let currentTurnId = null;
+
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (!record) continue;
+
+    const explicitTurnId = getRecordTurnId(record);
+    if (explicitTurnId) currentTurnId = explicitTurnId;
+
+    const effectiveTurnId = explicitTurnId || currentTurnId || null;
+    recordTurnIds[index] = effectiveTurnId;
+
+    if (effectiveTurnId && !turnStartIndexes.has(effectiveTurnId)) {
+      turnStartIndexes.set(effectiveTurnId, index);
+    }
+
+    if (record.type === 'event_msg') {
+      const eventType = record.payload?.type;
+      if ((eventType === 'task_complete' || eventType === 'turn_aborted') && effectiveTurnId === currentTurnId) {
+        currentTurnId = null;
+      }
+    }
+  }
+
+  return { turnStartIndexes, recordTurnIds };
+}
+
 function pruneRolloutLines(lines, pruneAtTurn) {
   if (!Number.isFinite(pruneAtTurn) || pruneAtTurn <= 0) return lines;
   const records = lines.map(line => {
@@ -1047,13 +1137,16 @@ function pruneRolloutLines(lines, pruneAtTurn) {
   const preferEventUser = records.some(record =>
     record?.type === 'event_msg' && record.payload?.type === 'user_message'
   );
+  const { turnStartIndexes, recordTurnIds } = buildTurnMetadata(records);
 
   let seenUserTurns = 0;
   for (let index = 0; index < records.length; index++) {
     if (!isUserBoundary(records[index], preferEventUser)) continue;
     seenUserTurns++;
     if (seenUserTurns > pruneAtTurn) {
-      return lines.slice(0, index);
+      const turnId = recordTurnIds[index];
+      const turnStartIndex = turnId ? turnStartIndexes.get(turnId) : null;
+      return lines.slice(0, Number.isInteger(turnStartIndex) ? turnStartIndex : index);
     }
   }
 
@@ -1083,6 +1176,12 @@ export function cloneSession(oldAcpId, newAcpId, pruneAtTurn) {
     const newJson = newJsonl.replace(/\.jsonl$/i, '.json');
     const content = fs.readFileSync(oldJson, 'utf8').replaceAll(oldAcpId, newAcpId);
     fs.writeFileSync(newJson, content, 'utf8');
+  }
+
+  const oldTasksDir = path.join(sessionDir, oldAcpId);
+  const newTasksDir = path.join(sessionDir, newAcpId);
+  if (fs.existsSync(oldTasksDir)) {
+    fs.cpSync(oldTasksDir, newTasksDir, { recursive: true });
   }
 }
 
@@ -1187,6 +1286,12 @@ function addUserMessage(state, text, id) {
 }
 
 function addTool(state, toolEvent) {
+  if (!toolEvent?.id) return;
+  const existing = state.tools.get(toolEvent.id);
+  if (existing) {
+    Object.assign(existing, toolEvent);
+    return;
+  }
   if (!state.currentAssistant) state.currentAssistant = newAssistantMessage();
   state.currentAssistant.timeline.push({
     type: 'tool',
@@ -1233,6 +1338,96 @@ function toolEventFromPayload(payload, title, status = 'pending_result', output 
   }, update);
 }
 
+function normalizeMessagePhase(phase) {
+  return typeof phase === 'string' ? phase.trim().toLowerCase() : '';
+}
+
+function parseCallArguments(argumentsValue) {
+  const parsed = parseMaybeJson(argumentsValue);
+  return isObject(parsed) ? parsed : {};
+}
+
+function extractReasoningSummary(summary) {
+  if (typeof summary === 'string') return summary.trim();
+  if (!Array.isArray(summary)) return '';
+
+  const parts = [];
+  for (const item of summary) {
+    if (typeof item === 'string') {
+      if (item.trim()) parts.push(item.trim());
+      continue;
+    }
+    if (!isObject(item)) continue;
+
+    const text = item.text || item.summary || item.message || extractText(item.content);
+    if (typeof text === 'string' && text.trim()) {
+      parts.push(text.trim());
+    }
+  }
+  return parts.join('\n').trim();
+}
+
+function resultTextFromCallOutput(outputValue, Diff) {
+  const parsed = parseMaybeJson(outputValue);
+  if (isObject(parsed)) {
+    const wrappedOutput = parsed.output;
+    if (wrappedOutput !== undefined) {
+      const nested = parseMaybeJson(wrappedOutput);
+      if (isObject(nested)) {
+        const diff = diffFromChanges(nested.changes || nested.file_changes || nested.fileChanges, Diff);
+        return diff || resultText(nested);
+      }
+      return resultText(wrappedOutput);
+    }
+
+    const diff = diffFromChanges(parsed.changes || parsed.file_changes || parsed.fileChanges, Diff);
+    return diff || resultText(parsed);
+  }
+
+  return resultText(parsed);
+}
+
+function buildToolPayloadFromFunctionCall(payload) {
+  const args = parseCallArguments(payload.arguments);
+  return {
+    ...payload,
+    arguments: args,
+    invocation: {
+      server: payload.server,
+      tool: payload.name,
+      arguments: args
+    }
+  };
+}
+
+function buildToolPayloadFromCustomToolCall(payload) {
+  return {
+    ...payload,
+    invocation: {
+      server: payload.server,
+      tool: payload.name,
+      arguments: payload.input
+    },
+    arguments: payload.input
+  };
+}
+
+function resetFromCompactedRecord(record, state) {
+  const replacementHistory = record?.payload?.replacement_history;
+  if (!Array.isArray(replacementHistory)) return;
+
+  state.messages = [];
+  state.currentAssistant = null;
+  state.tools.clear();
+
+  for (let index = 0; index < replacementHistory.length; index++) {
+    const item = replacementHistory[index];
+    if (!isObject(item) || item.type !== 'message' || item.role !== 'user') continue;
+    const text = extractText(item.content || item.text || item.message);
+    addUserMessage(state, text, `${record.timestamp || Date.now()}-compact-${index}`);
+  }
+}
+
 function handleEventMsg(record, state, Diff) {
   const payload = record.payload || {};
   const type = payload.type;
@@ -1240,14 +1435,25 @@ function handleEventMsg(record, state, Diff) {
   if (type === 'user_message') {
     addUserMessage(state, payload.message || payload.text || '', record.timestamp);
   } else if (type === 'agent_message') {
-    addAssistantText(state, payload.message || payload.text || '', record.timestamp);
+    const phase = normalizeMessagePhase(payload.phase);
+    const message = payload.message || payload.text || '';
+    if (phase === 'commentary') {
+      addThought(state, message);
+    } else {
+      addAssistantText(state, message, record.timestamp);
+    }
   } else if (type === 'agent_reasoning' || type === 'agent_reasoning_raw_content') {
     addThought(state, payload.text || payload.message || payload.reasoning || '');
   } else if (type === 'exec_command_begin') {
     addTool(state, toolEventFromPayload(payload, 'Run command'));
   } else if (type === 'exec_command_end') {
     const status = payload.exit_code === 0 || payload.exitCode === 0 || payload.status === 'completed' ? 'completed' : 'failed';
-    updateTool(state, payloadId(payload), { status, output: resultText(payload), endTime: Date.now() });
+    updateTool(state, payloadId(payload), {
+      status,
+      output: resultText(payload),
+      filePath: findPathInRaw(payload),
+      endTime: Date.now()
+    });
   } else if (type === 'mcp_tool_call_begin') {
     const invocation = payload.invocation || {};
     addTool(state, toolEventFromPayload(payload, `Tool: ${invocation.server || ''}/${invocation.tool || 'tool'}`));
@@ -1266,18 +1472,73 @@ function handleEventMsg(record, state, Diff) {
       filePath: findPathInRaw(payload),
       endTime: Date.now()
     });
+  } else if (type === 'error') {
+    const message = payload.message || payload.error || '';
+    addAssistantText(state, message, record.timestamp);
   }
 }
 
-function handleResponseItem(record, state) {
+function handleResponseItem(record, state, Diff, allowUserFallback, allowAssistantFallback) {
   const payload = record.payload || {};
-  if (payload.type !== 'message') return;
+  const payloadType = payload.type;
 
-  const text = extractText(payload.content);
-  if (payload.role === 'user') {
-    addUserMessage(state, text, payload.id || record.timestamp);
-  } else if (payload.role === 'assistant') {
-    addAssistantText(state, text, payload.id || record.timestamp);
+  if (payloadType === 'message') {
+    const text = extractText(payload.content);
+    if (payload.role === 'user') {
+      if (allowUserFallback) {
+        addUserMessage(state, text, payload.id || record.timestamp);
+      }
+    } else if (payload.role === 'assistant') {
+      if (allowAssistantFallback) {
+        const phase = normalizeMessagePhase(payload.phase);
+        if (phase === 'commentary') {
+          addThought(state, text);
+        } else {
+          addAssistantText(state, text, payload.id || record.timestamp);
+        }
+      }
+    }
+    return;
+  }
+
+  if (payloadType === 'reasoning') {
+    const summaryText = extractReasoningSummary(payload.summary);
+    if (summaryText) addThought(state, summaryText);
+    return;
+  }
+
+  if (payloadType === 'function_call') {
+    const callPayload = buildToolPayloadFromFunctionCall(payload);
+    addTool(state, toolEventFromPayload(callPayload, payload.name || 'Tool'));
+    return;
+  }
+
+  if (payloadType === 'function_call_output') {
+    const callId = payload.call_id || payload.callId || payloadId(payload);
+    const output = resultTextFromCallOutput(payload.output, Diff);
+    updateTool(state, callId, {
+      status: 'completed',
+      output,
+      endTime: Date.now()
+    });
+    return;
+  }
+
+  if (payloadType === 'custom_tool_call') {
+    const callPayload = buildToolPayloadFromCustomToolCall(payload);
+    const status = payload.status === 'failed' ? 'failed' : 'pending_result';
+    addTool(state, toolEventFromPayload(callPayload, payload.name || 'Tool', status));
+    return;
+  }
+
+  if (payloadType === 'custom_tool_call_output') {
+    const callId = payload.call_id || payload.callId || payloadId(payload);
+    const output = resultTextFromCallOutput(payload.output, Diff);
+    updateTool(state, callId, {
+      status: 'completed',
+      output,
+      endTime: Date.now()
+    });
   }
 }
 
@@ -1296,12 +1557,23 @@ export async function parseSessionHistory(filePath, Diff) {
     const hasEventUserMessages = records.some(record =>
       record.type === 'event_msg' && record.payload?.type === 'user_message'
     );
+    const hasEventAgentMessages = records.some(record =>
+      record.type === 'event_msg' && record.payload?.type === 'agent_message'
+    );
 
     for (const record of records) {
+      if (record.type === 'compacted') {
+        resetFromCompactedRecord(record, state);
+        continue;
+      }
+
       if (record.type === 'event_msg') {
         handleEventMsg(record, state, Diff);
-      } else if (record.type === 'response_item' && !hasEventUserMessages) {
-        handleResponseItem(record, state);
+        continue;
+      }
+
+      if (record.type === 'response_item') {
+        handleResponseItem(record, state, Diff, !hasEventUserMessages, !hasEventAgentMessages);
       }
     }
 

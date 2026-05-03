@@ -14,6 +14,7 @@ The footer-positioned input interface for composing and sending prompts, includi
 - **Context progress bar** — Real-time percentage display of token usage (color-coded: green <50%, blue 50-60%, yellow 60-80%, red ≥80%)
 - **Reasoning effort selector** — Animated footer toggle for models supporting reasoning levels (e.g., `low`, `medium`, `high`)
 - **Canvas/Terminal toggles** — Quick-access pills to open canvas pane or spawn new terminals
+- **Auto-scroll toggle pill** — Footer control to enable/disable chat viewport auto-scroll (detailed behavior documented in `[Feature Doc] - Auto-scroll System.md`)
 - **Merge fork button** — Appears when chat is a fork; summarizes work and sends back to parent
 - **Send/Cancel button** — Changes to cancel button during generation; disabled when no input/attachments or engine not ready
 

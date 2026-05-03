@@ -151,6 +151,15 @@ describe('AcpClient Service', () => {
       expect(reject).toHaveBeenCalledWith(expect.objectContaining({ message: 'fail' }));
     });
 
+    it('should log extra info for invalid argument errors', async () => {
+      await acpClient.start();
+      const reject = vi.fn();
+      acpClient.transport.pendingRequests.set(100, { resolve: vi.fn(), reject, method: 'test', params: { long: 'x'.repeat(2500) } });
+      const response = JSON.stringify({ jsonrpc: '2.0', id: 100, error: { message: 'Invalid argument' } }) + '\n';
+      acpClient.acpProcess.stdout.emit('data', response);
+      expect(reject).toHaveBeenCalled();
+    });
+
     it('should return same result if start is called during handshake', async () => {
       const AcpClientClass = acpClient.constructor;
       const client = new AcpClientClass();
@@ -223,6 +232,25 @@ describe('AcpClient Service', () => {
          params: { sessionId: 'real-id', options: [{ id: 'opt1', currentValue: 'v1' }] }
        });
        expect(acpClient.sessionMetadata.get('pending-new').configOptions).toHaveLength(1);
+    });
+
+    it('handles handleProviderExtension with model data', async () => {
+      const spy = vi.spyOn(acpClient, 'handleModelStateUpdate');
+      await acpClient.handleProviderExtension({
+        method: 'prefix/any',
+        params: { sessionId: 's1', currentModelId: 'm1' }
+      });
+      expect(spy).toHaveBeenCalledWith('s1', expect.objectContaining({ currentModelId: 'm1' }));
+    });
+
+    it('handles handleProviderExtension config_options with replace: true', async () => {
+      acpClient.sessionMetadata.set('s1', { configOptions: [{ id: 'old' }] });
+      await acpClient.handleProviderExtension({
+        method: '_test.dev/config_options',
+        params: { sessionId: 's1', options: [{ id: 'new' }], replace: true }
+      });
+      expect(acpClient.sessionMetadata.get('s1').configOptions).toHaveLength(1);
+      expect(acpClient.sessionMetadata.get('s1').configOptions[0].id).toBe('new');
     });
   });
 

@@ -79,16 +79,16 @@ This is crucial — it lets the backend later correlate sub-agent events to thei
 
 The `ux_invoke_subagents` handler starts:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 116-260)
+**File:** `backend/mcp/mcpServer.js` (Lines 118-263)
 
-**Line 134:** Generate a unique invocation ID:
+**Line 137:** Generate a unique invocation ID:
 ```javascript
 const invocationId = `inv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 ```
 
-**Line 146:** Emit `sub_agents_starting` to the frontend:
+**Line 149:** Emit `sub_agents_starting` to the frontend:
 ```javascript
-io.emit('sub_agents_starting', { invocationId, parentUiId, providerId, count: requests.length });
+io.emit('sub_agents_starting', { invocationId, parentUiId, providerId: resolvedProviderId, count: requests.length });
 ```
 
 The frontend receives this and **clears stale sidebar sessions** for the parent before showing the new batch.
@@ -99,12 +99,12 @@ The frontend receives this and **clears stale sidebar sessions** for the parent 
 
 The backend translates parent ACP session ID to parent UI ID:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 139-142)
+**File:** `backend/mcp/mcpServer.js` (Lines 141-145)
 
 ```javascript
 let parentUiId = null;
 if (acpClient.lastSubAgentParentAcpId) {
-  const parentSession = await db.getSessionByAcpId(providerId, acpClient.lastSubAgentParentAcpId);
+  const parentSession = await db.getSessionByAcpId(resolvedProviderId, acpClient.lastSubAgentParentAcpId);
   if (parentSession) parentUiId = parentSession.id;  // Resolve ACP ID → UI ID
 }
 ```
@@ -117,19 +117,19 @@ This is needed because all socket events use **UI IDs**, but the tool handler on
 
 For each request, with a 1-second stagger:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 162-224)
+**File:** `backend/mcp/mcpServer.js` (Lines 165-227)
 
-**Lines 170-172:** Create sub-agent session via ACP:
+**Lines 173-176:** Create sub-agent session via ACP:
 ```javascript
 const result = await sendWithTimeout('session/new', { 
   cwd, 
-  mcpServers: getMcpServers(), 
+  mcpServers: getMcpServers(resolvedProviderId), 
   ...sessionParams  // From provider's buildSessionParams(agent)
 }, 30000);
 const subAcpId = result.sessionId;
 ```
 
-**Lines 179-187:** Save to database with `isSubAgent` flag:
+**Lines 182-190:** Save to database with `isSubAgent` flag:
 ```javascript
 await db.saveSession({
   id: uiId, acpSessionId: subAcpId,
@@ -137,16 +137,16 @@ await db.saveSession({
   model: resolvedModelKey || null,
   messages: [],
   isPinned: false,
-  isSubAgent: true,        // LINE 183: Mark as sub-agent
-  forkedFrom: parentUiId,  // LINE 183: Link to parent
+  isSubAgent: true,        // LINE 186: Mark as sub-agent
+  forkedFrom: parentUiId,  // LINE 186: Link to parent
   ...
 });
 ```
 
-**Lines 201-209:** Emit `sub_agent_started` to frontend:
+**Lines 206-212:** Emit `sub_agent_started` to frontend:
 ```javascript
 io.emit('sub_agent_started', {
-  providerId,
+  providerId: resolvedProviderId,
   acpSessionId: subAcpId,
   uiId,
   parentUiId,
@@ -155,7 +155,7 @@ io.emit('sub_agent_started', {
   prompt: req.prompt,
   agent: agentName,
   model: resolvedModelKey,
-  invocationId,  // LINE 208: Ties agent to this spawn batch
+  invocationId,  // LINE 211: Ties agent to this spawn batch
 });
 ```
 
@@ -182,7 +182,7 @@ socket.on('sub_agents_starting', (data) => {
 });
 ```
 
-When `sub_agent_started` arrives (Lines 325-358):
+When `sub_agent_started` arrives:
 ```typescript
 socket.on('sub_agent_started', (data) => {
   // Add to orchestration store (for SubAgentPanel)
@@ -190,7 +190,7 @@ socket.on('sub_agent_started', (data) => {
     providerId: data.providerId,
     acpSessionId: data.acpSessionId,
     parentSessionId: data.parentSessionId,
-    invocationId: data.invocationId,  // LINE 326
+    invocationId: data.invocationId,
     index: data.index,
     name: data.name,
     ...
@@ -239,6 +239,7 @@ const wrappedOnStreamToken = (data: { sessionId: string; text: string }) => {
       id: pending.uiId,
       acpSessionId: pending.acpSessionId,
       name: pending.name,
+      provider: pending.providerId,
       messages: [],
       isTyping: true,
       isWarmingUp: false,
@@ -264,7 +265,7 @@ socket.on('token', wrappedOnStreamToken);
 
 Each sub-agent executes independently:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 231-234)
+**File:** `backend/mcp/mcpServer.js` (Lines 234-237)
 
 ```javascript
 await sendWithTimeout('session/prompt', {
@@ -346,7 +347,7 @@ Permissions from sub-agents show in the SubAgentPanel (lines 66-77 of `SubAgentP
 
 ### 10. **Backend: Capture Response & Cleanup**
 
-**File:** `backend/mcp/mcpServer.js` (Lines 235-240)
+**File:** `backend/mcp/mcpServer.js` (Lines 238-244)
 
 ```javascript
 const meta = acpClient.sessionMetadata.get(s.subAcpId);
@@ -354,7 +355,7 @@ const response = meta?.lastResponseBuffer?.trim() || '(no response)';
 completeSubAgent(s.subAcpId);
 io.emit('sub_agent_completed', { providerId, acpSessionId: s.subAcpId, index: s.index });
 writeLog(`[SUB-AGENT ${s.index}] Completed: ${s.subAcpId}`);
-cleanupAcpSession(s.subAcpId, providerId);  // LINE 240: Clean up .jsonl, .json, tasks/
+cleanupAcpSession(s.subAcpId, providerId);  // LINE 243: Clean up .jsonl, .json, tasks/
 acpClient.sessionMetadata.delete(s.subAcpId);
 ```
 
@@ -381,7 +382,7 @@ socket.on('sub_agent_completed', (data) => {
 
 ### 12. **Return Summary**
 
-**File:** `backend/mcp/mcpServer.js` (Lines 251-259)
+**File:** `backend/mcp/mcpServer.js` (Lines 254-262)
 
 ```javascript
 const summary = results.map((r, i) => {
@@ -403,7 +404,7 @@ The ACP tool call completes with the concatenated summary, which becomes a regul
 graph TB
     subgraph Backend
         B1["Parent ACP Session<br/>(requests tool call)"]
-        B2["mcpServer.ux_invoke_subagents<br/>(lines 116-260)"]
+        B2["mcpServer.ux_invoke_subagents<br/>(lines 118-263)"]
         B3["Generate invocationId<br/>subAgentRegistry track"]
         B4["For each request:<br/>session/new + session/prompt"]
         B5["Emit: sub_agents_starting<br/>Emit: sub_agent_started[0..N]"]
@@ -592,6 +593,7 @@ if (pendingSubAgents.has(data.sessionId)) {
   const subSession = {
     id: pending.uiId,
     acpSessionId: pending.acpSessionId,
+    provider: pending.providerId,
     isSubAgent: true,
     forkedFrom: pending.parentUiId,
     ...
@@ -779,13 +781,13 @@ A provider must support two hooks for sub-agent spawning:
 
 Called before `session/new` for each sub-agent. Return extra parameters to pass to the daemon.
 
-**File:** `backend/mcp/mcpServer.js` (Lines 171)
+**File:** `backend/mcp/mcpServer.js` (Lines 174-176)
 
 ```javascript
 const sessionParams = providerModule.buildSessionParams(agentName);
 const result = await sendWithTimeout('session/new', { 
   cwd, 
-  mcpServers: getMcpServers(), 
+  mcpServers: getMcpServers(resolvedProviderId), 
   ...sessionParams  // Spread provider's extra params
 }, 30000);
 ```
@@ -803,10 +805,10 @@ export function buildSessionParams(agent) {
 
 Called after `session/new` completes. Use this to switch agents at runtime via a command.
 
-**File:** `backend/mcp/mcpServer.js` (Lines 211-213)
+**File:** `backend/mcp/mcpServer.js` (Lines 214-216)
 
 ```javascript
-if (agentName !== getProvider(providerId).config.defaultSystemAgentName) {
+if (agentName !== provider.config.defaultSystemAgentName) {
   await providerModule.setInitialAgent(acpClient, subAcpId, agentName);
 }
 ```

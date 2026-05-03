@@ -2,31 +2,34 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as gemini from '../index.js';
 import fs from 'fs';
 import path from 'path';
+import { getProvider } from '../../../backend/services/providerLoader.js';
 
 // Mock getProvider
-vi.mock('../../../backend/services/providerLoader.js', () => ({
-  getProvider: () => ({
-    config: {
-      protocolPrefix: '_gemini/',
-      mcpName: 'AcpUI',
-      clientInfo: { name: 'AcpUI', version: '1.0.0' },
-      toolCategories: {
-        read_file: { category: 'file_read', isFileOperation: true },
-        write_file: { category: 'file_write', isFileOperation: true },
-        edit_file: { category: 'file_edit', isFileOperation: true },
-        glob: { category: 'glob', isFileOperation: true },
-        grep: { category: 'grep' }
-      },
-      paths: {
-        home: '/mock/home',
-        sessions: '/mock/sessions',
-        attachments: '/mock/attachments',
-        agents: '/mock/agents',
-        archive: '/mock/archive'
+vi.mock('../../../backend/services/providerLoader.js', () => {
+  return {
+    getProvider: vi.fn(() => ({
+      config: {
+        protocolPrefix: '_gemini/',
+        mcpName: 'AcpUI',
+        clientInfo: { name: 'AcpUI', version: '1.0.0' },
+        toolCategories: {
+          read_file: { category: 'file_read', isFileOperation: true },
+          write_file: { category: 'file_write', isFileOperation: true },
+          edit_file: { category: 'file_edit', isFileOperation: true },
+          glob: { category: 'glob', isFileOperation: true },
+          grep: { category: 'grep' }
+        },
+        paths: {
+          home: '/mock/home',
+          sessions: '/mock/sessions',
+          attachments: '/mock/attachments',
+          agents: '/mock/agents',
+          archive: '/mock/archive'
+        }
       }
-    }
-  })
-}));
+    }))
+  };
+});
 
 vi.mock('fs', () => ({
   default: {
@@ -82,6 +85,32 @@ describe('Gemini Provider', () => {
   });
 
   describe('intercept', () => {
+    it('normalizes available commands into slash commands', () => {
+      const payload = {
+        method: 'session/update',
+        params: {
+          sessionId: 'sid-123',
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: [
+              { name: 'help', description: 'Show help' },
+              { name: '/compact', description: 'Compact context', input: { hint: 'optional note' } }
+            ]
+          }
+        }
+      };
+
+      const result = gemini.intercept(payload);
+      expect(result.method).toBe('_gemini/commands/available');
+      expect(result.params.sessionId).toBe('sid-123');
+      expect(result.params.commands[0]).toEqual({ name: '/help', description: 'Show help' });
+      expect(result.params.commands[1]).toEqual({
+        name: '/compact',
+        description: 'Compact context',
+        meta: { hint: 'optional note' }
+      });
+    });
+
     it('emits persisted context for a loaded session on request', async () => {
       const emitProviderExtension = vi.fn();
       fs.existsSync.mockImplementation(filePath => String(filePath).endsWith('acp_session_tokens.json'));
@@ -288,6 +317,14 @@ describe('Gemini Provider', () => {
     });
   });
 
+  describe('parseExtension', () => {
+    it('parses commands/available extensions', () => {
+      const commands = [{ name: '/help', description: 'Show help' }];
+      const result = gemini.parseExtension('_gemini/commands/available', { commands });
+      expect(result).toEqual({ type: 'commands', commands });
+    });
+  });
+
   describe('Session Operations', () => {
     it('getSessionPaths resolves project-hashed dirs', () => {
       const acpId = 'a1b2c3d4-e5f6-7890';
@@ -371,21 +408,37 @@ describe('Gemini Provider', () => {
       expect(gemini.prepareAcpEnvironment).toBeDefined();
     });
 
-    it('handles token refresh on 401 response', async () => {
+    it('handles token refresh on 401 response during startup', async () => {
+      getProvider.mockReturnValue({
+        config: {
+          protocolPrefix: '_gemini/',
+          paths: { home: '/mock/home' },
+          fetchQuotaStatus: true
+        }
+      });
+
       fs.existsSync.mockReturnValue(true);
-      fs.readFileSync.mockReturnValueOnce(JSON.stringify({
+      fs.readFileSync.mockReturnValue(JSON.stringify({
         access_token: 'old-token',
         id_token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhenAiOiI2ODEyNTU4MDkzOTUtb280ZnQyb3ByZHJucDllM2FxZjZhdjNobWRpYjEzNWouYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20ifQ.sig',
         refresh_token: 'refresh123'
       }));
 
-      // First request returns 401, second after refresh returns 200
+      // 1. Initial loadCodeAssist -> 401
       global.fetch.mockResolvedValueOnce({
         ok: false,
         status: 401,
         json: async () => ({})
       });
 
+      // 2. Retry loadCodeAssist after re-reading from disk -> still 401
+      global.fetch.mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        json: async () => ({})
+      });
+
+      // 3. Refresh token request -> 200 OK
       global.fetch.mockResolvedValueOnce({
         ok: true,
         status: 200,
@@ -396,18 +449,29 @@ describe('Gemini Provider', () => {
         })
       });
 
+      // 4. Retry loadCodeAssist -> 200 OK
+      global.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ cloudaicompanionProject: 'proj-123' })
+      });
+
+      // 5. Initial quota fetch (_fetchAndEmitQuota) -> 200 OK
       global.fetch.mockResolvedValueOnce({
         ok: true,
         status: 200,
         json: async () => ({ buckets: [{ modelId: 'gemini-pro', remainingFraction: 0.5 }] })
       });
 
-      fs.writeFileSync.mockImplementation(() => {});
+      fs.writeFileSync.mockClear();
 
       await gemini.prepareAcpEnvironment({}, { emitProviderExtension: emitSpy });
 
-      // Verify writeFileSync was called to save refreshed credentials
-      expect(fs.writeFileSync).toBeDefined();
+      // Use vi.waitFor because _startQuotaFetching runs as a background task
+      await vi.waitFor(() => {
+        expect(fs.writeFileSync).toHaveBeenCalled();
+        expect(global.fetch).toHaveBeenCalledTimes(5);
+      }, { timeout: 1000 });
     });
 
     it('extracts client ID from JWT azp field', async () => {

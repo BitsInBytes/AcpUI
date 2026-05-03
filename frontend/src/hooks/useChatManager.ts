@@ -197,6 +197,7 @@ export function useChatManager(
           id: pending.uiId,
           acpSessionId: pending.acpSessionId,
           name: pending.name,
+          provider: pending.providerId,
           messages: [],
           isTyping: true,
           isWarmingUp: false,
@@ -392,6 +393,7 @@ export function useChatManager(
         useSessionLifecycleStore.setState(state => ({ sessions: [...state.sessions, {
           id: pending.uiId, acpSessionId: pending.acpSessionId,
           name: pending.name,
+          provider: pending.providerId,
           messages: [], isTyping: true, isWarmingUp: false, model: pending.model as 'fast' | 'balanced' | 'flagship',
           isSubAgent: true, parentAcpSessionId: pending.parentSessionId,
           forkedFrom: pending.parentUiId,

@@ -248,4 +248,37 @@ describe('acpUpdateHandler', () => {
     const lastEmit = systemEvents.at(-1)[1];
     expect(lastEmit.title).toBe('Cached Title');
   });
+
+  it('assigns lastSubAgentParentAcpId for sub-agent spawning tools', async () => {
+    const update = { sessionUpdate: 'tool_call', title: 'ux_invoke_subagents', toolCallId: 't1' };
+    await handleUpdate(client, sid, update);
+    expect(client.lastSubAgentParentAcpId).toBe(sid);
+  });
+
+  it('ignores empty tool_call_update', async () => {
+    const update = { sessionUpdate: 'tool_call_update', toolCallId: 't1' };
+    await handleUpdate(client, sid, update);
+    const systemEvents = client.io.emit.mock.calls.filter(c => c[0] === 'system_event');
+    expect(systemEvents).toHaveLength(0);
+  });
+
+  it('handles diff fallback in tool_call_update', async () => {
+    mockProviderModule.extractToolOutput.mockReturnValue(undefined);
+    const update = {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 't1',
+      content: [{ type: 'diff', oldText: 'a', newText: 'b' }]
+    };
+    await handleUpdate(client, sid, update);
+    expect(client.io.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+      output: 'diff-output'
+    }));
+  });
+
+  it('skips path resolution for paths with ellipses', async () => {
+    mockProviderModule.extractFilePath.mockImplementation((u, resolve) => resolve('some/.../path'));
+    await handleUpdate(client, sid, { sessionUpdate: 'tool_call_update', toolCallId: 't1', title: 'test' });
+    const systemEvents = client.io.emit.mock.calls.filter(c => c[0] === 'system_event');
+    expect(systemEvents[0][1].filePath).toBeUndefined();
+  });
 });

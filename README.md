@@ -4,6 +4,14 @@ A lightweight, high-performance web UI for ACP-based AI agents. Strictly provide
 
 Spawns an ACP daemon natively on the host OS, parses the JSON-RPC stream into a **Unified Timeline**, and presents a high-fidelity chat interface with an integrated canvas, terminal, and diff viewer.
 
+## Documentation Map
+
+- **Agent standards and workflow:** [BOOTSTRAP.md](BOOTSTRAP.md) for development standards, coding practices, and operating instructions for coding agents.
+- **Root README (this file):** platform overview, architecture, setup, and operational entry points.
+- **Backend guide:** [backend/README.md](backend/README.md) for human-readable backend responsibilities, structure, and ops commands.
+- **Frontend guide:** [frontend/README.md](frontend/README.md) for human-readable frontend responsibilities, structure, and build/test commands.
+- **Deep implementation docs:** [documents/](documents/) (`[Feature Doc] - *.md`) for exact technical breakdowns and line-level references.
+
 ## Architecture
 
 ```
@@ -26,6 +34,18 @@ Spawns an ACP daemon natively on the host OS, parses the JSON-RPC stream into a 
 ```
 
 The backend supports multiple concurrent providers configured via `configuration/providers.json` (or the `ACP_PROVIDERS_CONFIG` env var). Each provider defines its own ACP command, models, branding, extension protocol, and file paths. See the [Provider System feature doc](<documents/[Feature Doc] - Provider System.md>) for full documentation.
+
+### Runtime Flow Graph
+
+```mermaid
+flowchart LR
+  U[Browser UI<br/>React + Zustand] -->|Socket.IO events| B[Backend<br/>Express + Socket.IO]
+  B -->|JSON-RPC over stdio| A[ACP Daemon]
+  A -->|session/update, permission requests| B
+  B -->|Unified timeline events| U
+  B <-->|SQLite persistence| D[(persistence.db)]
+  B <-->|MCP tool calls| M[Stdio MCP Proxy]
+```
 
 ### Backend Orchestration
 
@@ -274,16 +294,21 @@ The MCP server name that exposes these tools is defined in the provider's `provi
 ## Tests
 
 ```powershell
-cd backend; npm test     # 527 tests
-cd frontend; npm test    # 736 tests
+cd backend; npx vitest run --coverage
+cd frontend; npx vitest run --coverage
 ```
 
-Total: 1,263 tests.
+Last updated: **May 3, 2026 at 1:47 PM (America/Winnipeg)**.
 
-| Suite | Statements | Branches | Functions | Lines |
-|---|---|---|---|---|
-| Backend | 90.09% | 79.32% | 91.53% | 92.64% |
-| Frontend | 74.87% | 67.51% | 73.87% | 77.83% |
+| Suite | Test Files | Tests | Statements | Branches | Functions | Lines |
+|---|---:|---:|---:|---:|---:|---:|
+| Backend | 61 | 637 | 91.09% | 80.03% | 93.42% | 93.71% |
+| Frontend | 77 | 685 | 79.23% | 70.21% | 78.36% | 83.14% |
+| **Total** | **138** | **1,322** | — | — | — | — |
+
+Notes:
+- Coverage values come from `vitest --coverage` “All files” for each package.
+- Frontend run emitted expected test-environment warnings for unimplemented browser APIs (`canvas`, `window.alert`, `window.open`), but all tests passed.
 
 ## Provider System
 

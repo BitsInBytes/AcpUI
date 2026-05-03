@@ -12,7 +12,7 @@ Gemini is implemented via the `@google/gemini-cli` npm package running in ACP (A
 
 Gemini implements all required provider contract functions:
 
-- **intercept()** — Caches tool arguments on `tool_call`, extracts Context Usage Percentage on `end_turn`, triggers OAuth quota fetching, and actively **swallows** the native Gemini `usage_update` event to prevent wild UI percentage swings.
+- **intercept()** — Caches tool arguments on `tool_call`, normalizes `available_commands_update` into slash-prefixed `commands/available` provider extensions, extracts Context Usage Percentage on `end_turn`, triggers OAuth quota fetching, and actively **swallows** the native Gemini `usage_update` event to prevent wild UI percentage swings.
 - **normalizeUpdate()** — Strips `<system-reminder>` XML tags from message chunks and trims leading/trailing whitespace.
 - **extractToolOutput()** — Multi-stage lookup for tool output. Fixes `read_file` by reading from disk directly. Reconstructs dropped structured outputs (like `list_directory`) using cached arguments.
 - **extractFilePath()** — Fallback chain to find paths in `locations` arrays, `content` arrays, and parsed JSON `arguments`.
@@ -278,14 +278,14 @@ Unlike other providers, Gemini does not physically truncate the JSONL file when 
 | Lines | Function | Purpose |
 |-------|----------|---------|
 | 11–22 | logContext() | JSONL logging to `context_debug.log`. |
-| 53–158 | intercept() | Emit context %, trigger quota fetch, cache tool args, track active prompts. |
+| 78–181 | intercept() | Emit context %, normalize available commands, trigger quota fetch, cache tool args, track active prompts. |
 | 163–185 | normalizeUpdate() | Strips `<system-reminder>` XML tags. |
 | 205–302 | extractToolOutput() | Extracts from `result` / `content`, fixes `read_file` disk reads, reconstructions. |
 | 314–343 | extractFilePath() | Extracts file paths from locations, content arrays, or parsed JSON args. |
 | 355–385 | extractDiffFromToolCall() | Pulls unified diff patches from Write/Edit tools for live rendering. |
 | 413–487 | normalizeTool() | Maps `kind` enums, synthesizes titles, strips MCP prefixes. |
 | 492–513 | categorizeToolCall() | Routes AcpUI MCP tools and standard categories. |
-| 515–534 | parseExtension() | Maps `{prefix}metadata` and `{prefix}provider/status`. |
+| 592–614 | parseExtension() | Maps `{prefix}commands/available`, `{prefix}metadata`, and `{prefix}provider/status`. |
 | 610-631 | prepareAcpEnvironment() | Bootstraps background quota polling if allowed. |
 | 660–696 | findSessionDir() / getShortId() | Resolves Gemini's deep project-hash directory structure. |
 | 732–809 | cloneSession() | Truncates user turns and copies files into the same project dir. |

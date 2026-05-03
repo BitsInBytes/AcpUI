@@ -60,6 +60,17 @@ export function normalizeModelState(modelState) {
   return modelState;
 }
 
+function normalizeCommands(commands) {
+  if (!Array.isArray(commands)) return [];
+  return commands
+    .filter(command => command && typeof command.name === 'string')
+    .map(command => ({
+      name: command.name.startsWith('/') ? command.name : `/${command.name}`,
+      description: command.description || '',
+      ...(command.input?.hint ? { meta: { hint: command.input.hint } } : {})
+    }));
+}
+
 /**
  * Intercept raw messages from the Gemini process and translate them into
  * standardized ACP protocol messages.
@@ -73,6 +84,17 @@ export function intercept(payload) {
     if (payload?.method === 'session/update' || payload?.method === 'session/notification') {
       const sessionId = payload.params?.sessionId;
       const update = payload.params?.update;
+
+      if (update?.sessionUpdate === 'available_commands_update') {
+        return {
+          id: payload.id,
+          method: `${config.protocolPrefix}commands/available`,
+          params: {
+            sessionId,
+            commands: normalizeCommands(update.availableCommands)
+          }
+        };
+      }
 
       if (sessionId) {
         _lastSessionId = sessionId;
@@ -575,6 +597,9 @@ export function parseExtension(method, params) {
   let result = null;
 
   switch (type) {
+    case 'commands/available':
+      result = { type: 'commands', commands: params.commands };
+      break;
     case 'metadata':
       result = { type: 'metadata', sessionId: params.sessionId, contextUsagePercentage: params.contextUsagePercentage };
       break;
@@ -1242,30 +1267,47 @@ function _ensureQuotaPolling() {
   _quotaPollTimer.unref?.();
 }
 
+async function _requestLoadCodeAssist(token) {
+  return fetch('https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      metadata: {
+        ideName: 'IDE_UNSPECIFIED',
+        pluginType: 'GEMINI',
+        ideVersion: '1.0.0',
+        platform: 'PLATFORM_UNSPECIFIED',
+        updateChannel: 'stable'
+      }
+    })
+  });
+}
+
 async function _startQuotaFetching(homePath) {
   stopQuotaFetching();
   try {
     const { config } = getProvider();
-    const token = _readTokenFromDisk(homePath);
+    let token = _readTokenFromDisk(homePath);
     if (!token) return;
 
     // Discover cloudaicompanionProject ID (required for quota calls)
-    const loadRes = await fetch('https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        metadata: {
-          ideName: 'IDE_UNSPECIFIED',
-          pluginType: 'GEMINI',
-          ideVersion: '1.0.0',
-          platform: 'PLATFORM_UNSPECIFIED',
-          updateChannel: 'stable'
-        }
-      })
-    });
+    let loadRes = await _requestLoadCodeAssist(token);
+
+    if (loadRes.status === 401) {
+      // Re-read from disk first (another process may have refreshed it)
+      token = _readTokenFromDisk(homePath);
+      loadRes = await _requestLoadCodeAssist(token);
+
+      if (loadRes.status === 401) {
+        // Only now do we refresh and save new creds
+        token = await _refreshAndSaveToken(homePath);
+        if (!token) return;
+        loadRes = await _requestLoadCodeAssist(token);
+      }
+    }
 
     if (!loadRes.ok) {
       throw new Error(`loadCodeAssist returned ${loadRes.status}`);

@@ -188,7 +188,7 @@ The provider:
 
 - Finds sessions recursively by UUID in filename first, then by file content.
 - Clones sessions by copying the rollout and replacing the old UUID with the new fork UUID.
-- Prunes cloned rollouts by user-turn boundaries.
+- Prunes cloned rollouts by user-turn boundaries, cutting at the next turn start so no orphan user prompt records remain.
 - Archives/restores rollouts while preserving the original dated directory.
 - Parses `event_msg` and `response_item` records for rehydration.
 

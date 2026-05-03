@@ -486,11 +486,12 @@ export function getMcpServers(providerId) {
 
 ### Version 2: For Sub-Agent Sessions (mcpServer.js)
 
-**File:** `backend/mcp/mcpServer.js` (Lines 40-53)
+**File:** `backend/mcp/mcpServer.js` (Lines 40-55)
 
 ```javascript
-export function getMcpServers() {  // ← No providerId parameter
-  const name = getProvider().config.mcpName;  // ← Uses getProvider() without args
+export function getMcpServers(providerId = null) {
+  const provider = getProvider(providerId);
+  const name = provider.config.mcpName;
   if (!name) return [];
   const proxyPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'stdio-proxy.js');
   return [{
@@ -498,7 +499,7 @@ export function getMcpServers() {  // ← No providerId parameter
     command: 'node',
     args: [proxyPath],
     env: [
-      // ← NO ACP_SESSION_PROVIDER_ID here
+      { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ]
@@ -506,17 +507,17 @@ export function getMcpServers() {  // ← No providerId parameter
 }
 ```
 
-**Used by:** Inside `mcpServer.js` at line 172 for sub-agent spawning.
+**Used by:** Inside `mcpServer.js` for sub-agent spawning (line 175: `mcpServers: getMcpServers(resolvedProviderId)`).
 
-**Key:** Does NOT include `ACP_SESSION_PROVIDER_ID`. The proxy will send `providerId: null` to the backend, and the backend falls back to the default/active provider.
+**Key:** Includes `ACP_SESSION_PROVIDER_ID` to ensure sub-agent sessions inherit the parent provider scope, enabling nested tool calls to work correctly.
 
 ### Why Two?
 
-The sessionManager version is the "proper" one with full context. The mcpServer version is a shortcut for internal sub-agent use where the provider is already known in the calling context.
+The sessionManager version is used by socket session creation paths. The mcpServer version is used by internal sub-agent session creation paths.
 
 ### Implication
 
-When tools are called from within a sub-agent, they may not know their provider explicitly (it defaults). This is usually fine because there's typically one active provider at a time.
+Both flows propagate provider identity explicitly via `ACP_SESSION_PROVIDER_ID` env var. The gotcha is maintenance drift: there are two implementations in different files and both must stay aligned to ensure provider scoping works consistently for user sessions and sub-agent sessions.
 
 ---
 
@@ -578,11 +579,11 @@ After making changes:
 
 | File | Functions | Lines | Purpose |
 |------|-----------|-------|---------|
-| `backend/mcp/mcpServer.js` | `createToolHandlers(io)` | 61-297 | Defines all tool handlers (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) |
-| | `getMcpServers()` | 40-53 | Returns MCP server config for sub-agent spawning (no providerId env) |
-| | `ux_invoke_shell` | 64-114 | Spawn PTY, stream output, handle timeout |
-| | `ux_invoke_subagents` | 116-260 | Spawn sub-agents, await responses, cleanup |
-| | `ux_invoke_counsel` | 274-297 | Spawn counsel agents (delegates to ux_invoke_subagents) |
+| `backend/mcp/mcpServer.js` | `createToolHandlers(io)` | 63-303 | Defines all tool handlers (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) |
+| | `getMcpServers()` | 40-55 | Returns MCP server config for sub-agent spawning (includes ACP_SESSION_PROVIDER_ID env) |
+| | `ux_invoke_shell` | 66-116 | Spawn PTY, stream output, handle timeout |
+| | `ux_invoke_subagents` | 118-263 | Spawn sub-agents, await responses, cleanup |
+| | `ux_invoke_counsel` | 277-300 | Spawn counsel agents (delegates to ux_invoke_subagents) |
 | `backend/mcp/stdio-proxy.js` | `runProxy()` | 40-66 | Fetch schemas, register with MCP SDK, forward tool calls |
 | | `backendFetch()` | 25-38 | HTTP request with 3-attempt retry loop |
 | `backend/routes/mcpApi.js` | `GET /tools` | 24-78 | Return tool schemas and server name |
@@ -605,7 +606,7 @@ Lines 85-87 of `mcpApi.js` disable all HTTP timeouts. **This is intentional** �
 
 ### 3. **Two Different getMcpServers Functions**
 
-`sessionManager.js:getMcpServers(providerId)` has `ACP_SESSION_PROVIDER_ID` in env. `mcpServer.js:getMcpServers()` doesn't. Don't mix them up.
+Both `sessionManager.js:getMcpServers(providerId)` and `mcpServer.js:getMcpServers(providerId)` include `ACP_SESSION_PROVIDER_ID` in env. They exist in two places because one is used for user session creation (sessionManager) and the other for sub-agent session creation within tool handlers (mcpServer). Both must stay aligned.
 
 ### 4. **The Proxy Retries Three Times**
 
@@ -615,9 +616,9 @@ Lines 85-87 of `mcpApi.js` disable all HTTP timeouts. **This is intentional** �
 
 Handlers must return `{ content: [{ type: 'text', text: '...' }, ...] }`. Returning raw strings or other shapes will confuse the ACP.
 
-### 6. **providerId May Be Null for Sub-Agent Tools**
+### 6. **Provider Scope Is Inherited by Sub-Agents**
 
-Because the sub-agent version of `getMcpServers()` doesn't include `ACP_SESSION_PROVIDER_ID`, tools called from within sub-agents receive `providerId: null`. The backend falls back to the active/default provider. This is usually fine but worth being aware of.
+Sub-agent sessions inherit the parent provider's `ACP_SESSION_PROVIDER_ID` via environment variable. This ensures tools called from within sub-agents maintain the correct provider scope and access the right configuration, models, and branding. No fallback logic needed.
 
 ### 7. **Tool Definitions Are Cached by Proxy**
 

@@ -80,15 +80,17 @@ The Codex provider connects AcpUI to the `codex-acp` executable. The main implem
 
 10. **Session Files**
 
-    `providers/codex/index.js:551` finds rollout JSONL files recursively. `providers/codex/index.js:601` clones and prunes by user-turn boundaries. `providers/codex/index.js:822` parses rollout history for rehydration.
+    `providers/codex/index.js` finds rollout JSONL files recursively, clones/prunes by user-turn boundaries, trims from the next turn start boundary (so forked files never retain orphan `response_item` user prompts), copies matching task directories, and parses modern Codex rollout records for rehydration (`event_msg`, `response_item`, and `compacted`).
+    - Rehydration links tool starts/ends through `call_id` across `function_call`, `function_call_output`, `exec_command_end`, `custom_tool_call`, and `patch_apply_end`.
+    - `compacted.replacement_history` is treated as the replacement source-of-truth for earlier messages when compaction records appear.
 
 11. **Quota & OAuth Management**
 
     `providers/codex/index.js:500` starts background fetching in `prepareAcpEnvironment()`.
     - **Initial Load:** Fetches quota immediately on boot and emits `_codex/provider/status`.
-    - **Reactive Refresh:** `fetchCodexQuota()` (Lines 577-594) implements a retry loop. On 401, it reads `auth.json`, refreshes the token, saves it, and retries.
-    - **Client ID Derivation:** `extractClientIdFromAccessToken()` (Lines 631-643) decodes the JWT `access_token` from `auth.json` to find the `client_id` automatically.
-    - **Poll Control:** `intercept()` (Lines 105-141) tracks `_activePromptCount`. Polling only occurs when at least one prompt is in-flight and stops when all turns end.
+    - **Reactive Refresh:** `fetchCodexQuota()` (Lines 769-793) implements a retry loop. On 401, it reads `auth.json`, refreshes the token, saves it, and retries.
+    - **Client ID Derivation:** `extractClientIdFromAccessToken()` (Lines 840-854) decodes the JWT `access_token` from `auth.json` to find the `client_id` automatically.
+    - **Poll Control:** `intercept()` (Lines 220-336) tracks `_activePromptCount`. Polling only occurs when at least one prompt is in-flight and stops when all turns end.
 
 ## Architecture Diagram
 
@@ -174,7 +176,7 @@ Frontend receives:
 | File | Key Functions | Purpose |
 | --- | --- | --- |
 | `providers/codex/index.js` | `performHandshake`, `prepareAcpEnvironment` | Startup, auth, and quota init |
-| `providers/codex/index.js` | `intercept`, `normalizeConfigOptions` | Config/Command updates; active prompt tracking |
+| `providers/codex/index.js` | `intercept`, `normalizeConfigOptions` | Config/Command updates; active prompt tracking; error message promotion |
 | `providers/codex/index.js` | `fetchCodexQuota` | Handled OAuth-backed quota retrieval with 401 retry |
 | `providers/codex/index.js` | `refreshCodexOAuthToken` | Refreshes and persists tokens to `auth.json` |
 | `providers/codex/index.js` | `buildCodexProviderStatus` | Maps raw ChatGPT usage JSON to UI status shape |
@@ -195,6 +197,8 @@ Frontend receives:
 6. **Do not auto-trigger ChatGPT auth in `"auto"` mode.** It can launch browser/device login during backend startup.
 7. **Do not persist the Codex `model` config option.** It is represented by AcpUI model state instead.
 8. **Automatic OAuth refresh requires a valid JWT.** If `auth.json` contains an opaque token without a `client_id`, refresh will fail.
+9. **Codex buries the user-facing error message in `error.data.message`.** The JSON-RPC top-level `error.message` is always the generic sentinel `"Internal error"` (-32603). The `intercept()` function promotes `error.data.message` to `error.message` so the real cause (e.g. `usage_limit_exceeded`) surfaces in logs and in the UI error box.
+10. **Avoid double-counting assistant text during rehydration.** When `event_msg/agent_message` exists, treat `response_item/message(role=assistant)` as fallback-only for text to prevent duplicate assistant outputs.
 
 ## Unit Tests
 
@@ -202,11 +206,11 @@ Frontend receives:
   - **Quota Status:** Handshake, 401 refresh loop, client ID derivation, status mapping
   - Handshake and auth selection
   - Environment injection
-  - Command/config update normalization
+  - Command/config update normalization; error message promotion
   - Config option routing
   - Tool output/path/diff extraction
   - Tool normalization/categorization
-  - Rollout cloning and parsing
+  - Rollout cloning and parsing (modern Codex JSONL schema + compaction handling)
 
 - `backend/test/sessionHandlers.test.js`
   - `captures normalized config options returned by session/new`

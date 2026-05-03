@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getMcpServers, createToolHandlers, getMaxShellResultLines } from '../mcp/mcpServer.js';
+import { loadCounselConfig } from '../services/counselConfig.js';
 import EventEmitter from 'events';
 
 // Hoist Mocks
@@ -76,18 +77,19 @@ vi.mock('../database.js', () => ({
     saveSession: vi.fn().mockResolvedValue(),
     deleteSession: vi.fn().mockResolvedValue()
 }));
-vi.mock('./subAgentRegistry.js', () => ({
+vi.mock('../mcp/subAgentRegistry.js', () => ({
     registerSubAgent: vi.fn(),
     completeSubAgent: vi.fn(),
     failSubAgent: vi.fn()
 }));
-vi.mock('./acpCleanup.js', () => ({ cleanupAcpSession: vi.fn() }));
+vi.mock('../mcp/acpCleanup.js', () => ({ cleanupAcpSession: vi.fn() }));
 vi.mock('../services/counselConfig.js', () => ({
-    loadCounselConfig: () => ({ core: [{ name: 'A', prompt: 'p' }], specialized: [{ name: 'B', prompt: 'p2' }] })
+    loadCounselConfig: vi.fn(() => ({ core: [{ name: 'A', prompt: 'p' }], specialized: [{ name: 'B', prompt: 'p2' }] }))
 }));
 
 /** Default provider config used by most tests. Uses the new quickAccess[] format. */
 const DEFAULT_PROVIDER_CONFIG = {
+  id: 'provider-a',
   config: {
     mcpName: 'TestUI',
     defaultSubAgentName: 'dev',
@@ -126,9 +128,24 @@ describe('mcpServer', () => {
   });
 
   it('getMcpServers returns server config', () => {
-    const servers = getMcpServers();
+    const servers = getMcpServers('provider-a');
     expect(servers).toHaveLength(1);
     expect(servers[0].name).toBe('TestUI');
+    expect(servers[0].env).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'ACP_SESSION_PROVIDER_ID', value: 'provider-a' })
+    ]));
+  });
+
+  it('getMcpServers handles null providerId by using default provider', () => {
+    mockGetProvider.mockImplementation((id) => {
+      if (!id) return DEFAULT_PROVIDER_CONFIG;
+      return null;
+    });
+    const servers = getMcpServers(null);
+    expect(servers).toHaveLength(1);
+    expect(servers[0].env).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'ACP_SESSION_PROVIDER_ID', value: 'provider-a' })
+    ]));
   });
 
   describe('ux_invoke_shell', () => {
@@ -273,6 +290,7 @@ describe('mcpServer', () => {
       // sub_agents_starting must be emitted synchronously / before any timers fire
       expect(mockIo.emit).toHaveBeenCalledWith('sub_agents_starting', expect.objectContaining({
         invocationId: expect.stringMatching(/^inv-/),
+        providerId: 'provider-a',
         count: 2,
       }));
 
@@ -378,6 +396,7 @@ describe('mcpServer', () => {
     it('uses models.default when no explicit model and no subAgent configured', async () => {
       // Override provider to have no subAgent field
       mockGetProvider.mockReturnValueOnce({
+        id: 'provider-a',
         config: {
           mcpName: 'TestUI',
           defaultSubAgentName: 'dev',
@@ -409,6 +428,7 @@ describe('mcpServer', () => {
     it('stores null (not empty string) for model when no model can be resolved', async () => {
       // Override provider to have completely empty models
       mockGetProvider.mockReturnValueOnce({
+        id: 'provider-a',
         config: {
           mcpName: 'TestUI',
           defaultSubAgentName: 'dev',
@@ -438,6 +458,7 @@ describe('mcpServer', () => {
     it('stores null in db.saveSession.model when no model resolves', async () => {
       const { saveSession } = await import('../database.js');
       mockGetProvider.mockReturnValueOnce({
+        id: 'provider-a',
         config: {
           mcpName: 'TestUI',
           defaultSubAgentName: 'dev',
@@ -489,10 +510,65 @@ describe('mcpServer', () => {
         expect.objectContaining({ model: 'explicit-model-id', currentModelId: 'explicit-model-id' })
       );
     });
-  });
 
-  describe('ux_invoke_counsel', () => {
+    it('passes resolvedProviderId to sub-agent registration and database', async () => {
+      const { saveSession } = await import('../database.js');
+      const { registerSubAgent } = await import('../mcp/subAgentRegistry.js');
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'multi-provider-sub';
+
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        return {};
+      });
+
+      await runInvokeSubAgents(handlers, {
+        requests: [{ name: 'Agent', prompt: 'Do thing', agent: 'dev' }]
+      });
+
+      expect(registerSubAgent).toHaveBeenCalledWith(
+        'provider-a',
+        subId,
+        null,
+        'Do thing',
+        'dev'
+      );
+      expect(saveSession).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'provider-a' })
+      );
+      });
+
+      it('returns error if io is missing', async () => {
+      const handlers = createToolHandlers(null);
+      const result = await handlers.ux_invoke_subagents({ requests: [] });
+      expect(result.content[0].text).toContain('Error: Sub-agent system not available');
+      });
+
+      it('resolves parentUiId if lastSubAgentParentAcpId is set', async () => {
+      const { getSessionByAcpId } = await import('../database.js');
+      vi.mocked(getSessionByAcpId).mockResolvedValueOnce({ id: 'parent-ui-123' });
+      mockAcpClient.lastSubAgentParentAcpId = 'parent-acp-456';
+
+      const handlers = createToolHandlers(mockIo);
+      await handlers.ux_invoke_subagents({ requests: [{ prompt: 'hi' }], providerId: 'provider-a' });
+
+      expect(getSessionByAcpId).toHaveBeenCalledWith('provider-a', 'parent-acp-456');
+      expect(mockIo.emit).toHaveBeenCalledWith('sub_agents_starting', expect.objectContaining({
+        parentUiId: 'parent-ui-123'
+      }));
+      });
+      });
+
+      describe('ux_invoke_counsel', () => {
+      it('returns error if no counsel agents are configured', async () => {
+      vi.mocked(loadCounselConfig).mockReturnValueOnce({ core: [], specialized: [] });
+      const handlers = createToolHandlers(mockIo);
+      const result = await handlers.ux_invoke_counsel({ question: 'What to do?' });
+      expect(result.content[0].text).toContain('Error: No counsel agents configured');
+      });
+
       it('runs counsel with specialized agents', async () => {
+
           const handlers = createToolHandlers(mockIo);
           vi.spyOn(handlers, 'ux_invoke_subagents').mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
 

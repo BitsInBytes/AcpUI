@@ -56,22 +56,28 @@
   display: flex;
   align-items: center;
   gap: 1rem;
+  flex: 1;
+  min-width: 0;
 }
 
 .header-divider {
   width: 1px;
   height: 24px;
   background-color: var(--border-color);
+  flex-shrink: 0;
 }
 
 .header-title-container {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+  flex: 1;
+  min-width: 0;
 }
 
 .header-icon {
   color: var(--accent-color);
+  flex-shrink: 0;
 }
 
 .header-title {
@@ -80,6 +86,8 @@
   margin: 0;
   display: flex;
   align-items: center;
+  flex: 1;
+  min-width: 0;
 }
 
 .header-session-name {
@@ -89,13 +97,14 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 400px;
+  width: 100%;
 }
 
 .header-actions {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+  flex-shrink: 0;
 }
 
 .brain-button {

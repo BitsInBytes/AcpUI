@@ -279,7 +279,7 @@ describe('useChatManager hook', () => {
     renderHook(() => useChatManager(vi.fn()));
     const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_started')[1];
 
-    const data = { acpSessionId: 'sub-acp', uiId: 'sub-ui', parentUiId: 'parent-ui', index: 0, name: 'Agent', prompt: 'p', agent: 'a', invocationId: 'inv-abc' };
+    const data = { providerId: 'provider-a', acpSessionId: 'sub-acp', uiId: 'sub-ui', parentUiId: 'parent-ui', index: 0, name: 'Agent', prompt: 'p', agent: 'a', invocationId: 'inv-abc' };
     act(() => { handler(data); });
 
     expect(addAgent).toHaveBeenCalled();
@@ -289,6 +289,77 @@ describe('useChatManager hook', () => {
     const parentSession = sessions.find((s: any) => s.id === 'parent-ui') as any;
     const toolStep = parentSession?.messages?.[0]?.timeline?.[0];
     expect(toolStep?.event?.invocationId).toBe('inv-abc');
+  });
+
+  it('creates lazy sub-agent session with provider on first token', async () => {
+    const { useSubAgentStore } = await import('../store/useSubAgentStore');
+    act(() => {
+      useSubAgentStore.setState({ addAgent: vi.fn() as any });
+      useSessionLifecycleStore.setState({
+        sessions: [{ id: 'parent-ui', acpSessionId: 'parent-acp', messages: [] } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const startedHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_started')[1];
+    const tokenHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'token')[1];
+
+    act(() => {
+      startedHandler({
+        providerId: 'provider-a',
+        acpSessionId: 'sub-acp-token',
+        uiId: 'sub-ui-token',
+        parentUiId: 'parent-ui',
+        index: 0,
+        name: 'Token Agent',
+        prompt: 'p',
+        agent: 'a',
+        invocationId: 'inv-token'
+      });
+      tokenHandler({ sessionId: 'sub-acp-token', text: 'hello' });
+    });
+
+    const created = useSessionLifecycleStore.getState().sessions.find((s: any) => s.id === 'sub-ui-token') as any;
+    expect(created).toBeDefined();
+    expect(created.provider).toBe('provider-a');
+    expect(created.name).toBe('Token Agent');
+  });
+
+  it('creates lazy sub-agent session with provider on first system_event', async () => {
+    const { useSubAgentStore } = await import('../store/useSubAgentStore');
+    act(() => {
+      useSubAgentStore.setState({
+        agents: [],
+        addAgent: vi.fn() as any,
+      });
+      useSessionLifecycleStore.setState({
+        sessions: [{ id: 'parent-ui', acpSessionId: 'parent-acp', messages: [] } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const startedHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_started')[1];
+    const systemHandlers = mockSocket.on.mock.calls.filter((c: any) => c[0] === 'system_event').map((c: any) => c[1]);
+
+    act(() => {
+      startedHandler({
+        providerId: 'provider-b',
+        acpSessionId: 'sub-acp-event',
+        uiId: 'sub-ui-event',
+        parentUiId: 'parent-ui',
+        index: 0,
+        name: 'Event Agent',
+        prompt: 'p',
+        agent: 'a',
+        invocationId: 'inv-event'
+      });
+      for (const h of systemHandlers) h({ sessionId: 'sub-acp-event', type: 'noop', id: 't1', title: 'Tool' });
+    });
+
+    const created = useSessionLifecycleStore.getState().sessions.find((s: any) => s.id === 'sub-ui-event') as any;
+    expect(created).toBeDefined();
+    expect(created.provider).toBe('provider-b');
+    expect(created.name).toBe('Event Agent');
   });
 
   it('handles "session_renamed" event', () => {

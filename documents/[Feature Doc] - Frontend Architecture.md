@@ -147,12 +147,12 @@ The session's messages array is populated from the backend, which reconstructs t
 ---
 
 ### 4. Socket Listener Setup & Event Binding
-**File:** `frontend/src/hooks/useChatManager.ts` (Lines 62-417)
+**File:** `frontend/src/hooks/useChatManager.ts` (Lines 62-438)
 
 In a useEffect, the `useChatManager()` hook attaches Socket.IO event listeners for all streaming events:
 
 ```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 62-417)
+// FILE: frontend/src/hooks/useChatManager.ts (Lines 62-438)
 useEffect(() => {
   const socket = getSocket();
   
@@ -228,7 +228,7 @@ The token is **not immediately rendered** — it's buffered. This allows the `pr
 ### 6. processBuffer() — The Typewriter Heart
 **File:** `frontend/src/store/useStreamStore.ts` (Lines 199-402)
 
-`processBuffer()` is the **core rendering engine**. It's called repeatedly by a loop (Lines 419-427 in useChatManager.ts) and slowly drains the buffer, character-by-character:
+`processBuffer()` is the **core rendering engine**. It's called repeatedly by a loop (Lines 440-444 in useChatManager.ts) and slowly drains the buffer, character-by-character:
 
 ```typescript
 // FILE: frontend/src/store/useStreamStore.ts (Lines 199-402)
@@ -515,6 +515,7 @@ This is a **pure function** (no side effects). It just routes and returns the ac
 │  │  ├─ useFileUpload(): drag & drop, paste handler            │  │
 │  │  ├─ useVoice(): WavRecorder integration                    │  │
 │  │  └─ useScroll(): auto-scroll with manual override          │  │
+│  │      (See [Feature Doc] - Auto-scroll System.md)          │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
@@ -727,11 +728,13 @@ onStreamToken({ text: 'Hel' }) {
 ### 4. Typewriter Loop Calls processBuffer()
 
 ```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 419-427)
+// FILE: frontend/src/hooks/useChatManager.ts (Lines 440-444)
 // Called every 16ms (~60 FPS)
-setInterval(() => {
-  useStreamStore.getState().processBuffer();
-}, 16);
+useEffect(() => {
+  if (hasQueues && !typewriterInterval) {
+    processBuffer(scrollToBottom, onFileEdited, onOpenFileInCanvas);
+  }
+}, [hasQueues, typewriterInterval, processBuffer, scrollToBottom, onFileEdited, onOpenFileInCanvas]);
 ```
 
 ### 5. processBuffer() Drains Character-by-Character
@@ -795,10 +798,10 @@ The text appears instantly (re-rendered on next frame). If more tokens arrive wh
 |------|--------|---------|-----------|
 | `useSocket.ts` | `getOrCreateSocket()` | Singleton Socket.IO + event handlers | 19-147 |
 | | `useSocket()` | React hook that returns socket instance | 149-167 |
-| `useChatManager.ts` | `useChatManager()` | Attach socket listeners + typewriter loop | 23-428 |
-| | `trimShellOutputLines()` | Utility to truncate shell output | 430-441 |
+| `useChatManager.ts` | `useChatManager()` | Attach socket listeners + typewriter loop | 23-445 |
+| | `trimShellOutputLines()` | Utility to truncate shell output | 447-458 |
 | `useFileUpload.ts` | `useFileUpload()` | Drag & drop + paste handler | (implied) |
-| `useScroll.ts` | `useScroll()` | Auto-scroll with manual override | (implied) |
+| `useScroll.ts` | `useScroll()` | Auto-scroll with manual override (See `[Feature Doc] - Auto-scroll System.md`) | (implied) |
 | `useVoice.ts` | `useVoice()` | WavRecorder integration | (implied) |
 
 ### Key Utilities
@@ -837,7 +840,7 @@ The text appears instantly (re-rendered on next frame). If more tokens arrive wh
 | `ChatInput.tsx` | `ChatInput` | Input area, file upload, voice, buttons |
 | `SlashDropdown.tsx` | `SlashDropdown` | Slash command autocomplete |
 | `ModelSelector.tsx` | `ModelSelector` | Footer model display |
-| `ChatHeader.tsx` | `ChatHeader` | Auto-scroll, file explorer, settings buttons |
+| `ChatHeader.tsx` | `ChatHeader` | Session/provider header, file explorer button, settings button |
 | `MessageList.tsx` | `MessageList` | Virtualized message list |
 | `StatusIndicator.tsx` | `StatusIndicator` | Connection status |
 | `SSLErrorOverlay.tsx` | `SSLErrorOverlay` | SSL certificate error |

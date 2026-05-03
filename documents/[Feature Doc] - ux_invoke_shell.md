@@ -176,62 +176,62 @@ router.post('/tool-call', async (req, res) => {
 
 When the ACP calls the tool, the backend handler runs:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 64-114)
+**File:** `backend/mcp/mcpServer.js` (Lines 66-116)
 
 ```javascript
 tools.ux_invoke_shell = async ({ command, cwd, providerId }) => {
-  const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();  // LINE 66
-  const maxLines = getMaxShellResultLines();  // LINE 67 (default 1000)
-  const shellId = `shell-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;  // LINE 71
+  const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();  // LINE 68
+  const maxLines = getMaxShellResultLines();  // LINE 69 (default 1000)
+  const shellId = `shell-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;  // LINE 73
 
   return new Promise((resolve) => {
     let output = '';
     let exitCode = 0;
 
     // Platform detection: Windows → PowerShell, else → Bash
-    const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';  // LINE 78
+    const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';  // LINE 80
     const args = process.platform === 'win32'
-      ? ['-NoProfile', '-Command', `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]  // LINE 80
+      ? ['-NoProfile', '-Command', `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]  // LINE 82
       : ['-c', command];
 
     // Spawn PTY with ANSI color support
-    const proc = pty.spawn(shell, args, {  // LINE 83
-      name: 'xterm-256color',  // LINE 84
+    const proc = pty.spawn(shell, args, {  // LINE 85
+      name: 'xterm-256color',  // LINE 86
       cols: 120,
       rows: 30,
       cwd: workingDir,
-      env: { ...process.env, TERM: 'xterm-256color', FORCE_COLOR: '1', PYTHONIOENCODING: 'utf-8' },  // LINE 88
+      env: { ...process.env, TERM: 'xterm-256color', FORCE_COLOR: '1', PYTHONIOENCODING: 'utf-8' },  // LINE 90
     });
 
     // Emit first chunk: the prompt
-    emitToolOutput(`$ ${command}\n`);  // LINE 95
+    emitToolOutput(`$ ${command}\n`);  // LINE 97
 
     // Stream all data chunks
     proc.onData((data) => {
       output += data;
-      emitToolOutput(data);  // LINE 99
+      emitToolOutput(data);  // LINE 101
     });
 
     // On exit, strip ANSI and resolve
     proc.onExit(({ exitCode: code }) => {
       exitCode = code;
-      const plain = stripAnsi(output).trim() || '(no output)';  // LINE 105
-      const result = exitCode !== 0 ? `${plain}\n\nExit Code: ${exitCode}` : plain;  // LINE 106
+      const plain = stripAnsi(output).trim() || '(no output)';  // LINE 107
+      const result = exitCode !== 0 ? `${plain}\n\nExit Code: ${exitCode}` : plain;  // LINE 108
       resolve({ content: [{ type: 'text', text: result }] });
     });
 
     // Inactivity timeout: 30 minutes (resets on each data event = heartbeat)
-    let timer = setTimeout(() => { proc.kill(); }, 1800000);  // LINE 111
-    proc.onData(() => { clearTimeout(timer); timer = setTimeout(() => { proc.kill(); }, 1800000); });  // LINE 112
+    let timer = setTimeout(() => { proc.kill(); }, 1800000);  // LINE 113
+    proc.onData(() => { clearTimeout(timer); timer = setTimeout(() => { proc.kill(); }, 1800000); });  // LINE 114
   });
 };
 ```
 
-The `emitToolOutput` function (line 91-93):
+The `emitToolOutput` function (lines 93-95):
 
 ```javascript
 const emitToolOutput = (chunk) => {
-  if (io) io.emit('tool_output_stream', { providerId, chunk, maxLines, shellId });  // LINE 92
+  if (io) io.emit('tool_output_stream', { providerId, chunk, maxLines, shellId });  // LINE 94
 };
 ```
 
@@ -487,6 +487,9 @@ This is **critical** — without it, the entire streamed output would be replace
 ### 10. **Auto-Scroll**
 
 The ToolStep auto-scrolls to the bottom during output:
+
+> Scope note: this is **tool-output container auto-scroll** only.  
+> For chat viewport stickiness/manual override (`useScroll`, back-to-bottom button, persisted toggle), see **`[Feature Doc] - Auto-scroll System.md`**.
 
 **File:** `frontend/src/components/ToolStep.tsx` (Lines 88-92)
 

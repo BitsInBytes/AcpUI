@@ -19,18 +19,25 @@ describe('ChatHeader Component', () => {
           isEngineReady: true,
           workspaceCwds: [],
           activeProviderId: 'p1', 
+          providersById: {
+            p1: {
+              providerId: 'p1',
+              label: 'provider-lowercase',
+              branding: { providerId: 'p1', title: 'Provider Title', appHeader: 'Default Title' }
+            } as any
+          },
           branding: { appHeader: 'Default Title' } 
       } as any);
       useSessionLifecycleStore.setState({ 
         activeSessionId: 's1',
-        sessions: [{ id: 's1', name: 'Test Chat', model: 'balanced', acpSessionId: 'a1' } as any]
+        sessions: [{ id: 's1', name: 'Test Chat', model: 'balanced', acpSessionId: 'a1', provider: 'p1' } as any]
       });
     });
   });
 
-  it('renders session name correctly', () => {
+  it('renders provider title and session name correctly', () => {
     render(<ChatHeader />);
-    expect(screen.getByText('Test Chat')).toBeInTheDocument();
+    expect(screen.getByText('Provider Title: Test Chat')).toBeInTheDocument();
   });
 
   it('handles "System Settings" button click', () => {

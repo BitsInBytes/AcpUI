@@ -15,6 +15,8 @@ const ChatHeader: React.FC = () => {
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
   const branding = useSystemStore(state => state.getBranding(activeSession?.provider));
+  const providerSummary = useSystemStore(state => activeSession?.provider ? state.providersById[activeSession.provider] : undefined);
+  const providerName = providerSummary?.branding?.title || providerSummary?.label || activeSession?.provider || '';
   const activeSessionName = activeSession?.name;
   const isPopout = new URLSearchParams(window.location.search).has('popout');
 
@@ -36,7 +38,11 @@ const ChatHeader: React.FC = () => {
           <Terminal size={18} className="header-icon" />
           <h1 className="header-title">
             {activeSessionName ? (
-              <span className="header-session-name">{activeSessionName}{cwdLabel && <span className="header-cwd-label"> ({cwdLabel})</span>}</span>
+              <span className="header-session-name">
+                {providerName && `${providerName}${activeSession?.isSubAgent ? ' Subagent' : ''}: `}
+                {activeSessionName}
+                {cwdLabel && <span className="header-cwd-label"> ({cwdLabel})</span>}
+              </span>
             ) : (
               <span className="header-mobile-fallback">{branding.appHeader}</span>
             )}

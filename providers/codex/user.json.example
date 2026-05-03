@@ -14,13 +14,13 @@
     "archive": "%USERPROFILE%\\.codex\\archive"
   },
     "models": {
-        "default": "GPT-5.5",
+        "default": "gpt-5.5/xhigh",
         "quickAccess": [
-            { "id": "GPT-5.5", "displayName": "GPT 5.5", "description": "Highest capability" },
-            { "id": "gpt-5.3-codex", "displayName": "GPT 5.3 Codex", "description": "Balanced everyday work" },
-            { "id": "GPT-5.4-Mini", "displayName": "GPT 5.4 Mini", "description": "Fastest responses" }
+            { "id": "gpt-5.5/xhigh", "displayName": "GPT 5.5", "description": "Highest capability" },
+            { "id": "gpt-5.3-codex/high", "displayName": "GPT 5.3 Codex", "description": "Balanced everyday work" },
+            { "id": "gpt-5.4-mini/medium", "displayName": "GPT 5.4 Mini", "description": "Fastest responses" }
         ],
-        "titleGeneration": "GPT-5.4-Mini",
-        "subAgent": "GPT-5.4-Mini"
+        "titleGeneration": "gpt-5.4-mini/low",
+        "subAgent": "gpt-5.4-mini/medium"
     }
 }
