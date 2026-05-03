@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useSubAgentStore } from '../store/useSubAgentStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 describe('useSubAgentStore (Pure Logic)', () => {
   beforeEach(() => {

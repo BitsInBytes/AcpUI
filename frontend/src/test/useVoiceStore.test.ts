@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useVoiceStore } from '../store/useVoiceStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 describe('useVoiceStore', () => {
   beforeEach(() => {

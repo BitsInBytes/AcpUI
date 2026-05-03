@@ -308,7 +308,7 @@ Last updated: **May 3, 2026 at 1:47 PM (America/Winnipeg)**.
 
 Notes:
 - Coverage values come from `vitest --coverage` “All files” for each package.
-- Frontend run emitted expected test-environment warnings for unimplemented browser APIs (`canvas`, `window.alert`, `window.open`), but all tests passed.
+- Frontend test setup now mocks `HTMLCanvasElement.getContext`, `window.alert`, and `window.open` to keep CI/local test output stable and warning-free.
 
 ## Provider System
 

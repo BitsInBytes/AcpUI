@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSystemStore } from '../store/useSystemStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 describe('useSessionLifecycleStore (Deep Logic)', () => {
   let mockSocket: any;

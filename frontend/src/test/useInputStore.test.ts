@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useInputStore } from '../store/useInputStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 describe('useInputStore', () => {
   beforeEach(() => {

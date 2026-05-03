@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AcpClient } from '../services/acpClient.js';
+import { AcpClient, buildAcpSpawnCommand } from '../services/acpClient.js';
 import { spawn } from 'child_process';
 import EventEmitter from 'events';
 
@@ -62,8 +62,10 @@ describe('AcpClient Multi-Instance', () => {
     expect(clientA.getProviderId()).toBe('provider-a');
     expect(clientB.getProviderId()).toBe('provider-b');
 
-    expect(spawn).toHaveBeenCalledWith('cli-provider-a', expect.any(Array), expect.any(Object));
-    expect(spawn).toHaveBeenCalledWith('cli-provider-b', expect.any(Array), expect.any(Object));
+    const expectedA = buildAcpSpawnCommand('cli-provider-a', ['acp'], process.platform);
+    const expectedB = buildAcpSpawnCommand('cli-provider-b', ['acp'], process.platform);
+    expect(spawn).toHaveBeenCalledWith(expectedA.command, expectedA.args, expect.any(Object));
+    expect(spawn).toHaveBeenCalledWith(expectedB.command, expectedB.args, expect.any(Object));
   });
 
   it('restarts only the dead instance', async () => {

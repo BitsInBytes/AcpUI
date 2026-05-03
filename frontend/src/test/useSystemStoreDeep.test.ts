@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useSystemStore } from '../store/useSystemStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 describe('useSystemStore (Deep Logic)', () => {
   beforeEach(() => {

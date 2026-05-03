@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useFolderStore } from '../store/useFolderStore';
 import { useSystemStore } from '../store/useSystemStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 describe('useFolderStore (Pure Logic)', () => {
   let mockSocket: any;

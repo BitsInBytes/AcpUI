@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useStreamStore } from '../store/useStreamStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSystemStore } from '../store/useSystemStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 describe('useStreamStore (Pure Logic)', () => {
   beforeEach(() => {

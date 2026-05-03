@@ -115,6 +115,8 @@ async start() {
 
 The daemon's `stdio` is piped: stdin receives JSON-RPC requests, stdout receives responses and notifications. The transport layer handles JSON-RPC 2.0 correlation (request ID matching).
 
+On Windows, the runtime now resolves bare CLI and `.cmd`/`.bat` provider commands through `cmd.exe /d /s /c` while keeping `shell: false` in Node spawn options. This preserves npm shim compatibility and avoids Node's `DEP0190` warning.
+
 **Exit handling** (Lines 157-195): If the daemon crashes, an exponential backoff timer (2s → 4s → 8s → 16s → 30s) schedules a restart. This prevents resource thrashing during persistent failures.
 
 ---

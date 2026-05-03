@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Copy, Check, Archive, Brain, ChevronDown, ChevronRight, GitFork } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import MemoizedMarkdown from './MemoizedMarkdown';
@@ -52,6 +52,7 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
 }) => {
   const [copied, setCopied] = useState(false);
   const [forking, setForking] = useState(false);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const socket = useSystemStore(state => state.socket);
   const branding = useSystemStore(state => state.getBranding(providerId));
   
@@ -68,9 +69,16 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
     const success = await copyToClipboard(cleanContent);
     if (success) {
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => setCopied(false), 2000);
     }
   };
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    };
+  }, []);
 
   const handleFork = () => {
     if (!socket || !activeSessionId || forking) return;

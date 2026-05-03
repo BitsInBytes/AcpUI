@@ -1,5 +1,5 @@
 import { useChatStore } from '../store/useChatStore';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ChatMessage from '../components/ChatMessage';
 import type { Message, TimelineStep } from '../types';
@@ -323,7 +323,10 @@ describe('ChatMessage', () => {
     };
     render(<ChatMessage message={message} />);
     const copyBtn = screen.getByTitle('Copy full response');
-    fireEvent.click(copyBtn);
+    await act(async () => {
+      fireEvent.click(copyBtn);
+      await Promise.resolve();
+    });
     expect(writeText).toHaveBeenCalledWith('Copy me');
   });
 
@@ -462,7 +465,10 @@ describe('ChatMessage - additional coverage', () => {
     };
     render(<ChatMessage message={message} />);
     const copyBtns = screen.getAllByText('Copy');
-    fireEvent.click(copyBtns[0]);
+    await act(async () => {
+      fireEvent.click(copyBtns[0]);
+      await Promise.resolve();
+    });
     expect(writeText).toHaveBeenCalled();
   });
 

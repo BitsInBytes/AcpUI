@@ -9,7 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useStreamStore } from '../store/useStreamStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSystemStore } from '../store/useSystemStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 const SESSION_A = { id: 'ui-a', acpSessionId: 'acp-a', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, provider: 'p1' };
 const SESSION_B = { id: 'ui-b', acpSessionId: 'acp-b', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, provider: 'p1' };

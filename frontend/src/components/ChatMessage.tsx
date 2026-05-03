@@ -43,6 +43,7 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
 
 const CodeBlock = ({ language, value }: { language: string; value: string }) => {
   const [copied, setCopied] = useState(false);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isCanvasOpen = useCanvasStore(state => state.isCanvasOpen);
   const handleOpenInCanvas = useCanvasStore(state => state.handleOpenInCanvas);
   const socket = useSystemStore(state => state.socket);
@@ -50,8 +51,18 @@ const CodeBlock = ({ language, value }: { language: string; value: string }) => 
 
   const handleCopy = async () => {
     const success = await copyToClipboard(value);
-    if (success) { setCopied(true); setTimeout(() => setCopied(false), 2000); }
+    if (success) {
+      setCopied(true);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => setCopied(false), 2000);
+    }
   };
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    };
+  }, []);
 
   const handleOpenCanvas = () => {
     handleOpenInCanvas(socket, activeSessionId, {

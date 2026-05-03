@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import path from 'path';
 import { writeLog } from './logger.js';
 import * as db from '../database.js';
 import { getProvider, getProviderModule, runWithProvider } from './providerLoader.js';
@@ -20,6 +21,29 @@ function withProviderContext(providerId, fn) {
     if (process.env.VITEST) return fn();
     throw err;
   }
+}
+
+export function buildAcpSpawnCommand(command, args = [], platform = process.platform) {
+  if (platform !== 'win32') {
+    return { command, args };
+  }
+
+  const ext = path.extname(command || '').toLowerCase();
+  const hasPathSeparators = /[\\/]/.test(command || '');
+  const isAbsolutePath = path.isAbsolute(command || '');
+  const isCmdOrBat = ext === '.cmd' || ext === '.bat';
+  const isBareCommand = !ext && !hasPathSeparators && !isAbsolutePath;
+
+  // npm-style CLIs on Windows are commonly .cmd shims. Route through cmd.exe
+  // without shell:true to avoid Node DEP0190 while preserving compatibility.
+  if (isCmdOrBat || isBareCommand) {
+    return {
+      command: 'cmd.exe',
+      args: ['/d', '/s', '/c', command, ...args]
+    };
+  }
+
+  return { command, args };
 }
 
 /**
@@ -106,21 +130,21 @@ export class AcpClient {
       const baseArgs = config.args || ['acp'];
       const agent = null;
       const args = agent ? [...baseArgs, '--agent', agent] : baseArgs;
-      writeLog(`[ACP] Spawning: ${shell} ${args.join(' ')}`);
+      const spawnTarget = buildAcpSpawnCommand(shell, args);
+      writeLog(`[ACP] Spawning: ${spawnTarget.command} ${spawnTarget.args.join(' ')}`);
 
       // Suppress ANSI escape codes — stdout must be clean JSON lines for parsing
       let childEnv = { ...process.env, TERM: 'dumb', CI: 'true', FORCE_COLOR: '0', DEBUG: '1' };
-    childEnv = await this.providerModule.prepareAcpEnvironment(childEnv, {
-      providerConfig: config,
-      io: this.io,
-      writeLog,
-      emitProviderExtension: (method, params) => this.handleProviderExtension({ providerId, method, params })
-    }) || childEnv;
+      childEnv = await this.providerModule.prepareAcpEnvironment(childEnv, {
+        providerConfig: config,
+        io: this.io,
+        writeLog,
+        emitProviderExtension: (method, params) => this.handleProviderExtension({ providerId, method, params })
+      }) || childEnv;
 
-      this.acpProcess = spawn(shell, args, {
+      this.acpProcess = spawn(spawnTarget.command, spawnTarget.args, {
         cwd: process.env.DEFAULT_WORKSPACE_CWD || process.env.USERPROFILE || process.cwd(),
-        env: childEnv,
-        shell: process.platform === 'win32'
+        env: childEnv
       });
 
       if (!this.acpProcess) {

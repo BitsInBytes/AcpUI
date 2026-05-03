@@ -193,7 +193,10 @@ describe('AssistantMessage - fork and copy extended', () => {
 
     const { container } = render(<AssistantMessage {...defaultProps({ isStreaming: false })} />);
     const copyBtn = container.querySelector('.copy-btn[title="Copy full response"]')!;
-    fireEvent.click(copyBtn);
+    await act(async () => {
+      fireEvent.click(copyBtn);
+      await Promise.resolve();
+    });
 
     // After click, the Check icon should appear (copied state = true)
     await vi.waitFor(() => {

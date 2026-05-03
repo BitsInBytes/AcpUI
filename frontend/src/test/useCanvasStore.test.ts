@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useCanvasStore } from '../store/useCanvasStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 describe('useCanvasStore', () => {
   beforeEach(() => {

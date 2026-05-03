@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import acpClient from '../services/acpClient.js';
+import acpClient, { buildAcpSpawnCommand } from '../services/acpClient.js';
 import { getProviderModule } from '../services/providerLoader.js';
 import { rememberProviderStatusExtension } from '../services/providerStatusMemory.js';
 import { spawn } from 'child_process';
@@ -299,6 +299,26 @@ describe('AcpClient Service', () => {
       // This is for autoLoadPinnedSessions catch
       vi.spyOn(db, 'initDb').mockResolvedValue(); 
       // We trigger the error in autoLoadPinnedSessions or later
+    });
+  });
+
+  describe('buildAcpSpawnCommand', () => {
+    it('uses cmd.exe wrapper for bare commands on Windows', () => {
+      const target = buildAcpSpawnCommand('codex-acp', ['--help'], 'win32');
+      expect(target.command).toBe('cmd.exe');
+      expect(target.args).toEqual(['/d', '/s', '/c', 'codex-acp', '--help']);
+    });
+
+    it('uses cmd.exe wrapper for .cmd files on Windows', () => {
+      const target = buildAcpSpawnCommand('C:\\tools\\agent.cmd', ['--acp'], 'win32');
+      expect(target.command).toBe('cmd.exe');
+      expect(target.args).toEqual(['/d', '/s', '/c', 'C:\\tools\\agent.cmd', '--acp']);
+    });
+
+    it('keeps direct spawn for non-Windows', () => {
+      const target = buildAcpSpawnCommand('codex-acp', ['--help'], 'linux');
+      expect(target.command).toBe('codex-acp');
+      expect(target.args).toEqual(['--help']);
     });
   });
 });

@@ -4,7 +4,7 @@ import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useInputStore } from '../store/useInputStore';
 import { useStreamStore } from '../store/useStreamStore';
 import { useSystemStore } from '../store/useSystemStore';
-import { act } from 'react-dom/test-utils';
+import { act } from 'react';
 
 const getState = () => useChatStore.getState();
 
