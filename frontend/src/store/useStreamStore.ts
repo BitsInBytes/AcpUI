@@ -11,9 +11,8 @@ import type { StreamTokenData, StreamEventData, StreamDoneData, Message } from '
  * then drained by `processBuffer` on a 32ms tick. This decouples network arrival rate
  * from render rate, enabling adaptive typewriter speed based on buffer depth.
  *
- * Priority: `tool_end` events preserve shell output — if the tool's existing output
- * starts with `$ ` (indicating live shell streaming), it is NOT overwritten by the
- * final tool_end output payload.
+ * Priority: `tool_end` events preserve shell output. Legacy shell output is detected
+ * by a `$ ` prompt prefix; Shell V2 uses explicit `shellRunId` terminal state.
  */
 export interface StreamState {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -283,7 +282,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                       event: {
                         ...existingStep.event,
                         status: status || existingStep.event.status,
-                        output: (existingStep.event.output?.startsWith('$ ') ? existingStep.event.output : output) || existingStep.event.output,
+                        output: (existingStep.event.shellRunId ? existingStep.event.output : output) || existingStep.event.output,
                         filePath: mergedFilePath,
                         title: bestTitle,
                         toolCategory: action.data.toolCategory || existingStep.event.toolCategory,

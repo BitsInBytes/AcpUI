@@ -10,6 +10,7 @@ import {
   resolveModelSelection
 } from './modelOptions.js';
 import { mergeConfigOptions, normalizeConfigOptions } from './configOptions.js';
+import { bindMcpProxy, createMcpProxyBinding, getMcpProxyIdFromServers } from '../mcp/mcpProxyRegistry.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,16 +25,18 @@ function emitCachedContext(providerModule, sessionId) {
 }
 
 // Helper for MCP servers stdio transport
-export function getMcpServers(providerId) {
+export function getMcpServers(providerId, { acpSessionId = null } = {}) {
   const name = getProvider(providerId).config.mcpName;
   if (!name) return [];
   const proxyPath = path.resolve(__dirname, '..', 'mcp', 'stdio-proxy.js');
+  const proxyId = createMcpProxyBinding({ providerId, acpSessionId });
   return [{
     name,
     command: 'node',
     args: [proxyPath],
     env: [
       { name: 'ACP_SESSION_PROVIDER_ID', value: String(providerId) },
+      { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ]
@@ -208,12 +211,14 @@ export async function loadSessionIntoMemory(acpClient, dbSession) {
   }
 
   acpClient.stream.beginDraining(sessionId);
+  const mcpServers = getMcpServers(providerId, { acpSessionId: sessionId });
   const result = await acpClient.transport.sendRequest('session/load', {
     sessionId,
     cwd: dbSession.cwd || process.cwd(),
-    mcpServers: getMcpServers(providerId),
+    mcpServers,
     ...sessionParams
   });
+  bindMcpProxy(getMcpProxyIdFromServers(mcpServers), { providerId, acpSessionId: sessionId });
   await acpClient.stream.waitForDrainToFinish(sessionId, 1500);
   emitCachedContext(providerModule, sessionId);
 

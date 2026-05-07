@@ -1,8 +1,15 @@
-import { describe, it, expect, vi } from 'vitest';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
 
 const mockHandlers = {};
+const { mockResolveMcpProxy } = vi.hoisted(() => ({
+  mockResolveMcpProxy: vi.fn(() => null)
+}));
+
 vi.mock('../mcp/mcpServer.js', () => ({
   createToolHandlers: () => mockHandlers
+}));
+vi.mock('../mcp/mcpProxyRegistry.js', () => ({
+  resolveMcpProxy: mockResolveMcpProxy
 }));
 vi.mock('../services/providerLoader.js', () => ({
   getProvider: () => ({ config: { mcpName: 'testmcp', defaultSubAgentName: 'test-agent', defaultSystemAgentName: 'default', models: { flagship: { id: 'test-model', displayName: 'Test Model' }, subAgent: 'test-model' } } }),
@@ -15,6 +22,12 @@ import createMcpApiRoutes from '../routes/mcpApi.js';
 describe('MCP API Routes', () => {
   const io = { emit: vi.fn(), fetchSockets: vi.fn().mockResolvedValue([]) };
   const acpClient = null;
+
+  beforeEach(() => {
+    for (const key of Object.keys(mockHandlers)) delete mockHandlers[key];
+    mockResolveMcpProxy.mockReset();
+    mockResolveMcpProxy.mockReturnValue(null);
+  });
 
   function getRoute(router, method, path) {
     return router.stack.find(l => l.route?.path === path && l.route.methods[method]);
@@ -44,7 +57,7 @@ describe('MCP API Routes', () => {
     }));
   });
 
-  it('GET /tools describes ux_invoke_shell as the required non-interactive shell replacement', () => {
+  it('GET /tools describes ux_invoke_shell as an interactive terminal-backed shell replacement', () => {
     const router = createMcpApiRoutes(io, acpClient);
     const route = getRoute(router, 'get', '/tools');
     const res = { json: vi.fn() };
@@ -55,7 +68,19 @@ describe('MCP API Routes', () => {
 
     expect(shellTool.description).toContain('Always use this tool for shell commands');
     expect(shellTool.description).toContain('never use system shell, bash, or powershell tools');
-    expect(shellTool.description).toContain('git --no-pager diff');
+    expect(shellTool.description).toContain('user-interactive stdin');
+    expect(shellTool.description).toContain('Multiple ux_invoke_shell calls may be invoked concurrently');
+    expect(shellTool.description).toContain('terminal becomes read-only after exit');
+    expect(shellTool.annotations).toEqual(expect.objectContaining({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true
+    }));
+    expect(shellTool._meta).toEqual(expect.objectContaining({
+      'acpui/concurrentInvocationsSupported': true
+    }));
+    expect(shellTool.description).not.toContain('only use non-interactive commands');
   });
 
   it('POST /tool-call returns 404 for unknown tool', async () => {
@@ -89,6 +114,39 @@ describe('MCP API Routes', () => {
     await route.route.stack[0].handle(mockReq({ tool: 'good_tool', args: { x: 1 } }), res, vi.fn());
 
     expect(mockHandlers.good_tool).toHaveBeenCalledWith({ x: 1 });
+    expect(res.json).toHaveBeenCalledWith(expected);
+  });
+
+  it('POST /tool-call passes resolved proxy context to handlers', async () => {
+    const expected = { content: [{ type: 'text', text: 'done' }] };
+    mockResolveMcpProxy.mockReturnValue({
+      proxyId: 'proxy-1',
+      providerId: 'provider-a',
+      acpSessionId: 'acp-1'
+    });
+    mockHandlers.good_tool = vi.fn().mockResolvedValue(expected);
+
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'post', '/tool-call');
+    const res = mockRes();
+    await route.route.stack[0].handle(mockReq({
+      tool: 'good_tool',
+      args: { x: 1 },
+      providerId: 'fallback-provider',
+      proxyId: 'proxy-1',
+      mcpRequestId: 42,
+      requestMeta: { source: 'test' }
+    }), res, vi.fn());
+
+    expect(mockResolveMcpProxy).toHaveBeenCalledWith('proxy-1');
+    expect(mockHandlers.good_tool).toHaveBeenCalledWith({
+      x: 1,
+      providerId: 'provider-a',
+      acpSessionId: 'acp-1',
+      mcpProxyId: 'proxy-1',
+      mcpRequestId: 42,
+      requestMeta: { source: 'test' }
+    });
     expect(res.json).toHaveBeenCalledWith(expected);
   });
 });

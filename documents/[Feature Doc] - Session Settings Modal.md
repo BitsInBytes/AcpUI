@@ -480,9 +480,9 @@ const selectedModelValue = getFullModelSelectionValue(session, brandingModels);
    ```json
    {
      "models": {
-       "default": "claude-opus-4-1",
-       "titleGeneration": "claude-haiku",
-       "balanced": { "id": "claude-sonnet-4", "label": "Sonnet 4" }
+       "default": "provider-model-capable",
+       "titleGeneration": "provider-model-fast",
+       "balanced": { "id": "provider-model-standard", "label": "Standard" }
      }
    }
    ```

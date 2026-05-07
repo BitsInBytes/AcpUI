@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import registerSessionHandlers from '../sockets/sessionHandlers.js';
 import { providerRuntimeManager } from '../services/providerRuntimeManager.js';
+import { clearMcpProxyRegistry, getMcpProxyIdFromServers, resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
 import EventEmitter from 'events';
 import fs from 'fs';
 
@@ -132,6 +133,7 @@ describe('Session Handlers', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    clearMcpProxyRegistry();
     mockProviderModule.normalizeModelState.mockImplementation((state) => state);
     mockAcpClient.sessionMetadata.clear();
     mockIo = new EventEmitter();
@@ -204,6 +206,12 @@ describe('Session Handlers', () => {
     const handler = mockSocket.listeners('create_session')[0];
     await handler({ providerId: 'provider-a', model: 'test-flagship' }, callback);
     expect(mockAcpClient.transport.sendRequest).toHaveBeenCalledWith('session/new', expect.any(Object));
+    const sessionNewCall = mockAcpClient.transport.sendRequest.mock.calls.find(([method]) => method === 'session/new');
+    const proxyId = getMcpProxyIdFromServers(sessionNewCall[1].mcpServers);
+    expect(resolveMcpProxy(proxyId)).toEqual(expect.objectContaining({
+      providerId: 'provider-a',
+      acpSessionId: 'acp-new'
+    }));
   });
 
   it('captures normalized config options returned by session/new', async () => {

@@ -45,6 +45,8 @@ The backend reads from repository-level configuration and environment files:
 - `configuration/counsel.json`
 - `.env`
 
+`ux_invoke_shell` uses the backend `ShellRunManager` and session-scoped `shell_run_*` socket events for interactive terminal execution. Concurrent shell calls are supported; each command receives a separate `shellRunId`, PTY, and terminal stream.
+
 ## Where To Find Detailed Technical Docs
 
 Feature docs are now the source of truth for implementation detail and exact line references:

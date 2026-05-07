@@ -13,6 +13,10 @@ vi.mock('../sockets/folderHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/fileExplorerHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/gitHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/terminalHandlers.js', () => ({ default: vi.fn() }));
+vi.mock('../sockets/shellRunHandlers.js', () => ({
+  default: vi.fn(),
+  emitShellRunSnapshotsForSession: vi.fn()
+}));
 
 vi.mock('../services/logger.js', () => ({ writeLog: vi.fn() }));
 vi.mock('../services/acpClient.js', () => ({
@@ -82,8 +86,10 @@ describe('Socket Index Handler', () => {
     connectSocket(mockIo);
     const promptHandlers = (await import('../sockets/promptHandlers.js')).default;
     const sessionHandlers = (await import('../sockets/sessionHandlers.js')).default;
+    const shellRunHandlers = (await import('../sockets/shellRunHandlers.js')).default;
     expect(promptHandlers).toHaveBeenCalled();
     expect(sessionHandlers).toHaveBeenCalled();
+    expect(shellRunHandlers).toHaveBeenCalled();
   });
 
   it('emits sidebar_settings on connection', () => {
@@ -144,6 +150,13 @@ describe('Socket Index - session rooms', () => {
     const s = connectSocket(mockIo);
     s.emit('watch_session', { sessionId: 'sess-123' });
     expect(s.join).toHaveBeenCalledWith('session:sess-123');
+  });
+
+  it('watch_session emits shell run snapshots', async () => {
+    const { emitShellRunSnapshotsForSession } = await import('../sockets/shellRunHandlers.js');
+    const s = connectSocket(mockIo);
+    s.emit('watch_session', { providerId: 'provider-a', sessionId: 'sess-123' });
+    expect(emitShellRunSnapshotsForSession).toHaveBeenCalledWith(s, { providerId: 'provider-a', sessionId: 'sess-123' });
   });
 
   it('unwatch_session leaves the session room', () => {

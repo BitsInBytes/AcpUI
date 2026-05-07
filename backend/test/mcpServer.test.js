@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getMcpServers, createToolHandlers, getMaxShellResultLines } from '../mcp/mcpServer.js';
+import { clearMcpProxyRegistry, getMcpProxyIdFromServers, resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
 import EventEmitter from 'events';
 
@@ -30,6 +31,13 @@ const { mockGetProvider } = vi.hoisted(() => ({
     mockGetProvider: vi.fn()
 }));
 
+const { mockShellRunManager } = vi.hoisted(() => ({
+    mockShellRunManager: {
+        setIo: vi.fn(),
+        startPreparedRun: vi.fn()
+    }
+}));
+
 const { mockAcpClient } = vi.hoisted(() => ({
     mockAcpClient: {
         transport: {
@@ -55,6 +63,9 @@ const { mockAcpClient } = vi.hoisted(() => ({
 
 vi.mock('node-pty', () => ({ default: mockPty }));
 vi.mock('../services/logger.js', () => ({ writeLog: vi.fn(), setIo: vi.fn() }));
+vi.mock('../services/shellRunManager.js', () => ({
+  shellRunManager: mockShellRunManager
+}));
 vi.mock('../services/providerLoader.js', () => ({
   getProvider: mockGetProvider,
   getProviderModule: vi.fn().mockResolvedValue(mockProviderModule),
@@ -120,6 +131,8 @@ describe('mcpServer', () => {
     mockAcpClient.sessionMetadata.clear();
     mockAcpClient.stream.statsCaptures.clear();
     mockAcpClient.transport.pendingRequests.clear();
+    clearMcpProxyRegistry();
+    mockShellRunManager.startPreparedRun.mockResolvedValue({ content: [{ type: 'text', text: 'shell done' }] });
     
     mockProviderModule.buildSessionParams.mockImplementation((agent) => agent
       ? { _meta: { 'agent-meta': { options: { agent } } } }
@@ -132,7 +145,8 @@ describe('mcpServer', () => {
     expect(servers).toHaveLength(1);
     expect(servers[0].name).toBe('TestUI');
     expect(servers[0].env).toEqual(expect.arrayContaining([
-      expect.objectContaining({ name: 'ACP_SESSION_PROVIDER_ID', value: 'provider-a' })
+      expect.objectContaining({ name: 'ACP_SESSION_PROVIDER_ID', value: 'provider-a' }),
+      expect.objectContaining({ name: 'ACP_UI_MCP_PROXY_ID', value: expect.stringMatching(/^mcp-proxy-/) })
     ]));
   });
 
@@ -144,7 +158,8 @@ describe('mcpServer', () => {
     const servers = getMcpServers(null);
     expect(servers).toHaveLength(1);
     expect(servers[0].env).toEqual(expect.arrayContaining([
-      expect.objectContaining({ name: 'ACP_SESSION_PROVIDER_ID', value: 'provider-a' })
+      expect.objectContaining({ name: 'ACP_SESSION_PROVIDER_ID', value: 'provider-a' }),
+      expect.objectContaining({ name: 'ACP_UI_MCP_PROXY_ID', value: expect.stringMatching(/^mcp-proxy-/) })
     ]));
   });
 
@@ -155,88 +170,62 @@ describe('mcpServer', () => {
       expect(getMaxShellResultLines({ MAX_SHELL_RESULT_LINES: '25' })).toBe(25);
     });
 
-    it('executes a command via node-pty', async () => {
+    it('delegates to shellRunManager with session context', async () => {
       const handlers = createToolHandlers(mockIo);
-      const mockProc = {
-          onData: vi.fn(),
-          onExit: vi.fn(),
-          kill: vi.fn()
-      };
-      mockPty.spawn.mockReturnValue(mockProc);
 
-      const promise = handlers.ux_invoke_shell({ command: 'ls' });
+      const result = await handlers.ux_invoke_shell({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        mcpRequestId: 42,
+        requestMeta: { toolCallId: 'tool-1' },
+        command: 'npm test',
+        cwd: 'D:/repo'
+      });
 
-      const onDataCb = mockProc.onData.mock.calls[0][0];
-      const onExitCb = mockProc.onExit.mock.calls[0][0];
-
-      onDataCb('file.txt');
-      onExitCb({ exitCode: 0 });
-
-      const result = await promise;
-      expect(result.content[0].text).toBe('file.txt');
+      expect(mockShellRunManager.setIo).toHaveBeenCalledWith(mockIo);
+      expect(mockShellRunManager.startPreparedRun).toHaveBeenCalledWith({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        toolCallId: 'tool-1',
+        mcpRequestId: 42,
+        command: 'npm test',
+        cwd: 'D:/repo',
+        maxLines: getMaxShellResultLines()
+      });
+      expect(mockPty.spawn).not.toHaveBeenCalled();
+      expect(result.content[0].text).toBe('shell done');
     });
 
-    it('sends MAX_SHELL_RESULT_LINES to the UI stream while returning the full shell result', async () => {
-      const previous = process.env.MAX_SHELL_RESULT_LINES;
-      process.env.MAX_SHELL_RESULT_LINES = '2';
-      try {
-        const handlers = createToolHandlers(mockIo);
-        const mockProc = { onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() };
-        mockPty.spawn.mockReturnValue(mockProc);
-
-        const promise = handlers.ux_invoke_shell({ command: 'many-lines' });
-        mockProc.onData.mock.calls[0][0]('one\ntwo\nthree\n');
-        mockProc.onExit.mock.calls[0][0]({ exitCode: 0 });
-
-        const result = await promise;
-        expect(result.content[0].text).toBe('one\ntwo\nthree');
-        // All tool_output_stream events for this invocation carry the same shellId
-        expect(mockIo.emit).toHaveBeenCalledWith('tool_output_stream', expect.objectContaining({ chunk: '$ many-lines\n', maxLines: 2 }));
-        expect(mockIo.emit).toHaveBeenCalledWith('tool_output_stream', expect.objectContaining({ chunk: 'one\ntwo\nthree\n', maxLines: 2 }));
-        // Verify shellId is present and consistent across all emits for this invocation
-        const shellEmits = mockIo.emit.mock.calls.filter(c => c[0] === 'tool_output_stream');
-        const shellIds = shellEmits.map(c => c[1].shellId);
-        expect(shellIds.every(id => typeof id === 'string' && id.startsWith('shell-'))).toBe(true);
-        expect(new Set(shellIds).size).toBe(1); // all same shellId within one invocation
-      } finally {
-        if (previous === undefined) delete process.env.MAX_SHELL_RESULT_LINES;
-        else process.env.MAX_SHELL_RESULT_LINES = previous;
-      }
-    });
-
-    it('uses distinct shellIds for concurrent shell invocations', async () => {
+    it('keeps the MCP tool call pending until shell completion', async () => {
+      let resolveRun;
+      mockShellRunManager.startPreparedRun.mockReturnValue(new Promise(resolve => {
+        resolveRun = resolve;
+      }));
       const handlers = createToolHandlers(mockIo);
-      const mockProc1 = { onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() };
-      const mockProc2 = { onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() };
-      mockPty.spawn.mockReturnValueOnce(mockProc1).mockReturnValueOnce(mockProc2);
 
-      // Start both shells concurrently (don't await)
-      const p1 = handlers.ux_invoke_shell({ command: 'shell-a' });
-      const p2 = handlers.ux_invoke_shell({ command: 'shell-b' });
+      let completed = false;
+      const promise = handlers.ux_invoke_shell({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        command: 'interactive'
+      }).then(result => {
+        completed = true;
+        return result;
+      });
 
-      mockProc1.onData.mock.calls[0][0]('output-a');
-      mockProc2.onData.mock.calls[0][0]('output-b');
-      mockProc1.onExit.mock.calls[0][0]({ exitCode: 0 });
-      mockProc2.onExit.mock.calls[0][0]({ exitCode: 0 });
-      await Promise.all([p1, p2]);
+      await Promise.resolve();
+      expect(completed).toBe(false);
 
-      const shellEmits = mockIo.emit.mock.calls.filter(c => c[0] === 'tool_output_stream');
-      const shellIds = [...new Set(shellEmits.map(c => c[1].shellId))];
-      // Two separate invocations must produce two distinct shellIds
-      expect(shellIds).toHaveLength(2);
-      expect(shellIds[0]).toMatch(/^shell-/);
-      expect(shellIds[1]).toMatch(/^shell-/);
-      expect(shellIds[0]).not.toBe(shellIds[1]);
+      resolveRun({ content: [{ type: 'text', text: 'after input' }] });
+      await expect(promise).resolves.toEqual({ content: [{ type: 'text', text: 'after input' }] });
+      expect(completed).toBe(true);
     });
 
-    it('handles shell command error', async () => {
-        const handlers = createToolHandlers(mockIo);
-        const mockProc = { onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() };
-        mockPty.spawn.mockReturnValue(mockProc);
-        const promise = handlers.ux_invoke_shell({ command: 'bad' });
-        mockProc.onExit.mock.calls[0][0]({ exitCode: 1 });
-        const result = await promise;
-        expect(result.content[0].text).toContain('Exit Code: 1');
+    it('aborts when lacking session context', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const result = await handlers.ux_invoke_shell({ providerId: 'provider-a', command: 'ls' });
+      expect(result.content[0].text).toContain('Error: Shell execution context unavailable');
+      expect(mockShellRunManager.startPreparedRun).not.toHaveBeenCalled();
     });
   });
 
@@ -365,6 +354,28 @@ describe('mcpServer', () => {
         _meta: { 'agent-meta': { options: { agent: 'dev' } } }
       }));
       expect(mockProviderModule.setInitialAgent).toHaveBeenCalledWith(mockAcpClient, subId, 'dev');
+    });
+
+    it('binds the MCP proxy id to the sub-agent ACP session after session/new', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'proxy-bound-sub';
+
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        if (method === 'session/prompt') return {};
+        return {};
+      });
+
+      await runInvokeSubAgents(handlers, {
+        requests: [{ name: 'Agent', prompt: 'Do thing', agent: 'dev' }]
+      });
+
+      const sessionNewCall = mockAcpClient.transport.sendRequest.mock.calls.find(call => call[0] === 'session/new');
+      const proxyId = getMcpProxyIdFromServers(sessionNewCall[1].mcpServers);
+      expect(resolveMcpProxy(proxyId)).toEqual(expect.objectContaining({
+        providerId: 'provider-a',
+        acpSessionId: subId
+      }));
     });
 
     it('uses models.subAgent when no explicit model arg is provided', async () => {

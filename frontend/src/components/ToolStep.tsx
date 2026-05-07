@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import type { SystemEvent } from '../types';
 import { renderToolOutput } from './renderToolOutput';
 import SubAgentPanel from './SubAgentPanel';
+import ShellToolTerminal from './ShellToolTerminal';
 import { useElapsed } from '../utils/timer';
 
 interface ToolStepProps {
@@ -70,16 +71,6 @@ const getFilePathFromEvent = (event: SystemEvent): string | undefined => {
   return undefined;
 };
 
-const isShellOutputEvent = (event: SystemEvent): boolean => {
-  const titleLower = (event.title || '').toLowerCase();
-  const idLower = (event.id || '').toLowerCase();
-  return event.toolName === 'ux_invoke_shell' ||
-    event.isShellCommand === true ||
-    event.output?.startsWith('$ ') === true ||
-    titleLower.includes('running shell') ||
-    idLower.includes('shell');
-};
-
 const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpenInCanvas, markdownComponents }) => {
   const filePath = getFilePathFromEvent(step.event);
   const elapsed = useElapsed(step.event.startTime, step.event.endTime);
@@ -87,9 +78,9 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
 
   useEffect(() => {
     const outputContainer = outputContainerRef.current;
-    if (!outputContainer || isCollapsed || !isShellOutputEvent(step.event)) return;
+    if (!outputContainer || isCollapsed || step.event.shellRunId) return;
     outputContainer.scrollTop = outputContainer.scrollHeight;
-  }, [isCollapsed, step.event]);
+  }, [isCollapsed, step.event.output, step.event.status, step.event.shellRunId]);
 
   return (
     <div className={`system-event ${step.event.status}`}>
@@ -120,7 +111,9 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
             exit={{ height: 0, opacity: 0 }}
             className="step-content-wrapper"
           >
-            {(step.event.output || step.event.status === 'failed') && (
+            {step.event.shellRunId ? (
+              <ShellToolTerminal event={step.event} />
+            ) : (step.event.output || step.event.status === 'failed') && (
               <div className="tool-output-details-unified">
                 <div className="tool-output-container" ref={outputContainerRef}>
                   {renderToolOutput(step.event.output, markdownComponents, step.event.filePath)}

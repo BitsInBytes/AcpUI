@@ -77,6 +77,12 @@ export interface StreamEventData {
   status?: string;
   output?: string;
   filePath?: string;
+  providerId?: string;
+  command?: string;
+  cwd?: string;
+  shellRunId?: string;
+  shellInteractive?: boolean;
+  shellState?: 'pending' | 'starting' | 'running' | 'exiting' | 'exited';
   options?: PermissionOption[];
   toolCall?: { toolCallId: string; title: string };
 }
@@ -189,10 +195,15 @@ export interface SystemEvent {
    *  ToolStep with the specific batch of sub-agents it spawned. Enables per-invocation
    *  filtering in SubAgentPanel so historical turns show their own agents. */
   invocationId?: string;
-  /** Stamped on the first tool_output_stream chunk for this shell invocation. Correlates
-   *  streaming output to the correct ToolStep when multiple shells run in parallel,
-   *  preventing the shared-buffer output-mixing bug. */
-  shellId?: string;
+  /** Shell run id assigned by the backend before ux_invoke_shell starts.
+   *  Used for terminal stdin, resize, kill, snapshot replay, and output routing. */
+  shellRunId?: string;
+  shellInteractive?: boolean;
+  shellState?: 'pending' | 'starting' | 'running' | 'exiting' | 'exited';
+  providerId?: string;
+  sessionId?: string;
+  command?: string;
+  cwd?: string;
 }
 
 export interface PermissionOption {

@@ -4,6 +4,7 @@ import { useChatManager } from '../hooks/useChatManager';
 import { useSystemStore } from '../store/useSystemStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useStreamStore } from '../store/useStreamStore';
+import { useShellRunStore } from '../store/useShellRunStore';
 
 describe('useChatManager hook', () => {
   let mockSocket: any;
@@ -19,6 +20,7 @@ describe('useChatManager hook', () => {
     act(() => {
       useSystemStore.setState({ socket: mockSocket as any, connected: true });
       useSessionLifecycleStore.setState({ sessions: [], activeSessionId: null, handleInitialLoad: vi.fn() });
+      useShellRunStore.getState().reset();
     });
   });
 
@@ -63,8 +65,7 @@ describe('useChatManager hook', () => {
     expect(setPermission).toHaveBeenCalledWith('sub-1', expect.objectContaining({ id: 42 }));
   });
 
-  it('handles "tool_output_stream" with shellId — routes to claimed ToolStep', async () => {
-    vi.useFakeTimers();
+  it('handles Shell V2 socket events by explicit shellRunId', async () => {
     act(() => {
       useSessionLifecycleStore.setState({
         activeSessionId: 's1',
@@ -74,7 +75,14 @@ describe('useChatManager hook', () => {
             role: 'assistant',
             timeline: [{
               type: 'tool',
-              event: { status: 'in_progress', toolName: 'ux_invoke_shell', output: '' }
+              event: {
+                id: 'tool-1',
+                status: 'in_progress',
+                toolName: 'ux_invoke_shell',
+                shellRunId: 'shell-run-1',
+                shellState: 'pending',
+                output: ''
+              }
             }]
           }]
         } as any]
@@ -82,100 +90,47 @@ describe('useChatManager hook', () => {
     });
 
     renderHook(() => useChatManager(vi.fn()));
-    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'tool_output_stream')[1];
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
 
     act(() => {
-      handler({ chunk: 'Hello ', shellId: 'shell-test-1' });
-      handler({ chunk: 'World', shellId: 'shell-test-1' });
-    });
-
-    act(() => { vi.advanceTimersByTime(100); });
-
-    const sessions = useSessionLifecycleStore.getState().sessions;
-    const toolStep = (sessions[0].messages[0] as any).timeline[0];
-    // shellId should be stamped on the ToolStep
-    expect(toolStep.event.shellId).toBe('shell-test-1');
-    // output should contain the concatenated chunks
-    expect(toolStep.event.output).toContain('Hello World');
-
-    vi.useRealTimers();
-  });
-
-  it('handles "tool_output_stream" for a background session', async () => {
-    vi.useFakeTimers();
-    act(() => {
-      useSessionLifecycleStore.setState({
-        activeSessionId: 's2', // Currently viewing s2
-        sessions: [
-          {
-            id: 's1', // Background session running the shell
-            messages: [{
-              role: 'assistant',
-              timeline: [{
-                type: 'tool',
-                event: { status: 'in_progress', toolName: 'ux_invoke_shell', output: '' }
-              }]
-            }]
-          } as any,
-          {
-            id: 's2', // Active session doing nothing
-            messages: []
-          } as any
-        ]
+      handlers.shell_run_snapshot({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-1',
+        status: 'running',
+        command: 'npm test',
+        cwd: 'D:/repo',
+        transcript: '$ npm test\n'
+      });
+      handlers.shell_run_output({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-1',
+        chunk: 'PASS\n',
+        maxLines: 10
+      });
+      handlers.shell_run_exit({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-1',
+        exitCode: 0,
+        reason: 'completed',
+        finalText: 'PASS'
       });
     });
 
-    renderHook(() => useChatManager(vi.fn()));
-    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'tool_output_stream')[1];
+    const run = useShellRunStore.getState().runs['shell-run-1'];
+    expect(run.transcript).toBe('$ npm test\nPASS\n');
+    expect(run.status).toBe('exited');
 
-    act(() => {
-      handler({ chunk: 'Background ', shellId: 'shell-bg-1' });
-      handler({ chunk: 'Output', shellId: 'shell-bg-1' });
-    });
-
-    act(() => { vi.advanceTimersByTime(100); });
-
-    const sessions = useSessionLifecycleStore.getState().sessions;
-    const toolStep = (sessions[0].messages[0] as any).timeline[0];
-    // shellId should be stamped on the ToolStep in s1 even though s2 is active
-    expect(toolStep.event.shellId).toBe('shell-bg-1');
-    // output should contain the concatenated chunks
-    expect(toolStep.event.output).toContain('Background Output');
-
-    vi.useRealTimers();
+    const toolStep = (useSessionLifecycleStore.getState().sessions[0].messages[0] as any).timeline[0];
+    expect(toolStep.event.shellState).toBe('exited');
+    expect(toolStep.event.command).toBe('npm test');
+    expect(toolStep.event.cwd).toBe('D:/repo');
+    expect(toolStep.event.output).toBe('PASS');
   });
 
-  it('handles "tool_output_stream" without shellId — legacy fallback writes to in-progress step', async () => {
-    vi.useFakeTimers();
-    act(() => {
-      useSessionLifecycleStore.setState({
-        activeSessionId: 's1',
-        sessions: [{
-          id: 's1',
-          messages: [{ role: 'assistant', timeline: [{ type: 'tool', event: { status: 'in_progress', output: '' } }] }]
-        } as any]
-      });
-    });
-
-    renderHook(() => useChatManager(vi.fn()));
-    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'tool_output_stream')[1];
-
-    act(() => {
-      handler({ chunk: 'Hello ' });
-      handler({ chunk: 'World' });
-    });
-
-    act(() => { vi.advanceTimersByTime(100); });
-
-    const sessions = useSessionLifecycleStore.getState().sessions;
-    const output = (sessions[0].messages[0] as any).timeline[0].event.output;
-    expect(output).toContain('Hello World');
-
-    vi.useRealTimers();
-  });
-
-  it('handles parallel "tool_output_stream" — two shellIds write to separate ToolSteps', async () => {
-    vi.useFakeTimers();
+  it('routes parallel Shell V2 output by shellRunId without claiming legacy shell steps', async () => {
     act(() => {
       useSessionLifecycleStore.setState({
         activeSessionId: 's1',
@@ -184,8 +139,8 @@ describe('useChatManager hook', () => {
           messages: [{
             role: 'assistant',
             timeline: [
-              { type: 'tool', event: { status: 'in_progress', toolName: 'ux_invoke_shell', output: '' } },
-              { type: 'tool', event: { status: 'in_progress', toolName: 'ux_invoke_shell', output: '' } },
+              { type: 'tool', event: { id: 'a', status: 'in_progress', toolName: 'ux_invoke_shell', shellRunId: 'run-a' } },
+              { type: 'tool', event: { id: 'b', status: 'in_progress', toolName: 'ux_invoke_shell', shellRunId: 'run-b' } },
             ]
           }]
         } as any]
@@ -193,29 +148,15 @@ describe('useChatManager hook', () => {
     });
 
     renderHook(() => useChatManager(vi.fn()));
-    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'tool_output_stream')[1];
+    const outputHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'shell_run_output')[1];
 
     act(() => {
-      // First shell claims first ToolStep; second shell claims second
-      handler({ chunk: 'output-A', shellId: 'shell-A' });
-      handler({ chunk: 'output-B', shellId: 'shell-B' });
+      outputHandler({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'run-b', chunk: 'B' });
+      outputHandler({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'run-a', chunk: 'A' });
     });
 
-    act(() => { vi.advanceTimersByTime(100); });
-
-    const sessions = useSessionLifecycleStore.getState().sessions;
-    const timeline = (sessions[0].messages[0] as any).timeline;
-    // Each ToolStep gets only its own shell's output — no mixing
-    const stepA = timeline.find((e: any) => e.event.shellId === 'shell-A');
-    const stepB = timeline.find((e: any) => e.event.shellId === 'shell-B');
-    expect(stepA).toBeDefined();
-    expect(stepB).toBeDefined();
-    expect(stepA.event.output).toContain('output-A');
-    expect(stepA.event.output).not.toContain('output-B');
-    expect(stepB.event.output).toContain('output-B');
-    expect(stepB.event.output).not.toContain('output-A');
-
-    vi.useRealTimers();
+    expect(useShellRunStore.getState().runs['run-a'].transcript).toBe('A');
+    expect(useShellRunStore.getState().runs['run-b'].transcript).toBe('B');
   });
 
   it('handles "sub_agents_starting" — clears old sidebar sessions immediately', async () => {

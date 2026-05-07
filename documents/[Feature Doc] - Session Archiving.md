@@ -154,7 +154,7 @@ socket.on('archive_session', async ({ uiId }) => {
 ### Step 4: Provider Module Implements `archiveSessionFiles()`
 **File:** `providers/{provider}/index.js` (Provider-specific)
 
-Each provider implements how its session data is archived. Example (Claude):
+Each provider implements how its session data is archived. Example:
 
 ```javascript
 // Pseudo-code; actual implementation varies by provider
@@ -445,7 +445,7 @@ archivePath/
 ├── Session-1-Name/
 │   ├── session.json           (metadata + messages)
 │   ├── attachments/           (optional; user files)
-│   └── [provider-files]       (provider-specific; e.g., .claude folder)
+│   └── [provider-files]       (provider-specific session files)
 ├── Session-2-Name/
 │   └── session.json
 └── ...
@@ -458,8 +458,8 @@ archivePath/
   "id": "ui-id-123",                    // Original UI ID
   "acpSessionId": "acp-id-abc",         // Provider session ID
   "name": "Session Name",               // Display name
-  "model": "claude-3-5-sonnet",         // Model used
-  "currentModelId": "claude-...",       // Active model variant
+  "model": "provider-model-standard",    // Model used
+  "currentModelId": "provider-model-id",// Active model variant
   "modelOptions": [],                   // Model configuration array
   "messages": [                         // Full message history
     { "role": "user", "content": "..." },

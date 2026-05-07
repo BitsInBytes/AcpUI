@@ -19,6 +19,12 @@ vi.mock('../components/SubAgentPanel', () => ({
   ),
 }));
 
+vi.mock('../components/ShellToolTerminal', () => ({
+  default: ({ event }: { event: SystemEvent }) => (
+    <div data-testid="shell-tool-terminal" data-run-id={event.shellRunId ?? ''} />
+  ),
+}));
+
 const makeEvent = (overrides: Partial<SystemEvent> = {}): SystemEvent => ({
   id: 'tool-1',
   title: 'Running read_file: src/app.ts',
@@ -154,6 +160,19 @@ describe('ToolStep', () => {
     props.step.event = makeEvent({ toolName: 'read_file' });
     render(<ToolStep {...props} />);
     expect(screen.queryByTestId('sub-agent-panel')).not.toBeInTheDocument();
+  });
+
+  it('renders ShellToolTerminal for Shell V2 tool steps', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({
+      toolName: 'ux_invoke_shell',
+      shellRunId: 'shell-run-1',
+      status: 'in_progress',
+      output: 'final output should not render here'
+    });
+    render(<ToolStep {...props} />);
+    expect(screen.getByTestId('shell-tool-terminal')).toHaveAttribute('data-run-id', 'shell-run-1');
+    expect(screen.queryByText('final output should not render here')).not.toBeInTheDocument();
   });
 
   it('renders diff lines with correct classes for + and -', () => {

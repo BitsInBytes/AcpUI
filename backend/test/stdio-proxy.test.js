@@ -25,6 +25,8 @@ describe('stdio-proxy', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.BACKEND_PORT = '3005';
+    process.env.ACP_SESSION_PROVIDER_ID = 'provider-a';
+    process.env.ACP_UI_MCP_PROXY_ID = 'proxy-1';
   });
 
   it('runs the proxy lifecycle', async () => {
@@ -33,7 +35,7 @@ describe('stdio-proxy', () => {
     });
     
     await runProxy();
-    expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tools'), expect.any(Object));
+    expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tools?providerId=provider-a&proxyId=proxy-1'), expect.any(Object));
   });
 
   it('handles fetch errors with retry', async () => {
@@ -53,7 +55,17 @@ describe('stdio-proxy', () => {
     });
 
     global.fetch.mockResolvedValue({
-      json: () => Promise.resolve({ tools: [{ name: 't1', inputSchema: {} }], serverName: 'test' })
+      json: () => Promise.resolve({
+        tools: [{
+          name: 't1',
+          title: 'Tool One',
+          description: 'test tool',
+          inputSchema: {},
+          annotations: { readOnlyHint: false },
+          _meta: { custom: true }
+        }],
+        serverName: 'test'
+      })
     });
 
     await runProxy();
@@ -61,17 +73,32 @@ describe('stdio-proxy', () => {
     if (listHandler) {
       const res = await listHandler();
       expect(res.tools).toHaveLength(1);
+      expect(res.tools[0]).toEqual(expect.objectContaining({
+        title: 'Tool One',
+        description: 'test tool',
+        annotations: { readOnlyHint: false },
+        _meta: { custom: true }
+      }));
     }
 
     if (callHandler) {
       global.fetch.mockResolvedValue({ json: () => Promise.resolve({ ok: true }) });
-      const res = await callHandler({ params: { name: 't1', arguments: {} } });
+      const res = await callHandler({ params: { name: 't1', arguments: {}, _meta: { request: 'meta' } } }, { requestId: 42 });
       expect(res.ok).toBe(true);
 
       // Test with missing arguments
       await callHandler({ params: { name: 't1' } });
       expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tool-call'), expect.objectContaining({
         body: expect.stringContaining('"args":{}')
+      }));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tool-call'), expect.objectContaining({
+        body: expect.stringContaining('"providerId":"provider-a"')
+      }));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tool-call'), expect.objectContaining({
+        body: expect.stringContaining('"proxyId":"proxy-1"')
+      }));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tool-call'), expect.objectContaining({
+        body: expect.stringContaining('"mcpRequestId":42')
       }));
     }
   });

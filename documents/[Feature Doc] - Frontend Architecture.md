@@ -12,13 +12,13 @@ This is the user-facing layer. Understanding how stores share state, how Socket.
 
 The frontend performs these key responsibilities:
 
-- **State Management (Zustand Stores)**: Split stores for sessions (useChatStore), streaming events (useStreamStore), system state (useSystemStore), UI state (useUIStore), folders (useFolderStore), canvas (useCanvasStore), sub-agents (useSubAgentStore), and voice (useVoiceStore). Each store is a Zustand hook with actions and selectors.
+- **State Management (Zustand Stores)**: Split stores for sessions (useChatStore), streaming events (useStreamStore), shell run terminals (useShellRunStore), system state (useSystemStore), UI state (useUIStore), folders (useFolderStore), canvas (useCanvasStore), sub-agents (useSubAgentStore), and voice (useVoiceStore). Each store is a Zustand hook with actions and selectors.
 - **Real-Time Socket Connection**: Maintains a module-level singleton Socket.IO connection established at startup, never destroyed by React lifecycle. Handles provider hydration, reconnection, and provider extension events.
 - **Streaming & Typewriter Pipeline**: Receives real-time tokens, thoughts, tool calls, and system events via Socket.IO. Buffers them in useStreamStore, which has a sophisticated `processBuffer()` function that renders tokens character-by-character at adaptive speed (faster when buffer pressure increases).
 - **Provider Branding System**: All UI text, icons, model labels, and color scheme are sourced dynamically from the backend's branding.json. No hardcoded strings for provider identity anywhere in the code.
 - **Session Switching**: Tracks open sessions in useChatStore, supports hot-resume (instant switching for memory-resident sessions), and computes session switch state via pure function helper.
 - **Model State Management**: Tracks current model selection per session, available model catalog, and dynamic model options. The currentModelId is the source of truth.
-- **Canvas & Terminal Integration**: Supports Monaco editor for code viewing/editing, integrated terminal with multiple tabs via xterm.js, git file list, and diff viewer (SafeDiffEditor).
+- **Canvas & Terminal Integration**: Supports Monaco editor for code viewing/editing, integrated canvas terminals with multiple tabs via xterm.js, interactive shell tool terminals inside `ToolStep`, git file list, and diff viewer (SafeDiffEditor).
 - **Sub-Agent & Counsel System**: Displays sub-agents spawned in parallel, shows their tool steps and permissions, and emits parent cancel events when parent is cancelled.
 - **Permission & Hook Workflows**: Shows permission request prompts with approve/deny buttons, tracks tool execution hooks (session_start, pre_tool, post_tool, stop), and emits hook status.
 
@@ -147,12 +147,12 @@ The session's messages array is populated from the backend, which reconstructs t
 ---
 
 ### 4. Socket Listener Setup & Event Binding
-**File:** `frontend/src/hooks/useChatManager.ts` (Lines 62-438)
+**File:** `frontend/src/hooks/useChatManager.ts` (Lines 62-508)
 
 In a useEffect, the `useChatManager()` hook attaches Socket.IO event listeners for all streaming events:
 
 ```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 62-438)
+// FILE: frontend/src/hooks/useChatManager.ts (Lines 62-508)
 useEffect(() => {
   const socket = getSocket();
   
@@ -171,10 +171,10 @@ useEffect(() => {
   socket.on('permission_request', (event) => {
     useChatStore.getState().addPermission(event);
   });
-  
-  socket.on('tool_output_stream', (event) => {
-    // Lines 265-303: Shell output streaming
-    // Accumulate shell tool output, emit to DOM
+
+  socket.on('shell_run_output', (event) => {
+    // Shell terminal output routing by shellRunId
+    // Append terminal output to useShellRunStore
   });
   
   socket.on('sub_agent_started', (event) => {
@@ -504,6 +504,7 @@ This is a **pure function** (no side effects). It just routes and returns the ac
 │  │  ├─ useUIStore: sidebarOpen, settingsOpen, etc.           │  │
 │  │  ├─ useSubAgentStore: agents[], toolSteps[]               │  │
 │  │  ├─ useCanvasStore: artifacts[], activeTerminal            │  │
+│  │  ├─ useShellRunStore: interactive shell runs              │  │
 │  │  ├─ useFolderStore: folders[], expanded[]                 │  │
 │  │  └─ useVoiceStore: isRecording, devices[]                 │  │
 │  └──────────────────────────────────────────────────────────────┘  │
@@ -536,7 +537,7 @@ This is a **pure function** (no side effects). It just routes and returns the ac
 │  └──────────────────────────────────────────────────────────────┘  │
 └────────────┬────────────────────────────────────────────────────────┘
              │ Socket.IO (tokens, thoughts, system_event, 
-             │            permission_request, tool_output_stream, etc.)
+             │            permission_request, etc.)
              │
          [BACKEND]
 ```
@@ -700,7 +701,7 @@ All of these are **event-driven** — the frontend never hardcodes provider logi
 
 ```
 Socket.IO Emit:
-{ event: 'token', providerId: 'claude', sessionId: 'abc-123', text: 'Hel' }
+{ event: 'token', providerId: 'my-provider', sessionId: 'abc-123', text: 'Hel' }
 ```
 
 ### 2. Frontend Receives Token
@@ -790,6 +791,7 @@ The text appears instantly (re-rendered on next frame). If more tokens arrive wh
 | `useFolderStore.ts` | `useFolderStore()` | folders, expanded (localStorage-backed) | createFolder, renameFolder, deleteFolder, toggleFolder | 32-104 |
 | `useCanvasStore.ts` | `useCanvasStore()` | artifacts, activeArtifact, terminals, activeTerminalId | openTerminal, closeTerminal, handleOpenInCanvas, handleFileEdited | 31-169 |
 | `useSubAgentStore.ts` | `useSubAgentStore()` | agents[], tokens, toolSteps, permissions | addAgent, appendToken, addToolStep, setPermission, clear | 47-81 |
+| `useShellRunStore.ts` | `useShellRunStore()` | interactive shell runs keyed by `runId`; prunes old exited snapshots | upsertSnapshot, markStarted, appendOutput, markExited, reset | 58-127 |
 | `useVoiceStore.ts` | `useVoiceStore()` | isRecording, audioDevices | toggleRecording, setDevices | (implied) |
 
 ### Hooks
@@ -798,8 +800,8 @@ The text appears instantly (re-rendered on next frame). If more tokens arrive wh
 |------|--------|---------|-----------|
 | `useSocket.ts` | `getOrCreateSocket()` | Singleton Socket.IO + event handlers | 19-147 |
 | | `useSocket()` | React hook that returns socket instance | 149-167 |
-| `useChatManager.ts` | `useChatManager()` | Attach socket listeners + typewriter loop | 23-445 |
-| | `trimShellOutputLines()` | Utility to truncate shell output | 447-458 |
+| `useChatManager.ts` | `useChatManager()` | Attach socket listeners + typewriter loop | 22-344 |
+| | `trimShellOutputLines()` | Utility to truncate shell output | 346-357 |
 | `useFileUpload.ts` | `useFileUpload()` | Drag & drop + paste handler | (implied) |
 | `useScroll.ts` | `useScroll()` | Auto-scroll with manual override (See `[Feature Doc] - Auto-scroll System.md`) | (implied) |
 | `useVoice.ts` | `useVoice()` | WavRecorder integration | (implied) |
@@ -827,12 +829,13 @@ The text appears instantly (re-rendered on next frame). If more tokens arrive wh
 | `ChatMessage.tsx` | `ChatMessage` | Router: delegates to UserMessage or AssistantMessage |
 | `UserMessage.tsx` | `UserMessage` | User bubble with image thumbnails |
 | `AssistantMessage.tsx` | `AssistantMessage` | Timeline rendering, collapse, turn timer |
-| `ToolStep.tsx` | `ToolStep` | Tool call display with output rendering |
+| `ToolStep.tsx` | `ToolStep` | Tool call display; renders `ShellToolTerminal` when `shellRunId` exists |
 | `PermissionStep.tsx` | `PermissionStep` | Permission request with action buttons |
 | `renderToolOutput.tsx` | Various renders | Syntax highlighting, JSON, ANSI, diffs |
 | `MemoizedMarkdown.tsx` | `MemoizedMarkdown` | Memoized block rendering for streaming |
-| `Terminal.tsx` | `Terminal` | xterm.js integration |
-| `SubAgentPanel.tsx` | `SubAgentPanel` | Sub-agent cards |
+| `Terminal.tsx` | `Terminal` | Canvas terminal xterm.js integration |
+| `ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive shell xterm renderer for active runs; sanitized ANSI-colored read-only transcript renderer after exit |
+| `SubAgentPanel.tsx" | `SubAgentPanel` | Sub-agent cards |
 | `Sidebar.tsx` | `Sidebar` | Session list, folders, workspaces |
 | `SessionItem.tsx` | `SessionItem` | Session row with actions |
 | `FolderItem.tsx` | `FolderItem` | Recursive folder with drag & drop |
@@ -1001,7 +1004,7 @@ currentMessage.steps[index] = step;
 - `thought` → `onStreamThought()`
 - `system_event` → `onStreamEvent()`
 - `permission_request` → `addPermission()`
-- `tool_output_stream` → accumulate and merge
+- `shell_run_*` → update `useShellRunStore` and patch the matching `ToolStep` by `shellRunId`
 - `hooks_status` → create hook status step
 
 ---
@@ -1009,78 +1012,3 @@ currentMessage.steps[index] = step;
 ## Unit Tests
 
 ### Frontend Test Files
-
-Located in `frontend/src/` with \__tests__\` directories. Total: 736 tests across 64 files
-
-**Key test categories:**
-
-| Test File | Subject | Coverage |
-|-----------|---------|----------|
-| `store/*.test.ts` | Zustand store actions, selectors | 85%+ |
-| `hooks/*.test.ts` | Socket, chat manager, upload, voice | 82%+ |
-| `components/*.test.tsx` | Message rendering, tool steps, permissions | 78%+ |
-| `utils/*.test.ts` | Model options, extension routing, session switching | 90%+ |
-
-**Run tests:**
-```bash
-cd frontend
-npx vitest run              # Run all tests
-npx vitest run --coverage   # With coverage report
-```
-
----
-
-## How to Use This Guide
-
-### For Implementing Frontend Features
-
-1. **Understand the flow:** Read "How It Works — End-to-End Flow" (Steps 1-12)
-2. **Identify the layer:** Is your feature:
-   - **Socket event handling?** → See Step 4 + useChatManager hook
-   - **State management?** → See relevant Zustand store in Component Reference
-   - **Rendering timeline?** → See Steps 8-9 + AssistantMessage component
-   - **Model selection?** → See Step 10 + modelOptions utility
-   - **Sub-agents?** → See Step 11 + useSubAgentStore
-3. **Check the gotchas:** Read gotchas relevant to your area
-4. **Find exact line numbers:** Use Component Reference table; read those lines
-5. **Write tests:** Use existing tests as templates; maintain 75%+ coverage
-6. **Update docs:** If you change architecture/flow, update this Feature Doc
-
-### For Debugging Frontend Issues
-
-1. **Check the Unified Timeline:** Open React DevTools, inspect `useChatStore.currentMessage.steps` — are all expected steps present and in order?
-2. **Check the buffer:** Is `useStreamStore.buffer` accumulating tokens or draining? If stuck, typewriter loop may have stopped.
-3. **Check socket listeners:** In browser console, inspect `socket.listeners('token')` — is the listener attached?
-4. **Check store subscription:** Is the component subscribed to the right store field? Use React DevTools Zustand extension to inspect store state.
-5. **Check provider branding:** Is `getBranding(providerId)` returning expected data? Check `useSystemStore.branding` in DevTools.
-6. **Trace the event:** Follow a token from socket emit (backend logs) → useStreamStore → processBuffer → re-render → DOM
-
----
-
-## Summary
-
-The AcpUI frontend is a **provider-agnostic, real-time UI** that:
-
-1. **Maintains a module-level Socket.IO singleton** that persists for app lifetime and handles reconnection
-2. **Receives provider metadata dynamically** from backend branding, never hardcoding provider identity
-3. **Normalizes all streaming via the Unified Timeline** — a chronological sequence of discrete steps (text, thoughts, tools, permissions)
-4. **Buffers tokens and renders adaptively** via processBuffer(), draining at variable speed based on buffer pressure
-5. **Splits stores to minimize re-renders** — streaming updates don't trigger session list re-renders
-6. **Supports hot-resume for instant session switching** — memory-resident sessions are instant
-7. **Manages concurrent sub-agents independently** — sub-agent events don't interfere with parent streaming
-8. **Routes provider events with pure functions** — extensionRouter maps backend events to store actions without side effects
-
-**The critical contract is the Unified Timeline:**
-- Every socket event maps to a step
-- Steps are chronological and immutable
-- Tool metadata is sticky (survives updates)
-- No event can bypass the timeline
-
-**Agents reading this doc should be able to:**
-- ✅ Add a new socket event listener and render it in the timeline
-- ✅ Debug streaming lag (processBuffer logic, typewriter loop)
-- ✅ Add a new Zustand store for new state
-- ✅ Implement dynamic model selection (currentModelId)
-- ✅ Trace a token from socket to rendered character
-- ✅ Understand why provider branding is always dynamic
-- ✅ Debug sub-agent rendering issues

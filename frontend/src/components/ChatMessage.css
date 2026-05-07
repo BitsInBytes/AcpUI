@@ -293,6 +293,79 @@
   padding: 0;
 }
 
+.shell-tool-terminal {
+  margin-top: 0.4rem;
+  margin-bottom: 0.5rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0b0f14;
+}
+
+.shell-tool-terminal-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 0.45rem 0 0.7rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+  background: #111821;
+}
+
+.shell-tool-terminal-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.72rem;
+  color: #cbd5e1;
+}
+
+.shell-tool-terminal-stop {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #f87171;
+  cursor: pointer;
+}
+
+.shell-tool-terminal-stop:hover:not(:disabled) {
+  border-color: rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.12);
+}
+
+.shell-tool-terminal-stop:disabled {
+  color: #64748b;
+  cursor: default;
+}
+
+.shell-tool-terminal-surface {
+  height: clamp(180px, 28vh, 320px);
+  min-height: 180px;
+  padding: 0.35rem;
+}
+
+.shell-tool-terminal-readonly {
+  margin: 0;
+  max-height: 320px;
+  min-height: 80px;
+  overflow: auto;
+  padding: 0.75rem;
+  color: #d6dde6;
+  font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #0b0f14;
+}
+
 .tool-output-pre {
   margin: 0;
   padding: 0;

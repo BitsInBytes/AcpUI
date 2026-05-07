@@ -248,7 +248,7 @@ An agent should be able to follow the flow with a debugger breakpoint and unders
 
 - Be as specific as possible with line numbers and file paths
 - "Around line 100" is useless; "Lines 98-103" is useful
-- "The backend emits an event" is vague; "The backend emits `tool_output_stream` via `io.emit()` at line 92" is useful
+- "The backend emits an event" is vague; "The backend emits `shell_run_output` via `io.emit()` at line 211" is useful
 
 ### Generality (For Providers)
 

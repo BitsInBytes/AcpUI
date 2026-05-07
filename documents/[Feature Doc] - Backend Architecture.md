@@ -223,7 +223,7 @@ socket.on('create_session', async (payload) => {
 
 **Key steps:**
 - MCP server config injected (stdio proxy path and configuration)
-- Provider module can inject custom params (e.g., agent forwarding for Kiro, spawn context for Claude)
+- Provider module can inject custom params via `buildSessionParams()` (e.g., agent forwarding, spawn context)
 - ACP daemon returns dynamic model catalog
 - Session persisted to SQLite with model metadata
 - Frontend receives session ID and initial model state
@@ -453,9 +453,9 @@ When a provider implements `emitCachedContext(sessionId)`, the backend calls it 
 When the ACP daemon calls a tool, the stdio proxy forwards the call to the backend HTTP API:
 
 ```javascript
-// FILE: backend/mcp/stdio-proxy.js (Lines 40-72)
+// FILE: backend/mcp/stdio-proxy.js
 async function runProxy() {
-  const tools = await backendFetch(`/api/mcp/tools?providerId=${providerId}`);
+  const tools = await backendFetch(`/api/mcp/tools?providerId=${providerId}&proxyId=${proxyId}`);
   const server = new Server({ name: serverName, ... });
   
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -465,8 +465,9 @@ async function runProxy() {
         tool: req.params.name,
         args: req.params.arguments,
         providerId,
-        sessionId,
-        ...
+        proxyId,
+        mcpRequestId,
+        requestMeta
       })
     });
     return result;
@@ -474,29 +475,25 @@ async function runProxy() {
 }
 ```
 
-The backend handler (Lines 61-300 in `mcpServer.js`) processes the tool:
+The backend handler processes the tool in `backend/mcp/mcpServer.js`. `ux_invoke_shell` uses the interactive `shellRunManager`:
 
 ```javascript
-// FILE: backend/mcp/mcpServer.js (Lines 64-114 for ux_invoke_shell)
-tools.ux_invoke_shell = async ({ command, cwd, providerId }) => {
-  const pty = spawn(shell, [], { cwd, ... });
-  const chunks = [];
-  
-  pty.on('data', (chunk) => {
-    chunks.push(chunk.toString());
-    // Emit real-time output to UI
-    io.emit('tool_output_stream', { providerId, chunk: chunk.toString() });
-  });
-  
-  await new Promise(resolve => pty.on('exit', resolve));
-  
-  return {
-    content: [{ type: 'text', text: chunks.join('') }]
-  };
+// FILE: backend/mcp/mcpServer.js (Lines 70-85)
+tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+  if (providerId && acpSessionId) {
+    return shellRunManager.startPreparedRun({
+      providerId,
+      acpSessionId,
+      mcpRequestId,
+      command,
+      cwd,
+      maxLines
+    });
+  }
 };
 ```
 
-The tool is executed in the backend Node.js process (not the proxy), so it can emit Socket.IO events for live streaming. The result is returned to the ACP daemon via the proxy.
+The tool is executed in the backend Node.js process (not the proxy). `backend/services/shellRunManager.js` owns the PTY lifecycle and emits `shell_run_started`, `shell_run_output`, and `shell_run_exit` to `session:${sessionId}`. The MCP tool call remains blocked until the process exits or the user terminates it.
 
 ---
 
@@ -579,7 +576,7 @@ The tool is executed in the backend Node.js process (not the proxy), so it can e
              │
 ┌────────────▼───────────────────────────────────────────────────────┐
 │                  ACP DAEMON (per provider)                         │
-│              (ai-cli, claude-cli, gemini-cli, etc.)               │
+│              (provider-cli, my-agent-cli, etc.)                    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -956,19 +953,22 @@ Assistant Message (turn_end)
 | `sockets/fileExplorerHandlers.js` | `explorer_list`, `explorer_read`, `explorer_write` | 19-64 | File system browsing (safe paths) |
 | `sockets/gitHandlers.js` | `git_status`, `git_diff`, `git_stage`, `git_unstage` | 11-89 | Git integration |
 | `sockets/terminalHandlers.js` | `terminal_spawn`, `terminal_input`, `terminal_resize`, `terminal_kill` | 9-59 | PTY terminal sessions |
+| `sockets/shellRunHandlers.js` | `shell_run_input`, `shell_run_resize`, `shell_run_kill` | 39-82 | Interactive shell controls; also exports `emitShellRunSnapshotsForSession()` called by `watch_session` to push `shell_run_snapshot` events to reconnecting clients |
 
 ### MCP Layer
 
 | File | Key Exports | Lines | Purpose |
 |------|-------------|-------|---------|
-| `mcp/mcpServer.js` | `createToolHandlers()` | 61-300 | Tool implementations |
-| | `.ux_invoke_shell` | 64-114 | Shell command execution |
-| | `.ux_invoke_subagents` | 116-260 | Parallel agent spawning |
-| | `.ux_invoke_counsel` | 274-297 | Expert evaluation |
-| `mcp/stdio-proxy.js` | `runProxy()` | 40-72 | Stdio MCP proxy setup |
-| | `backendFetch()` | 25-38 | HTTP fetch to backend with retries |
-| `mcp/routes/mcpApi.js` | `GET /api/mcp/tools` | 24-78 | Tool schema endpoint |
-| | `POST /api/mcp/tool-call` | 84-106 | Tool execution endpoint |
+| `mcp/mcpServer.js` | `createToolHandlers()` | 67-329 | Tool implementations |
+| | `.ux_invoke_shell` | 70-85 | Shell command execution via `shellRunManager` |
+| | `.ux_invoke_subagents` | 142-301 | Parallel agent spawning |
+| | `.ux_invoke_counsel` | 303-325 | Expert evaluation |
+| `mcp/stdio-proxy.js` | `runProxy()` | 52-108 | Stdio MCP proxy setup and proxy/session context forwarding |
+| | `backendFetch()` | 20-39 | HTTP fetch to backend with retries |
+| `routes/mcpApi.js` | `GET /api/mcp/tools` | 30-73 | Tool schema endpoint |
+| | `POST /api/mcp/tool-call` | 81-113 | Tool execution endpoint with timeout disabled |
+| `mcp/mcpProxyRegistry.js` | proxy binding helpers | 1-78 | Correlates stdio MCP proxy instances to provider/session context |
+| `services/shellRunManager.js` | `ShellRunManager` | 60-374 | Interactive PTY lifecycle, transcripts, termination formatting, completed-run cleanup |
 | `mcp/subAgentRegistry.js` | `registerSubAgent()` | 8-10 | Track sub-agent lifecycle |
 | | `getSubAgentsForParent()` | 26-34 | Find children of parent session |
 | | `removeSubAgentsForParent()` | 44-54 | Cleanup orphaned sub-agents |

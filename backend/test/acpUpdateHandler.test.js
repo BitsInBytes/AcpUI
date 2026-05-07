@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleUpdate } from '../services/acpUpdateHandler.js';
 
 // Hoist Mocks
-const { mockProviderModule } = vi.hoisted(() => ({
+const { mockProviderModule, mockShellRunManager } = vi.hoisted(() => ({
     mockProviderModule: {
         intercept: vi.fn(p => p),
         normalizeUpdate: vi.fn(u => u),
@@ -17,6 +17,10 @@ const { mockProviderModule } = vi.hoisted(() => ({
         categorizeToolCall: vi.fn(),
         normalizeConfigOptions: vi.fn(options => Array.isArray(options) ? options : []),
         parseExtension: vi.fn()
+    },
+    mockShellRunManager: {
+      setIo: vi.fn(),
+      prepareRun: vi.fn()
     }
 }));
 
@@ -31,6 +35,9 @@ vi.mock('../services/providerLoader.js', () => ({
   getProviderModuleSync: () => mockProviderModule
 }));
 vi.mock('../services/hookRunner.js', () => ({ runHooks: vi.fn() }));
+vi.mock('../services/shellRunManager.js', () => ({
+  shellRunManager: mockShellRunManager
+}));
 vi.mock('diff', () => ({ createPatch: vi.fn().mockReturnValue('diff-output') }));
 vi.mock('fs', () => ({ default: { existsSync: vi.fn().mockReturnValue(true), realpathSync: vi.fn(p => p) } }));
 
@@ -68,7 +75,14 @@ describe('acpUpdateHandler', () => {
     client.sessionMetadata.set(sid, { toolCalls: 0, usedTokens: 0 });
     mockProviderModule.normalizeUpdate.mockImplementation(u => u);
     mockProviderModule.normalizeTool.mockImplementation(e => e);
+    mockProviderModule.categorizeToolCall.mockReturnValue(undefined);
     mockProviderModule.normalizeConfigOptions.mockImplementation(options => Array.isArray(options) ? options : []);
+    mockShellRunManager.prepareRun.mockReturnValue({
+      runId: 'shell-run-test',
+      status: 'pending',
+      command: 'npm test',
+      cwd: 'D:/repo'
+    });
   });
 
   it('delegates normalization to provider', async () => {
@@ -124,6 +138,72 @@ describe('acpUpdateHandler', () => {
   it('handles tool_call start', async () => {
       await handleUpdate(client, sid, { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Running' });
       expect(client.io.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({ type: 'tool_start' }));
+  });
+
+  it('prepares shell run metadata for ux_invoke_shell tool starts', async () => {
+      client.providerId = 'test-provider';
+      mockProviderModule.normalizeTool.mockImplementation(e => ({ ...e, toolName: 'ux_invoke_shell' }));
+      mockProviderModule.categorizeToolCall.mockReturnValue({ category: 'shell', isShellCommand: true });
+
+      await handleUpdate(client, sid, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 't1',
+        title: 'Tool: AcpUI/ux_invoke_shell',
+        rawInput: {
+          invocation: {
+            server: 'AcpUI',
+            tool: 'ux_invoke_shell',
+            arguments: { command: 'npm test', cwd: 'D:/repo' }
+          }
+        }
+      });
+
+      expect(mockShellRunManager.setIo).toHaveBeenCalledWith(client.io);
+      expect(mockShellRunManager.prepareRun).toHaveBeenCalledWith({
+        providerId: 'test-provider',
+        sessionId: sid,
+        toolCallId: 't1',
+        command: 'npm test',
+        cwd: 'D:/repo'
+      });
+      expect(client.io.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+        type: 'tool_start',
+        shellRunId: 'shell-run-test',
+        shellInteractive: true,
+        shellState: 'pending',
+        command: 'npm test',
+        cwd: 'D:/repo',
+        title: 'Tool: AcpUI/ux_invoke_shell'
+      }));
+  });
+
+  it('does not prepare shell metadata for non-shell tools that mention ux_invoke_shell', async () => {
+      client.providerId = 'test-provider';
+      mockProviderModule.normalizeTool.mockImplementation(e => ({
+        ...e,
+        toolName: 'edit',
+        filePath: 'documents/[Feature Doc] - ux_invoke_shell.md'
+      }));
+      mockProviderModule.categorizeToolCall.mockReturnValue({ category: 'file_edit', isFileOperation: true });
+
+      await handleUpdate(client, sid, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 't1',
+        title: 'Running edit: documents/[Feature Doc] - ux_invoke_shell.md',
+        rawInput: {
+          filePath: 'documents/[Feature Doc] - ux_invoke_shell.md',
+          oldText: 'before',
+          newText: '{"tool":"ux_invoke_shell"}'
+        }
+      });
+
+      expect(mockShellRunManager.prepareRun).not.toHaveBeenCalled();
+      const systemEvent = client.io.emit.mock.calls.find(c => c[0] === 'system_event')[1];
+      expect(systemEvent).toEqual(expect.objectContaining({
+        type: 'tool_start',
+        toolName: 'edit'
+      }));
+      expect(systemEvent).not.toHaveProperty('shellRunId');
   });
 
   it('handles config_option_update and emits provider_extension', async () => {

@@ -2,11 +2,143 @@ import { writeLog } from './logger.js';
 import { autoSaveTurn } from './sessionManager.js';
 import { runHooks } from './hookRunner.js';
 import { getProvider, getProviderModule } from './providerLoader.js';
+import { shellRunManager } from './shellRunManager.js';
 import { applyConfigOptionsChange, normalizeConfigOptions, normalizeRemovedConfigOptionIds } from './configOptions.js';
 import * as db from '../database.js';
 import * as Diff from 'diff';
 import fs from 'fs';
 import path from 'path';
+
+const SHELL_COMMAND_KEYS = ['command', 'cmd', 'parsed_cmd', 'parsedCmd', 'commandLine', 'command_line', 'script', 'line'];
+const SHELL_CWD_KEYS = ['cwd', 'workdir', 'workingDirectory', 'working_dir', 'folder'];
+
+function parseMaybeJson(value) {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function isObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function pushParsedObject(candidates, value) {
+  const parsed = parseMaybeJson(value);
+  if (!isObject(parsed)) return;
+  candidates.push(parsed);
+
+  const invocation = parseMaybeJson(parsed.invocation);
+  if (isObject(invocation)) {
+    candidates.push(invocation);
+    pushNestedArgs(candidates, invocation);
+  }
+
+  pushNestedArgs(candidates, parsed);
+}
+
+function pushNestedArgs(candidates, obj) {
+  for (const key of ['arguments', 'args', 'params', 'input']) {
+    const parsed = parseMaybeJson(obj[key]);
+    if (isObject(parsed)) candidates.push(parsed);
+  }
+}
+
+function shellCandidateObjects(update, event) {
+  const candidates = [];
+  pushParsedObject(candidates, event);
+  pushParsedObject(candidates, update);
+  pushParsedObject(candidates, update?.rawInput);
+  pushParsedObject(candidates, update?.arguments);
+  pushParsedObject(candidates, update?.params);
+  pushParsedObject(candidates, update?.input);
+  pushParsedObject(candidates, update?.toolCall?.arguments);
+  return candidates;
+}
+
+function firstShellValue(candidates, keys) {
+  for (const candidate of candidates) {
+    for (const key of keys) {
+      const value = candidate[key];
+      if (typeof value === 'string' && value.trim()) return value;
+      if (Array.isArray(value) && value.length > 0) return value.join(' ');
+    }
+  }
+  return '';
+}
+
+function getInvocationToolName(update) {
+  const rawInput = parseMaybeJson(update?.rawInput);
+  const explicitInvocation = parseMaybeJson(rawInput?.invocation || update?.invocation || update?.toolCall);
+  const candidates = [
+    explicitInvocation,
+    rawInput,
+    update
+  ].filter(isObject);
+
+  for (const candidate of candidates) {
+    const toolName = candidate.toolName || candidate.tool || candidate.name;
+    if (isUxInvokeShellToolName(toolName)) return 'ux_invoke_shell';
+  }
+  return '';
+}
+
+function isUxInvokeShellToolName(value) {
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === 'ux_invoke_shell' ||
+    normalized.endsWith('/ux_invoke_shell') ||
+    normalized.endsWith('_ux_invoke_shell') ||
+    normalized.endsWith('__ux_invoke_shell') ||
+    normalized.endsWith(':ux_invoke_shell');
+}
+
+function isUxShellToolEvent(update, event) {
+  const values = [
+    event.toolName,
+    update.toolName,
+    update.name,
+    update.toolCall?.toolName,
+    update.toolCall?.tool,
+    update.toolCall?.name,
+    getInvocationToolName(update)
+  ].filter(Boolean);
+
+  return values.some(isUxInvokeShellToolName);
+}
+
+function prepareShellRunForToolStart(acpClient, providerId, sessionId, update, eventToEmit) {
+  if (!providerId || !isUxShellToolEvent(update, eventToEmit)) {
+    return eventToEmit;
+  }
+
+  try {
+    shellRunManager.setIo?.(acpClient.io);
+    const candidates = shellCandidateObjects(update, eventToEmit);
+    const command = firstShellValue(candidates, SHELL_COMMAND_KEYS);
+    const prepared = shellRunManager.prepareRun({
+      providerId,
+      sessionId,
+      toolCallId: update.toolCallId,
+      command,
+      cwd: firstShellValue(candidates, SHELL_CWD_KEYS) || null
+    });
+
+    return {
+      ...eventToEmit,
+      shellRunId: prepared.runId,
+      shellInteractive: true,
+      shellState: prepared.status,
+      command: prepared.command,
+      cwd: prepared.cwd
+    };
+  } catch (err) {
+    writeLog(`[SHELL V2] Failed to prepare shell run for ${sessionId}: ${err.message}`);
+    return eventToEmit;
+  }
+}
 
 /**
  * Routes ACP session/update events to the UI via socket.io.
@@ -167,6 +299,8 @@ export async function handleUpdate(acpClient, sessionId, update) {
     // Step 2: Categorize (provider maps its own tools to a category — UI tools are the frontend's concern)
     const category = providerModule.categorizeToolCall(eventToEmit);
     if (category) eventToEmit = { ...eventToEmit, ...category };
+
+    eventToEmit = prepareShellRunForToolStart(acpClient, providerId, sessionId, update, eventToEmit);
 
     acpClient.io.to('session:' + sessionId).emit('system_event', eventToEmit);
 

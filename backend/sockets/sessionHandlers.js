@@ -27,6 +27,7 @@ import {
   getConfigOptionsFromSetResult,
   normalizeProviderConfigOptions
 } from '../services/sessionManager.js';
+import { bindMcpProxy, getMcpProxyIdFromServers } from '../mcp/mcpProxyRegistry.js';
 
 async function saveModelState(sessionId, modelState) {
   if (typeof db.saveModelState === 'function') {
@@ -238,9 +239,10 @@ export default function registerSessionHandlers(io, socket) {
       });
 
       acpClient.stream.beginDraining(newAcpId);
+      const forkMcpServers = getMcpServers(providerId, { acpSessionId: newAcpId });
       await acpClient.transport.sendRequest('session/load', {
         sessionId: newAcpId, cwd: session.cwd || process.cwd(),
-        mcpServers: getMcpServers(providerId)
+        mcpServers: forkMcpServers
       });
       await acpClient.stream.waitForDrainToFinish(newAcpId, 3000);
 
@@ -320,8 +322,9 @@ export default function registerSessionHandlers(io, socket) {
             });
           }
           acpClient.stream.beginDraining(existingAcpId);
+          const loadMcpServers = getMcpServers(resolvedProviderId, { acpSessionId: existingAcpId });
           result = await acpClient.transport.sendRequest('session/load', {
-            sessionId: existingAcpId, cwd: sessionCwd, mcpServers: getMcpServers(resolvedProviderId), ...sessionParams
+            sessionId: existingAcpId, cwd: sessionCwd, mcpServers: loadMcpServers, ...sessionParams
           });
           await acpClient.stream.waitForDrainToFinish(existingAcpId, 1500);
           if (!result.sessionId) result.sessionId = existingAcpId;
@@ -341,9 +344,11 @@ export default function registerSessionHandlers(io, socket) {
           usedTokens: 0, totalTokens: 0, promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '',
           agentName: requestAgent || null, spawnContext: null, provider: resolvedProviderId
         });
+        const newMcpServers = getMcpServers(resolvedProviderId);
         result = await acpClient.transport.sendRequest('session/new', {
-          cwd: sessionCwd, mcpServers: getMcpServers(resolvedProviderId), ...sessionParams
+          cwd: sessionCwd, mcpServers: newMcpServers, ...sessionParams
         });
+        bindMcpProxy(getMcpProxyIdFromServers(newMcpServers), { providerId: resolvedProviderId, acpSessionId: result.sessionId });
         const meta = acpClient.sessionMetadata.get('pending-new');
         acpClient.sessionMetadata.delete('pending-new');
         acpClient.sessionMetadata.set(result.sessionId, meta);

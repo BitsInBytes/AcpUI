@@ -2,7 +2,7 @@
 
 **AcpUI's custom MCP (Model Context Protocol) server bridges the ACP daemon to AcpUI-specific tools via a stateless stdio proxy. Tools like `ux_invoke_shell`, `ux_invoke_subagents`, and `ux_invoke_counsel` run as tool handlers in the backend, not in the proxy — keeping all orchestration and I/O logic centralized.**
 
-This is a critical infrastructure component. The system's key insight: the proxy is a thin, generic passthrough, while all intelligence (PTY spawning, socket emission, sub-agent orchestration) stays in the backend Node.js process.
+This is a critical infrastructure component. The system's key insight: the proxy is a thin, generic passthrough, while all intelligence (interactive shell PTY lifecycle, socket emission, sub-agent orchestration) stays in the backend Node.js process.
 
 ---
 
@@ -19,7 +19,7 @@ When an ACP session is created, the backend injects an MCP server config telling
 5. Returns the result to the ACP
 
 Meanwhile, the **backend** handles all the real work:
-- Spawning PTYs for shell commands
+- Spawning PTYs for shell commands through `ShellRunManager`
 - Creating sub-agent ACP sessions
 - Emitting Socket.IO events for live updates
 - Managing databases and file systems
@@ -48,14 +48,14 @@ The system has **three components**:
 ### 1. **Backend Tool Handlers** (`backend/mcp/mcpServer.js`)
 
 Where the actual tool logic lives. These are plain async functions that receive `{ command, args, providerId, ... }` and resolve with `{ content: [{ type: 'text', text: '...' }] }` or throw errors.
-
 ```javascript
-// FILE: backend/mcp/mcpServer.js (Line 64)
-tools.ux_invoke_shell = async ({ command, cwd, providerId }) => {
-  // Real logic: spawn PTY, emit tool_output_stream, return result
+// FILE: backend/mcp/mcpServer.js (Lines 70-85)
+tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+  // Delegate to shellRunManager for interactive terminal execution.
 };
 
 tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {
+```
   // Real logic: spawn sub-agent sessions, await responses, cleanup
 };
 ```
@@ -65,19 +65,26 @@ tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {
 A child process spawned per ACP session. The proxy is stateless and generic.
 
 ```javascript
-// FILE: backend/mcp/stdio-proxy.js (Full file, 74 lines)
+// FILE: backend/mcp/stdio-proxy.js
 async function runProxy() {
   // Fetch tool definitions from backend
-  const { tools, serverName } = await backendFetch(`/api/mcp/tools?providerId=...`);
+  const { tools, serverName } = await backendFetch(`/api/mcp/tools?providerId=...&proxyId=...`);
   
-  // Register with MCP SDK
-  const server = new Server({ name: serverName, ... });
+  // Register with MCP SDK and advertise server-level instructions
+  const instructions = buildServerInstructions(tools, serverName);
+  const server = new Server({ name: serverName, ... }, { instructions, ... });
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [...] }));
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     // Forward to backend HTTP endpoint
     return await backendFetch('/api/mcp/tool-call', {
       method: 'POST',
-      body: JSON.stringify({ tool: req.params.name, args: req.params.arguments, providerId: ... })
+      body: JSON.stringify({
+        tool: req.params.name,
+        args: req.params.arguments,
+        providerId: ...,
+        proxyId: ...,
+        mcpRequestId: extra?.requestId,
+      })
     });
   });
   
@@ -87,21 +94,21 @@ async function runProxy() {
 }
 ```
 
-**Key detail (Line 40):** The proxy fetches tool definitions on startup. If new tools are added and schemas aren't updated, the ACP won't see them.
+**Key details:** The proxy fetches tool definitions on startup and derives MCP `instructions` from the same tool list. If schemas are out of date, discovery and instructions will both be stale until a new session starts.
 
 ### 3. **Backend HTTP API** (`backend/routes/mcpApi.js`)
 
 Two routes that bridge proxy ↔ backend:
 
-**GET /api/mcp/tools?providerId=...** — Returns tool definitions with JSON schemas.
+**GET /api/mcp/tools?providerId=...&proxyId=...** — Returns tool definitions with JSON schemas and MCP tool metadata.
 ```javascript
-// FILE: backend/routes/mcpApi.js (Lines 24-78)
+// FILE: backend/routes/mcpApi.js (Lines 30-73)
 router.get('/tools', (req, res) => {
-  const providerId = req.query.providerId || null;
+  const context = resolveToolContext(req.query.providerId || null, req.query.proxyId || null);
   const toolList = [
     { 
       name: 'ux_invoke_shell', 
-      description: 'Execute a shell command with live streaming output. Always use this tool for shell commands; never use system shell, bash, or powershell tools when they are present. Use only non-interactive commands and adjust pager-prone commands like git diff to be non-interactive, for example git --no-pager diff.',
+      description: 'Execute a shell command in a real terminal with live streaming output and user-interactive stdin while the process is running...',
       inputSchema: { type: 'object', properties: { command: {...}, cwd: {...} }, required: ['command'] }
     },
     { 
@@ -116,7 +123,7 @@ router.get('/tools', (req, res) => {
 
 **POST /api/mcp/tool-call** — Executes a tool and returns the result.
 ```javascript
-// FILE: backend/routes/mcpApi.js (Lines 84-106)
+// FILE: backend/routes/mcpApi.js (Lines 81-113)
 router.post('/tool-call', async (req, res) => {
   // CRITICAL: Disable timeouts so tools can run indefinitely
   req.setTimeout(0);      // LINE 85
@@ -149,19 +156,21 @@ User creates a session in the UI. Backend receives `create_session` via Socket.I
 
 ### 2. **Backend Constructs MCP Server Config**
 
-**File:** `backend/services/sessionManager.js` (Lines 24-38)
+**File:** `backend/services/sessionManager.js` (Lines 28-44)
 
 ```javascript
-export function getMcpServers(providerId) {
+export function getMcpServers(providerId, { acpSessionId = null } = {}) {
   const name = getProvider(providerId).config.mcpName;  // "AcpUI" (configurable)
   if (!name) return [];
   const proxyPath = path.resolve(__dirname, '..', 'mcp', 'stdio-proxy.js');
+  const proxyId = createMcpProxyBinding({ providerId, acpSessionId });  // LINE 32: Creates proxy registry entry
   return [{
     name,
     command: 'node',
     args: [proxyPath],
     env: [
-      { name: 'ACP_SESSION_PROVIDER_ID', value: String(providerId) },  // LINE 27: Critical for multi-provider
+      { name: 'ACP_SESSION_PROVIDER_ID', value: String(providerId) },  // LINE 38: Critical for multi-provider
+      { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },                  // LINE 39: Proxy identity for session binding
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ]
@@ -171,6 +180,7 @@ export function getMcpServers(providerId) {
 
 **Note the environment variables:**
 - `ACP_SESSION_PROVIDER_ID` — So the proxy knows which provider to report tools for
+- `ACP_UI_MCP_PROXY_ID` — A unique proxy id that binds this proxy to its provider/session context in the registry
 - `BACKEND_PORT` — So the proxy knows where to send HTTP requests
 - `NODE_TLS_REJECT_UNAUTHORIZED` — For self-signed localhost certs
 
@@ -202,19 +212,25 @@ With environment variables from the config.
 **File:** `backend/mcp/stdio-proxy.js` (Lines 40-41)
 
 ```javascript
-const { tools, serverName } = await backendFetch(`/api/mcp/tools?providerId=${process.env.ACP_SESSION_PROVIDER_ID || ''}`);
+const queryParts = [];
+if (providerId) queryParts.push(`providerId=${encodeURIComponent(providerId)}`);
+if (proxyId) queryParts.push(`proxyId=${encodeURIComponent(proxyId)}`);
+const query = queryParts.length > 0 ? `?${queryParts.join('&')}` : '';
+const { tools, serverName } = await backendFetch(`/api/mcp/tools${query}`);
 ```
 
 The proxy makes an HTTPS request to the backend's GET /api/mcp/tools endpoint. Includes a retry loop (lines 25-38) with exponential backoff (500ms * attempt) for reliability.
 
 ### 6. **Proxy Registers with MCP SDK**
 
-**File:** `backend/mcp/stdio-proxy.js` (Lines 43-66)
+**File:** `backend/mcp/stdio-proxy.js`
 
 ```javascript
+const resolvedServerName = serverName || 'acpui-proxy';
+const instructions = buildServerInstructions(tools, resolvedServerName);
 const server = new Server(
-  { name: serverName || 'acpui-proxy', version: '1.0.0' },
-  { capabilities: { tools: {} } }
+  { name: resolvedServerName, version: '1.0.0' },
+  { capabilities: { tools: {} }, instructions }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -225,19 +241,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   }))
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
-  return await backendFetch('/api/mcp/tool-call', {  // LINE 58
+  return await backendFetch('/api/mcp/tool-call', {
     method: 'POST',
-    body: JSON.stringify({ tool: name, args: args || {}, providerId: process.env.ACP_SESSION_PROVIDER_ID || null }),
+    body: JSON.stringify({
+      tool: name,
+      args: args || {},
+      providerId: process.env.ACP_SESSION_PROVIDER_ID || null,
+      proxyId: process.env.ACP_UI_MCP_PROXY_ID || null,
+      mcpRequestId: extra?.requestId ?? null,
+      requestMeta: request.params?._meta || extra?._meta || null
+    }),
   });
 });
 
-const transport = new StdioServerTransport();  // LINE 64
-await server.connect(transport);  // LINE 65
+const transport = new StdioServerTransport();
+await server.connect(transport);
 ```
 
-Now the proxy is listening on stdin/stdout for MCP RPC requests from the ACP.
+Now the proxy is listening on stdin/stdout for MCP RPC requests from the ACP. The `instructions` payload gives the agent server-level guidance about available AcpUI tools before it decides whether to call any tool.
 
 ### 7. **Agent Calls a Tool**
 
@@ -267,17 +290,19 @@ The ACP sends a JSON-RPC request on stdout:
 
 ### 9. **Proxy Forwards to Backend HTTP Endpoint**
 
-**File:** `backend/mcp/stdio-proxy.js` (Lines 56-62)
+**File:** `backend/mcp/stdio-proxy.js`
 
 ```typescript
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
   return await backendFetch('/api/mcp/tool-call', {
     method: 'POST',
     body: JSON.stringify({ 
       tool: name,                                       // "ux_invoke_shell"
       args: args || {},                                // { command, cwd }
-      providerId: process.env.ACP_SESSION_PROVIDER_ID  // From env
+      providerId: process.env.ACP_SESSION_PROVIDER_ID, // From env
+      proxyId: process.env.ACP_UI_MCP_PROXY_ID,        // Session binding
+      mcpRequestId: extra?.requestId ?? null
     }),
   });
 });
@@ -287,15 +312,21 @@ The proxy calls `backendFetch()` (with retry logic) to POST /api/mcp/tool-call.
 
 ### 10. **Backend Executes Tool Handler**
 
-**File:** `backend/routes/mcpApi.js` (Lines 84-106)
+**File:** `backend/routes/mcpApi.js` (Lines 103-132)
 
 ```javascript
-const handler = tools[toolName];  // Get ux_invoke_shell handler
-const result = await handler({ command, cwd, providerId });  // Execute
-res.json(result);  // Return immediately
+const context = resolveToolContext(providerId || null, proxyId || null);  // LINE 118: Resolve from proxy registry
+const handlerArgs = { ...(args || {}) };
+if (context.providerId)   handlerArgs.providerId   = context.providerId;
+if (context.acpSessionId) handlerArgs.acpSessionId = context.acpSessionId;
+if (context.mcpProxyId)   handlerArgs.mcpProxyId   = context.mcpProxyId;
+if (mcpRequestId !== undefined && mcpRequestId !== null) handlerArgs.mcpRequestId = mcpRequestId;
+if (requestMeta)          handlerArgs.requestMeta  = requestMeta;
+const result = await handler(handlerArgs);  // Execute; may block for long-running tools
+res.json(result);
 ```
 
-The handler for `ux_invoke_shell` runs (spawns PTY, streams output, etc.). It may emit Socket.IO events during execution.
+The handler for `ux_invoke_shell` delegates to `shellRunManager.startPreparedRun(...)` and blocks until the PTY exits or is user-terminated. It emits `shell_run_started`, `shell_run_output`, and `shell_run_exit` during execution.
 
 ### 11. **Tool Result Returned to Proxy**
 
@@ -373,12 +404,12 @@ Tool schemas and handlers are defined in **two separate files** with **no code l
 
 ### Where Schemas Are Defined
 
-**File:** `backend/routes/mcpApi.js` (Lines 32-76)
+**File:** `backend/routes/mcpApi.js` (Lines 30-73)
 
 ```javascript
 const toolList = [
   { 
-    name: 'ux_invoke_shell',                    // LINE 33
+    name: 'ux_invoke_shell',
     description: '...',
     inputSchema: {
       type: 'object',
@@ -396,21 +427,21 @@ res.json({ tools: toolList, serverName });
 
 ### Where Handlers Are Defined
 
-**File:** `backend/mcp/mcpServer.js` (Lines 61-297)
+**File:** `backend/mcp/mcpServer.js` (Lines 67-329)
 
 ```javascript
 export function createToolHandlers(io) {
   const tools = {};
 
-  tools.ux_invoke_shell = async ({ command, cwd, providerId }) => {  // LINE 64
+  tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {  // LINE 70
+    // Interactive implementation via shellRunManager
+  };
+```
+  tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {  // LINE 142
     // Real implementation
   };
 
-  tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {  // LINE 116
-    // Real implementation
-  };
-
-  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId }) => {  // LINE 274
+  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId }) => {  // LINE 303
     // Real implementation
   };
 
@@ -460,19 +491,21 @@ Both files have warning comments (read them!):
 
 ### Version 1: For User Sessions (sessionManager.js)
 
-**File:** `backend/services/sessionManager.js` (Lines 24-38)
+**File:** `backend/services/sessionManager.js` (Lines 28-44)
 
 ```javascript
-export function getMcpServers(providerId) {
+export function getMcpServers(providerId, { acpSessionId = null } = {}) {
   const name = getProvider(providerId).config.mcpName;
   if (!name) return [];
   const proxyPath = path.resolve(__dirname, '..', 'mcp', 'stdio-proxy.js');
+  const proxyId = createMcpProxyBinding({ providerId, acpSessionId });  // ← Creates registry entry
   return [{
     name,
     command: 'node',
     args: [proxyPath],
     env: [
-      { name: 'ACP_SESSION_PROVIDER_ID', value: String(providerId) },  // ← Includes provider ID
+      { name: 'ACP_SESSION_PROVIDER_ID', value: String(providerId) },  // ← Provider identity
+      { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },                  // ← Proxy registry binding
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ]
@@ -482,24 +515,26 @@ export function getMcpServers(providerId) {
 
 **Used by:** `sessionHandlers.js` for regular `session/new` and `session/load` calls.
 
-**Key:** Includes `ACP_SESSION_PROVIDER_ID` in the environment so the proxy knows which provider to use.
+**Key:** Creates a proxy registry entry and includes both `ACP_SESSION_PROVIDER_ID` and `ACP_UI_MCP_PROXY_ID` so the backend can resolve the proxy back to its provider/session context when a tool call arrives.
 
 ### Version 2: For Sub-Agent Sessions (mcpServer.js)
 
-**File:** `backend/mcp/mcpServer.js` (Lines 40-55)
+**File:** `backend/mcp/mcpServer.js` (Lines 38-55)
 
 ```javascript
-export function getMcpServers(providerId = null) {
+export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
   const provider = getProvider(providerId);
   const name = provider.config.mcpName;
   if (!name) return [];
   const proxyPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'stdio-proxy.js');
+  const proxyId = createMcpProxyBinding({ providerId: provider.id, acpSessionId });  // ← Creates registry entry
   return [{
     name,
     command: 'node',
     args: [proxyPath],
     env: [
       { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
+      { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ]
@@ -507,9 +542,9 @@ export function getMcpServers(providerId = null) {
 }
 ```
 
-**Used by:** Inside `mcpServer.js` for sub-agent spawning (line 175: `mcpServers: getMcpServers(resolvedProviderId)`).
+**Used by:** Inside `mcpServer.js` for sub-agent spawning (line 146: `mcpServers: getMcpServers(resolvedProviderId)`). After `session/new` returns, `bindMcpProxy` is called to associate the proxy id with the newly created ACP session id.
 
-**Key:** Includes `ACP_SESSION_PROVIDER_ID` to ensure sub-agent sessions inherit the parent provider scope, enabling nested tool calls to work correctly.
+**Key:** Same contract as Version 1 — both include `ACP_SESSION_PROVIDER_ID` and `ACP_UI_MCP_PROXY_ID`. The distinction is purely about which call site uses which version.
 
 ### Why Two?
 
@@ -517,7 +552,7 @@ The sessionManager version is used by socket session creation paths. The mcpServ
 
 ### Implication
 
-Both flows propagate provider identity explicitly via `ACP_SESSION_PROVIDER_ID` env var. The gotcha is maintenance drift: there are two implementations in different files and both must stay aligned to ensure provider scoping works consistently for user sessions and sub-agent sessions.
+Both flows propagate provider identity and proxy identity via env vars. The gotcha is maintenance drift: there are two implementations in different files and both must stay aligned to ensure provider scoping and proxy resolution work consistently for user sessions and sub-agent sessions.
 
 ---
 
@@ -579,16 +614,18 @@ After making changes:
 
 | File | Functions | Lines | Purpose |
 |------|-----------|-------|---------|
-| `backend/mcp/mcpServer.js` | `createToolHandlers(io)` | 63-303 | Defines all tool handlers (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) |
-| | `getMcpServers()` | 40-55 | Returns MCP server config for sub-agent spawning (includes ACP_SESSION_PROVIDER_ID env) |
-| | `ux_invoke_shell` | 66-116 | Spawn PTY, stream output, handle timeout |
-| | `ux_invoke_subagents` | 118-263 | Spawn sub-agents, await responses, cleanup |
-| | `ux_invoke_counsel` | 277-300 | Spawn counsel agents (delegates to ux_invoke_subagents) |
-| `backend/mcp/stdio-proxy.js` | `runProxy()` | 40-66 | Fetch schemas, register with MCP SDK, forward tool calls |
-| | `backendFetch()` | 25-38 | HTTP request with 3-attempt retry loop |
-| `backend/routes/mcpApi.js` | `GET /tools` | 24-78 | Return tool schemas and server name |
-| | `POST /tool-call` | 84-106 | Execute tool handler, disable timeouts, return result |
-| `backend/services/sessionManager.js` | `getMcpServers(providerId)` | 24-38 | Returns MCP server config for user sessions (includes ACP_SESSION_PROVIDER_ID) |
+| `backend/mcp/mcpServer.js` | `createToolHandlers(io)` | 63-276 | Defines all tool handlers (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) |
+| | `getMcpServers()` | 38-55 | Returns MCP server config for sub-agent spawning (includes proxy id env) |
+| | `ux_invoke_shell` | 66-88 | Delegate to `shellRunManager` for interactive shell execution |
+| | `ux_invoke_subagents` | 89-248 | Spawn sub-agents, await responses, cleanup |
+| | `ux_invoke_counsel` | 250-276 | Spawn counsel agents (delegates to ux_invoke_subagents) |
+| `backend/mcp/stdio-proxy.js` | `runProxy()`, `buildServerInstructions()` | 52-108 | Fetch schemas, derive MCP instructions, register with MCP SDK, forward tool calls with proxy/session context |
+| | `backendFetch()` | 20-39 | HTTP request with 3-attempt retry loop |
+| `backend/routes/mcpApi.js` | `GET /tools` | 34-97 | Return tool schemas and server name |
+| | `POST /tool-call` | 103-132 | Execute tool handler, disable timeouts, return result |
+| `backend/mcp/mcpProxyRegistry.js` | proxy binding helpers | 1-78 | Correlate stdio proxy ids to provider/session context |
+| `backend/services/shellRunManager.js` | `ShellRunManager` | 60-374 | Interactive PTY lifecycle and final-result formatting |
+| `backend/services/sessionManager.js` | `getMcpServers(providerId, { acpSessionId })` | 28-44 | Returns MCP server config for user sessions (includes proxy id env) |
 
 ---
 
@@ -628,13 +665,28 @@ The proxy fetches tool definitions once at startup (line 41). If you update sche
 
 If a handler throws, mcpApi.js catches it (line 102) and returns `{ content: [{ type: 'text', text: 'Error: ...' }] }`. The proxy passes this back as a successful response. The ACP sees it as tool output, not an error. This is acceptable — the tool ran and returned an error message.
 
-### 9. **Tool Output Streaming Happens Outside Tool Call**
+### 9. **Shell Terminal Events Happen Outside Tool Result**
 
-`ux_invoke_shell` doesn't stream output through the tool result. It emits `tool_output_stream` events via Socket.IO while the PTY is running. The final result is just a summary. This is efficient because streaming in the HTTP response would be slow.
+`ux_invoke_shell` emits `shell_run_started`, `shell_run_output`, and `shell_run_exit` through Socket.IO while the HTTP/MCP tool call remains pending. The final MCP result is returned only after process exit or user termination. Multiple shell calls can be pending at once because each run is correlated by `shellRunId`.
 
-### 10. **The Proxy Is Stateless**
+### 10. **MCP Tool Annotations Are Hints, Not Scheduling Controls**
 
-Every tool call includes `providerId`. The proxy doesn't store state. If you need to track state across tool calls, use the backend's session metadata (acpClient.sessionMetadata).
+`GET /api/mcp/tools` includes conservative `annotations` for `ux_invoke_shell`:
+
+- `readOnlyHint: false`
+- `destructiveHint: true`
+- `idempotentHint: false`
+- `openWorldHint: true`
+
+MCP does not define a standard `parallelizable` flag. The shell tool description states that independent shell calls may be invoked concurrently, and the tool descriptor includes `_meta["acpui/concurrentInvocationsSupported"] = true` for AcpUI-aware clients. The stdio proxy preserves `title`, `annotations`, `execution`, `outputSchema`, and `_meta` when registering tools.
+
+### 11. **Tool Output Streaming Happens Outside Tool Call**
+
+Shell output is not streamed through the HTTP response body. It is sent through Socket.IO terminal events, and the HTTP response carries only the final MCP content array.
+
+### 12. **The Proxy Is Stateless**
+
+Every tool call includes `providerId` and `proxyId`. The proxy doesn't store state. If you need to track state across tool calls, use backend state keyed by proxy/session/run id.
 
 ---
 
@@ -643,14 +695,20 @@ Every tool call includes `providerId`. The proxy doesn't store state. If you nee
 ### Backend Tests
 
 - **`backend/test/mcpServer.test.js`** — Tests tool handlers:
-  - `getMcpServers returns server config` (line 128-131)
-  - `ux_invoke_shell spawns PTY and returns output`
+  - `getMcpServers returns server config`
+  - `ux_invoke_shell` interactive path via `shellRunManager`
+  - MCP call remains pending until PTY resolves
   - Tool handler signatures and result format
 
 - **`backend/test/mcpApi.test.js`** — Tests HTTP routes:
   - `GET /tools returns correct schema`
+  - Shell schema advertises interactive terminal behavior
   - `POST /tool-call routes to correct handler`
+  - Proxy context is forwarded to handlers
   - Error handling
+
+- **`backend/test/mcpProxyRegistry.test.js`** — Tests proxy id creation, binding, lookup, and expiration.
+- **`backend/test/shellRunManager.test.js`** — Tests interactive shell lifecycle, output formatting, Ctrl+C, hard kill, timeout, and snapshots.
 
 ---
 
@@ -663,7 +721,7 @@ The AcpUI MCP server is a clean two-process design:
 
 **The critical contract:** Tool schemas (mcpApi.js) and handlers (mcpServer.js) must be manually kept in sync. No code links them.
 
-**The key gotcha:** Two different `getMcpServers` functions exist. SessionManager version includes `ACP_SESSION_PROVIDER_ID` for user sessions. MCP Server version doesn't, for sub-agent internal use.
+**The key gotcha:** Two different `getMcpServers` functions exist — one in `sessionManager.js` (for user sessions via socket handlers) and one in `mcpServer.js` (for sub-agent sessions inside tool handlers). Both include `ACP_SESSION_PROVIDER_ID` and `ACP_UI_MCP_PROXY_ID`. They must stay aligned or proxy resolution will break for one of the two paths.
 
 **Why it matters:** This architecture allows agents to have powerful, extensible tools (shell, sub-agents, counsel) without bloating the proxy. Tools can emit live updates, spawn long-running processes, and orchestrate complex workflows — all while the proxy remains a simple passthrough.
 

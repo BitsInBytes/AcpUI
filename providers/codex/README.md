@@ -64,15 +64,16 @@ When token refresh is needed, AcpUI automatically derives the OAuth client ID fr
 
 AcpUI injects MCP tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) into your Codex sessions. Codex also has native built-in tools with overlapping functionality. For the best experience, you can configure AcpUI's enhanced versions as the preferred tools and manage their permissions.
 
-### 1. Block Codex's Built-In System Tools (Recommended for Better UX)
+### 1. Block Codex's Built-In System Tools and Steer Tool Usage (Recommended for Better UX)
 
-**Why:** Codex has native system tools (like `shell_tool` and `multi_agent`) that are available by default. By default, the LLM might prefer these over AcpUI's tools.
+**Why:** Codex has native system tools (like `shell_tool` and `multi_agent`) that are available by default. By default, the LLM might prefer these over AcpUI's tools. Unlike other ACP providers, Codex requires explicit steering instructions to reliably use the AcpUI tools.
 
 AcpUI's versions of these tools provide a superior user experience:
-- **`ux_invoke_shell`** — Live colored shell output with real-time streaming
-- **`ux_invoke_subagents`** — Agent orchestration view showing parallel agent execution, not just raw output
+- **`ux_invoke_shell`** — Live colored shell output with real-time streaming, interactive terminal with user input
+- **`ux_invoke_subagents`** — Agent orchestration view showing parallel agent execution with live progress
+- **`ux_invoke_counsel`** — Multi-perspective evaluation with Advocate, Critic, Pragmatist, and domain experts
 
-To get the best experience, you can disable Codex's built-in tools in your global config.
+#### Step 1: Disable Codex's Built-In System Tools
 
 **Configuration File Location:**
 - macOS/Linux: `~/.codex/config.toml`
@@ -86,7 +87,73 @@ shell_tool = false
 multi_agent = false
 ```
 
-*Note: On some versions of Codex, setting `shell_tool = false` may aggressively disable any tool with "shell" in the name, including AcpUI's `ux_invoke_shell`. If you find that `ux_invoke_shell` is missing after adding this setting, you must remove `shell_tool = false` (or set it to `true`) to restore it.*
+#### Step 2: Create AGENTS.md to Steer Tool Usage (Critical for Codex)
+
+Codex's LLM benefits from explicit instructions on which tools to use and when. Create an `AGENTS.md` file in your Codex home directory to provide global agent steering:
+
+**File Location:**
+- macOS/Linux: `~/.codex/AGENTS.md`
+- Windows: `%USERPROFILE%\.codex\AGENTS.md`
+
+**Example AGENTS.md:**
+
+```markdown
+# Codex Agents Configuration
+
+This file provides steering instructions for all Codex agents to properly use AcpUI tools.
+
+## Global Tool Usage Instructions
+
+### Always Use AcpUI Tools for System Interaction
+
+You have access to three powerful AcpUI tools through the AcpUI MCP server. Use these tools for system interaction instead of built-in alternatives:
+
+1. **ux_invoke_shell** — Execute shell commands with interactive terminal support
+   - **When to use:** Any time you need to run shell commands, scripts, tests, builds, or terminal operations
+   - **Why it's better:** Provides live colored output, real-time streaming, and interactive terminal with user input support
+   - **Example:** Running `npm test`, `git status`, `python script.py`, system commands
+   - **Prefer this over:** Any built-in shell tool alternatives
+
+2. **ux_invoke_subagents** — Spawn parallel AI agents to work on independent tasks
+   - **When to use:** Breaking down complex tasks into parallel independent work streams
+   - **Why it's better:** Shows live progress for each agent, enables parallel execution, provides clear orchestration view
+   - **Example:** Reviewing multiple files in parallel, running independent analyses, parallel testing
+   - **Prefer this over:** Sequential processing or built-in agent alternatives
+
+3. **ux_invoke_counsel** — Get multi-perspective evaluation on decisions
+   - **When to use:** Before making architectural decisions, evaluating approaches, or assessing trade-offs
+   - **Why it's better:** Provides Advocate (for), Critic (against), Pragmatist (practical), and optional domain experts
+   - **Example:** Evaluating authentication approaches, assessing refactoring strategies, reviewing design decisions
+   - **Always use for:** Major architectural decisions, technology selection, significant refactoring choices
+
+## Important Notes
+
+- **AcpUI tools are always available** — They are injected into every session via the AcpUI MCP server
+- **Prefer AcpUI over built-in tools** — AcpUI tools provide better UX, streaming, and integration
+- **Interactive shell support** — The `ux_invoke_shell` tool supports user input, terminal resize, and Ctrl+C handling
+- **Non-blocking agent spawning** — Use `ux_invoke_subagents` when you need parallel execution
+- **Always evaluate decisions** — Use `ux_invoke_counsel` before committing to major decisions
+
+## Agent Defaults
+
+Unless you create a custom agent configuration, all agents should:
+1. Prefer AcpUI tools (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel)
+2. Use these tools for their intended purposes as described above
+3. Avoid falling back to built-in alternatives even if they exist
+```
+
+**Why this matters for Codex:**
+
+- **Explicit steering** — Codex's LLM tends to use whatever tools it sees first in the tool list. This markdown provides clear guidance on which tools to prioritize
+- **Use case examples** — Showing concrete examples helps the LLM make better decisions about which tool to use
+- **Decision rationale** — Explaining *why* AcpUI tools are better helps the LLM internalize the preference
+- **Consistent behavior** — All agents benefit from the same steering without needing to configure each one individually
+
+#### Step 3: Create Custom Agents with Tool Steering (Optional)
+
+For even more precise control, you can create custom agent configurations that combine tool preferences with task-specific instructions. This is covered in Section 3 below.
+
+**Tip:** The AGENTS.md file is read by Codex's internal system prompt mechanism, so changes take effect on the next session creation.
 
 ### 2. Blocking Additional Tools (Optional)
 

@@ -304,9 +304,9 @@ describe('AcpClient Service', () => {
 
   describe('buildAcpSpawnCommand', () => {
     it('uses cmd.exe wrapper for bare commands on Windows', () => {
-      const target = buildAcpSpawnCommand('codex-acp', ['--help'], 'win32');
+      const target = buildAcpSpawnCommand('test-provider-cli', ['--help'], 'win32');
       expect(target.command).toBe('cmd.exe');
-      expect(target.args).toEqual(['/d', '/s', '/c', 'codex-acp', '--help']);
+      expect(target.args).toEqual(['/d', '/s', '/c', 'test-provider-cli', '--help']);
     });
 
     it('uses cmd.exe wrapper for .cmd files on Windows', () => {
@@ -316,8 +316,8 @@ describe('AcpClient Service', () => {
     });
 
     it('keeps direct spawn for non-Windows', () => {
-      const target = buildAcpSpawnCommand('codex-acp', ['--help'], 'linux');
-      expect(target.command).toBe('codex-acp');
+      const target = buildAcpSpawnCommand('test-provider-cli', ['--help'], 'linux');
+      expect(target.command).toBe('test-provider-cli');
       expect(target.args).toEqual(['--help']);
     });
   });

@@ -537,7 +537,7 @@ Provider-specific structure; defined by the provider. Example:
 {
   "apiKey": "sk-...",
   "organizationId": "org-...",
-  "modelDefaults": { "default": "claude-3-5-sonnet" }
+  "modelDefaults": { "default": "provider-model-id" }
 }
 ```
 

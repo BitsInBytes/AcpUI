@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as sessionManager from '../services/sessionManager.js';
 import * as db from '../database.js';
 import { getProvider, getProviderModule } from '../services/providerLoader.js';
+import { clearMcpProxyRegistry, getMcpProxyIdFromServers, resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
 
 vi.mock('../database.js');
 vi.mock('../services/providerLoader.js');
@@ -10,6 +11,7 @@ vi.mock('../services/logger.js');
 describe('sessionManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearMcpProxyRegistry();
   });
 
   describe('getMcpServers', () => {
@@ -23,6 +25,9 @@ describe('sessionManager', () => {
       const servers = sessionManager.getMcpServers('p1');
       expect(servers).toHaveLength(1);
       expect(servers[0].name).toBe('test-mcp');
+      expect(servers[0].env).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'ACP_UI_MCP_PROXY_ID', value: expect.stringMatching(/^mcp-proxy-/) })
+      ]));
     });
   });
 
@@ -99,6 +104,12 @@ describe('sessionManager', () => {
       expect(acpClient.sessionMetadata.set).toHaveBeenCalledWith('a1', expect.any(Object));
       expect(acpClient.stream.beginDraining).toHaveBeenCalledWith('a1');
       expect(acpClient.transport.sendRequest).toHaveBeenCalledWith('session/load', expect.objectContaining({ sessionId: 'a1' }));
+      const loadRequest = acpClient.transport.sendRequest.mock.calls.find(call => call[0] === 'session/load')[1];
+      const proxyId = getMcpProxyIdFromServers(loadRequest.mcpServers);
+      expect(resolveMcpProxy(proxyId)).toEqual(expect.objectContaining({
+        providerId: 'p1',
+        acpSessionId: 'a1'
+      }));
       expect(providerModule.emitCachedContext).toHaveBeenCalledWith('a1');
       expect(providerModule.normalizeModelState).toHaveBeenCalledWith(
         expect.objectContaining({ currentModelId: 'm1' }),

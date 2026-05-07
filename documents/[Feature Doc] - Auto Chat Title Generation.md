@@ -351,7 +351,7 @@ graph TB
    - Payload structure:
    ```typescript
    {
-     providerId: string;      // Provider ID (e.g., 'claude', 'kiro')
+     providerId: string;      // Provider ID (e.g., 'my-provider')
      uiId: string;            // UI Session ID (from database, not ACP ID)
      newName: string;         // Generated title (1-100 chars)
    }
@@ -388,8 +388,8 @@ A provider's `provider.json` must include a `models` section with an optional `t
 ```json
 {
   "models": {
-    "default": "claude-3-5-sonnet-20241022",
-    "titleGeneration": "claude-3-5-haiku-20241022",
+    "default": "provider-model-standard",
+    "titleGeneration": "provider-model-fast",
     "balanced": { "id": "some-model", "label": "Balanced" }
   }
 }
@@ -449,7 +449,7 @@ Providers do **not** need to implement any special logic for title generation. T
 
 [STEP 4] Socket Emission
   Event: session_renamed
-  Payload: { providerId: 'claude', uiId: 'abc-123', newName: 'React Tailwind Component Tutorial' }
+  Payload: { providerId: 'my-provider', uiId: 'abc-123', newName: 'React Tailwind Component Tutorial' }
 
 [STEP 5] Frontend Update
   Zustand state: sessions[x] = { ...sessions[x], name: 'React Tailwind Component Tutorial' }

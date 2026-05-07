@@ -1,4 +1,4 @@
-import type { StreamEventData, StreamDoneData, ChatSession } from '../types';
+import type { StreamEventData, StreamDoneData, ChatSession, SystemEvent } from '../types';
 import { useEffect } from 'react';
 import { useSystemStore } from '../store/useSystemStore';
 import { shouldNotify as shouldNotifyHelper } from '../utils/notificationHelper';
@@ -6,13 +6,12 @@ import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useStreamStore } from '../store/useStreamStore';
 import { useVoiceStore } from '../store/useVoiceStore';
 import { useSubAgentStore } from '../store/useSubAgentStore';
+import { useShellRunStore, type ShellRunSnapshot } from '../store/useShellRunStore';
 
 /**
  * Central socket event dispatcher. Wires socket.io events to the appropriate stores.
  *
  * Key mechanisms:
- * - tool_output_stream: Buffers shell output chunks and flushes every 50ms into the
- *   in-progress tool's timeline entry, avoiding per-character React re-renders.
  * - Sub-agent lazy session creation: ChatSession objects are NOT created on
  *   `sub_agent_started` — only when the first token/event arrives (pendingSubAgents map).
  *   This avoids empty ghost tabs for agents that fail before producing output.
@@ -62,127 +61,20 @@ export function useChatManager(
   useEffect(() => {
     if (!socket) return;
 
-    // Per-shell buffers: keyed by shellId from the backend.
-    // Each shell invocation gets its own buffer so parallel shells don't mix output.
-    // shellId → { buffer, maxLines, timer }
-    type ShellBuf = { buffer: string; maxLines: number | null; timer: ReturnType<typeof setInterval> | null };
-    const shellBuffers = new Map<string, ShellBuf>();
-
-    // Flush one shell's buffer to the ToolStep stamped with that shellId.
-    // Returns true if the write succeeded, false if the ToolStep wasn't ready yet.
-    const flushShellBuffer = (shellId: string) => {
-      const entry = shellBuffers.get(shellId);
-      if (!entry || !entry.buffer) return false;
-      let flushed = false;
-      const chunk = entry.buffer;
-
-      useSessionLifecycleStore.setState(state => {
-        let globalFlushed = false;
-        const newSessions = state.sessions.map(s => {
-          if (globalFlushed) return s;
-          const msgs = [...s.messages];
-          const msg = msgs[msgs.length - 1];
-          if (!msg || msg.role !== 'assistant' || !msg.timeline) return s;
-
-          let hasClaimed = msg.timeline.some(e => e.type === 'tool' && e.event.shellId === shellId && e.event.status === 'in_progress');
-          
-          if (!hasClaimed) {
-            // Lazy claim: if the tool_start event arrived after the first tool_output_stream chunk
-            const unclaimedIndex = msg.timeline.findIndex(e => e.type === 'tool' && e.event.status === 'in_progress' && e.event.toolName === 'ux_invoke_shell' && !e.event.shellId);
-            if (unclaimedIndex !== -1) {
-              msg.timeline = [...msg.timeline];
-              const step = msg.timeline[unclaimedIndex];
-              if (step.type === 'tool') {
-                msg.timeline[unclaimedIndex] = { ...step, event: { ...step.event, shellId } };
-                hasClaimed = true;
-              }
-            }
-          }
-
-          // Only flush if the target ToolStep (matched by shellId) is still in-progress in this session
-          if (!hasClaimed) return s;
-
-          globalFlushed = true;
-          flushed = true;
-
-          const timeline = msg.timeline.map(e =>
-            e.type === 'tool' && e.event.shellId === shellId
-              ? { ...e, event: { ...e.event, output: trimShellOutputLines((e.event.output || '') + chunk, entry.maxLines) } }
-              : e
-          );
-          msgs[msgs.length - 1] = { ...msg, timeline };
-          return { ...s, messages: msgs };
-        });
-        return globalFlushed ? { sessions: newSessions } : state;
-      });
-
-      if (flushed) {
-        entry.buffer = '';
-      }
-      return flushed;
+    const patchShellRunToolStep = (runId: string, patch: Partial<SystemEvent>) => {
+      useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.map(session => ({
+          ...session,
+          messages: session.messages.map(message => ({
+            ...message,
+            timeline: message.timeline?.map(entry => {
+              if (entry.type !== 'tool' || entry.event.shellRunId !== runId) return entry;
+              return { ...entry, event: { ...entry.event, ...patch } };
+            }) || message.timeline
+          }))
+        }))
+      }));
     };
-
-    // Stamp shellId onto the first unclaimed in-progress ux_invoke_shell ToolStep
-    // across any session. Called on the first chunk for a new shellId.
-    const claimShellToolStep = (shellId: string) => {
-      useSessionLifecycleStore.setState(state => {
-        let globalClaimed = false;
-        const newSessions = state.sessions.map(s => {
-          if (globalClaimed) return s;
-          const msgs = [...s.messages];
-          const lastMsg = msgs[msgs.length - 1];
-          if (!lastMsg || lastMsg.role !== 'assistant' || !lastMsg.timeline) return s;
-          
-          let localClaimed = false;
-          const timeline = lastMsg.timeline.map(e => {
-            if (!localClaimed && e.type === 'tool' && e.event.status === 'in_progress' && e.event.toolName === 'ux_invoke_shell' && !e.event.shellId) {
-              localClaimed = true;
-              globalClaimed = true;
-              return { ...e, event: { ...e.event, shellId } };
-            }
-            return e;
-          });
-          
-          if (!localClaimed) return s;
-          msgs[msgs.length - 1] = { ...lastMsg, timeline };
-          return { ...s, messages: msgs };
-        });
-        return globalClaimed ? { sessions: newSessions } : state;
-      });
-    };
-
-    // Legacy fallback buffer for tool_output_stream events without a shellId
-    // (backwards compatibility with older backend versions).
-    let legacyToolOutputBuffer: string | null = null;
-    let legacyToolOutputMaxLines: number | null = null;
-
-    const flushLegacyBuffer = () => {
-      const activeId = useSessionLifecycleStore.getState().activeSessionId;
-      if (!activeId || !legacyToolOutputBuffer) return false;
-      const session = useSessionLifecycleStore.getState().sessions.find(s => s.id === activeId);
-      if (!session) return false;
-      const lastMsg = session.messages[session.messages.length - 1];
-      if (!lastMsg || lastMsg.role !== 'assistant' || !lastMsg.timeline) return false;
-      if (!lastMsg.timeline.some(e => e.type === 'tool' && e.event.status === 'in_progress')) return false;
-      const chunk = legacyToolOutputBuffer;
-      legacyToolOutputBuffer = null;
-      useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => {
-          if (s.id !== activeId) return s;
-          const msgs = [...s.messages];
-          const msg = msgs[msgs.length - 1];
-          if (!msg || msg.role !== 'assistant' || !msg.timeline) return s;
-          const timeline = msg.timeline.map(e =>
-            e.type === 'tool' && e.event.status === 'in_progress'
-              ? { ...e, event: { ...e.event, output: trimShellOutputLines((e.event.output || '') + chunk, legacyToolOutputMaxLines) } }
-              : e
-          );
-          msgs[msgs.length - 1] = { ...msg, timeline };
-          return { ...s, messages: msgs };
-        }) }));
-      return true;
-    };
-
-    let legacyFlushTimer: ReturnType<typeof setInterval> | null = null;
 
     // Pending sub-agents — session created lazily on first token
     const pendingSubAgents = new Map<string, { providerId: string; acpSessionId: string; uiId: string; index: number; name: string; prompt: string; agent: string; parentSessionId: string; parentUiId: string; model: string }>();
@@ -278,44 +170,53 @@ export function useChatManager(
         ) }));
     });
 
-    socket.on('tool_output_stream', (data: { chunk: string; maxLines?: number; shellId?: string }) => {
-      if (data.shellId) {
-        // Per-shell path: isolated buffer, targeted ToolStep flush
-        const shellId = data.shellId;
-        if (!shellBuffers.has(shellId)) {
-          // First chunk for this shell — claim the matching ToolStep
-          shellBuffers.set(shellId, { buffer: '', maxLines: null, timer: null });
-          claimShellToolStep(shellId);
-        }
-        const entry = shellBuffers.get(shellId)!;
-        if (typeof data.maxLines === 'number' && Number.isInteger(data.maxLines) && data.maxLines > 0) {
-          entry.maxLines = data.maxLines;
-        }
-        entry.buffer += data.chunk;
-        entry.buffer = trimShellOutputLines(entry.buffer, entry.maxLines);
-        if (!flushShellBuffer(shellId) && !entry.timer) {
-          entry.timer = setInterval(() => {
-            flushShellBuffer(shellId);
-            const e = shellBuffers.get(shellId);
-            if (e && !e.buffer && e.timer) { clearInterval(e.timer); e.timer = null; shellBuffers.delete(shellId); }
-          }, 50);
-        }
-      } else {
-        // Legacy path: no shellId (old backend) — write to first in-progress tool step
-        const maxLines = data.maxLines;
-        if (typeof maxLines === 'number' && Number.isInteger(maxLines) && maxLines > 0) {
-          legacyToolOutputMaxLines = maxLines;
-        }
-        if (!legacyToolOutputBuffer) legacyToolOutputBuffer = '';
-        legacyToolOutputBuffer += data.chunk;
-        legacyToolOutputBuffer = trimShellOutputLines(legacyToolOutputBuffer, legacyToolOutputMaxLines);
-        if (!flushLegacyBuffer() && !legacyFlushTimer) {
-          legacyFlushTimer = setInterval(() => {
-            flushLegacyBuffer();
-            if (!legacyToolOutputBuffer && legacyFlushTimer) { clearInterval(legacyFlushTimer); legacyFlushTimer = null; }
-          }, 50);
-        }
-      }
+    socket.on('shell_run_prepared', (snapshot: ShellRunSnapshot) => {
+      if (!snapshot?.runId) return;
+      useShellRunStore.getState().upsertSnapshot(snapshot);
+      patchShellRunToolStep(snapshot.runId, {
+        shellRunId: snapshot.runId,
+        shellState: snapshot.status,
+        command: snapshot.command,
+        cwd: snapshot.cwd
+      });
+    });
+
+    socket.on('shell_run_snapshot', (snapshot: ShellRunSnapshot) => {
+      if (!snapshot?.runId) return;
+      useShellRunStore.getState().upsertSnapshot(snapshot);
+      patchShellRunToolStep(snapshot.runId, {
+        shellRunId: snapshot.runId,
+        shellState: snapshot.status,
+        command: snapshot.command,
+        cwd: snapshot.cwd
+      });
+    });
+
+    socket.on('shell_run_started', (snapshot: ShellRunSnapshot) => {
+      if (!snapshot?.runId) return;
+      const started = { ...snapshot, status: snapshot.status || 'running' } as ShellRunSnapshot;
+      useShellRunStore.getState().markStarted(started);
+      patchShellRunToolStep(snapshot.runId, { 
+        shellState: started.status,
+        command: started.command,
+        cwd: started.cwd
+      });
+    });
+
+    socket.on('shell_run_output', (data: { providerId: string; sessionId: string; runId: string; chunk: string; maxLines?: number }) => {
+      if (!data?.runId) return;
+      useShellRunStore.getState().appendOutput(data);
+      // Ensure the step is updated if it wasn't already
+      patchShellRunToolStep(data.runId, { shellState: 'running' });
+    });
+
+    socket.on('shell_run_exit', (data: { providerId: string; sessionId: string; runId: string; exitCode?: number | null; reason?: string | null; finalText?: string }) => {
+      if (!data?.runId) return;
+      useShellRunStore.getState().markExited(data);
+      patchShellRunToolStep(data.runId, {
+        shellState: 'exited',
+        ...(data.finalText !== undefined ? { output: data.finalText } : {})
+      });
     });
 
     // Sub-agent events
@@ -411,12 +312,6 @@ export function useChatManager(
     socket.on('system_event', subAgentSystemHandler);
 
     return () => {
-      // Clean up all per-shell timers
-      for (const entry of shellBuffers.values()) {
-        if (entry.timer) clearInterval(entry.timer);
-      }
-      shellBuffers.clear();
-      if (legacyFlushTimer) clearInterval(legacyFlushTimer);
       socket.off('stats_push');
       socket.off('session_renamed');
       socket.off('merge_message');
@@ -426,7 +321,11 @@ export function useChatManager(
       socket.off('permission_request');
       socket.off('token_done');
       socket.off('hooks_status');
-      socket.off('tool_output_stream');
+      socket.off('shell_run_prepared');
+      socket.off('shell_run_snapshot');
+      socket.off('shell_run_started');
+      socket.off('shell_run_output');
+      socket.off('shell_run_exit');
       socket.off('sub_agents_starting');
       socket.off('sub_agent_started');
       socket.off('sub_agent_completed');

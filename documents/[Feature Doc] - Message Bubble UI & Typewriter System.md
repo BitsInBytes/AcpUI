@@ -215,7 +215,7 @@ export interface SystemEvent {
   startTime?: number;              // Timestamp when tool started
   endTime?: number;                // Timestamp when tool ended (undefined = in_progress)
   invocationId?: string;           // Sub-agent batch correlation ID
-  shellId?: string;                // Shell process correlation ID
+  shellRunId?: string;             // Shell process correlation ID
 }
 ```
 

@@ -31,16 +31,16 @@ The ProviderStatusPanel system:
 ## How It Works — End-to-End Flow
 
 ### 1. Provider Emits Status (ACP Daemon)
-**File:** (Provider-specific, e.g., Claude CLI daemon)
+**File:** (Provider-specific — each provider daemon implements its own status emission)
 
 The ACP provider daemon sends a `provider_extension` notification:
 
 ```json
 {
-  "method": "claude-protocol://provider/status",
+  "method": "my-protocol://provider/status",
   "params": {
     "status": {
-      "title": "Claude API",
+      "title": "Provider API",
       "subtitle": "Usage this month",
       "updatedAt": "2026-05-01T14:32:00Z",
       "sections": [
@@ -461,7 +461,7 @@ interface ProviderStatusSummary {
 
 interface ProviderStatus {
   providerId?: string;    // Inferred from route; can be explicit
-  title?: string;         // "Claude API"
+  title?: string;         // e.g., "Provider API"
   subtitle?: string;      // "Usage this month"
   updatedAt?: string;     // ISO 8601 timestamp
   summary?: ProviderStatusSummary;
@@ -479,17 +479,17 @@ interface ProviderStatus {
 
 ---
 
-## Data Flow Example: Claude Provider Emitting Quota Status
+## Data Flow Example: Provider Emitting Quota Status
 
 ### 1. Provider Emits
 
 ```json
 {
-  "method": "claude-protocol://provider/status",
+  "method": "my-protocol://provider/status",
   "params": {
     "status": {
-      "providerId": "claude",
-      "title": "Claude API",
+      "providerId": "my-provider",
+      "title": "Provider API",
       "subtitle": "Usage this billing period",
       "updatedAt": "2026-05-01T14:32:15Z",
       "sections": [
@@ -550,7 +550,7 @@ interface ProviderStatus {
 
 ```
 ╔════════════════════════════╗
-║  Claude API               ║
+║  Provider API             ║
 ║  Usage this billing peri…  ║
 ╟────────────────────────────╢
 ║ Total Usage: 3M / 15M tokens │
@@ -566,7 +566,7 @@ Only the summary item is shown (1 item). Progress bar filled to 20%. Tone: green
 
 ```
 ╔════════════════════════════════════════╗
-║  Claude API                            ║
+║  Provider API                          ║
 ║  Usage this billing period        [✕] ║
 ╟────────────────────────────────────────╢
 ║                                        ║

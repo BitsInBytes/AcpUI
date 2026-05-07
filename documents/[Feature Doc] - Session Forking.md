@@ -496,7 +496,7 @@ This ensures the summary is captured without polluting the UI or triggering stre
   "fork_point": 8,
   "messages_json": "[... sliced messages from index 0 to 8 ...]",
   "model": "test-flagship",
-  "current_model_id": "claude-3-5-sonnet",
+  "current_model_id": "provider-model-id",
   "provider": "provider-a"
 }
 ```
@@ -511,7 +511,7 @@ This ensures the summary is captured without polluting the UI or triggering stre
   forkedFrom: "session-parent-ui",
   forkPoint: 8,
   model: "test-flagship",
-  currentModelId: "claude-3-5-sonnet",
+  currentModelId: "provider-model-id",
   provider: "provider-a",
   isTyping: false,
   isWarmingUp: false,

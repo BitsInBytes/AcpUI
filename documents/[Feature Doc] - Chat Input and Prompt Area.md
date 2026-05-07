@@ -587,11 +587,11 @@ This feature requires **no provider-specific configuration** beyond standard bra
 ```json
 {
   "models": {
-    "default": "claude-3-5-sonnet-20241022",
+    "default": "provider-model-standard",
     "quickAccess": [
-      { "id": "claude-3-5-haiku-20241022", "name": "Haiku", "description": "Fast, cheap" },
-      { "id": "claude-3-5-sonnet-20241022", "name": "Sonnet", "description": "Balanced" },
-      { "id": "claude-3-opus-20250219", "name": "Opus", "description": "Powerful" }
+      { "id": "provider-model-fast", "name": "Fast", "description": "Fast, cheap" },
+      { "id": "provider-model-standard", "name": "Standard", "description": "Balanced" },
+      { "id": "provider-model-capable", "name": "Capable", "description": "Powerful" }
     ]
   }
 }
@@ -697,25 +697,25 @@ User clicks footer dropdown (currently shows "Using Sonnet (62%)")
   │   → filters provider.branding.models.quickAccess
   │
   ├─ Renders list:
-  │   [x] Haiku
-  │   [ ] Sonnet  ← active
-  │   [ ] Opus
+  │   [x] Model Fast  ← active
+  │   [ ] Model Standard
+  │   [ ] Model Capable
   │
-  ▼ User clicks "Opus"
+  ▼ User clicks "Model Capable"
   │
-  ├─ onModelSelect('claude-3-opus-...')
+  ├─ onModelSelect('provider-model-capable')
   │
   ├─ handleActiveSessionModelChange(socket, modelId)
   │
   ├─ socket.emit('set_session_model', {
   │    uiId: 'sess-123',
   │    acpSessionId: 'acp-123',
-  │    model: 'claude-3-opus-...'
+  │    model: 'provider-model-capable'
   │  })
   │
   ▼ (Backend: sessionHandlers.js)
   │
-  ├─ session.model = 'claude-3-opus-...'
+  ├─ session.model = 'provider-model-capable'
   ├─ Persist to SQLite
   ├─ Emit 'session_model_options' to UI
   │

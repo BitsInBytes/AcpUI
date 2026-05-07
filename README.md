@@ -217,7 +217,7 @@ Access at `https://localhost:3005`.
 
 When setting up the system and your custom agents, for the best experience **agents must be configured without their built-in `Bash`, `PowerShell`, `Shell`, and sub-agent commands**. Some providers allow you to do this on a per-agent basis while others require their global settings file to be changed. Each provider in this repo contains a README that will have information on how to do this or will contain information on how this is done automatically for you. The AcpUI-specific tools that will be used instead are:
 
-- **`ux_invoke_shell`** — Execute shell commands with live-streaming output and ANSI color rendering. This tool provides cross-platform shell execution integrated directly into the AcpUI.
+- **`ux_invoke_shell`** — Execute shell commands through AcpUI in a real terminal-backed tool step with live output, user stdin, resize, stop controls, and separate terminals for concurrent shell calls.
 - **`ux_invoke_subagents`** — Spawn parallel AI agents with live streaming, sidebar nesting under parent chat, and permission controls. This provides the full agent coordination within AcpUI with full transparency and a global overview.
 
 The MCP server name that exposes these tools is defined in the provider's `provider.json` file and defaults to `AcpUI`, each provider README will also cover how to allow these tools if you don't want to see permission requests when these are used. This ensures all agent execution (shell commands, sub-agent spawning, and tool calls) flows through the AcpUI's unified timeline, maintains proper session context, respects permissions, and integrates with the UI's canvas, terminal, and diff viewer.
@@ -283,7 +283,7 @@ The MCP server name that exposes these tools is defined in the provider's `provi
 - **Stdio MCP proxy** — Stdio MCP proxy spawned per ACP session — exposes UI-specific tools (shell, sub-agents) via /api/mcp/tool-call
 - **Sub-agent system** — `ux_invoke_subagents` spawns parallel AI agents with live streaming, sidebar nesting under parent chat, and permission inheritance
 - **Multi-perspective counsel** — `ux_invoke_counsel` spawns Advocate, Critic, Pragmatist + optional domain experts to evaluate decisions
-- **Shell execution** — `ux_invoke_shell` with live streaming output and ANSI color rendering
+- **Shell execution** — `ux_invoke_shell` with interactive terminal interaction
 - **Tool & turn timers** — live elapsed time on each tool call and assistant turn
 - **File explorer** — full-screen file browser with Monaco editor and markdown preview
 - **JSONL rehydration** — rebuild chat history from raw session files
@@ -298,17 +298,16 @@ cd backend; npx vitest run --coverage
 cd frontend; npx vitest run --coverage
 ```
 
-Last updated: **May 3, 2026 at 1:47 PM (America/Winnipeg)**.
+Last validated: **May 3, 2026 at 5:36 PM (America/Winnipeg)**.
 
-| Suite | Test Files | Tests | Statements | Branches | Functions | Lines |
-|---|---:|---:|---:|---:|---:|---:|
-| Backend | 61 | 637 | 91.09% | 80.03% | 93.42% | 93.71% |
-| Frontend | 77 | 685 | 79.23% | 70.21% | 78.36% | 83.14% |
-| **Total** | **138** | **1,322** | — | — | — | — |
+| Suite | Command | Result |
+|---|---|---:|
+| Backend | `npx vitest run` | 64 files / 684 tests passed |
+| Frontend | `npx vitest run` | 79 files / 699 tests passed |
 
 Notes:
-- Coverage values come from `vitest --coverage` “All files” for each package.
-- Frontend test setup now mocks `HTMLCanvasElement.getContext`, `window.alert`, and `window.open` to keep CI/local test output stable and warning-free.
+- Run the coverage commands above when coverage percentages are needed.
+- Frontend test setup mocks `HTMLCanvasElement.getContext`, `window.alert`, and `window.open` to keep CI/local test output stable and warning-free.
 
 ## Provider System
 

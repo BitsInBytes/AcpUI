@@ -14,7 +14,6 @@
  */
 import { getProvider, getProviderModule } from '../services/providerLoader.js';
 import { writeLog } from '../services/logger.js';
-import pty from 'node-pty';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { registerSubAgent, completeSubAgent, failSubAgent } from './subAgentRegistry.js';
@@ -22,11 +21,10 @@ import { cleanupAcpSession } from './acpCleanup.js';
 import * as db from '../database.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
 import { modelOptionsFromProviderConfig, resolveModelSelection } from '../services/modelOptions.js';
+import { bindMcpProxy, createMcpProxyBinding, getMcpProxyIdFromServers } from './mcpProxyRegistry.js';
+import { shellRunManager } from '../services/shellRunManager.js';
 
 const DEFAULT_MAX_SHELL_RESULT_LINES = 1000;
-
-// eslint-disable-next-line no-control-regex
-const stripAnsi = (str) => str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/\x1b\[[?]?[0-9;]*[a-zA-Z]/g, '');
 
 export function getMaxShellResultLines(env = process.env) {
   const parsed = Number.parseInt(env.MAX_SHELL_RESULT_LINES || '', 10);
@@ -37,17 +35,19 @@ export function getMaxShellResultLines(env = process.env) {
  * Returns the stdio MCP server config for passing in session/new mcpServers array.
  * The ACP spawns this as a child process and communicates via stdin/stdout.
  */
-export function getMcpServers(providerId = null) {
+export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
   const provider = getProvider(providerId);
   const name = provider.config.mcpName;
   if (!name) return [];
   const proxyPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'stdio-proxy.js');
+  const proxyId = createMcpProxyBinding({ providerId: provider.id, acpSessionId });
   return [{
     name,
     command: 'node',
     args: [proxyPath],
     env: [
       { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
+      { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ]
@@ -63,56 +63,27 @@ import { providerRuntimeManager } from '../services/providerRuntimeManager.js';
 export function createToolHandlers(io) {
   const tools = {};
 
-  tools.ux_invoke_shell = async ({ command, cwd, providerId }) => {
-
+  tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
     const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
     const maxLines = getMaxShellResultLines();
-    // Unique ID for this specific shell invocation — lets the frontend route
-    // tool_output_stream chunks to the correct ToolStep when multiple shells
-    // run in parallel (without it, a single shared buffer causes output mixing).
-    const shellId = `shell-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
 
-    return new Promise((resolve) => {
-      let output = '';
-      let exitCode = 0;
-
-      const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';
-      const args = process.platform === 'win32'
-        ? ['-NoProfile', '-Command', `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]
-        : ['-c', command];
-
-      const proc = pty.spawn(shell, args, {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
+    if (providerId && acpSessionId) {
+      const toolCallId = requestMeta?.toolCallId || requestMeta?.tool_call_id || requestMeta?.callId || null;
+      shellRunManager.setIo?.(io);
+      writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
+      return shellRunManager.startPreparedRun({
+        providerId,
+        acpSessionId,
+        toolCallId,
+        mcpRequestId,
+        command,
         cwd: workingDir,
-        env: { ...process.env, TERM: 'xterm-256color', FORCE_COLOR: '1', PYTHONIOENCODING: 'utf-8' },
+        maxLines
       });
+    }
 
-      const emitToolOutput = (chunk) => {
-        if (io) io.emit('tool_output_stream', { providerId, chunk, maxLines, shellId });
-      };
-
-      emitToolOutput(`$ ${command}\n`);
-
-      proc.onData((data) => {
-        output += data;
-        emitToolOutput(data);
-      });
-
-      proc.onExit(({ exitCode: code }) => {
-        exitCode = code;
-        writeLog(`[MCP SHELL] Exit code: ${code}`);
-        const plain = stripAnsi(output).trim() || '(no output)';
-        const result = exitCode !== 0 ? `${plain}\n\nExit Code: ${exitCode}` : plain;
-        resolve({ content: [{ type: 'text', text: result }] });
-      });
-
-      // Inactivity timeout: 30 minutes
-      let timer = setTimeout(() => { proc.kill(); }, 1800000);
-      proc.onData(() => { clearTimeout(timer); timer = setTimeout(() => { proc.kill(); }, 1800000); });
-    });
+    writeLog('[MCP SHELL] Missing provider/session context; tool call aborted');
+    return { content: [{ type: 'text', text: 'Error: Shell execution context unavailable' }] };
   };
 
   tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {
@@ -172,8 +143,10 @@ export function createToolHandlers(io) {
           try {
             const providerModule = await getProviderModule(resolvedProviderId);
             const sessionParams = providerModule.buildSessionParams(agentName);
-            const result = await sendWithTimeout('session/new', { cwd, mcpServers: getMcpServers(resolvedProviderId), ...sessionParams }, 30000);
+            const mcpServers = getMcpServers(resolvedProviderId);
+            const result = await sendWithTimeout('session/new', { cwd, mcpServers, ...sessionParams }, 30000);
             const subAcpId = result.sessionId;
+            bindMcpProxy(getMcpProxyIdFromServers(mcpServers), { providerId: resolvedProviderId, acpSessionId: subAcpId });
             writeLog(`[SUB-AGENT ${i}] Created session ${subAcpId} (agent: ${agentName})`);
 
             const uiId = `sub-${subAcpId}`;

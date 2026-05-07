@@ -12,7 +12,7 @@ Understanding the sidebar's rendering architecture is critical for any UI work: 
 
 The sidebar displays:
 
-- **Provider Stacks**: Sessions grouped by AI provider (Claude, Gemini, etc.), with collapsible accordions. Only one provider at a time shows full content.
+- **Provider Stacks**: Sessions grouped by AI provider, with collapsible accordions. Only one provider at a time shows full content.
 - **Folder Tree**: Hierarchical folders with recursive nesting. Folders expand/collapse, with child count badges.
 - **Session List**: Chat sessions as rows within folders or at root. Sessions show name, icons (indicating fork/sub-agent/terminal status), pin status, and notes indicator.
 - **Session States**: Real-time animations for typing (blue breathe glow), unread responses (bold + solid border), and permission-awaiting (green glow).
@@ -549,7 +549,7 @@ expandedProviderId: string | null;  // Which provider's accordion is open
 
 **Critical invariants:**
 
-1. **Only one provider shows content:** If `expandedProviderId === "claude"`, only Claude's sessions/folders render. All others hidden.
+1. **Only one provider shows content:** If `expandedProviderId === "my-provider"`, only that provider's sessions/folders render. All others hidden.
 2. **Collapsed provider shows unread indicator:** If provider is collapsed but has typing/unread sessions, a small indicator shows (line 331-334).
 
 ---

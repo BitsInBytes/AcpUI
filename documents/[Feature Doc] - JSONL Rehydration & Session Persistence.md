@@ -20,7 +20,7 @@ Session persistence in AcpUI is a **dual-source system** where SQLite DB is the 
 ## Why This Matters
 
 - **Resilience** — Sessions survive app crash, browser tab close, network interruption
-- **Provider flexibility** — Each provider (Claude, Gemini, Kiro) stores history differently; parsing is delegated
+- **Provider flexibility** — Each provider stores history differently; parsing is delegated to the provider module
 - **Performance** — Draining prevents UI from re-rendering historical messages on every resume
 - **Data integrity** — Dual sources prevent loss if one source becomes corrupted
 - **User recovery** — Rehydration allows manual recovery from stale DB or sync issues
@@ -142,12 +142,12 @@ const result = await acpClient.transport.sendRequest('session/load', {
   sessionId,
   cwd: dbSession.cwd || process.cwd(),
   mcpServers: getMcpServers(providerId),
-  ...sessionParams  // Provider-specific (Claude: _meta, Gemini: agent, etc.)
+  ...sessionParams  // Provider-specific fields injected by buildSessionParams()
 });
 ```
 
 **Step 4d: ACP Provider Replays History (Drained)**
-- The ACP provider (Claude, Gemini, Kiro) streams back the historical messages
+- The ACP provider streams back the historical messages
 - Messages appear as update events: `user_message_chunk`, `agent_message_chunk`, `tool_call`, etc.
 - **But** the `acpUpdateHandler` drops all these because draining is active
 - File: `backend/services/acpUpdateHandler.js` (Lines 74–82)
@@ -438,7 +438,7 @@ Returns an object with file paths for a session. AcpUI calls this to locate JSON
 
 ```typescript
 interface SessionPaths {
-  jsonl: string;        // Path to JSONL file (e.g., ~/.claude/sessions/uuid.jsonl)
+  jsonl: string;        // Path to JSONL file (e.g., ~/.provider/sessions/uuid.jsonl)
   json?: string;        // Optional: path to session metadata JSON
   tasksDir?: string;    // Optional: directory for task files
 }
@@ -469,10 +469,7 @@ Parses provider-specific JSONL format and returns normalized messages.
 - If provider doesn't implement this, rehydration fails with error: "Provider missing parseSessionHistory implementation"
 - Diff library is provided for message diffing (used by some providers to reconstruct changes)
 
-**Example Provider Implementations:**
-- **Claude** (`providers/claude/index.js:705`): Parses JSONL with `type: 'user'` / `type: 'assistant'` entries
-- **Gemini** (`providers/gemini/index.js:756`): Parses with `type: 'user'` / `type: 'gemini'`; supports `$rewindTo` for conversation branching
-- **Kiro** (`providers/kiro/index.js:455`): Parses with `kind: 'Prompt'` / `kind: 'AssistantMessage'` entries
+Provider-specific implementations live in each provider's `providers/{provider}/index.js`. Each provider defines its own JSONL schema (e.g., different `type` or `kind` field names, branching markers). See the provider-specific Feature Doc for the exact format used by each provider.
 
 ### Environment Variables
 

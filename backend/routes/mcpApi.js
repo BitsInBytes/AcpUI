@@ -3,6 +3,16 @@ import { createToolHandlers } from '../mcp/mcpServer.js';
 import { getProvider } from '../services/providerLoader.js';
 import { writeLog } from '../services/logger.js';
 import { modelOptionsFromProviderConfig } from '../services/modelOptions.js';
+import { resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
+
+function resolveToolContext(providerId, proxyId) {
+  const proxy = resolveMcpProxy(proxyId);
+  return {
+    providerId: proxy?.providerId || providerId || null,
+    acpSessionId: proxy?.acpSessionId || null,
+    mcpProxyId: proxy?.proxyId || proxyId || null
+  };
+}
 
 /**
  * Internal API for the stdio MCP proxy.
@@ -22,15 +32,24 @@ export default function createMcpApiRoutes(io) {
    * SYNC THIS with the tool handlers in mcpServer.js when adding/changing tools.
    */
   router.get('/tools', (req, res) => {
-    const providerId = (req?.query || {}).providerId || null;
-    const providerConfig = getProvider(providerId).config;
+    const query = req?.query || {};
+    const context = resolveToolContext(query.providerId || null, query.proxyId || null);
+    const providerConfig = getProvider(context.providerId).config;
     const serverName = providerConfig.mcpName || 'acpui';
     const quickModels = modelOptionsFromProviderConfig(providerConfig.models || {});
     const modelDescription = quickModels.length > 0
       ? `Optional model to use for these agents. Pass the model id. Available: ${quickModels.map(model => `${model.name} (id: ${model.id})`).join(', ')}`
       : 'Optional model id to use for these agents.';
     const toolList = [
-      { name: 'ux_invoke_shell', description: 'Execute a shell command with live streaming output. Always use this tool for shell commands; never use system shell, bash, or powershell tools when they are present. This is a full replacement for all shell execution. Use for running build commands, tests, scripts, or any CLI operation. IMPORTANT: only use non-interactive commands. Adjust commands that can become interactive, such as git diff, to be non-interactive (for example, git --no-pager diff). Do not run commands that require user input, open a pager, or start an interactive process (for example, vim, top, ssh). Such commands will hang indefinitely.', inputSchema: {
+      { name: 'ux_invoke_shell', title: 'Interactive shell', description: 'Execute a shell command in a real terminal with live streaming output and user-interactive stdin while the process is running. Always use this tool for shell commands; never use system shell, bash, or powershell tools when they are present. This is a full replacement for shell execution. Use for running build commands, tests, scripts, package installs, CLIs that may prompt, and other command-line operations. Multiple ux_invoke_shell calls may be invoked concurrently; each command gets its own terminal. Use parallel calls for independent commands that do not contend for the same files, ports, packages, or other shared resources. The tool call returns after the command exits or the user terminates it, and the terminal becomes read-only after exit.', annotations: {
+        title: 'Interactive shell',
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true
+      }, _meta: {
+        'acpui/concurrentInvocationsSupported': true
+      }, inputSchema: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'The shell command to execute' },
@@ -86,7 +105,7 @@ export default function createMcpApiRoutes(io) {
     res.setTimeout(0);
     if (req.socket) req.socket.setTimeout(0);
 
-    const { tool: toolName, args, providerId } = req.body;
+    const { tool: toolName, args, providerId, proxyId, mcpRequestId, requestMeta } = req.body;
     writeLog(`[MCP API] Tool call: ${toolName}`);
 
     const handler = tools[toolName];
@@ -96,7 +115,14 @@ export default function createMcpApiRoutes(io) {
     }
 
     try {
-      const result = await handler({ ...(args || {}), providerId });
+      const context = resolveToolContext(providerId || null, proxyId || null);
+      const handlerArgs = { ...(args || {}) };
+      if (context.providerId) handlerArgs.providerId = context.providerId;
+      if (context.acpSessionId) handlerArgs.acpSessionId = context.acpSessionId;
+      if (context.mcpProxyId) handlerArgs.mcpProxyId = context.mcpProxyId;
+      if (mcpRequestId !== undefined && mcpRequestId !== null) handlerArgs.mcpRequestId = mcpRequestId;
+      if (requestMeta) handlerArgs.requestMeta = requestMeta;
+      const result = await handler(handlerArgs);
       writeLog(`[MCP API] Tool ${toolName} completed`);
       res.json(result);
     } catch (err) {

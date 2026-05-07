@@ -483,7 +483,7 @@ const agents = invocationId ? allAgents.filter(a => a.invocationId === invocatio
 
 **Display (Lines 43-79):**
 - Agent status icon (🟢 running, ✅ completed, ❌ failed)
-- Agent name and index (e.g., "1: Agent 1 (claude)")
+- Agent name and index (e.g., "1: Agent 1 (my-agent)")
 - **Last 4 tool steps** with status (lines 54-63)
 - Permission requests with action buttons (lines 66-77)
 
@@ -839,9 +839,9 @@ Example:
 ```json
 {
   "models": {
-    "default": "claude-opus",
-    "subAgent": "claude-sonnet",
-    "titleGeneration": "claude-haiku"
+    "default": "provider-model-capable",
+    "subAgent": "provider-model-fast",
+    "titleGeneration": "provider-model-fast"
   }
 }
 ```
@@ -944,7 +944,7 @@ Only delete is functional. This is intentional — sub-agents are transient and 
 
 ### 9. **Sub-Agent Sessions Share Parent's Provider**
 
-All sub-agents inherit the parent's provider. There's no per-sub-agent provider selection. If the parent is Claude, all sub-agents are Claude.
+All sub-agents inherit the parent's provider. There's no per-sub-agent provider selection — all sub-agents run under the same provider as the parent session.
 
 ### 10. **The Summary Text Becomes a Regular Message**
 

@@ -155,6 +155,33 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(tool.event._fallbackOutput).toBe('some progress');
   });
 
+  it('preserves Shell V2 terminal output on tool_end by shellRunId', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 't1',
+        title: 'Run shell',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_end',
+        id: 't1',
+        status: 'completed',
+        output: 'final MCP result'
+      });
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const tool = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline![0] as any;
+    expect(tool.event.shellRunId).toBe('shell-run-1');
+    expect(tool.event.output).toBeUndefined();
+  });
+
   it('processBuffer removes Thinking placeholder when real thoughts or tokens arrive', () => {
     const scrollToBottom = vi.fn();
     act(() => {

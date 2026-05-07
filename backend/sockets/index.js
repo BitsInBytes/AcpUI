@@ -10,6 +10,7 @@ import registerFolderHandlers from './folderHandlers.js';
 import registerFileExplorerHandlers from './fileExplorerHandlers.js';
 import registerGitHandlers from './gitHandlers.js';
 import registerTerminalHandlers from './terminalHandlers.js';
+import registerShellRunHandlers, { emitShellRunSnapshotsForSession } from './shellRunHandlers.js';
 import acpClient from '../services/acpClient.js';
 import providerRuntimeManager from '../services/providerRuntimeManager.js';
 import { loadWorkspaces } from '../services/workspaceConfig.js';
@@ -104,11 +105,13 @@ export default function registerSocketHandlers(io) {
     registerFileExplorerHandlers(io, socket);
     registerGitHandlers(io, socket);
     registerTerminalHandlers(io, socket);
+    registerShellRunHandlers(io, socket);
 
     // Room system: clients join session-scoped rooms to receive only relevant streaming events
-    socket.on('watch_session', ({ sessionId }) => {
+    socket.on('watch_session', ({ providerId = null, sessionId }) => {
       if (sessionId) {
         socket.join(`session:${sessionId}`);
+        emitShellRunSnapshotsForSession(socket, { providerId, sessionId });
         writeLog(`[ROOMS] ${socket.id} watching session ${sessionId}`);
       }
     });

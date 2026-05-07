@@ -2,6 +2,8 @@
 
 Terminals are session-scoped pseudo-terminal (PTY) instances hosted as tabs inside the canvas pane. They are independent of file artifacts and provide a native shell experience with output streaming, input handling, and resize support.
 
+This feature is separate from the `ux_invoke_shell` interactive terminal. Canvas terminals are long-lived user-opened terminals keyed by `socketId:terminalId` in `backend/sockets/terminalHandlers.js`. Interactive shell tool terminals are short-lived command terminals keyed by backend `shellRunId`, managed by `backend/services/shellRunManager.js`, and rendered inside `ToolStep` through `frontend/src/components/ShellToolTerminal.tsx`.
+
 ---
 
 ## Overview
@@ -15,6 +17,19 @@ Terminals are session-scoped pseudo-terminal (PTY) instances hosted as tabs insi
 - **Session Scoping** — Each terminal belongs to a specific session (`sessionId` in the terminal object); switching sessions hides non-matching terminals.
 - **Spawn-Once Guarantee** — Module-level `spawnedTerminals` Set prevents re-spawning on React component remounts while preserving the PTY connection.
 - **Graceful Cleanup** — Terminals are killed explicitly via `terminal_kill` or on socket disconnect; no orphaned PTY processes.
+
+### Canvas Terminal vs Shell Tool Terminal
+
+| Area | Canvas Terminal | Shell Tool Terminal |
+|---|---|---|
+| User entry point | ChatInput terminal button opens a canvas tab | Agent calls `ux_invoke_shell` |
+| Backend owner | `backend/sockets/terminalHandlers.js` | `backend/services/shellRunManager.js` |
+| Frontend component | `frontend/src/components/Terminal.tsx` | `frontend/src/components/ShellToolTerminal.tsx` |
+| Correlation id | `terminalId` plus socket id | `shellRunId` |
+| Spawn behavior | Frontend emits `terminal_spawn` | MCP tool call starts a prepared run |
+| Lifetime | Long-lived until explicit close/disconnect | Ends when command exits or user terminates it |
+| Reattach | Spawn guard avoids duplicate frontend spawns | `shell_run_snapshot` replays active transcript only |
+| After exit | Canvas terminal tab closes or reports exit | xterm is disposed; ToolStep renders sanitized ANSI-colored read-only transcript |
 
 ### Why This Matters
 

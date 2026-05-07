@@ -547,13 +547,13 @@ openFileHandler('src/app.js') invoked (line 81)
     ↓
 socket.emit('explorer_read', {
   filePath: 'src/app.js',
-  providerId: 'claude'
+  providerId: 'my-provider'
 })
     ↓ [SOCKET.IO TRANSMISSION]
     ↓
 Backend receives (fileExplorerHandlers.js line 37)
     ↓
-safePath('src/app.js', 'claude') validates path (line 39)
+safePath('src/app.js', 'my-provider') validates path (line 39)
     ↓
 fs.readFileSync() returns content
     ↓
@@ -661,7 +661,7 @@ if (node && !node.loaded) {
 
 ### 2. **Backward-Compatible explorer_root Handler Pattern**
 **What breaks:** The backend's `explorer_root` handler (lines 60–64) accepts **two different payload patterns**:
-- Modern: `{ providerId: 'claude' }` (payload object)
+- Modern: `{ providerId: 'my-provider' }` (payload object)
 - Legacy: callback as first argument (for older clients)
 
 If you refactor this handler to reject the callback-style pattern, old clients will hang.
