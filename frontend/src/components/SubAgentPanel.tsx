@@ -44,9 +44,15 @@ const SubAgentPanel: React.FC<SubAgentPanelProps> = ({ invocationId }) => {
         <div key={agent.acpSessionId} className={`sub-agent-card ${agent.status}`}>
           <div className="sub-agent-header">
             <span className={`sub-agent-status ${agent.status}`}>
-              {agent.status === 'running' ? '🟢' : agent.status === 'completed' ? '✅' : '❌'}
+              {agent.status === 'completed' ? '✅' : agent.status === 'failed' ? '❌' : agent.status === 'cancelled' ? '⬜' : '🔄'}
             </span>
-            <span className="sub-agent-label">{agent.index + 1}: {agent.name} ({agent.agent})</span>
+            <span className="sub-agent-label">
+              {agent.index + 1}: {agent.name} ({agent.agent})
+              {agent.status === 'spawning' && ' - Starting...'}
+              {agent.status === 'prompting' && ' - Thinking...'}
+              {agent.status === 'failed' && ' - Error'}
+              {agent.status === 'cancelled' && ' - Cancelled'}
+            </span>
           </div>
 
           {agent.toolSteps.length > 0 && (

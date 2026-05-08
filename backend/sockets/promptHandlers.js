@@ -5,8 +5,7 @@ import { providerRuntimeManager } from '../services/providerRuntimeManager.js';
 import { autoSaveTurn } from '../services/sessionManager.js';
 import { resolveModelSelection } from '../services/modelOptions.js';
 
-import { getAllRunning, removeSubAgentsForParent } from '../mcp/subAgentRegistry.js';
-import { cleanupAcpSession } from '../mcp/acpCleanup.js';
+import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
 
 export default function registerPromptHandlers(io, socket) {
   socket.on('prompt', async ({ providerId, uiId: _uiId, sessionId, prompt, model, attachments = [] }) => {
@@ -167,30 +166,8 @@ export default function registerPromptHandlers(io, socket) {
     writeLog(`Canceling prompt for session: ${sessionId}`);
     acpClient.transport.sendNotification('session/cancel', { sessionId });
 
-    // Abort any running sub-agent MCP tool
-    if (acpClient._abortSubAgents) {
-      acpClient._abortSubAgents();
-      acpClient._abortSubAgents = null;
-    }
-
-    // Also cancel any running sub-agents
-    for (const sub of getAllRunning(resolvedProviderId)) {
-      if (sub.parentAcpSessionId !== sessionId) continue;
-      // NOTE: Task 08 sub-agent provider scoping will refine this to isolate sub-agents by provider
-      writeLog(`[SUB-AGENT] Canceling sub-agent ${sub.acpId}`);
-      acpClient.transport.sendNotification('session/cancel', { sessionId: sub.acpId });
-      // Reject any pending requests for this sub-agent session
-      for (const [id, pending] of acpClient.transport.pendingRequests) {
-        if (pending.params?.sessionId === sub.acpId) {
-          pending.reject(new Error('Session cancelled'));
-          acpClient.transport.pendingRequests.delete(id);
-        }
-      }
-      io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: sub.acpId, index: sub.index, error: 'Cancelled' });
-      cleanupAcpSession(sub.acpId, resolvedProviderId, 'sub-agent-cancel');
-      acpClient.sessionMetadata.delete(sub.acpId);
-    }
-    removeSubAgentsForParent(sessionId, resolvedProviderId); // clear all
+    // Abort ALL in-flight invocations for this provider
+    subAgentInvocationManager.cancelAllForParent(sessionId, resolvedProviderId);
   });
 
   // ACP pauses execution on permission_request; this forwards the user's allow/deny

@@ -427,7 +427,7 @@ res.json({ tools: toolList, serverName });
 
 ### Where Handlers Are Defined
 
-**File:** `backend/mcp/mcpServer.js` (Lines 67-329)
+**File:** `backend/mcp/mcpServer.js` (Lines 67-117)
 
 ```javascript
 export function createToolHandlers(io) {
@@ -436,12 +436,12 @@ export function createToolHandlers(io) {
   tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {  // LINE 70
     // Interactive implementation via shellRunManager
   };
-```
-  tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {  // LINE 142
+
+  tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {  // LINE 87
     // Real implementation
   };
 
-  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId }) => {  // LINE 303
+  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId }) => {  // LINE 92
     // Real implementation
   };
 

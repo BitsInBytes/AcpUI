@@ -85,6 +85,12 @@ vi.mock('../mcp/subAgentRegistry.js', () => ({
   removeSubAgentsForParent: vi.fn()
 }));
 
+vi.mock('../mcp/subAgentInvocationManager.js', () => ({
+  subAgentInvocationManager: {
+    cancelAllForParent: vi.fn()
+  }
+}));
+
 vi.mock('../mcp/acpCleanup.js', () => ({ cleanupAcpSession: vi.fn() }));
 
 vi.mock('../services/providerRuntimeManager.js', () => ({
@@ -230,32 +236,12 @@ describe('Prompt Handlers', () => {
     expect(mockAcpClient.transport.sendNotification).toHaveBeenCalledWith('session/cancel', { sessionId: 'sess-1' });
   });
 
-  it('should call and clear _abortSubAgents on cancel', () => {
-    const abortFn = vi.fn();
-    mockAcpClient._abortSubAgents = abortFn;
-
-    const handler = mockSocket.listeners('cancel_prompt')[0];
-    handler({ sessionId: 'sess-1' });
-
-    expect(abortFn).toHaveBeenCalled();
-    expect(mockAcpClient._abortSubAgents).toBeNull();
-  });
-
   it('should cancel running sub-agents and emit completion on cancel_prompt', async () => {
-    const { getAllRunning, removeSubAgentsForParent } = await import('../mcp/subAgentRegistry.js');
-    const rejectFn = vi.fn();
-    const sub = { acpId: 'sub-acp-1', index: 0, parentAcpSessionId: 'sess-1' };
-    getAllRunning.mockReturnValue([sub]);
-    mockAcpClient.transport.pendingRequests = new Map([
-      ['req-1', { params: { sessionId: 'sub-acp-1' }, reject: rejectFn }]
-    ]);
-
+    const { subAgentInvocationManager } = await import('../mcp/subAgentInvocationManager.js');
     const handler = mockSocket.listeners('cancel_prompt')[0];
     handler({ sessionId: 'sess-1', providerId: 'provider-a' });
 
-    expect(rejectFn).toHaveBeenCalledWith(expect.any(Error));
-    expect(mockIo.emit).toHaveBeenCalledWith('sub_agent_completed', expect.objectContaining({ acpSessionId: 'sub-acp-1', error: 'Cancelled' }));
-    expect(removeSubAgentsForParent).toHaveBeenCalledWith('sess-1', 'provider-a');
+    expect(subAgentInvocationManager.cancelAllForParent).toHaveBeenCalledWith('sess-1', 'provider-a');
   });
 
   it('should forward permission response to acpClient', () => {

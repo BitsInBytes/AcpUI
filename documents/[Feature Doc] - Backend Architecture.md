@@ -16,7 +16,7 @@ The backend performs these key responsibilities:
 - **Session Orchestration**: Creates, loads, forks, and merges chat sessions; persists them to SQLite with model metadata, configuration options, and attachment references
 - **ACP Protocol Handling**: Implements JSON-RPC 2.0 handshake with ACP daemons, routes session updates, manages permissions, and forwards provider-specific extensions
 - **Socket.IO Gateway**: Emits real-time events (tokens, thoughts, tool calls, permissions) to the frontend; multiplexes all connections through provider context isolation
-- **MCP Tool System**: Spawns a stdio MCP proxy per ACP session that forwards tool calls (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) to backend handlers; keeps all orchestration centralized
+- **MCP Tool System**: Spawns a stdio MCP proxy per ACP session that forwards tool calls (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) to backend handlers. Shell commands are managed by `ShellRunManager` and sub-agent coordination is driven by `SubAgentInvocationManager`; keeps all orchestration centralized
 - **Stream & State Management**: Buffers output chunks, manages streaming saves, handles permission workflows, and enforces session isolation via AsyncLocalStorage
 - **Database Persistence**: Stores sessions, folders, canvas artifacts, notes, and dynamic model state in SQLite with provider scoping and cascade delete protection
 
@@ -550,6 +550,7 @@ The tool is executed in the backend Node.js process (not the proxy). `backend/se
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │  MCP Tool System                                             │  │
 │  │  ├─ mcpServer.js: tool handlers (shell, subagents, counsel) │  │
+│  │  ├─ subAgentInvocationManager.js: sub-agent orchestration   │  │
 │  │  ├─ stdio-proxy.js: thin JSON-RPC proxy (per session)       │  │
 │  │  ├─ /api/mcp/tools: schema endpoint                          │  │
 │  │  └─ /api/mcp/tool-call: execution endpoint (POST)           │  │
@@ -961,14 +962,15 @@ Assistant Message (turn_end)
 |------|-------------|-------|---------|
 | `mcp/mcpServer.js` | `createToolHandlers()` | 67-329 | Tool implementations |
 | | `.ux_invoke_shell` | 70-85 | Shell command execution via `shellRunManager` |
-| | `.ux_invoke_subagents` | 142-301 | Parallel agent spawning |
-| | `.ux_invoke_counsel` | 303-325 | Expert evaluation |
+| | `.ux_invoke_subagents` | 87-90 | Parallel agent spawning via `subAgentInvocationManager` |
+| | `.ux_invoke_counsel` | 92-114 | Expert evaluation |
 | `mcp/stdio-proxy.js` | `runProxy()` | 52-108 | Stdio MCP proxy setup and proxy/session context forwarding |
 | | `backendFetch()` | 20-39 | HTTP fetch to backend with retries |
 | `routes/mcpApi.js` | `GET /api/mcp/tools` | 30-73 | Tool schema endpoint |
 | | `POST /api/mcp/tool-call` | 81-113 | Tool execution endpoint with timeout disabled |
 | `mcp/mcpProxyRegistry.js` | proxy binding helpers | 1-78 | Correlates stdio MCP proxy instances to provider/session context |
 | `services/shellRunManager.js` | `ShellRunManager` | 60-374 | Interactive PTY lifecycle, transcripts, termination formatting, completed-run cleanup |
+| `mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager` | 10-317 | Orchestrates sub-agent sessions, state machine, and abort flow |
 | `mcp/subAgentRegistry.js` | `registerSubAgent()` | 8-10 | Track sub-agent lifecycle |
 | | `getSubAgentsForParent()` | 26-34 | Find children of parent session |
 | | `removeSubAgentsForParent()` | 44-54 | Cleanup orphaned sub-agents |

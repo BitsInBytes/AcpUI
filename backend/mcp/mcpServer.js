@@ -12,16 +12,13 @@
  *   getMcpServers()           — stdio MCP server config for session/new mcpServers array
  *   createToolHandlers(io, acpClient) — returns { toolName: handler(args) } map
  */
-import { getProvider, getProviderModule } from '../services/providerLoader.js';
+import { getProvider } from '../services/providerLoader.js';
 import { writeLog } from '../services/logger.js';
 import { fileURLToPath } from 'url';
 import path from 'path';
-import { registerSubAgent, completeSubAgent, failSubAgent } from './subAgentRegistry.js';
-import { cleanupAcpSession } from './acpCleanup.js';
-import * as db from '../database.js';
+import { subAgentInvocationManager } from './subAgentInvocationManager.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
-import { modelOptionsFromProviderConfig, resolveModelSelection } from '../services/modelOptions.js';
-import { bindMcpProxy, createMcpProxyBinding, getMcpProxyIdFromServers } from './mcpProxyRegistry.js';
+import { createMcpProxyBinding } from './mcpProxyRegistry.js';
 import { shellRunManager } from '../services/shellRunManager.js';
 
 const DEFAULT_MAX_SHELL_RESULT_LINES = 1000;
@@ -58,8 +55,6 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
  * Creates tool handlers bound to io and acpClient.
  * Returns a map of { toolName: handler(args) }.
  */
-import { providerRuntimeManager } from '../services/providerRuntimeManager.js';
-
 export function createToolHandlers(io) {
   const tools = {};
 
@@ -87,152 +82,8 @@ export function createToolHandlers(io) {
   };
 
   tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {
-  if (!io) {
-    return { content: [{ type: 'text', text: 'Error: Sub-agent system not available' }] };
-  }
-
-  writeLog(`[SUB-AGENT] Spawning ${requests.length} sub-agent(s)`);
-  const provider = getProvider(providerId);
-  const resolvedProviderId = provider.id;
-  const acpClient = providerRuntimeManager.getClient(resolvedProviderId);
-  if (!acpClient) return { content: [{ type: 'text', text: 'Error: Sub-agent system not available' }] };
-  const models = provider.config.models || {};
-  const quickModelOptions = modelOptionsFromProviderConfig(models);
-  // Prefer the explicit model arg, then the provider's configured sub-agent model,
-  // then fall through resolveModelSelection's chain (models.default → first quickAccess item).
-  const modelId = resolveModelSelection(model || models.subAgent, models, quickModelOptions).modelId;
-  const resolvedModelKey = modelId;
-
-    // Unique ID for this specific invocation — threads through sub_agent_started events
-    // so the frontend can correlate each agent with the ToolStep that spawned it.
-    const invocationId = `inv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-
-    // Resolve parentUiId up front (before the 1-second stagger) so sub_agents_starting
-    // can be emitted immediately, allowing the UI to clear old agent state right away.
-    let parentUiId = null;
-    if (acpClient.lastSubAgentParentAcpId) {
-      const parentSession = await db.getSessionByAcpId(resolvedProviderId, acpClient.lastSubAgentParentAcpId);
-      if (parentSession) parentUiId = parentSession.id;
-    }
-
-    // Emit immediately — before the 1-second stagger — so the frontend clears stale
-    // sub-agent panels without waiting for the first sub_agent_started event.
-    io.emit('sub_agents_starting', { invocationId, parentUiId, providerId: resolvedProviderId, count: requests.length });
-
-    let _aborted = false;
-    const abortCallbacks = [];
-    const onAbort = (cb) => abortCallbacks.push(cb);
-    acpClient._abortSubAgents = () => { _aborted = true; abortCallbacks.forEach(cb => cb()); };
-
-    const sendWithTimeout = (method, params, timeoutMs = 600000) => {
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`${method} timed out after ${timeoutMs / 1000}s`)), timeoutMs);
-        onAbort(() => { clearTimeout(timer); reject(new Error('Aborted')); });
-        acpClient.transport.sendRequest(method, params).then(r => { clearTimeout(timer); resolve(r); }).catch(e => { clearTimeout(timer); reject(e); });
-      });
-    };
-
-    // Create all sessions with a 1-second stagger to avoid overwhelming the ACP
-    const setupPromises = requests.map((req, i) => {
-      return new Promise(resolve => {
-        setTimeout(async () => {
-          const agentName = req.agent || provider.config.defaultSubAgentName;
-          if (!agentName) { resolve({ subAcpId: null, index: i, req, error: 'No agent configured' }); return; }
-          const cwd = req.cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
-
-          try {
-            const providerModule = await getProviderModule(resolvedProviderId);
-            const sessionParams = providerModule.buildSessionParams(agentName);
-            const mcpServers = getMcpServers(resolvedProviderId);
-            const result = await sendWithTimeout('session/new', { cwd, mcpServers, ...sessionParams }, 30000);
-            const subAcpId = result.sessionId;
-            bindMcpProxy(getMcpProxyIdFromServers(mcpServers), { providerId: resolvedProviderId, acpSessionId: subAcpId });
-            writeLog(`[SUB-AGENT ${i}] Created session ${subAcpId} (agent: ${agentName})`);
-
-            const uiId = `sub-${subAcpId}`;
-            registerSubAgent(resolvedProviderId, subAcpId, null, req.prompt, agentName);
-
-            await db.saveSession({
-              id: uiId, acpSessionId: subAcpId,
-              name: req.name || `Agent ${i + 1}: ${req.prompt.slice(0, 50)}`,
-              model: resolvedModelKey || null, messages: [], isPinned: false,
-              isSubAgent: true, forkedFrom: parentUiId,
-              currentModelId: modelId || null,
-              modelOptions: quickModelOptions,
-              provider: resolvedProviderId,
-            });
-
-            if (modelId) {
-              await sendWithTimeout('session/set_model', { sessionId: subAcpId, modelId }, 10000);
-            }
-
-            acpClient.sessionMetadata.set(subAcpId, {
-              model: modelId || null, currentModelId: modelId || null, modelOptions: quickModelOptions,
-              toolCalls: 0, successTools: 0, startTime: Date.now(),
-              usedTokens: 0, totalTokens: 0, promptCount: 0,
-              lastResponseBuffer: '', lastThoughtBuffer: '',
-              agentName, spawnContext: null, isSubAgent: true,
-            });
-
-            const sockets = await io.fetchSockets();
-            for (const s of sockets) s.join(`session:${subAcpId}`);
-            io.emit('sub_agent_started', {
-              providerId: resolvedProviderId,
-              acpSessionId: subAcpId, uiId, parentUiId, index: i,
-              name: req.name || `Agent ${i + 1}`,
-              prompt: req.prompt, agent: agentName, model: resolvedModelKey,
-              invocationId,
-            });
-
-            if (agentName !== provider.config.defaultSystemAgentName) {
-              await providerModule.setInitialAgent(acpClient, subAcpId, agentName);
-            }
-
-            resolve({ subAcpId, index: i, req });
-          } catch (err) {
-            writeLog(`[SUB-AGENT ${i}] Setup error: ${err.message}`);
-            failSubAgent(`sub-${i}`);
-            io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: `sub-${i}`, index: i, error: err.message });
-            resolve({ subAcpId: null, index: i, req, error: err.message });
-          }
-        }, i * 1000); // 1 second stagger
-      });
-    });
-
-    const sessions2 = await Promise.all(setupPromises);
-
-    const results = await Promise.all(sessions2.map(async (s) => {
-      if (s.error) return { index: s.index, response: null, error: s.error };
-      try {
-        await sendWithTimeout('session/prompt', {
-          sessionId: s.subAcpId,
-          prompt: [{ type: 'text', text: s.req.prompt }]
-        });
-        const meta = acpClient.sessionMetadata.get(s.subAcpId);
-        const response = meta?.lastResponseBuffer?.trim() || '(no response)';
-        completeSubAgent(s.subAcpId);
-        io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: s.subAcpId, index: s.index });
-        writeLog(`[SUB-AGENT ${s.index}] Completed: ${s.subAcpId}`);
-        cleanupAcpSession(s.subAcpId, resolvedProviderId);
-        acpClient.sessionMetadata.delete(s.subAcpId);
-        return { index: s.index, response, error: null };
-      } catch (err) {
-        writeLog(`[SUB-AGENT ${s.index}] Error: ${err.message}`);
-        failSubAgent(s.subAcpId);
-        io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: s.subAcpId, index: s.index, error: err.message });
-        return { index: s.index, response: null, error: err.message };
-      }
-    }));
-
-    const summary = results.map((r, i) => {
-      const header = `## Agent ${i + 1}`;
-      if (r.error) return `${header}\nError: ${r.error}`;
-      return `${header}\n${r.response}`;
-    }).join('\n\n---\n\n');
-
-    writeLog(`[SUB-AGENT] All ${requests.length} agents completed, returning summary (${summary.length} chars)`);
-    acpClient._abortSubAgents = null;
-    return { content: [{ type: 'text', text: summary }] };
+    subAgentInvocationManager.setIo(io);
+    return subAgentInvocationManager.runInvocation({ requests, model, providerId });
   };
 
   /**

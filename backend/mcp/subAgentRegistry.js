@@ -5,8 +5,45 @@
 
 const registry = new Map();
 
-export function registerSubAgent(providerId, subAgentAcpId, parentAcpSessionId, prompt, agent) {
-  registry.set(subAgentAcpId, { providerId, parentAcpSessionId, prompt, agent, status: 'running' });
+export function registerSubAgent(providerId, subAgentAcpId, {
+  parentAcpSessionId,
+  parentUiId,
+  invocationId,
+  uiId,
+  name,
+  index,
+  prompt,
+  agent,
+  model
+}) {
+  registry.set(subAgentAcpId, {
+    providerId,
+    parentAcpSessionId,
+    parentUiId,
+    invocationId,
+    uiId,
+    name,
+    index,
+    prompt,
+    agent,
+    model,
+    status: 'spawning'
+  });
+}
+
+export function setSpawningSubAgent(subAgentAcpId) {
+  const entry = registry.get(subAgentAcpId);
+  if (entry) entry.status = 'spawning';
+}
+
+export function setPromptingSubAgent(subAgentAcpId) {
+  const entry = registry.get(subAgentAcpId);
+  if (entry) entry.status = 'prompting';
+}
+
+export function cancelSubAgent(subAgentAcpId) {
+  const entry = registry.get(subAgentAcpId);
+  if (entry) entry.status = 'cancelled';
 }
 
 export function completeSubAgent(subAgentAcpId) {
@@ -36,7 +73,7 @@ export function getSubAgentsForParent(parentAcpSessionId, providerId = null) {
 export function getAllRunning(providerId = null) {
   const result = [];
   for (const [acpId, entry] of registry) {
-    if (entry.status === 'running' && (!providerId || entry.providerId === providerId)) result.push({ acpId, ...entry });
+    if (['spawning', 'prompting', 'running'].includes(entry.status) && (!providerId || entry.providerId === providerId)) result.push({ acpId, ...entry });
   }
   return result;
 }

@@ -436,7 +436,7 @@ interface SubAgentEntry {
   invocationId: string;
   agent: string;
   prompt: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'spawning' | 'prompting' | 'running' | 'completed' | 'failed' | 'cancelled';
   response: string;
   tokens: number;
   toolSteps: ToolStep[];
@@ -790,7 +790,7 @@ The text appears instantly (re-rendered on next frame). If more tokens arrive wh
 | `useUIStore.ts` | `useUIStore()` | sidebarOpen, settingsOpen, modelDropdownOpen, autoScroll | setSidebarOpen, setSettingsOpen, toggleAutoScroll | 43-97 |
 | `useFolderStore.ts` | `useFolderStore()` | folders, expanded (localStorage-backed) | createFolder, renameFolder, deleteFolder, toggleFolder | 32-104 |
 | `useCanvasStore.ts` | `useCanvasStore()` | artifacts, activeArtifact, terminals, activeTerminalId | openTerminal, closeTerminal, handleOpenInCanvas, handleFileEdited | 31-169 |
-| `useSubAgentStore.ts` | `useSubAgentStore()` | agents[], tokens, toolSteps, permissions | addAgent, appendToken, addToolStep, setPermission, clear | 47-81 |
+| `useSubAgentStore.ts` | `useSubAgentStore()` | agents[], tokens, toolSteps, permissions | addAgent, setStatus, appendToken, addToolStep, setPermission, clear | 47-81 |
 | `useShellRunStore.ts` | `useShellRunStore()` | interactive shell runs keyed by `runId`; prunes old exited snapshots | upsertSnapshot, markStarted, appendOutput, markExited, reset | 58-127 |
 | `useVoiceStore.ts` | `useVoiceStore()` | isRecording, audioDevices | toggleRecording, setDevices | (implied) |
 

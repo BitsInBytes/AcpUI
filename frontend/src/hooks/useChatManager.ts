@@ -100,6 +100,13 @@ export function useChatManager(
         };
         useSessionLifecycleStore.setState(state => ({ sessions: [...state.sessions, subSession] }));
       }
+      
+      const agents = useSubAgentStore.getState().agents;
+      const subAgent = agents.find(a => a.acpSessionId === data.sessionId);
+      if (subAgent && (subAgent.status === 'spawning' || subAgent.status === 'prompting')) {
+        useSubAgentStore.getState().setStatus(data.sessionId, 'running');
+      }
+
       origOnStreamToken(data);
     };
 
@@ -275,6 +282,33 @@ export function useChatManager(
       }
     });
 
+    socket.on('sub_agent_snapshot', (data: {
+      providerId: string; acpSessionId: string; uiId: string;
+      parentUiId: string | null; invocationId: string; index: number;
+      name: string; prompt: string; agent: string; model?: string; status: string;
+    }) => {
+      const existing = useSubAgentStore.getState().agents.find(a => a.acpSessionId === data.acpSessionId);
+      if (existing) return;
+
+      const parentUiId = data.parentUiId || 'unknown';
+      const parentSession = useSessionLifecycleStore.getState().sessions.find(s => s.id === parentUiId);
+      const parentSessionId = parentSession?.acpSessionId || 'unknown';
+
+      useSubAgentStore.getState().addAgent({ ...data, parentSessionId });
+      useSubAgentStore.getState().setStatus(data.acpSessionId, data.status as 'spawning' | 'prompting' | 'running' | 'completed' | 'failed' | 'cancelled');
+
+      const sidebarExists = useSessionLifecycleStore.getState().sessions.some(s => s.id === data.uiId);
+      if (!sidebarExists) {
+        pendingSubAgents.set(data.acpSessionId, {
+          ...data, parentSessionId, parentUiId, model: data.model || 'balanced'
+        });
+      }
+    });
+
+    socket.on('sub_agent_status', (data: { acpSessionId: string; status: string }) => {
+      useSubAgentStore.getState().setStatus(data.acpSessionId, data.status as 'spawning' | 'prompting' | 'running' | 'completed' | 'failed' | 'cancelled');
+    });
+
     socket.on('sub_agent_completed', (data: { acpSessionId: string }) => {
       useSubAgentStore.getState().completeAgent(data.acpSessionId);
       useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => {
@@ -328,6 +362,8 @@ export function useChatManager(
       socket.off('shell_run_exit');
       socket.off('sub_agents_starting');
       socket.off('sub_agent_started');
+      socket.off('sub_agent_snapshot');
+      socket.off('sub_agent_status');
       socket.off('sub_agent_completed');
     };
   }, [socket, setSessions, onStreamThought, onStreamToken, onStreamEvent, onStreamDone]);

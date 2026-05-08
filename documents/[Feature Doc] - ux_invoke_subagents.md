@@ -79,16 +79,16 @@ This is crucial — it lets the backend later correlate sub-agent events to thei
 
 The `ux_invoke_subagents` handler starts:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 118-263)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 69-317)
 
-**Line 137:** Generate a unique invocation ID:
+**Line 79:** Generate a unique invocation ID:
 ```javascript
-const invocationId = `inv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+const invocationId = `inv-${this.now()}-${Math.random().toString(36).slice(2, 7)}`;
 ```
 
-**Line 149:** Emit `sub_agents_starting` to the frontend:
+**Line 88:** Emit `sub_agents_starting` to the frontend:
 ```javascript
-io.emit('sub_agents_starting', { invocationId, parentUiId, providerId: resolvedProviderId, count: requests.length });
+this.io.emit('sub_agents_starting', { invocationId, parentUiId, providerId: resolvedProviderId, count: requests.length });
 ```
 
 The frontend receives this and **clears stale sidebar sessions** for the parent before showing the new batch.
@@ -99,12 +99,13 @@ The frontend receives this and **clears stale sidebar sessions** for the parent 
 
 The backend translates parent ACP session ID to parent UI ID:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 141-145)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 81-86)
 
 ```javascript
 let parentUiId = null;
-if (acpClient.lastSubAgentParentAcpId) {
-  const parentSession = await db.getSessionByAcpId(resolvedProviderId, acpClient.lastSubAgentParentAcpId);
+const parentAcpSessionId = acpClient.lastSubAgentParentAcpId || null;
+if (parentAcpSessionId) {
+  const parentSession = await this.db.getSessionByAcpId(resolvedProviderId, parentAcpSessionId);
   if (parentSession) parentUiId = parentSession.id;  // Resolve ACP ID → UI ID
 }
 ```
@@ -117,35 +118,47 @@ This is needed because all socket events use **UI IDs**, but the tool handler on
 
 For each request, with a 1-second stagger:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 165-227)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 102-184)
 
-**Lines 173-176:** Create sub-agent session via ACP:
+**Lines 111-114:** Create sub-agent session via ACP:
 ```javascript
 const result = await sendWithTimeout('session/new', { 
   cwd, 
-  mcpServers: getMcpServers(resolvedProviderId), 
+  mcpServers: this.getMcpServersFn(resolvedProviderId), 
   ...sessionParams  // From provider's buildSessionParams(agent)
 }, 30000);
 const subAcpId = result.sessionId;
 ```
 
-**Lines 182-190:** Save to database with `isSubAgent` flag:
+**Lines 134-142:** Save to database with `isSubAgent` flag:
 ```javascript
-await db.saveSession({
+await this.db.saveSession({
   id: uiId, acpSessionId: subAcpId,
   name: req.name || `Agent ${i + 1}`,
   model: resolvedModelKey || null,
   messages: [],
   isPinned: false,
-  isSubAgent: true,        // LINE 186: Mark as sub-agent
-  forkedFrom: parentUiId,  // LINE 186: Link to parent
+  isSubAgent: true,        // Mark as sub-agent
+  forkedFrom: parentUiId,  // Link to parent
   ...
 });
 ```
 
-**Lines 206-212:** Emit `sub_agent_started` to frontend:
+**Lines 159-170:** Filtered socket join and emit `sub_agent_started` to frontend:
 ```javascript
-io.emit('sub_agent_started', {
+if (!parentAcpSessionId) {
+  this.log('[SUB-AGENT] Warning: parent ACP session unknown, joining all sockets');
+  const sockets = await this.io.fetchSockets();
+  for (const s of sockets) s.join(`session:${subAcpId}`);
+} else {
+  // Only join sockets already watching the parent session
+  const parentRoom = `session:${parentAcpSessionId}`;
+  const sockets = await this.io.fetchSockets();
+  for (const s of sockets) {
+    if (s.rooms.has(parentRoom)) s.join(`session:${subAcpId}`);
+  }
+}
+this.io.emit('sub_agent_started', {
   providerId: resolvedProviderId,
   acpSessionId: subAcpId,
   uiId,
@@ -155,7 +168,7 @@ io.emit('sub_agent_started', {
   prompt: req.prompt,
   agent: agentName,
   model: resolvedModelKey,
-  invocationId,  // LINE 211: Ties agent to this spawn batch
+  invocationId,  // Ties agent to this spawn batch
 });
 ```
 
@@ -265,7 +278,7 @@ socket.on('token', wrappedOnStreamToken);
 
 Each sub-agent executes independently:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 234-237)
+**File:** `backend/mcp/subAgentInvocationManager.js`
 
 ```javascript
 await sendWithTimeout('session/prompt', {
@@ -347,15 +360,15 @@ Permissions from sub-agents show in the SubAgentPanel (lines 66-77 of `SubAgentP
 
 ### 10. **Backend: Capture Response & Cleanup**
 
-**File:** `backend/mcp/mcpServer.js` (Lines 238-244)
+**File:** `backend/mcp/subAgentInvocationManager.js`
 
 ```javascript
 const meta = acpClient.sessionMetadata.get(s.subAcpId);
 const response = meta?.lastResponseBuffer?.trim() || '(no response)';
-completeSubAgent(s.subAcpId);
-io.emit('sub_agent_completed', { providerId, acpSessionId: s.subAcpId, index: s.index });
-writeLog(`[SUB-AGENT ${s.index}] Completed: ${s.subAcpId}`);
-cleanupAcpSession(s.subAcpId, providerId);  // LINE 243: Clean up .jsonl, .json, tasks/
+if (agentRec) agentRec.status = 'completed';
+this.io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: s.subAcpId, index: s.index });
+this.log(`[SUB-AGENT ${s.index}] Completed: ${s.subAcpId}`);
+if (this.cleanupFn) this.cleanupFn(s.subAcpId, resolvedProviderId);  // Clean up .jsonl, .json, tasks/
 acpClient.sessionMetadata.delete(s.subAcpId);
 ```
 
@@ -382,7 +395,7 @@ socket.on('sub_agent_completed', (data) => {
 
 ### 12. **Return Summary**
 
-**File:** `backend/mcp/mcpServer.js` (Lines 254-262)
+**File:** `backend/mcp/subAgentInvocationManager.js`
 
 ```javascript
 const summary = results.map((r, i) => {
@@ -404,8 +417,8 @@ The ACP tool call completes with the concatenated summary, which becomes a regul
 graph TB
     subgraph Backend
         B1["Parent ACP Session<br/>(requests tool call)"]
-        B2["mcpServer.ux_invoke_subagents<br/>(lines 118-263)"]
-        B3["Generate invocationId<br/>subAgentRegistry track"]
+        B2["mcpServer.ux_invoke_subagents<br/>delegates to manager"]
+        B3["subAgentInvocationManager<br/>generates invocationId"]
         B4["For each request:<br/>session/new + session/prompt"]
         B5["Emit: sub_agents_starting<br/>Emit: sub_agent_started[0..N]"]
         B6["Await all responses"]
@@ -431,6 +444,7 @@ graph TB
         E4["system_event<br/>(tool steps → subAgentStore)"]
         E5["permission_request<br/>(route to panel or main)"]
         E6["sub_agent_completed<br/>(mark done)"]
+        E7["sub_agent_snapshot<br/>(reconnect hydration)"]
     end
     
     B1 --> B2
@@ -500,15 +514,18 @@ Each sub-agent is a real `ChatSession` in the sidebar (created lazily), nested u
 ```typescript
 const subs = getSubAgentsOf(parentId);  // All sub-agents where forkedFrom === parentId
 subs.map(sub => (
-  <div key={sub.id} className="fork-indent" style={{ paddingLeft: `${depth * 12}px` }}>
-    <SessionItem
-      session={sub}
-      onSelect={() => handleSelect(sub.id)}
-      onRename={() => {}}        // NO-OP for sub-agents
-      onTogglePin={() => {}}     // NO-OP
-      onArchive={() => handleRemoveSession(sub.id)}
-      onSettings={() => {}       // NO-OP
-    />
+  <div key={sub.id}>
+    <div className="fork-indent" style={{ paddingLeft: `${depth * 12}px` }}>
+      <SessionItem
+        session={sub}
+        onSelect={() => handleSelect(sub.id)}
+        onRename={() => {}}        // NO-OP for sub-agents
+        onTogglePin={() => {}}     // NO-OP
+        onArchive={() => handleRemoveSession(sub.id)}
+        onSettings={() => {}}      // NO-OP
+      />
+    </div>
+    {renderChildren(sub.id, depth + 1)}
   </div>
 ))
 ```
@@ -856,11 +873,13 @@ This allows sub-agents to run on a faster/cheaper model while the parent uses a 
 
 | File | Functions | Lines | Purpose |
 |------|-----------|-------|---------|
-| `backend/mcp/mcpServer.js` | `ux_invoke_subagents` | 116-260 | Main handler: spawn, prompt, cleanup |
+| `backend/mcp/mcpServer.js` | `ux_invoke_subagents` | 116-260 | Main handler: delegates to manager |
 | | `getMcpServers()` | 40-53 | MCP server config injection |
+| `backend/mcp/subAgentInvocationManager.js` | `runInvocation` | 69-317 | Main orchestration logic: spawn, prompt, cleanup, abort, snapshot generation |
 | `backend/mcp/subAgentRegistry.js` | `registerSubAgent` | 8-10 | Track running agents |
 | | `completeSubAgent` | 12-15 | Mark complete |
 | | `removeSubAgentsForParent` | 44-54 | Cascade cleanup |
+| `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession` | - | Reconnect hydration |
 | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | 12-17 | Delete ephemeral files |
 | `backend/services/acpUpdateHandler.js` | `handleUpdate` (tool_call) | 153-188 | Set `lastSubAgentParentAcpId` |
 | `backend/database.js` | `saveSession` | 119-157 | Store with `isSubAgent`, `forkedFrom` |
@@ -952,11 +971,28 @@ When sub-agents complete, the concatenated summary is returned as the tool's res
 
 ---
 
+## Reconnect Hydration
+
+When the user refreshes the page or the Socket.IO connection drops and reconnects, running sub-agents must be restored to the UI. 
+
+**File:** `backend/sockets/subAgentHandlers.js`
+**File:** `frontend/src/hooks/useChatManager.ts`
+
+When a client joins a session room (`watch_session`), the backend queries the `SubAgentInvocationManager` for all active agents belonging to that parent session, and emits `sub_agent_snapshot` for each.
+
+The frontend receives `sub_agent_snapshot` and:
+1. Re-registers the agent in `useSubAgentStore` with its current status (`spawning`, `prompting`, `running`, etc.)
+2. Adds the agent to the `pendingSubAgents` map so that the next token or tool step will lazily create the sidebar session (if it doesn't already exist)
+
+---
+
 ## Unit Tests
 
 ### Backend Tests
 
 - **`backend/test/mcpApi.test.js`** — Tool schema validation
+- **`backend/test/subAgentInvocationManager.test.js`** — Complete orchestration unit tests (spawning, cancelling, snapshotting, prompt timeouts)
+- **`backend/test/subAgentHandlers.test.js`** — Reconnect hydration snapshot emissions
 - **`backend/test/subAgentRegistry.test.js`** — Sub-agent lifecycle tracking (register, complete, cascade cleanup)
 - **`backend/test/sessionHandlers.test.js`** — Session deletion including cascade delete of sub-agents
 - **`backend/test/database-exhaustive.test.js`** — Sub-agent session storage and retrieval with `isSubAgent` flag

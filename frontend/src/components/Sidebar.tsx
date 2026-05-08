@@ -275,16 +275,19 @@ const Sidebar: React.FC = () => {
           </div>
         ))}
         {subs.map(sub => (
-          <div key={sub.id} className="fork-indent" style={{ paddingLeft: `${depth * 12}px` }}>
-            <SessionItem
-              session={sub}
-              isActive={sub.id === activeSessionId}
-              onSelect={() => handleSelect(sub.id)}
-              onRename={() => {}}
-              onTogglePin={() => {}}
-              onArchive={() => handleRemoveSession(sub.id)}
-              onSettings={() => {}}
-            />
+          <div key={sub.id}>
+            <div className="fork-indent" style={{ paddingLeft: `${depth * 12}px` }}>
+              <SessionItem
+                session={sub}
+                isActive={sub.id === activeSessionId}
+                onSelect={() => handleSelect(sub.id)}
+                onRename={() => {}}
+                onTogglePin={() => {}}
+                onArchive={() => handleRemoveSession(sub.id)}
+                onSettings={() => {}}
+              />
+            </div>
+            {renderChildren(sub.id, depth + 1)}
           </div>
         ))}
       </>

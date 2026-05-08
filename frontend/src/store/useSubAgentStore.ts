@@ -23,7 +23,7 @@ export interface SubAgentEntry {
   name: string;
   prompt: string;
   agent: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'spawning' | 'prompting' | 'running' | 'completed' | 'failed' | 'cancelled';
   tokens: string;
   thoughts: string;
   toolSteps: { id: string; title: string; status: string; output?: string }[];
@@ -33,6 +33,7 @@ export interface SubAgentEntry {
 interface SubAgentState {
   agents: SubAgentEntry[];
   addAgent: (entry: Omit<SubAgentEntry, 'status' | 'tokens' | 'thoughts' | 'toolSteps' | 'permission'>) => void;
+  setStatus: (acpSessionId: string, status: SubAgentEntry['status']) => void;
   completeAgent: (acpSessionId: string) => void;
   appendToken: (acpSessionId: string, text: string) => void;
   appendThought: (acpSessionId: string, text: string) => void;
@@ -47,7 +48,10 @@ interface SubAgentState {
 export const useSubAgentStore = create<SubAgentState>((set) => ({
   agents: [],
   addAgent: (entry) => set(state => ({
-    agents: [...state.agents, { ...entry, status: 'running', tokens: '', thoughts: '', toolSteps: [], permission: null }]
+    agents: [...state.agents, { ...entry, status: 'spawning', tokens: '', thoughts: '', toolSteps: [], permission: null }]
+  })),
+  setStatus: (acpSessionId, status) => set(state => ({
+    agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, status } : a)
   })),
   completeAgent: (acpSessionId) => set(state => ({
     agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, status: 'completed' } : a)

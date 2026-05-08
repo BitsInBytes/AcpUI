@@ -35,7 +35,8 @@ vi.mock('../services/providerLoader.js', () => ({
   getProvider: () => ({
     id: 'p1',
     config: { name: 'P1', branding: {}, paths: { icons: '/tmp' } }
-  })
+  }),
+  getProviderModule: vi.fn().mockResolvedValue({})
 }));
 
 describe('Express Server & Routes', () => {

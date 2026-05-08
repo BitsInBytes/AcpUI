@@ -80,7 +80,7 @@ describe('SubAgentPanel', () => {
     render(<SubAgentPanel invocationId="inv-test-1" />);
     expect(screen.getByText(/Research/)).toBeInTheDocument();
     expect(screen.getByText(/Implement/)).toBeInTheDocument();
-    expect(screen.getByText('🟢')).toBeInTheDocument();
+    expect(screen.getByText('🔄')).toBeInTheDocument();
     expect(screen.getByText('✅')).toBeInTheDocument();
   });
 

@@ -11,6 +11,7 @@ import registerFileExplorerHandlers from './fileExplorerHandlers.js';
 import registerGitHandlers from './gitHandlers.js';
 import registerTerminalHandlers from './terminalHandlers.js';
 import registerShellRunHandlers, { emitShellRunSnapshotsForSession } from './shellRunHandlers.js';
+import { emitSubAgentSnapshotsForSession } from './subAgentHandlers.js';
 import acpClient from '../services/acpClient.js';
 import providerRuntimeManager from '../services/providerRuntimeManager.js';
 import { loadWorkspaces } from '../services/workspaceConfig.js';
@@ -112,6 +113,7 @@ export default function registerSocketHandlers(io) {
       if (sessionId) {
         socket.join(`session:${sessionId}`);
         emitShellRunSnapshotsForSession(socket, { providerId, sessionId });
+        emitSubAgentSnapshotsForSession(socket, { providerId, sessionId });
         writeLog(`[ROOMS] ${socket.id} watching session ${sessionId}`);
       }
     });

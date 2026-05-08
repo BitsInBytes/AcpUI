@@ -24,7 +24,7 @@ describe('useSubAgentStore (Pure Logic)', () => {
     });
 
     expect(useSubAgentStore.getState().agents).toHaveLength(1);
-    expect(useSubAgentStore.getState().agents[0].status).toBe('running');
+    expect(useSubAgentStore.getState().agents[0].status).toBe('spawning');
 
     act(() => {
         useSubAgentStore.getState().completeAgent('a1');

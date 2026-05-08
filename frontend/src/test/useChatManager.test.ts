@@ -320,7 +320,9 @@ describe('useChatManager hook', () => {
     renderHook(() => useChatManager(vi.fn()));
     
     const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'merge_message')[1];
-    handler({ sessionId: 'acp-1', text: 'Merged' });
+    act(() => {
+      handler({ sessionId: 'acp-1', text: 'Merged' });
+    });
     
     expect(setState).toHaveBeenCalled();
   });

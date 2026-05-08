@@ -91,7 +91,8 @@ vi.mock('../database.js', () => ({
 vi.mock('../mcp/subAgentRegistry.js', () => ({
     registerSubAgent: vi.fn(),
     completeSubAgent: vi.fn(),
-    failSubAgent: vi.fn()
+    failSubAgent: vi.fn(),
+    setPromptingSubAgent: vi.fn()
 }));
 vi.mock('../mcp/acpCleanup.js', () => ({ cleanupAcpSession: vi.fn() }));
 vi.mock('../services/counselConfig.js', () => ({
@@ -522,40 +523,13 @@ describe('mcpServer', () => {
       );
     });
 
-    it('passes resolvedProviderId to sub-agent registration and database', async () => {
-      const { saveSession } = await import('../database.js');
-      const { registerSubAgent } = await import('../mcp/subAgentRegistry.js');
-      const handlers = createToolHandlers(mockIo);
-      const subId = 'multi-provider-sub';
-
-      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
-        if (method === 'session/new') return { sessionId: subId };
-        return {};
-      });
-
-      await runInvokeSubAgents(handlers, {
-        requests: [{ name: 'Agent', prompt: 'Do thing', agent: 'dev' }]
-      });
-
-      expect(registerSubAgent).toHaveBeenCalledWith(
-        'provider-a',
-        subId,
-        null,
-        'Do thing',
-        'dev'
-      );
-      expect(saveSession).toHaveBeenCalledWith(
-        expect.objectContaining({ provider: 'provider-a' })
-      );
-      });
-
-      it('returns error if io is missing', async () => {
+    it('returns error if io is missing', async () => {
       const handlers = createToolHandlers(null);
       const result = await handlers.ux_invoke_subagents({ requests: [] });
       expect(result.content[0].text).toContain('Error: Sub-agent system not available');
-      });
+    });
 
-      it('resolves parentUiId if lastSubAgentParentAcpId is set', async () => {
+    it('resolves parentUiId if lastSubAgentParentAcpId is set', async () => {
       const { getSessionByAcpId } = await import('../database.js');
       vi.mocked(getSessionByAcpId).mockResolvedValueOnce({ id: 'parent-ui-123' });
       mockAcpClient.lastSubAgentParentAcpId = 'parent-acp-456';
@@ -567,7 +541,51 @@ describe('mcpServer', () => {
       expect(mockIo.emit).toHaveBeenCalledWith('sub_agents_starting', expect.objectContaining({
         parentUiId: 'parent-ui-123'
       }));
+    });
+
+    it('only joins sockets to sub-agent room if they are watching the parent session', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'filtered-socket-sub';
+      mockAcpClient.lastSubAgentParentAcpId = 'parent-acp-123';
+      
+      const socket1 = { join: vi.fn(), rooms: new Set(['session:parent-acp-123']) };
+      const socket2 = { join: vi.fn(), rooms: new Set(['session:other-acp']) };
+      mockIo.fetchSockets.mockResolvedValue([socket1, socket2]);
+
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        return {};
       });
+
+      await runInvokeSubAgents(handlers, {
+        requests: [{ name: 'Agent', prompt: 'Do thing', agent: 'dev' }]
+      });
+
+      expect(socket1.join).toHaveBeenCalledWith(`session:${subId}`);
+      expect(socket2.join).not.toHaveBeenCalled();
+    });
+
+    it('joins all sockets to sub-agent room if parent session is unknown (fallback)', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'fallback-socket-sub';
+      mockAcpClient.lastSubAgentParentAcpId = null;
+      
+      const socket1 = { join: vi.fn(), rooms: new Set() };
+      const socket2 = { join: vi.fn(), rooms: new Set() };
+      mockIo.fetchSockets.mockResolvedValue([socket1, socket2]);
+
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        return {};
+      });
+
+      await runInvokeSubAgents(handlers, {
+        requests: [{ name: 'Agent', prompt: 'Do thing', agent: 'dev' }]
+      });
+
+      expect(socket1.join).toHaveBeenCalledWith(`session:${subId}`);
+      expect(socket2.join).toHaveBeenCalledWith(`session:${subId}`);
+    });
       });
 
       describe('ux_invoke_counsel', () => {
