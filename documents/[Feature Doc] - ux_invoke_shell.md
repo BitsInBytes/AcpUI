@@ -345,7 +345,7 @@ appendOutput: ({ providerId, sessionId, runId, chunk, maxLines }) => set(state =
 ---
 
 ### 8. Frontend Renders Interactive Terminal or Read-Only Transcript
-**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 76-253)
+**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 34-340)
 
 The `ToolStep` component detects `shellRunId` on a tool event and renders `ShellToolTerminal`:
 
@@ -358,16 +358,64 @@ if (step.event.shellRunId) {
 
 `ShellToolTerminal` has two render modes:
 
-**A. Interactive (Pending/Running)** (Lines 117-191):
+**A. Interactive (Pending/Running)** (Lines 152-299):
 - Creates xterm.js terminal with FitAddon (fit to container)
-- Replays entire stored transcript on mount/update
+- Queues transcript deltas through callback-paced `term.write(data, callback)` calls
+- Splits large writes into 64 KiB chunks so xterm's internal write buffer cannot be flooded by one React update
+- Uses suffix/prefix overlap detection so rolling transcript trimming appends only new output instead of repeatedly resetting and replaying the whole transcript
 - Listens for user input via `term.onData()` and emits `shell_run_input`
 - Handles resize events and emits `shell_run_resize`
 - Handles paste via Ctrl+V by reading clipboard and emitting `shell_run_input`
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 155-178)
-term.onData((data) => {
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 152-184)
+const drainWriteQueue = useCallback(() => {
+  const term = xtermRef.current;
+  if (!term || writeInFlightRef.current) return;
+
+  const next = writeQueueRef.current.shift();
+  if (!next) return;
+
+  const generation = writeGenerationRef.current;
+  writeInFlightRef.current = true;
+  try {
+    term.write(next, () => {
+      if (writeGenerationRef.current !== generation) return;
+      writeInFlightRef.current = false;
+      drainWriteQueueRef.current();
+    });
+  } catch {
+    if (writeGenerationRef.current !== generation) return;
+    writeInFlightRef.current = false;
+    drainWriteQueueRef.current();
+  }
+}, []);
+```
+
+Transcript updates use this queue:
+
+```typescript
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 287-299)
+useEffect(() => {
+  const term = xtermRef.current;
+  if (!term) return;
+  const transcript = run?.transcript || '';
+  const written = writtenRef.current;
+  const plan = getTranscriptWritePlan(written, transcript);
+  if (plan.reset) {
+    resetQueuedWrites();
+    term.reset();
+  }
+  enqueueTerminalWrite(plan.data);
+  writtenRef.current = transcript;
+}, [enqueueTerminalWrite, resetQueuedWrites, run?.transcript]);
+```
+
+User input still goes directly back to the backend:
+
+```typescript
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 255-264)
+const dataDisposable = term.onData((data) => {
   const currentRun = runRef.current;
   if (!isRunningRef.current || isPasting || !currentRun?.runId) return;
   socket?.emit('shell_run_input', {
@@ -379,14 +427,14 @@ term.onData((data) => {
 });
 ```
 
-**B. Read-Only (Exited)** (Lines 57-63, 234-235):
+**B. Read-Only (Exited)** (Lines 101-107, 331-334):
 - Converts stored transcript to HTML with ANSI color codes
 - Strips noise terminal escape sequences
 - Appends exit summary if needed (user terminated, timeout, exit code)
 - Renders as `<pre>` with HTML content
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 234-235)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 331-334)
 } : (
   <pre ref={readOnlyRef} className="shell-tool-terminal-readonly" dangerouslySetInnerHTML={{ __html: readOnlyHtml }} />
 )
@@ -395,7 +443,7 @@ term.onData((data) => {
 ---
 
 ### 9. Frontend Emits User Input Back to Backend
-**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 163-174) + `backend/sockets/shellRunHandlers.js` (Lines 35-52)
+**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 255-264) + `backend/sockets/shellRunHandlers.js` (Lines 35-52)
 
 User types in xterm → emits `shell_run_input`:
 
@@ -603,7 +651,7 @@ The ACP daemon receives this as the MCP tool result and continues executing, pot
 │  ┌──────────────────────────────────────────────────────────────┐ │
 │  │  ShellToolTerminal                                           │ │
 │  │  ├─ Interactive mode (pending/running): xterm.js terminal   │ │
-│  │  │  ├─ Replays transcript                                    │ │
+│  │  │  ├─ Queues transcript deltas with xterm flow control       │ │
 │  │  │  ├─ Emits shell_run_input (user typing)                  │ │
 │  │  │  ├─ Emits shell_run_resize (terminal resize)             │ │
 │  │  │  └─ Emits shell_run_kill (stop button)                   │ │
@@ -939,10 +987,13 @@ const nextRuns = {
 // ShellToolTerminal component
 const run = useShellRunStore(state => state.runs['shell-run-xyz']);
 
-// Replays transcript into xterm
-if (run?.transcript) {
-  term.write(newChunks);  // incremental write
+// Computes a transcript delta and queues it for callback-paced xterm writes.
+const plan = getTranscriptWritePlan(writtenRef.current, run?.transcript || '');
+if (plan.reset) {
+  resetQueuedWrites();
+  term.reset();
 }
+enqueueTerminalWrite(plan.data);
 
 // xterm renders live as user types
 ```
@@ -998,10 +1049,11 @@ npm ERR! code ENOENT
 
 | File | Export | Purpose | Key Lines |
 |------|---|---|---|
-| `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive xterm or read-only transcript | 76-253 |
-| | | Mounts xterm on pending/running | 117-191 |
-| | | Replays transcript on each update | 193-210 |
-| | | Switches to read-only on exited | 232-235 |
+| `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive xterm or read-only transcript | 123-340 |
+| | | Mounts xterm on pending/running | 206-279 |
+| | | Queues xterm writes with callback pacing | 152-184 |
+| | | Computes transcript deltas and trim overlap | 61-75, 287-299 |
+| | | Switches to read-only on exited | 331-334 |
 | `frontend/src/hooks/useChatManager.ts` | `useChatManager()` (implied) | Socket listeners for shell events | (implied) |
 
 ### Utility Functions
@@ -1014,11 +1066,13 @@ npm ERR! code ENOENT
 | | `normalizeCwd()` | Resolve working directory | 46-48 |
 | `frontend/src/store/useShellRunStore.ts` | `trimShellTranscript()` | Keep only last N lines of transcript | 30-43 |
 | | `pruneShellRuns()` | Keep at most 50 runs, prioritize active | 45-55 |
-| `frontend/src/components/ShellToolTerminal.tsx` | `stripAnsi()` | Remove ANSI escape codes | 21-24 |
-| | `stripTerminalNoise()` | Remove select escape sequences for rendering | 26-31 |
-| | `transcriptHasCommandOutput()` | Check if transcript has output beyond command line | 33-43 |
-| | `appendExitSummary()` | Add termination message to transcript | 45-54 |
-| | `getReadOnlyTerminalHtml()` | Convert transcript to HTML with colors | 56-64 |
+| `frontend/src/components/ShellToolTerminal.tsx` | `stripAnsi()` | Remove ANSI escape codes | 18-24 |
+| | `stripTerminalNoise()` | Remove select escape sequences for rendering | 26-32 |
+| | `getSuffixPrefixOverlap()` | Find trim overlap between previous and next transcript | 38-59 |
+| | `getTranscriptWritePlan()` | Decide append-vs-reset and return only data to queue | 61-75 |
+| | `transcriptHasCommandOutput()` | Check if transcript has output beyond command line | 77-85 |
+| | `appendExitSummary()` | Add termination message to transcript | 87-99 |
+| | `getReadOnlyTerminalHtml()` | Convert transcript to HTML with colors | 101-108 |
 
 ---
 
@@ -1096,12 +1150,12 @@ npm ERR! code ENOENT
 
 ---
 
-### 9. xterm.js Terminal Doesn't Persist Across Pause/Resume
-**What breaks:** User minimizes and reopens the terminal; the live xterm instance is destroyed, recreated, and replays the entire transcript.
+### 9. xterm.js Writes Must Be Callback-Paced
+**What breaks:** During fast command output, the browser can throw `write data discarded, use flow control to avoid losing data` and crash the UI.
 
-**Why:** `ShellToolTerminal` creates xterm on mount (if `isInteractiveTerminal`) and destroys on unmount. Replaying is efficient (incremental write), but if the transcript is 100K lines, replay takes time.
+**Why:** xterm.js `Terminal.write()` is buffered and asynchronous. If the frontend calls `write()` repeatedly before xterm has parsed prior data, xterm's internal write buffer can exceed its discard watermark. Rolling transcript trimming also used to force reset + full replay, multiplying the write volume during heavy output.
 
-**How to avoid:** This is acceptable. The replay is fast (<100ms for 100K lines). For very large transcripts, consider pagination or chunked rendering.
+**How to avoid:** All live shell output must go through `ShellToolTerminal`'s write queue. The queue splits large data into 64 KiB chunks and starts the next `term.write(data, callback)` only after the previous callback fires. Transcript trimming must use `getTranscriptWritePlan()` overlap detection so normal rolling output writes only the new delta, not a full replay.
 
 ---
 
@@ -1134,7 +1188,7 @@ Located in `frontend/src/test/`:
 | File | Key Tests | Coverage |
 |------|-----------|----------|
 | `useShellRunStore.test.ts` | upsert, append, mark exited, trim, prune | 93%+ |
-| `ShellToolTerminal.test.tsx` | xterm mount, replay, read-only render, user input, resize, kill | 89%+ |
+| `ShellToolTerminal.test.tsx` | xterm mount, callback-paced writes, trim overlap, read-only render, user input, resize, kill | 89%+ |
 | `useChatManager.test.ts` | socket listener setup, event routing to store | 85%+ |
 
 ---
@@ -1149,7 +1203,7 @@ Located in `frontend/src/test/`:
    - **Backend PTY management?** → `ShellRunManager` (Lines 49-367 in shellRunManager.js)
    - **Tool preparation?** → `acpUpdateHandler.prepareShellRunForToolStart()` (Lines 104-142)
    - **Socket routing?** → `shellRunHandlers.js` (Lines 26-84)
-   - **Frontend rendering?** → `ShellToolTerminal.tsx` (Lines 76-253)
+   - **Frontend rendering?** → `ShellToolTerminal.tsx` (Lines 34-340)
 4. **Find exact code** — Use Component Reference table for file paths and line numbers
 5. **Write tests** — Use existing test files as templates; target 90%+ coverage
 6. **Test concurrency** — Ensure multiple runs don't interfere; use the concurrent execution example as a guide

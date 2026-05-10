@@ -31,6 +31,49 @@ const stripTerminalNoise = (value: string) => value
   // eslint-disable-next-line no-control-regex
   .replace(/\x1b\[[0-9;]*[A-HJ-T]/g, '');
 
+const XTERM_WRITE_CHUNK_SIZE = 64 * 1024;
+const TRANSCRIPT_OVERLAP_SCAN_LIMIT = 64 * 1024;
+const MIN_TRIM_OVERLAP = 32;
+
+function getSuffixPrefixOverlap(previous: string, next: string) {
+  if (!previous || !next) return 0;
+
+  const nextHead = next.slice(0, TRANSCRIPT_OVERLAP_SCAN_LIMIT);
+  const previousTail = previous.slice(-TRANSCRIPT_OVERLAP_SCAN_LIMIT);
+  const marker = '\u0000';
+  const value = `${nextHead}${marker}${previousTail}`;
+  const prefix = new Array(value.length).fill(0);
+
+  for (let index = 1; index < value.length; index += 1) {
+    let length = prefix[index - 1];
+    while (length > 0 && value[index] !== value[length]) {
+      length = prefix[length - 1];
+    }
+    if (value[index] === value[length]) {
+      length += 1;
+    }
+    prefix[index] = length;
+  }
+
+  return Math.min(prefix[value.length - 1] || 0, next.length);
+}
+
+function getTranscriptWritePlan(previous: string, next: string) {
+  if (!next) return { reset: false, data: '' };
+  if (!previous) return { reset: false, data: next };
+  if (next.startsWith(previous)) {
+    return { reset: false, data: next.slice(previous.length) };
+  }
+
+  const overlap = getSuffixPrefixOverlap(previous, next);
+  const requiredOverlap = Math.min(MIN_TRIM_OVERLAP, Math.ceil(next.length / 2));
+  if (overlap >= requiredOverlap) {
+    return { reset: false, data: next.slice(overlap) };
+  }
+
+  return { reset: true, data: next };
+}
+
 function transcriptHasCommandOutput(transcript?: string, command?: string) {
   const plain = stripAnsi(transcript || '').replace(/\r\n/g, '\n');
   const lines = plain.split('\n');
@@ -87,6 +130,10 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
   const xtermRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const writtenRef = useRef('');
+  const writeQueueRef = useRef<string[]>([]);
+  const writeInFlightRef = useRef(false);
+  const writeGenerationRef = useRef(0);
+  const drainWriteQueueRef = useRef<() => void>(() => undefined);
   const isRunning = run?.status === 'running';
   const isInteractiveTerminal = Boolean(run && run.status !== 'exited');
   const canStop = Boolean(run && run.status !== 'exited');
@@ -101,6 +148,46 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
     runRef.current = run;
     isRunningRef.current = isRunning;
   }, [run, isRunning]);
+
+  const drainWriteQueue = useCallback(() => {
+    const term = xtermRef.current;
+    if (!term || writeInFlightRef.current) return;
+
+    const next = writeQueueRef.current.shift();
+    if (!next) return;
+
+    const generation = writeGenerationRef.current;
+    writeInFlightRef.current = true;
+    try {
+      term.write(next, () => {
+        if (writeGenerationRef.current !== generation) return;
+        writeInFlightRef.current = false;
+        drainWriteQueueRef.current();
+      });
+    } catch {
+      if (writeGenerationRef.current !== generation) return;
+      writeInFlightRef.current = false;
+      drainWriteQueueRef.current();
+    }
+  }, []);
+
+  useEffect(() => {
+    drainWriteQueueRef.current = drainWriteQueue;
+  }, [drainWriteQueue]);
+
+  const enqueueTerminalWrite = useCallback((data: string) => {
+    if (!data || !xtermRef.current) return;
+    for (let index = 0; index < data.length; index += XTERM_WRITE_CHUNK_SIZE) {
+      writeQueueRef.current.push(data.slice(index, index + XTERM_WRITE_CHUNK_SIZE));
+    }
+    drainWriteQueue();
+  }, [drainWriteQueue]);
+
+  const resetQueuedWrites = useCallback(() => {
+    writeGenerationRef.current += 1;
+    writeQueueRef.current = [];
+    writeInFlightRef.current = false;
+  }, []);
 
   const emitResize = useCallback(() => {
     const term = xtermRef.current;
@@ -187,8 +274,9 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
       xtermRef.current = null;
       fitRef.current = null;
       writtenRef.current = '';
+      resetQueuedWrites();
     };
-  }, [emitResize, socket, isInteractiveTerminal]);
+  }, [emitResize, socket, isInteractiveTerminal, resetQueuedWrites]);
 
   useEffect(() => {
     const term = xtermRef.current;
@@ -201,15 +289,14 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
     if (!term) return;
     const transcript = run?.transcript || '';
     const written = writtenRef.current;
-    if (transcript.startsWith(written)) {
-      const next = transcript.slice(written.length);
-      if (next) term.write(next);
-    } else {
+    const plan = getTranscriptWritePlan(written, transcript);
+    if (plan.reset) {
+      resetQueuedWrites();
       term.reset();
-      if (transcript) term.write(transcript);
     }
+    enqueueTerminalWrite(plan.data);
     writtenRef.current = transcript;
-  }, [run?.transcript]);
+  }, [enqueueTerminalWrite, resetQueuedWrites, run?.transcript]);
 
   useLayoutEffect(() => {
     if (isInteractiveTerminal) return;

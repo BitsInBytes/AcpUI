@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { useSystemStore } from '../store/useSystemStore';
 import { useShellRunStore } from '../store/useShellRunStore';
 import type { SystemEvent } from '../types';
@@ -12,7 +12,10 @@ vi.mock('@xterm/xterm', () => ({
     loadAddon = vi.fn();
     attachCustomKeyEventHandler = vi.fn((handler) => { this.keyHandler = handler; });
     onData = vi.fn((handler) => { this.dataHandler = handler; return { dispose: vi.fn() }; });
-    write = vi.fn();
+    writeCallbacks: Array<() => void> = [];
+    write = vi.fn((_data: string, callback?: () => void) => {
+      if (callback) this.writeCallbacks.push(callback);
+    });
     writeln = vi.fn();
     reset = vi.fn();
     dispose = vi.fn();
@@ -79,8 +82,102 @@ describe('ShellToolTerminal', () => {
 
     render(<ShellToolTerminal event={baseEvent()} />);
 
-    expect(terminals[0].write).toHaveBeenCalledWith('$ npm test\nPASS\n');
+    expect(terminals[0].write).toHaveBeenCalledWith('$ npm test\nPASS\n', expect.any(Function));
     expect(socket.emit).not.toHaveBeenCalledWith('terminal_spawn', expect.anything(), expect.anything());
+  });
+
+  it('paces xterm writes until the previous write callback completes', () => {
+    useShellRunStore.getState().upsertSnapshot({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      runId: 'shell-run-1',
+      status: 'running',
+      transcript: ''
+    });
+
+    render(<ShellToolTerminal event={baseEvent()} />);
+
+    act(() => {
+      useShellRunStore.getState().appendOutput({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-1',
+        chunk: 'first\n'
+      });
+    });
+    expect(terminals[0].write).toHaveBeenCalledTimes(1);
+    expect(terminals[0].write.mock.calls[0][0]).toBe('first\n');
+
+    act(() => {
+      useShellRunStore.getState().appendOutput({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-1',
+        chunk: 'second\n'
+      });
+    });
+    expect(terminals[0].write).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      terminals[0].writeCallbacks.shift()?.();
+    });
+    expect(terminals[0].write).toHaveBeenCalledTimes(2);
+    expect(terminals[0].write.mock.calls[1][0]).toBe('second\n');
+  });
+
+  it('writes only the overlapping delta when transcript trimming drops old lines', () => {
+    useShellRunStore.getState().upsertSnapshot({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      runId: 'shell-run-1',
+      status: 'running',
+      maxLines: 2,
+      transcript: 'line 1\nline 2\n'
+    });
+
+    render(<ShellToolTerminal event={baseEvent()} />);
+    act(() => {
+      terminals[0].writeCallbacks.shift()?.();
+    });
+    terminals[0].write.mockClear();
+    terminals[0].reset.mockClear();
+
+    act(() => {
+      useShellRunStore.getState().appendOutput({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-1',
+        chunk: 'line 3\n',
+        maxLines: 2
+      });
+    });
+
+    expect(terminals[0].reset).not.toHaveBeenCalled();
+    expect(terminals[0].write).toHaveBeenCalledTimes(1);
+    expect(terminals[0].write.mock.calls[0][0]).toBe('line 3\n');
+  });
+
+  it('splits large transcript writes into bounded xterm chunks', () => {
+    const largeTranscript = 'x'.repeat((64 * 1024) + 2048);
+    useShellRunStore.getState().upsertSnapshot({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      runId: 'shell-run-1',
+      status: 'running',
+      transcript: largeTranscript
+    });
+
+    render(<ShellToolTerminal event={baseEvent()} />);
+
+    expect(terminals[0].write).toHaveBeenCalledTimes(1);
+    expect(terminals[0].write.mock.calls[0][0]).toHaveLength(64 * 1024);
+
+    act(() => {
+      terminals[0].writeCallbacks.shift()?.();
+    });
+
+    expect(terminals[0].write).toHaveBeenCalledTimes(2);
+    expect(terminals[0].write.mock.calls[1][0]).toHaveLength(2048);
   });
 
   it('renders completed runs as read-only text without creating xterm', () => {
@@ -184,7 +281,9 @@ describe('ShellToolTerminal', () => {
       data: '\x03'
     });
 
-    useShellRunStore.getState().markExited({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-1' });
+    act(() => {
+      useShellRunStore.getState().markExited({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-1' });
+    });
     rerender(<ShellToolTerminal event={baseEvent({ shellState: 'exited', status: 'completed' })} />);
     socket.emit.mockClear();
     terminals[0].dataHandler?.('b');
@@ -251,7 +350,9 @@ describe('ShellToolTerminal', () => {
       runId: 'shell-run-1'
     });
 
-    useShellRunStore.getState().markExited({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-1' });
+    act(() => {
+      useShellRunStore.getState().markExited({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-1' });
+    });
     rerender(<ShellToolTerminal event={baseEvent({ shellState: 'exited', status: 'completed' })} />);
     expect(terminals[0].dispose).toHaveBeenCalled();
     expect(screen.getByTitle('Stop command')).toBeDisabled();

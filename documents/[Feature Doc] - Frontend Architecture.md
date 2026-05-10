@@ -834,7 +834,7 @@ The text appears instantly (re-rendered on next frame). If more tokens arrive wh
 | `renderToolOutput.tsx` | Various renders | Syntax highlighting, JSON, ANSI, diffs |
 | `MemoizedMarkdown.tsx` | `MemoizedMarkdown` | Memoized block rendering for streaming |
 | `Terminal.tsx` | `Terminal` | Canvas terminal xterm.js integration |
-| `ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive shell xterm renderer for active runs; sanitized ANSI-colored read-only transcript renderer after exit |
+| `ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive shell xterm renderer with callback-paced writes for active runs; sanitized ANSI-colored read-only transcript renderer after exit |
 | `SubAgentPanel.tsx" | `SubAgentPanel` | Sub-agent cards |
 | `Sidebar.tsx` | `Sidebar` | Session list, folders, workspaces |
 | `SessionItem.tsx` | `SessionItem` | Session row with actions |
