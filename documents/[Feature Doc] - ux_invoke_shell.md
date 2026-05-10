@@ -357,7 +357,7 @@ appendOutput: ({ providerId, sessionId, runId, chunk, maxLines }) => set(state =
 ---
 
 ### 8. Frontend Renders Interactive Terminal or Read-Only Transcript
-**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 18-359)
+**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 18-379)
 
 The `ToolStep` component detects `shellRunId` on a tool event and renders `ShellToolTerminal`:
 
@@ -370,8 +370,9 @@ if (step.event.shellRunId) {
 
 `ShellToolTerminal` has two render modes:
 
-**A. Interactive (Pending/Running)** (Lines 171-318):
+**A. Interactive (Pending/Running)** (Lines 189-338):
 - Creates xterm.js terminal with FitAddon (fit to container)
+- Automatically takes focus when the terminal is active and running, provided the user is viewing the associated chat session
 - Queues transcript deltas through callback-paced `term.write(data, callback)` calls
 - Splits large writes into 64 KiB chunks so xterm's internal write buffer cannot be flooded by one React update
 - Uses suffix/prefix overlap detection so rolling transcript trimming appends only new output instead of repeatedly resetting and replaying the whole transcript
@@ -380,7 +381,7 @@ if (step.event.shellRunId) {
 - Handles paste via Ctrl+V by reading clipboard and emitting `shell_run_input`
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 171-203)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 190-210)
 const drainWriteQueue = useCallback(() => {
   const term = xtermRef.current;
   if (!term || writeInFlightRef.current) return;
@@ -407,7 +408,7 @@ const drainWriteQueue = useCallback(() => {
 Transcript updates use this queue:
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 306-318)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 325-338)
 useEffect(() => {
   const term = xtermRef.current;
   if (!term) return;
@@ -426,7 +427,7 @@ useEffect(() => {
 User input still goes directly back to the backend:
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 274-283)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 293-302)
 const dataDisposable = term.onData((data) => {
   const currentRun = runRef.current;
   if (!isRunningRef.current || isPasting || !currentRun?.runId) return;
@@ -446,7 +447,7 @@ const dataDisposable = term.onData((data) => {
 - Renders as `<pre>` with HTML content
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 350-353)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 369-374)
 } : (
   <pre ref={readOnlyRef} className="shell-tool-terminal-readonly" dangerouslySetInnerHTML={{ __html: readOnlyHtml }} />
 )
@@ -1061,11 +1062,11 @@ npm ERR! code ENOENT
 
 | File | Export | Purpose | Key Lines |
 |------|---|---|---|
-| `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive xterm or read-only transcript | 142-359 |
-| | | Mounts xterm on pending/running | 225-298 |
-| | | Queues xterm writes with callback pacing | 171-203 |
-| | | Computes transcript deltas and trim overlap | 68-82, 306-318 |
-| | | Switches to read-only on exited | 350-353 |
+| `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive xterm or read-only transcript | 143-379 |
+| | | Mounts xterm on pending/running | 245-316 |
+| | | Queues xterm writes with callback pacing | 190-210 |
+| | | Computes transcript deltas and trim overlap | 68-82, 325-338 |
+| | | Switches to read-only on exited | 369-374 |
 | `frontend/src/hooks/useChatManager.ts` | `useChatManager()` (implied) | Socket listeners for shell events | (implied) |
 
 ### Utility Functions

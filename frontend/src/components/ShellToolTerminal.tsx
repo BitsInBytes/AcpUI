@@ -8,6 +8,7 @@ import '@xterm/xterm/css/xterm.css';
 import type { SystemEvent } from '../types';
 import { useSystemStore } from '../store/useSystemStore';
 import { useShellRunStore, type ShellRunSnapshot } from '../store/useShellRunStore';
+import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 
 interface ShellToolTerminalProps {
   event: SystemEvent;
@@ -144,6 +145,13 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
   const storedRun = useShellRunStore(state => event.shellRunId ? state.runs[event.shellRunId] : undefined);
   const fallbackRun = useMemo(() => fallbackRunFromEvent(event), [event]);
   const run = storedRun || fallbackRun;
+
+  const isActiveSession = useSessionLifecycleStore(state => {
+    if (!state.activeSessionId) return false;
+    const activeSession = state.sessions.find(s => s.id === state.activeSessionId);
+    return activeSession?.acpSessionId === event.sessionId;
+  });
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const readOnlyRef = useRef<HTMLPreElement | null>(null);
   const xtermRef = useRef<XTerm | null>(null);
@@ -163,10 +171,21 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
     [event, run]
   );
 
+  const [isTerminalReady, setIsTerminalReady] = React.useState(false);
+
   useEffect(() => {
     runRef.current = run;
     isRunningRef.current = isRunning;
   }, [run, isRunning]);
+
+  useEffect(() => {
+    if (isActiveSession && isRunning && isTerminalReady && xtermRef.current) {
+      const timer = setTimeout(() => {
+        xtermRef.current?.focus();
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [isActiveSession, isRunning, isTerminalReady]);
 
   const drainWriteQueue = useCallback(() => {
     const term = xtermRef.current;
@@ -241,6 +260,7 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
 
     xtermRef.current = term;
     fitRef.current = fit;
+    setIsTerminalReady(true);
 
     let isPasting = false;
     term.attachCustomKeyEventHandler((keyboardEvent) => {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { useSystemStore } from '../store/useSystemStore';
 import { useShellRunStore } from '../store/useShellRunStore';
+import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import type { SystemEvent } from '../types';
 
 const terminals: any[] = [];
@@ -10,6 +11,7 @@ vi.mock('@xterm/xterm', () => ({
   Terminal: class {
     open = vi.fn();
     loadAddon = vi.fn();
+    focus = vi.fn();
     attachCustomKeyEventHandler = vi.fn((handler) => { this.keyHandler = handler; });
     onData = vi.fn((handler) => { this.dataHandler = handler; return { dispose: vi.fn() }; });
     writeCallbacks: Array<() => void> = [];
@@ -377,5 +379,47 @@ describe('ShellToolTerminal', () => {
     rerender(<ShellToolTerminal event={baseEvent({ shellState: 'exited', status: 'completed' })} />);
     expect(terminals[0].dispose).toHaveBeenCalled();
     expect(screen.getByTitle('Stop command')).toBeDisabled();
+  });
+
+  it('focuses xterm when terminal is running and session is active', () => {
+    useShellRunStore.getState().upsertSnapshot({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      runId: 'shell-run-1',
+      status: 'running',
+      transcript: ''
+    });
+    useSessionLifecycleStore.setState({
+      activeSessionId: 'ui-1',
+      sessions: [{ id: 'ui-1', acpSessionId: 'acp-1' } as any]
+    });
+
+    render(<ShellToolTerminal event={baseEvent()} />);
+    act(() => {
+      vi.advanceTimersByTime(60);
+    });
+
+    expect(terminals[0].focus).toHaveBeenCalled();
+  });
+
+  it('does not focus xterm when session is not active', () => {
+    useShellRunStore.getState().upsertSnapshot({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      runId: 'shell-run-1',
+      status: 'running',
+      transcript: ''
+    });
+    useSessionLifecycleStore.setState({
+      activeSessionId: 'ui-2',
+      sessions: [{ id: 'ui-1', acpSessionId: 'acp-1' }, { id: 'ui-2', acpSessionId: 'acp-2' }] as any[]
+    });
+
+    render(<ShellToolTerminal event={baseEvent()} />);
+    act(() => {
+      vi.advanceTimersByTime(60);
+    });
+
+    expect(terminals[0].focus).not.toHaveBeenCalled();
   });
 });
