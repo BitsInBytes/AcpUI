@@ -491,12 +491,14 @@ Both files have warning comments (read them!):
 
 ### Version 1: For User Sessions (sessionManager.js)
 
-**File:** `backend/services/sessionManager.js` (Lines 28-44)
+**File:** `backend/services/sessionManager.js` (Lines 28-47)
 
 ```javascript
 export function getMcpServers(providerId, { acpSessionId = null } = {}) {
   const name = getProvider(providerId).config.mcpName;
   if (!name) return [];
+  const providerModule = getProviderModuleSync(providerId);
+  const mcpServerMeta = providerModule.getMcpServerMeta?.();
   const proxyPath = path.resolve(__dirname, '..', 'mcp', 'stdio-proxy.js');
   const proxyId = createMcpProxyBinding({ providerId, acpSessionId });  // ← Creates registry entry
   return [{
@@ -508,7 +510,8 @@ export function getMcpServers(providerId, { acpSessionId = null } = {}) {
       { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },                  // ← Proxy registry binding
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
-    ]
+    ],
+    ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
   }];
 }
 ```
@@ -519,13 +522,15 @@ export function getMcpServers(providerId, { acpSessionId = null } = {}) {
 
 ### Version 2: For Sub-Agent Sessions (mcpServer.js)
 
-**File:** `backend/mcp/mcpServer.js` (Lines 38-55)
+**File:** `backend/mcp/mcpServer.js` (Lines 38-58)
 
 ```javascript
 export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
   const provider = getProvider(providerId);
   const name = provider.config.mcpName;
   if (!name) return [];
+  const providerModule = getProviderModuleSync(providerId);
+  const mcpServerMeta = providerModule.getMcpServerMeta?.();
   const proxyPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'stdio-proxy.js');
   const proxyId = createMcpProxyBinding({ providerId: provider.id, acpSessionId });  // ← Creates registry entry
   return [{
@@ -537,7 +542,8 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
       { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
-    ]
+    ],
+    ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
   }];
 }
 ```
@@ -553,6 +559,8 @@ The sessionManager version is used by socket session creation paths. The mcpServ
 ### Implication
 
 Both flows propagate provider identity and proxy identity via env vars. The gotcha is maintenance drift: there are two implementations in different files and both must stay aligned to ensure provider scoping and proxy resolution work consistently for user sessions and sub-agent sessions.
+
+**Provider metadata injection:** Both versions also call `getProviderModuleSync(providerId).getMcpServerMeta?.()` and conditionally attach the result as `_meta` on the server config entry. This allows providers to inject daemon-specific metadata (e.g., MCP timeout overrides) into both user session and sub-agent session spawn paths without duplicating logic.
 
 ---
 

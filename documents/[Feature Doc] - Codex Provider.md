@@ -180,12 +180,37 @@ Frontend receives:
 | `providers/codex/index.js` | `fetchCodexQuota` | Handled OAuth-backed quota retrieval with 401 retry |
 | `providers/codex/index.js` | `refreshCodexOAuthToken` | Refreshes and persists tokens to `auth.json` |
 | `providers/codex/index.js` | `buildCodexProviderStatus` | Maps raw ChatGPT usage JSON to UI status shape |
+| `providers/codex/index.js` | `getMcpServerMeta` | Injects MCP timeout overrides into server config `_meta` when `acpSupportsMcpTimeouts` is enabled |
 | `providers/codex/index.js` | `emitCachedContext` | Emits cached `{protocolPrefix}metadata` context usage after session load or hot-resume |
 | `providers/codex/index.js` | `setConfigOption` | Routes mode/model/reasoning changes |
 | `providers/codex/index.js` | `getSessionPaths`, `cloneSession`, `parseSessionHistory` | Rollout lifecycle |
 | `backend/sockets/sessionHandlers.js` | `captureModelState` | Captures response-time config options |
 | `backend/services/sessionManager.js` | `normalizeProviderConfigOptions` | Shared provider config normalization |
 | `backend/services/acpUpdateHandler.js` | `handleUpdate` | Applies normalization to native config updates |
+
+## MCP Timeout Configuration
+
+Codex ACP has a known upstream bug where MCP tool calls can time out around the 2-minute mark (see https://github.com/zed-industries/codex-acp/issues/277). When a future `codex-acp` release adds support for MCP timeout overrides via `_meta`, AcpUI can inject them automatically.
+
+Enable in `providers/codex/user.json`:
+
+```json
+{
+  "acpSupportsMcpTimeouts": true,
+  "acpMcpStartupTimeoutSec": 30,
+  "acpMcpToolTimeoutSec": 3600
+}
+```
+
+When `acpSupportsMcpTimeouts` is `true`, `getMcpServerMeta()` returns:
+
+```json
+{
+  "codex_acp": { "startup_timeout_sec": 30, "tool_timeout_sec": 3600 }
+}
+```
+
+This is spread as `_meta` on the MCP server config entry in both `session/new` and `session/load` requests. Fields are omitted individually if their value is not a positive integer. Set `acpSupportsMcpTimeouts: false` (the default) until upstream support is confirmed.
 
 ## Gotchas
 
@@ -199,6 +224,7 @@ Frontend receives:
 8. **Automatic OAuth refresh requires a valid JWT.** If `auth.json` contains an opaque token without a `client_id`, refresh will fail.
 9. **Codex buries the user-facing error message in `error.data.message`.** The JSON-RPC top-level `error.message` is always the generic sentinel `"Internal error"` (-32603). The `intercept()` function promotes `error.data.message` to `error.message` so the real cause (e.g. `usage_limit_exceeded`) surfaces in logs and in the UI error box.
 10. **Avoid double-counting assistant text during rehydration.** When `event_msg/agent_message` exists, treat `response_item/message(role=assistant)` as fallback-only for text to prevent duplicate assistant outputs.
+11. **`acpSupportsMcpTimeouts` is `false` by default.** The `_meta` timeout injection only activates when explicitly set to `true`. Until `codex-acp` officially supports MCP `_meta` timeout overrides, leave this disabled to avoid sending unexpected fields to the daemon.
 
 ## Unit Tests
 

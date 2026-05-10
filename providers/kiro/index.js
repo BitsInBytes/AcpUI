@@ -479,6 +479,10 @@ export function buildSessionParams(_agent) {
   return undefined;
 }
 
+export function getMcpServerMeta() {
+  return undefined;
+}
+
 export async function setConfigOption(acpClient, sessionId, optionId, value) {
   if (optionId === 'model') {
     return acpClient.transport.sendRequest('session/set_model', {

@@ -676,6 +676,10 @@ export async function setInitialAgent(_acpClient, _sessionId, _agent) {
   return;
 }
 
+export function getMcpServerMeta() {
+  return undefined;
+}
+
 // --- Session File Operations ---
 
 /**

@@ -95,51 +95,77 @@ Codex's LLM benefits from explicit instructions on which tools to use and when. 
 - macOS/Linux: `~/.codex/AGENTS.md`
 - Windows: `%USERPROFILE%\.codex\AGENTS.md`
 
+> **Known issue (upstream):** `codex-acp` currently has a bug where some MCP tool calls can time out around the 2-minute mark. Track status here: https://github.com/zed-industries/codex-acp/issues/277
+
 **Example AGENTS.md:**
 
 ```markdown
-# Codex Agents Configuration
+# AcpUI Tooling Preference
 
-This file provides steering instructions for all Codex agents to properly use AcpUI tools.
+When there is overlap between built-in tools/systems and AcpUI MCP tools, prefer `mcp__AcpUI` tools.
 
-## Global Tool Usage Instructions
+## Mandatory Rules
 
-### Always Use AcpUI Tools for System Interaction
+- MUST use `mcp__AcpUI__ux_invoke_shell` for all shell command execution.
+- MUST NOT use built-in shell tools (including `functions.shell_command`, PowerShell, Bash, or similar) when `mcp__AcpUI__ux_invoke_shell` is available.
+- MUST use `mcp__AcpUI__ux_invoke_subagents` only for short-lived, bounded tasks to preserve main-agent context.
 
-You have access to three powerful AcpUI tools through the AcpUI MCP server. Use these tools for system interaction instead of built-in alternatives:
+## Startup Check
 
-1. **ux_invoke_shell** — Execute shell commands with interactive terminal support
-   - **When to use:** Any time you need to run shell commands, scripts, tests, builds, or terminal operations
-   - **Why it's better:** Provides live colored output, real-time streaming, and interactive terminal with user input support
-   - **Example:** Running `npm test`, `git status`, `python script.py`, system commands
-   - **Prefer this over:** Any built-in shell tool alternatives
+Before running the first shell command in a session:
 
-2. **ux_invoke_subagents** — Spawn parallel AI agents to work on independent tasks
-   - **When to use:** Breaking down complex tasks into parallel independent work streams
-   - **Why it's better:** Shows live progress for each agent, enables parallel execution, provides clear orchestration view
-   - **Example:** Reviewing multiple files in parallel, running independent analyses, parallel testing
-   - **Prefer this over:** Sequential processing or built-in agent alternatives
+1. Verify AcpUI MCP tools are available.
+2. If they are available, use them exclusively for overlapping capabilities.
+3. If they are not available, stop and report that state before using any fallback.
 
-3. **ux_invoke_counsel** — Get multi-perspective evaluation on decisions
-   - **When to use:** Before making architectural decisions, evaluating approaches, or assessing trade-offs
-   - **Why it's better:** Provides Advocate (for), Critic (against), Pragmatist (practical), and optional domain experts
-   - **Example:** Evaluating authentication approaches, assessing refactoring strategies, reviewing design decisions
-   - **Always use for:** Major architectural decisions, technology selection, significant refactoring choices
+## Command Execution
 
-## Important Notes
+Use `mcp__AcpUI__ux_invoke_shell` for running commands.
 
-- **AcpUI tools are always available** — They are injected into every session via the AcpUI MCP server
-- **Prefer AcpUI over built-in tools** — AcpUI tools provide better UX, streaming, and integration
-- **Interactive shell support** — The `ux_invoke_shell` tool supports user input, terminal resize, and Ctrl+C handling
-- **Non-blocking agent spawning** — Use `ux_invoke_subagents` when you need parallel execution
-- **Always evaluate decisions** — Use `ux_invoke_counsel` before committing to major decisions
+## Delegation and Context Management
 
-## Agent Defaults
+Use `mcp__AcpUI__ux_invoke_subagents` to delegate quick, bounded work to other agents in order to preserve main-agent context.
 
-Unless you create a custom agent configuration, all agents should:
-1. Prefer AcpUI tools (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel)
-2. Use these tools for their intended purposes as described above
-3. Avoid falling back to built-in alternatives even if they exist
+Use `mcp__AcpUI__ux_invoke_subagents` especially for:
+
+- A couple of quick web fetches/searches
+- A few fast file searches/lookups
+- Brief summarization tasks that reduce main-agent context bloat
+
+Avoid long-running or broad exploratory tasks with sub-agents because any task over a minute has the risk of timing out.
+
+## Sub agent prompts
+
+When using sub agents, it is important to instruct the sub agents to not invoke sub agents, otherwise it is easy for agents to spawn more sub agents that spawn more sub agents that ends up in never ending cascade waterfall of agents.
+
+Keep sub-agent tasks short and clearly bounded (generally under a minute of work).
+
+## Decision Making
+
+Use `mcp__AcpUI__ux_invoke_counsel` before making architectural decisions, evaluating approaches, or assessing trade-offs. It provides multi-perspective evaluation from Advocate (for), Critic (against), Pragmatist (practical), and optional domain experts (architect, performance, security, UX).
+
+Always use it for:
+
+- Major architectural decisions
+- Technology selection
+- Significant refactoring choices
+- Evaluating competing implementation approaches
+
+## Fallback Behavior
+
+If AcpUI MCP tools are unavailable:
+
+1. State explicitly that the required AcpUI tools are unavailable.
+2. Ask for permission before using any fallback tool with overlapping capability.
+3. Return to AcpUI MCP tools as soon as they become available.
+
+## Notes
+
+- AcpUI tools are always available — they are injected into every session via the AcpUI MCP server.
+- Prefer AcpUI over built-in tools — AcpUI tools provide better UX, streaming, and integration.
+- `ux_invoke_shell` supports user input, terminal resize, and Ctrl+C handling.
+- `ux_invoke_subagents` enables parallel execution across independent work streams.
+- `ux_invoke_counsel` should be used before committing to any major decision.
 ```
 
 **Why this matters for Codex:**

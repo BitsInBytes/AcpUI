@@ -252,7 +252,7 @@ startRun(run) {
 ```
 
 **Platform-specific invocation** (Lines 37-44):
-- **Windows**: `powershell.exe -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"`
+- **Windows**: `powershell.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"`
 - **Unix**: `bash -c <command>`
 
 The function **blocks** until the PTY exits, awaiting `run.resolve()` which is called in `finalizeRun()`.

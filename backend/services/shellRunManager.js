@@ -38,7 +38,8 @@ function buildShellInvocation(command, platform = process.platform) {
   if (platform === 'win32') {
     return {
       shell: 'powershell.exe',
-      args: ['-NoProfile', '-Command', `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]
+      // Prevent PowerShell from printing the Encoding object to stdout.
+      args: ['-NoProfile', '-Command', `$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]
     };
   }
   return { shell: 'bash', args: ['-c', command] };

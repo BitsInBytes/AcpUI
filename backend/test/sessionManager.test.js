@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as sessionManager from '../services/sessionManager.js';
 import * as db from '../database.js';
-import { getProvider, getProviderModule } from '../services/providerLoader.js';
+import { getProvider, getProviderModule, getProviderModuleSync } from '../services/providerLoader.js';
 import { clearMcpProxyRegistry, getMcpProxyIdFromServers, resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
 
 vi.mock('../database.js');
@@ -22,12 +22,23 @@ describe('sessionManager', () => {
 
     it('should return server config if mcpName exists', () => {
       getProvider.mockReturnValue({ config: { mcpName: 'test-mcp' } });
+      getProviderModuleSync.mockReturnValue({ getMcpServerMeta: () => undefined });
       const servers = sessionManager.getMcpServers('p1');
       expect(servers).toHaveLength(1);
       expect(servers[0].name).toBe('test-mcp');
       expect(servers[0].env).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: 'ACP_UI_MCP_PROXY_ID', value: expect.stringMatching(/^mcp-proxy-/) })
       ]));
+      expect(servers[0]._meta).toBeUndefined();
+    });
+
+    it('should attach _meta when getMcpServerMeta returns a value', () => {
+      getProvider.mockReturnValue({ config: { mcpName: 'test-mcp' } });
+      const meta = { codex_acp: { tool_timeout_sec: 3600 } };
+      getProviderModuleSync.mockReturnValue({ getMcpServerMeta: () => meta });
+      const servers = sessionManager.getMcpServers('p1');
+      expect(servers).toHaveLength(1);
+      expect(servers[0]._meta).toEqual(meta);
     });
   });
 
@@ -85,6 +96,7 @@ describe('sessionManager', () => {
       const dbSession = { id: 's1', acpSessionId: 'a1', configOptions: [], model: 'm1' };
 
       getProvider.mockReturnValue({ config: { models: {}, mcpName: 'mcp' } });
+      getProviderModuleSync.mockReturnValue({ getMcpServerMeta: () => undefined });
       const providerModule = {
         buildSessionParams: () => ({}),
         normalizeModelState: vi.fn(state => ({

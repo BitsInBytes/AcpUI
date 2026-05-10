@@ -638,7 +638,7 @@ This means `user.json` can override critical settings like `command`, `args`, `m
 Every function exported by a provider's `index.js` must match the signature and behavior of the corresponding function in `DEFAULT_MODULE`. If a new function is added to this contract, every provider must be updated in the same change to implement it, even if that implementation is only an explicit pass-through/no-op.
 
 ```javascript
-// FILE: backend/services/providerLoader.js (Lines 70-93)
+// FILE: backend/services/providerLoader.js (Lines 70-95)
 const DEFAULT_MODULE = {
   intercept: (p) => p,                                    // Pass through unchanged
   normalizeUpdate: (u) => u,                              // No transformation
@@ -653,6 +653,7 @@ const DEFAULT_MODULE = {
   prepareAcpEnvironment: async (env) => env,              // Environment unchanged
   performHandshake: async () => {},                       // No-op
   buildSessionParams: (_agent) => undefined,              // No extra params
+  getMcpServerMeta: () => undefined,                      // No MCP server metadata
   setInitialAgent: async () => {},                        // No-op
   setConfigOption: async () => {},                        // No-op
   getSessionPaths: () => ({ jsonl: '', json: '', tasksDir: '' }),
@@ -1308,6 +1309,39 @@ const result = await client.sendRequest('session/new', {
   ...buildSessionParams(requestAgent)  // Spread here
 });
 ```
+
+#### getMcpServerMeta()
+
+**Purpose:** Returns optional metadata to attach as `_meta` on the MCP server config object sent to the ACP daemon in `session/new` and `session/load` requests.
+
+**Default:** Returns `undefined` (no metadata attached).
+
+**Use When:** The daemon's MCP implementation supports non-standard metadata fields (e.g., timeout overrides). The returned object is conditionally spread onto the server config entry only when non-null/undefined.
+
+**Signature:**
+```javascript
+export function getMcpServerMeta() {
+  // Return undefined for no metadata
+  return undefined;
+
+  // Or return an object with daemon-specific fields:
+  // return { codex_acp: { tool_timeout_sec: 3600 } };
+}
+```
+
+The returned value is spread onto the MCP server config:
+```javascript
+const mcpServerMeta = providerModule.getMcpServerMeta?.();
+return [{
+  name,
+  command: 'node',
+  args: [proxyPath],
+  env: [...],
+  ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
+}];
+```
+
+**Golden Rule:** Return `undefined` (not `{}`) when not needed. An empty object would still be spread as `_meta: {}`, which may confuse daemons that check for `_meta` presence.
 
 #### setInitialAgent(client, sessionId, agent)
 

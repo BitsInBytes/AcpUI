@@ -23,7 +23,8 @@ const { mockProviderModule } = vi.hoisted(() => ({
         deleteSessionFiles: vi.fn(),
         extractToolOutput: vi.fn(),
         setInitialAgent: vi.fn().mockResolvedValue(),
-        buildSessionParams: vi.fn()
+        buildSessionParams: vi.fn(),
+        getMcpServerMeta: vi.fn().mockReturnValue(undefined)
     }
 }));
 
@@ -149,6 +150,21 @@ describe('mcpServer', () => {
       expect.objectContaining({ name: 'ACP_SESSION_PROVIDER_ID', value: 'provider-a' }),
       expect.objectContaining({ name: 'ACP_UI_MCP_PROXY_ID', value: expect.stringMatching(/^mcp-proxy-/) })
     ]));
+  });
+
+  it('getMcpServers attaches _meta when getMcpServerMeta returns a value', () => {
+    const meta = { codex_acp: { tool_timeout_sec: 3600 } };
+    mockProviderModule.getMcpServerMeta.mockReturnValueOnce(meta);
+    const servers = getMcpServers('provider-a');
+    expect(servers).toHaveLength(1);
+    expect(servers[0]._meta).toEqual(meta);
+  });
+
+  it('getMcpServers omits _meta when getMcpServerMeta returns undefined', () => {
+    mockProviderModule.getMcpServerMeta.mockReturnValueOnce(undefined);
+    const servers = getMcpServers('provider-a');
+    expect(servers).toHaveLength(1);
+    expect(servers[0]._meta).toBeUndefined();
   });
 
   it('getMcpServers handles null providerId by using default provider', () => {

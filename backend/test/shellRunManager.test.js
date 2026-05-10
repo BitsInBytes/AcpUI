@@ -109,13 +109,13 @@ describe('shellRunManager', () => {
       cwd: 'D:/repo'
     });
 
-    expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('powershell.exe', [
-      '-NoProfile',
-      '-Command',
-      '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; npm test'
-    ], expect.objectContaining({
-      cwd: 'D:/repo',
-      name: 'xterm-256color',
+        expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('powershell.exe', [
+          '-NoProfile',
+          '-Command',
+          '$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; npm test'
+        ], expect.objectContaining({
+          cwd: 'D:/repo',
+          name: 'xterm-256color',
       cols: 120,
       rows: 30
     }));

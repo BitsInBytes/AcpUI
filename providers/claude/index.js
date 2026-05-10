@@ -1019,6 +1019,10 @@ export async function setInitialAgent(acpClient, sessionId, agent) {
   return;
 }
 
+export function getMcpServerMeta() {
+  return undefined;
+}
+
 export function buildSessionParams(agent) {
   const options = { disallowedTools: ['Bash', 'PowerShell', 'Agent'] };
   if (agent) options.agent = agent;

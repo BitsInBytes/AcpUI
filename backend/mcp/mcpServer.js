@@ -12,7 +12,7 @@
  *   getMcpServers()           — stdio MCP server config for session/new mcpServers array
  *   createToolHandlers(io, acpClient) — returns { toolName: handler(args) } map
  */
-import { getProvider } from '../services/providerLoader.js';
+import { getProvider, getProviderModuleSync } from '../services/providerLoader.js';
 import { writeLog } from '../services/logger.js';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -36,6 +36,8 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
   const provider = getProvider(providerId);
   const name = provider.config.mcpName;
   if (!name) return [];
+  const providerModule = getProviderModuleSync(provider.id);
+  const mcpServerMeta = providerModule.getMcpServerMeta?.();
   const proxyPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'stdio-proxy.js');
   const proxyId = createMcpProxyBinding({ providerId: provider.id, acpSessionId });
   return [{
@@ -47,7 +49,8 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
       { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
-    ]
+    ],
+    ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
   }];
 }
 

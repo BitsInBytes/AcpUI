@@ -1588,6 +1588,29 @@ export async function setInitialAgent(_acpClient, _sessionId, _agent) {
   return;
 }
 
+function parsePositiveInteger(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+export function getMcpServerMeta() {
+  const { config } = getProvider();
+  if (config.acpSupportsMcpTimeouts !== true) return undefined;
+
+  const startupTimeoutSec = parsePositiveInteger(config.acpMcpStartupTimeoutSec);
+  const toolTimeoutSec = parsePositiveInteger(config.acpMcpToolTimeoutSec);
+  if (startupTimeoutSec === undefined && toolTimeoutSec === undefined) return undefined;
+
+  const timeoutOverrides = {
+    ...(startupTimeoutSec !== undefined ? { startup_timeout_sec: startupTimeoutSec } : {}),
+    ...(toolTimeoutSec !== undefined ? { tool_timeout_sec: toolTimeoutSec } : {})
+  };
+
+  return {
+    codex_acp: { ...timeoutOverrides }
+  };
+}
+
 export function buildSessionParams(_agent) {
   return undefined;
 }

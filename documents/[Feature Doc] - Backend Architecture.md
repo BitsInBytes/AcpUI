@@ -811,6 +811,11 @@ export default {
     };
   },
   
+  // Called when building the MCP server config; can attach _meta to server entry
+  getMcpServerMeta() {
+    return undefined;  // Return object to attach as _meta on the MCP server config
+  },
+  
   // Called after session/new to set initial agent (post-creation)
   setInitialAgent(sessionId, agentName) {
     return request('session/set_agent', { sessionId, agent: agentName });
@@ -835,6 +840,7 @@ export default {
 Different providers can:
 - **Intercept updates** via `normalizeUpdate()` (e.g., parse custom response fields)
 - **Inject spawn params** via `buildSessionParams()` (e.g., pass agent name at session creation)
+- **Attach MCP server metadata** via `getMcpServerMeta()` (e.g., inject timeout overrides into the MCP server config)
 - **Set post-creation agent** via `setInitialAgent()` (e.g., after session is created, switch to a different agent)
 - **Define hooks** via `getHooksForAgent()` (e.g., run scripts on session start, pre/post tool)
 - **Parse session history** via `parseSessionHistory()` (e.g., convert provider-specific JSONL format to Unified Timeline)

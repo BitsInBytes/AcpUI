@@ -1,6 +1,9 @@
 {
   "command": "codex-acp",
   "args": [],
+  "acpSupportsMcpTimeouts": false,
+  "acpMcpStartupTimeoutSec": 30,
+  "acpMcpToolTimeoutSec": 3600,
   "authMethod": "auto",
   "fetchQuotaStatus": true,
   "refreshQuotaOAuth": true,

@@ -2,7 +2,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { writeLog } from './logger.js';
 import * as db from '../database.js';
-import { getProvider, getProviderModule } from './providerLoader.js';
+import { getProvider, getProviderModule, getProviderModuleSync } from './providerLoader.js';
 import {
   extractModelState,
   mergeModelOptions,
@@ -28,6 +28,8 @@ function emitCachedContext(providerModule, sessionId) {
 export function getMcpServers(providerId, { acpSessionId = null } = {}) {
   const name = getProvider(providerId).config.mcpName;
   if (!name) return [];
+  const providerModule = getProviderModuleSync(providerId);
+  const mcpServerMeta = providerModule.getMcpServerMeta?.();
   const proxyPath = path.resolve(__dirname, '..', 'mcp', 'stdio-proxy.js');
   const proxyId = createMcpProxyBinding({ providerId, acpSessionId });
   return [{
@@ -39,7 +41,8 @@ export function getMcpServers(providerId, { acpSessionId = null } = {}) {
       { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
-    ]
+    ],
+    ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
   }];
 }
 

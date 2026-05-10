@@ -655,6 +655,65 @@ describe('Codex Provider', () => {
     });
   });
 
+  describe('getMcpServerMeta', () => {
+    it('returns undefined when acpSupportsMcpTimeouts is false', () => {
+      mockConfig.acpSupportsMcpTimeouts = false;
+      mockConfig.acpMcpStartupTimeoutSec = 30;
+      mockConfig.acpMcpToolTimeoutSec = 3600;
+      expect(codex.getMcpServerMeta()).toBeUndefined();
+    });
+
+    it('returns undefined when acpSupportsMcpTimeouts is missing', () => {
+      delete mockConfig.acpSupportsMcpTimeouts;
+      mockConfig.acpMcpStartupTimeoutSec = 30;
+      mockConfig.acpMcpToolTimeoutSec = 3600;
+      expect(codex.getMcpServerMeta()).toBeUndefined();
+    });
+
+    it('returns undefined when both timeout values are invalid', () => {
+      mockConfig.acpSupportsMcpTimeouts = true;
+      mockConfig.acpMcpStartupTimeoutSec = 0;
+      mockConfig.acpMcpToolTimeoutSec = 'bad';
+      expect(codex.getMcpServerMeta()).toBeUndefined();
+    });
+
+    it('returns codex_acp meta with both timeouts when both are valid', () => {
+      mockConfig.acpSupportsMcpTimeouts = true;
+      mockConfig.acpMcpStartupTimeoutSec = 30;
+      mockConfig.acpMcpToolTimeoutSec = 3600;
+      expect(codex.getMcpServerMeta()).toEqual({
+        codex_acp: { startup_timeout_sec: 30, tool_timeout_sec: 3600 }
+      });
+    });
+
+    it('omits startup_timeout_sec when only tool timeout is valid', () => {
+      mockConfig.acpSupportsMcpTimeouts = true;
+      mockConfig.acpMcpStartupTimeoutSec = -1;
+      mockConfig.acpMcpToolTimeoutSec = 3600;
+      expect(codex.getMcpServerMeta()).toEqual({
+        codex_acp: { tool_timeout_sec: 3600 }
+      });
+    });
+
+    it('omits tool_timeout_sec when only startup timeout is valid', () => {
+      mockConfig.acpSupportsMcpTimeouts = true;
+      mockConfig.acpMcpStartupTimeoutSec = 30;
+      mockConfig.acpMcpToolTimeoutSec = undefined;
+      expect(codex.getMcpServerMeta()).toEqual({
+        codex_acp: { startup_timeout_sec: 30 }
+      });
+    });
+
+    it('parses string integers correctly', () => {
+      mockConfig.acpSupportsMcpTimeouts = true;
+      mockConfig.acpMcpStartupTimeoutSec = '45';
+      mockConfig.acpMcpToolTimeoutSec = '7200';
+      expect(codex.getMcpServerMeta()).toEqual({
+        codex_acp: { startup_timeout_sec: 45, tool_timeout_sec: 7200 }
+      });
+    });
+  });
+
   describe('session file operations', () => {
     it('clones and prunes Codex rollout files recursively', () => {
       const oldId = '11111111-1111-1111-1111-111111111111';
