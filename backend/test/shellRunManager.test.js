@@ -3,6 +3,7 @@ import {
   ShellRunManager,
   getMaxShellResultLines,
   isShellV2Enabled,
+  sanitizeShellOutputChunk,
   trimShellOutputLines
 } from '../services/shellRunManager.js';
 
@@ -63,6 +64,12 @@ describe('shellRunManager', () => {
   it('trims shell output to the last N lines', () => {
     expect(trimShellOutputLines('one\ntwo\nthree\n', 2)).toBe('two\nthree\n');
     expect(trimShellOutputLines('one\ntwo\nthree', 2)).toBe('two\nthree');
+  });
+
+  it('removes PowerShell startup screen controls while preserving real output', () => {
+    const chunk = '\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H\r\n\r\n\x1b[32mPASS\x1b[0m\r\n\x1b]0;title\x07\x1b[?25h';
+
+    expect(sanitizeShellOutputChunk(chunk, { stripStartupControls: true })).toBe('\x1b[32mPASS\x1b[0m\r\n');
   });
 
   it('prepares a run and emits a session-scoped prepared event', () => {
@@ -139,6 +146,41 @@ describe('shellRunManager', () => {
       reason: 'completed',
       finalText: 'PASS'
     }));
+  });
+
+  it('streams sanitized PowerShell startup output after the injected prompt', async () => {
+    const prepared = manager.prepareRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'tool-1',
+      command: 'node --version',
+      cwd: 'D:/repo',
+      maxLines: 10
+    });
+
+    const promise = manager.startPreparedRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'tool-1',
+      command: 'node --version',
+      cwd: 'D:/repo'
+    });
+
+    ioMock.room.emit.mockClear();
+    ptyMock.proc.dataCb('\x1b[?9001h\x1b[?1004h');
+    expect(ioMock.room.emit).not.toHaveBeenCalledWith('shell_run_output', expect.anything());
+
+    ptyMock.proc.dataCb('\x1b[?25l\x1b[2J\x1b[m\x1b[H\r\n\r\nv24.14.0\r\n\x1b]0;powershell.exe\x07\x1b[?25h');
+    expect(ioMock.room.emit).toHaveBeenCalledWith('shell_run_output', expect.objectContaining({
+      runId: prepared.runId,
+      chunk: 'v24.14.0\r\n'
+    }));
+    expect(manager.snapshot(prepared.runId).transcript).toBe('$ node --version\nv24.14.0\r\n');
+
+    ptyMock.proc.exitCb({ exitCode: 0 });
+    await expect(promise).resolves.toEqual({
+      content: [{ type: 'text', text: 'v24.14.0' }]
+    });
   });
 
   it('formats non-zero exits with exit code', async () => {

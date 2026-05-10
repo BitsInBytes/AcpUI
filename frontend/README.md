@@ -9,7 +9,7 @@ It is designed to stay provider-agnostic. Branding, model metadata, and provider
 - Session navigation and message rendering.
 - Streaming output display (thoughts, tools, assistant text).
 - Sidebar/folder/session UX flows.
-- Canvas/editor/terminal surfaces, plus Shell V2 tool terminals rendered inside shell ToolSteps when `shellRunId` metadata is present.
+- Canvas/editor/terminal surfaces, plus Shell V2 tool terminals rendered inside shell ToolSteps when `shellRunId` metadata is present, with sanitized read-only transcript rendering after command exit.
 - Settings, attachments, and utility modals.
 
 ## Quick Start

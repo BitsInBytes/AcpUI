@@ -9,6 +9,13 @@ const DEFAULT_COMPLETED_RETENTION_MS = 5 * 60 * 1000;
 
 // eslint-disable-next-line no-control-regex
 const stripAnsi = (str) => str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/\x1b\[[?]?[0-9;]*[a-zA-Z]/g, '');
+// eslint-disable-next-line no-control-regex
+const OSC_SEQUENCE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+// eslint-disable-next-line no-control-regex
+const POWERSHELL_SESSION_MODE_SEQUENCE = /\x1b\[\?(?:25|1004|9001)[hl]/g;
+// eslint-disable-next-line no-control-regex
+const STARTUP_SCREEN_CONTROL_SEQUENCE = /\x1b\[(?:[0-9;]*[HfJX]|m)/g;
+const LEADING_BLANK_ROWS = /^(?:[ \t]*\r?\n)+/;
 
 export function getMaxShellResultLines(env = process.env) {
   const parsed = Number.parseInt(env.MAX_SHELL_RESULT_LINES || '', 10);
@@ -28,6 +35,26 @@ export function trimShellOutputLines(output, maxLines) {
   const start = lineCount - maxLines;
   const tail = lines.slice(start, hasTrailingNewline ? -1 : undefined).join('\n');
   return hasTrailingNewline ? `${tail}\n` : tail;
+}
+
+export function sanitizeShellOutputChunk(chunk, { stripStartupControls = false } = {}) {
+  if (!chunk) return chunk;
+
+  let sanitized = String(chunk)
+    .replace(OSC_SEQUENCE, '')
+    .replace(POWERSHELL_SESSION_MODE_SEQUENCE, '');
+
+  if (stripStartupControls) {
+    sanitized = sanitized
+      .replace(STARTUP_SCREEN_CONTROL_SEQUENCE, '')
+      .replace(LEADING_BLANK_ROWS, '');
+  }
+
+  return sanitized;
+}
+
+function hasVisibleShellOutput(chunk) {
+  return stripAnsi(chunk || '').trim().length > 0;
 }
 
 function createRunId() {
@@ -95,6 +122,7 @@ export class ShellRunManager {
       status: 'pending',
       rawOutput: '',
       transcript: '',
+      stripStartupControls: this.platform === 'win32',
       exitCode: null,
       reason: null,
       pty: null,
@@ -209,13 +237,23 @@ export class ShellRunManager {
 
   appendOutput(run, chunk, { includeInRaw = true } = {}) {
     if (!chunk) return;
-    if (includeInRaw) run.rawOutput += chunk;
-    run.transcript = trimShellOutputLines(`${run.transcript}${chunk}`, run.maxLines);
+    let outputChunk = chunk;
+    if (includeInRaw) {
+      outputChunk = sanitizeShellOutputChunk(outputChunk, {
+        stripStartupControls: Boolean(run.stripStartupControls)
+      });
+      if (run.stripStartupControls && hasVisibleShellOutput(outputChunk)) {
+        run.stripStartupControls = false;
+      }
+    }
+    if (!outputChunk) return;
+    if (includeInRaw) run.rawOutput += outputChunk;
+    run.transcript = trimShellOutputLines(`${run.transcript}${outputChunk}`, run.maxLines);
     this.emit(run, 'shell_run_output', {
       providerId: run.providerId,
       sessionId: run.sessionId,
       runId: run.runId,
-      chunk,
+      chunk: outputChunk,
       maxLines: run.maxLines
     });
   }

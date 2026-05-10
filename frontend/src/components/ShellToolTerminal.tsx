@@ -19,17 +19,24 @@ const stripAnsi = (value: string) => value
   // eslint-disable-next-line no-control-regex
   .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
   // eslint-disable-next-line no-control-regex
-  .replace(/\x1b\][^\x07]*\x07/g, '')
+  .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
   // eslint-disable-next-line no-control-regex
   .replace(/\x1b\[[?]?[0-9;]*[a-zA-Z]/g, '');
 
 const stripTerminalNoise = (value: string) => value
   // eslint-disable-next-line no-control-regex
-  .replace(/\x1b\][^\x07]*\x07/g, '')
+  .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
   // eslint-disable-next-line no-control-regex
   .replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, '')
   // eslint-disable-next-line no-control-regex
-  .replace(/\x1b\[[0-9;]*[A-HJ-T]/g, '');
+  .replace(/\x1b\[[0-9;]*[A-HJ-TX]/g, '');
+
+// eslint-disable-next-line no-control-regex
+const SCREEN_CONTROL_SEQUENCE = /\x1b\[[0-9;]*[HfJ]/;
+// eslint-disable-next-line no-control-regex
+const LEADING_ANSI_RESETS_AND_BLANK_ROWS = /^((?:\x1b\[[0-9;]*m)*)(?:[ \t]*\r?\n)+/;
+// eslint-disable-next-line no-control-regex
+const PROMPT_ANSI_RESETS_AND_BLANK_ROWS = /^(\$ [^\n]*\n)((?:\x1b\[[0-9;]*m)*)(?:[ \t]*\r?\n)+/;
 
 const XTERM_WRITE_CHUNK_SIZE = 64 * 1024;
 const TRANSCRIPT_OVERLAP_SCAN_LIMIT = 64 * 1024;
@@ -98,13 +105,25 @@ function appendExitSummary(source: string, run: ShellRunSnapshot | null, finalOu
   return source || finalOutput || '';
 }
 
+function trimStartupBlankRows(source: string, command?: string) {
+  const prompt = command ? `$ ${command}\n` : '';
+  if (prompt && source.startsWith(prompt)) {
+    return `${prompt}${source.slice(prompt.length).replace(LEADING_ANSI_RESETS_AND_BLANK_ROWS, '$1')}`;
+  }
+  return source.replace(PROMPT_ANSI_RESETS_AND_BLANK_ROWS, '$1$2');
+}
+
 function getReadOnlyTerminalHtml(run: ShellRunSnapshot | null, event: SystemEvent) {
   const transcript = run?.transcript || '';
   const finalOutput = event.output || '';
   const source = run?.status === 'exited' && transcriptHasCommandOutput(transcript, run.command || event.command)
     ? appendExitSummary(transcript, run, finalOutput)
     : finalOutput || transcript || '';
-  return ansiConverter.toHtml(stripTerminalNoise(source || '(no output)'));
+  const cleaned = stripTerminalNoise(source || '(no output)');
+  const displaySource = SCREEN_CONTROL_SEQUENCE.test(source)
+    ? trimStartupBlankRows(cleaned, run?.command || event.command)
+    : cleaned;
+  return ansiConverter.toHtml(displaySource);
 }
 
 function fallbackRunFromEvent(event: SystemEvent): ShellRunSnapshot | null {

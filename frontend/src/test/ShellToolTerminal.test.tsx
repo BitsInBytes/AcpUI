@@ -214,6 +214,27 @@ describe('ShellToolTerminal', () => {
     expect(readonly?.innerHTML).toContain('color');
   });
 
+  it('collapses PowerShell startup blank rows in read-only output', () => {
+    useShellRunStore.getState().upsertSnapshot({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      runId: 'shell-run-1',
+      status: 'exited',
+      command: 'node --version',
+      transcript: '$ node --version\n\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H\r\n\r\nv24.14.0\r\n\x1b]0;powershell.exe\x07\x1b[?25h'
+    });
+
+    const { container } = render(<ShellToolTerminal event={baseEvent({
+      status: 'completed',
+      shellState: 'exited',
+      output: 'v24.14.0'
+    })} />);
+
+    const readonlyText = container.querySelector('.shell-tool-terminal-readonly')?.textContent?.replace(/\r\n/g, '\n');
+    expect(readonlyText).toContain('$ node --version\nv24.14.0');
+    expect(readonlyText).not.toContain('$ node --version\n\n');
+  });
+
   it('prefers final output over prompt-only stored transcript after exit', () => {
     useShellRunStore.getState().upsertSnapshot({
       providerId: 'provider-a',

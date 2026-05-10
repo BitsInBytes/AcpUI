@@ -493,7 +493,7 @@ tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequ
 };
 ```
 
-The tool is executed in the backend Node.js process (not the proxy). `backend/services/shellRunManager.js` owns the PTY lifecycle and emits `shell_run_started`, `shell_run_output`, and `shell_run_exit` to `session:${sessionId}`. The MCP tool call remains blocked until the process exits or the user terminates it.
+The tool is executed in the backend Node.js process (not the proxy). `backend/services/shellRunManager.js` owns the PTY lifecycle, sanitizes Windows PowerShell startup terminal controls before transcript streaming, and emits `shell_run_started`, `shell_run_output`, and `shell_run_exit` to `session:${sessionId}`. The MCP tool call remains blocked until the process exits or the user terminates it.
 
 ---
 
@@ -975,7 +975,7 @@ Assistant Message (turn_end)
 | `routes/mcpApi.js` | `GET /api/mcp/tools` | 30-73 | Tool schema endpoint |
 | | `POST /api/mcp/tool-call` | 81-113 | Tool execution endpoint with timeout disabled |
 | `mcp/mcpProxyRegistry.js` | proxy binding helpers | 1-78 | Correlates stdio MCP proxy instances to provider/session context |
-| `services/shellRunManager.js` | `ShellRunManager` | 60-374 | Interactive PTY lifecycle, transcripts, termination formatting, completed-run cleanup |
+| `services/shellRunManager.js` | `ShellRunManager` | 79-413 | Interactive PTY lifecycle, startup control sanitation, transcripts, termination formatting, completed-run cleanup |
 | `mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager` | 10-317 | Orchestrates sub-agent sessions, state machine, and abort flow |
 | `mcp/subAgentRegistry.js` | `registerSubAgent()` | 8-10 | Track sub-agent lifecycle |
 | | `getSubAgentsForParent()` | 26-34 | Find children of parent session |

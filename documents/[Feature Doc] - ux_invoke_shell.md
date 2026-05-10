@@ -173,7 +173,7 @@ Frontend receives:
 ---
 
 ### 5. MCP Handler Starts the Prepared Run
-**File:** `backend/mcp/mcpServer.js` (Lines 74-83) + `backend/services/shellRunManager.js` (Lines 117-199)
+**File:** `backend/mcp/mcpServer.js` (Lines 74-83) + `backend/services/shellRunManager.js` (Lines 144-235)
 
 When the ACP daemon calls `ux_invoke_shell`, the tool handler invokes:
 
@@ -193,7 +193,7 @@ return shellRunManager.startPreparedRun({
 `startPreparedRun()` finds the prepared run by `toolCallId` (or command/cwd fallback):
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 117-137)
+// FILE: backend/services/shellRunManager.js (Lines 144-166)
 let run = this.findPreparedRun({ providerId, sessionId: resolvedSessionId, toolCallId, command, cwd });
 if (!run) {
   const prepared = this.prepareRun({ providerId, sessionId: resolvedSessionId, toolCallId, command, cwd, maxLines });
@@ -204,7 +204,7 @@ if (!run) {
 Then calls `startRun(run)` which spawns the PTY:
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 140-199)
+// FILE: backend/services/shellRunManager.js (Lines 193-235)
 startRun(run) {
   if (run.status !== 'pending') {
     throw new Error(`Shell run ${run.runId} cannot start from status ${run.status}`);
@@ -251,7 +251,7 @@ startRun(run) {
 }
 ```
 
-**Platform-specific invocation** (Lines 37-44):
+**Platform-specific invocation** (Lines 64-72):
 - **Windows**: `powershell.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"`
 - **Unix**: `bash -c <command>`
 
@@ -260,25 +260,37 @@ The function **blocks** until the PTY exits, awaiting `run.resolve()` which is c
 ---
 
 ### 6. PTY Output Streams to Frontend via Socket.IO
-**File:** `backend/services/shellRunManager.js` (Lines 201-215)
+**File:** `backend/services/shellRunManager.js` (Lines 238-259)
 
 As the PTY writes data, `appendOutput()` is called:
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 201-215)
+// FILE: backend/services/shellRunManager.js (Lines 238-259)
 appendOutput(run, chunk, { includeInRaw = true } = {}) {
   if (!chunk) return;
-  if (includeInRaw) run.rawOutput += chunk;
-  run.transcript = trimShellOutputLines(`${run.transcript}${chunk}`, run.maxLines);
+  let outputChunk = chunk;
+  if (includeInRaw) {
+    outputChunk = sanitizeShellOutputChunk(outputChunk, {
+      stripStartupControls: Boolean(run.stripStartupControls)
+    });
+    if (run.stripStartupControls && hasVisibleShellOutput(outputChunk)) {
+      run.stripStartupControls = false;
+    }
+  }
+  if (!outputChunk) return;
+  if (includeInRaw) run.rawOutput += outputChunk;
+  run.transcript = trimShellOutputLines(`${run.transcript}${outputChunk}`, run.maxLines);
   this.emit(run, 'shell_run_output', {
     providerId: run.providerId,
     sessionId: run.sessionId,
     runId: run.runId,
-    chunk,
+    chunk: outputChunk,
     maxLines: run.maxLines
   });
 }
 ```
+
+On Windows, `sanitizeShellOutputChunk()` removes the initial PowerShell/ConPTY screen-control prologue before it reaches `rawOutput`, `transcript`, or the frontend. This keeps AcpUI's injected `$ command` prompt adjacent to the command output instead of letting PowerShell startup `clear screen` and `cursor home` sequences create blank rows or overwrite the prompt.
 
 Each chunk emits `shell_run_output` to `session:<sessionId>` room:
 
@@ -345,7 +357,7 @@ appendOutput: ({ providerId, sessionId, runId, chunk, maxLines }) => set(state =
 ---
 
 ### 8. Frontend Renders Interactive Terminal or Read-Only Transcript
-**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 34-340)
+**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 18-359)
 
 The `ToolStep` component detects `shellRunId` on a tool event and renders `ShellToolTerminal`:
 
@@ -358,7 +370,7 @@ if (step.event.shellRunId) {
 
 `ShellToolTerminal` has two render modes:
 
-**A. Interactive (Pending/Running)** (Lines 152-299):
+**A. Interactive (Pending/Running)** (Lines 171-318):
 - Creates xterm.js terminal with FitAddon (fit to container)
 - Queues transcript deltas through callback-paced `term.write(data, callback)` calls
 - Splits large writes into 64 KiB chunks so xterm's internal write buffer cannot be flooded by one React update
@@ -368,7 +380,7 @@ if (step.event.shellRunId) {
 - Handles paste via Ctrl+V by reading clipboard and emitting `shell_run_input`
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 152-184)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 171-203)
 const drainWriteQueue = useCallback(() => {
   const term = xtermRef.current;
   if (!term || writeInFlightRef.current) return;
@@ -395,7 +407,7 @@ const drainWriteQueue = useCallback(() => {
 Transcript updates use this queue:
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 287-299)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 306-318)
 useEffect(() => {
   const term = xtermRef.current;
   if (!term) return;
@@ -414,7 +426,7 @@ useEffect(() => {
 User input still goes directly back to the backend:
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 255-264)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 274-283)
 const dataDisposable = term.onData((data) => {
   const currentRun = runRef.current;
   if (!isRunningRef.current || isPasting || !currentRun?.runId) return;
@@ -427,14 +439,14 @@ const dataDisposable = term.onData((data) => {
 });
 ```
 
-**B. Read-Only (Exited)** (Lines 101-107, 331-334):
+**B. Read-Only (Exited)** (Lines 116-127, 350-353):
 - Converts stored transcript to HTML with ANSI color codes
 - Strips noise terminal escape sequences
 - Appends exit summary if needed (user terminated, timeout, exit code)
 - Renders as `<pre>` with HTML content
 
 ```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 331-334)
+// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 350-353)
 } : (
   <pre ref={readOnlyRef} className="shell-tool-terminal-readonly" dangerouslySetInnerHTML={{ __html: readOnlyHtml }} />
 )
@@ -443,7 +455,7 @@ const dataDisposable = term.onData((data) => {
 ---
 
 ### 9. Frontend Emits User Input Back to Backend
-**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 255-264) + `backend/sockets/shellRunHandlers.js` (Lines 35-52)
+**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 274-283) + `backend/sockets/shellRunHandlers.js` (Lines 35-52)
 
 User types in xterm → emits `shell_run_input`:
 
@@ -481,7 +493,7 @@ socket.on('shell_run_input', (payload = {}, callback) => {
 Handler calls `shellRunManager.writeInput()`:
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 217-224)
+// FILE: backend/services/shellRunManager.js (Lines 261-269)
 writeInput(runId, data) {
   const run = this.runs.get(runId);
   if (!run || run.status !== 'running' || !run.pty) return false;
@@ -498,12 +510,12 @@ The data is written directly to the PTY, where the shell process reads it as std
 ---
 
 ### 10. PTY Exit and Finalization
-**File:** `backend/services/shellRunManager.js` (Lines 264-304)
+**File:** `backend/services/shellRunManager.js` (Lines 300-338)
 
 When the PTY exits (either naturally or via kill), `finalizeRun()` is called:
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 264-304)
+// FILE: backend/services/shellRunManager.js (Lines 300-338)
 finalizeRun(run, exitCode, forcedReason = null, err = null) {
   if (run.status === 'exited') return;
   if (run.inactivityTimer) {
@@ -545,12 +557,12 @@ finalizeRun(run, exitCode, forcedReason = null, err = null) {
 }
 ```
 
-**Reason detection** (Lines 276-281):
+**Reason detection** (Lines 307-312):
 - If user sent Ctrl+C within 1.5s of exit → `user_terminated`
 - Otherwise, exit code 0 → `completed`, non-zero → `failed`
 - Can be forced to `timeout`, `error`, etc.
 
-**Final text formatting** (Lines 306-327):
+**Final text formatting** (Lines 351-365):
 ```javascript
 formatFinalText(run, reason, exitCode, err = null) {
   if (err) return `Error: ${err.message}`;
@@ -1013,21 +1025,21 @@ npm ERR! code ENOENT
 
 | File | Function/Class | Lines | Purpose |
 |------|---|---|---|
-| `backend/services/shellRunManager.js` | `ShellRunManager` (class) | 49-78 | Owns PTY lifecycle, manages concurrent runs |
-| | `prepareRun()` | 80-107 | Create pending run before MCP execution |
-| | `startPreparedRun()` | 109-137 | Find prepared run or create new, then start |
-| | `findPreparedRun()` | 139-156 | Locate run by toolCallId or command+cwd |
-| | `startRun()` | 158-199 | Spawn PTY, setup listeners, return promise |
-| | `appendOutput()` | 201-215 | Buffer chunk, emit shell_run_output |
-| | `writeInput()` | 217-224 | Write data to pty.stdin, detect Ctrl+C |
-| | `resizeRun()` | 226-229 | Resize PTY to cols/rows |
-| | `killRun()` | 231-241 | Kill PTY, mark as exiting |
-| | `resetInactivityTimer()` | 243-250 | Set 30-min inactivity timeout |
-| | `finalizeRun()` | 252-304 | Mark exited, format result, resolve promise |
-| | `formatFinalText()` | 306-327 | Generate final text based on reason |
-| | `snapshot()` | 329-348 | Return immutable snapshot of run |
-| | `getSnapshotsForSession()` | 350-355 | Get all snapshots for a session |
-| | `emit()` | 357-367 | Emit socket event to session room |
+| `backend/services/shellRunManager.js` | `ShellRunManager` (class) | 79-103 | Owns PTY lifecycle, manages concurrent runs |
+| | `prepareRun()` | 109-141 | Create pending run before MCP execution |
+| | `startPreparedRun()` | 144-166 | Find prepared run or create new, then start |
+| | `findPreparedRun()` | 169-190 | Locate run by toolCallId or command+cwd |
+| | `startRun()` | 193-235 | Spawn PTY, setup listeners, return promise |
+| | `appendOutput()` | 238-259 | Sanitize startup control noise, buffer chunk, emit shell_run_output |
+| | `writeInput()` | 261-269 | Write data to pty.stdin, detect Ctrl+C |
+| | `resizeRun()` | 271-276 | Resize PTY to cols/rows |
+| | `killRun()` | 278-289 | Kill PTY, mark as exiting |
+| | `resetInactivityTimer()` | 291-298 | Set 30-min inactivity timeout |
+| | `finalizeRun()` | 300-338 | Mark exited, format result, resolve promise |
+| | `formatFinalText()` | 351-365 | Generate final text based on reason |
+| | `snapshot()` | 367-384 | Return immutable snapshot of run |
+| | `getSnapshotsForSession()` | 386-390 | Get all snapshots for a session |
+| | `emit()` | 392-400 | Emit socket event to session room |
 | `backend/services/acpUpdateHandler.js` | `isUxInvokeShellToolName()` | 75-81 | Check if string matches ux_invoke_shell patterns |
 | | `isUxShellToolEvent()` | 93-102 | Check if tool_call is ux_invoke_shell |
 | | `prepareShellRunForToolStart()` | 104-142 | Prepare run on tool_call, extract cmd/cwd |
@@ -1049,30 +1061,32 @@ npm ERR! code ENOENT
 
 | File | Export | Purpose | Key Lines |
 |------|---|---|---|
-| `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive xterm or read-only transcript | 123-340 |
-| | | Mounts xterm on pending/running | 206-279 |
-| | | Queues xterm writes with callback pacing | 152-184 |
-| | | Computes transcript deltas and trim overlap | 61-75, 287-299 |
-| | | Switches to read-only on exited | 331-334 |
+| `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive xterm or read-only transcript | 142-359 |
+| | | Mounts xterm on pending/running | 225-298 |
+| | | Queues xterm writes with callback pacing | 171-203 |
+| | | Computes transcript deltas and trim overlap | 68-82, 306-318 |
+| | | Switches to read-only on exited | 350-353 |
 | `frontend/src/hooks/useChatManager.ts` | `useChatManager()` (implied) | Socket listeners for shell events | (implied) |
 
 ### Utility Functions
 
 | File | Function | Purpose | Lines |
 |------|---|---|---|
-| `backend/services/shellRunManager.js` | `getMaxShellResultLines()` | Read MAX_SHELL_RESULT_LINES env var | 14-17 |
-| | `trimShellOutputLines()` | Keep only last N lines of output | 21-30 |
-| | `buildShellInvocation()` | Platform-specific shell command | 37-44 |
-| | `normalizeCwd()` | Resolve working directory | 46-48 |
+| `backend/services/shellRunManager.js` | `getMaxShellResultLines()` | Read MAX_SHELL_RESULT_LINES env var | 20-23 |
+| | `trimShellOutputLines()` | Keep only last N lines of output | 29-38 |
+| | `sanitizeShellOutputChunk()` | Remove PowerShell startup terminal noise before streaming | 40-54 |
+| | `buildShellInvocation()` | Platform-specific shell command | 64-72 |
+| | `normalizeCwd()` | Resolve working directory | 75-77 |
 | `frontend/src/store/useShellRunStore.ts` | `trimShellTranscript()` | Keep only last N lines of transcript | 30-43 |
 | | `pruneShellRuns()` | Keep at most 50 runs, prioritize active | 45-55 |
 | `frontend/src/components/ShellToolTerminal.tsx` | `stripAnsi()` | Remove ANSI escape codes | 18-24 |
 | | `stripTerminalNoise()` | Remove select escape sequences for rendering | 26-32 |
-| | `getSuffixPrefixOverlap()` | Find trim overlap between previous and next transcript | 38-59 |
-| | `getTranscriptWritePlan()` | Decide append-vs-reset and return only data to queue | 61-75 |
-| | `transcriptHasCommandOutput()` | Check if transcript has output beyond command line | 77-85 |
-| | `appendExitSummary()` | Add termination message to transcript | 87-99 |
-| | `getReadOnlyTerminalHtml()` | Convert transcript to HTML with colors | 101-108 |
+| | `getSuffixPrefixOverlap()` | Find trim overlap between previous and next transcript | 45-66 |
+| | `getTranscriptWritePlan()` | Decide append-vs-reset and return only data to queue | 68-82 |
+| | `transcriptHasCommandOutput()` | Check if transcript has output beyond command line | 84-92 |
+| | `appendExitSummary()` | Add termination message to transcript | 94-106 |
+| | `trimStartupBlankRows()` | Collapse blank rows left by stripped screen controls | 108-114 |
+| | `getReadOnlyTerminalHtml()` | Convert transcript to HTML with colors | 116-127 |
 
 ---
 
@@ -1168,6 +1182,15 @@ npm ERR! code ENOENT
 
 ---
 
+### 11. Windows PowerShell Startup Controls Must Not Reach the Transcript
+**What breaks:** A simple command can display `$ command`, then many blank rows, then the actual output.
+
+**Why:** Windows PowerShell under ConPTY emits startup terminal controls such as private mode toggles, cursor hide/show, full-screen clear, cursor-home, and title OSC sequences. Those bytes are correct for a fresh PTY viewport, but AcpUI has already injected its own `$ command` prompt into the transcript. If the startup prologue is stored or replayed as normal output, xterm/read-only rendering can separate the prompt from the output or erase/reposition around it.
+
+**How to avoid:** Keep `sanitizeShellOutputChunk()` in the backend `appendOutput()` path for raw PTY chunks. It removes the initial Windows startup screen controls before the chunk is appended to `rawOutput`, persisted in `transcript`, or emitted as `shell_run_output`. The frontend read-only renderer also collapses blank rows left by already-buffered screen-control noise.
+
+---
+
 ## Unit Tests
 
 ### Backend Tests
@@ -1200,10 +1223,10 @@ Located in `frontend/src/test/`:
 1. **Understand the lifecycle** — Read Section "How It Works — End-to-End Flow" (Steps 1-12)
 2. **Check the contract** — Read "The Critical Contract" section to understand run states and concurrency
 3. **Identify the layer** — Is your feature:
-   - **Backend PTY management?** → `ShellRunManager` (Lines 49-367 in shellRunManager.js)
+   - **Backend PTY management?** → `ShellRunManager` (Lines 79-410 in shellRunManager.js)
    - **Tool preparation?** → `acpUpdateHandler.prepareShellRunForToolStart()` (Lines 104-142)
    - **Socket routing?** → `shellRunHandlers.js` (Lines 26-84)
-   - **Frontend rendering?** → `ShellToolTerminal.tsx` (Lines 34-340)
+   - **Frontend rendering?** → `ShellToolTerminal.tsx` (Lines 18-359)
 4. **Find exact code** — Use Component Reference table for file paths and line numbers
 5. **Write tests** — Use existing test files as templates; target 90%+ coverage
 6. **Test concurrency** — Ensure multiple runs don't interfere; use the concurrent execution example as a guide
@@ -1231,13 +1254,14 @@ Located in `frontend/src/test/`:
 1. **Detects tool calls** via strict naming pattern matching in acpUpdateHandler
 2. **Prepares runs early** before MCP execution, associating them with tool_call events
 3. **Spawns isolated PTY instances** on Windows (PowerShell) and Unix (bash) with full environment support
-4. **Streams output in real-time** via Socket.IO, allowing live rendering in xterm.js
-5. **Accepts user interaction** — input, resize, kill — routed back through socket handlers to the PTY
-6. **Manages lifecycle** with strict state machine (pending → starting → running → exiting → exited)
-7. **Enforces resource limits** — max lines, inactivity timeout (30 min), user termination handling
-8. **Returns formatted results** to the MCP tool call, distinguishing between completed, failed, user_terminated, timeout, error
-9. **Supports concurrency** with independent run IDs and no cross-contamination
-10. **Integrates seamlessly** with the Unified Timeline (tool starts → output chunks → tool exit)
+4. **Sanitizes Windows startup terminal controls** before transcript storage/streaming
+5. **Streams output in real-time** via Socket.IO, allowing live rendering in xterm.js
+6. **Accepts user interaction** — input, resize, kill — routed back through socket handlers to the PTY
+7. **Manages lifecycle** with strict state machine (pending → starting → running → exiting → exited)
+8. **Enforces resource limits** — max lines, inactivity timeout (30 min), user termination handling
+9. **Returns formatted results** to the MCP tool call, distinguishing between completed, failed, user_terminated, timeout, error
+10. **Supports concurrency** with independent run IDs and no cross-contamination
+11. **Integrates seamlessly** with the Unified Timeline (tool starts → output chunks → tool exit)
 
 **Critical contract:**
 - Runs are identified by `runId` and stored in `ShellRunManager.runs`
