@@ -569,7 +569,7 @@ CREATE TABLE sessions (
 
 Messages are stored as **JSON.stringify(messages)** — no individual message table. This keeps the schema simple and makes rehydration straightforward: parse JSONL → update messages_json → done.
 
-Context usage metadata (`used_tokens` / `total_tokens`) is persisted on the session row and rehydrated into frontend `contextUsageBySession` as a fallback when the provider does not emit immediate metadata during session resume.
+Context usage metadata (`used_tokens` / `total_tokens`) is persisted on the session row and rehydrated into frontend `contextUsageBySession` as a fallback when the provider does not emit immediate metadata during session resume. Rehydration only writes a percentage when `total_tokens > 0`, and fallback writes do not override an already-positive cached value with `0%`.
 
 ---
 

@@ -113,6 +113,45 @@ describe('Claude Provider', () => {
       });
     });
 
+    it('does not consume initial replay when cached context is unavailable', async () => {
+      const emitProviderExtension = vi.fn();
+      const sessionId = 'claude-session-delayed-cache';
+      fs.existsSync.mockImplementation(filePath => String(filePath).endsWith('acp_session_context.json'));
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) {
+          return JSON.stringify({});
+        }
+        return '';
+      });
+
+      await claude.prepareAcpEnvironment(
+        { CLAUDE_QUOTA_PROXY: 'false' },
+        { emitProviderExtension }
+      );
+
+      expect(claude.emitCachedContext(sessionId)).toBe(false);
+
+      claude.intercept({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'usage_update',
+            used: 50,
+            size: 100
+          }
+        }
+      });
+
+      expect(claude.emitCachedContext(sessionId)).toBe(true);
+      expect(claude.emitCachedContext(sessionId)).toBe(false);
+      expect(emitProviderExtension).toHaveBeenCalledTimes(1);
+      expect(emitProviderExtension).toHaveBeenCalledWith('_anthropic/metadata', {
+        sessionId,
+        contextUsagePercentage: 50
+      });
+    });
+
     it('starts a provider-owned proxy and injects ANTHROPIC_BASE_URL', async () => {
       const writeLog = vi.fn();
       const env = { KEEP: '1' };

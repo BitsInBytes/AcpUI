@@ -37,7 +37,10 @@ function maybeHydrateContextUsage(session: ChatSession) {
   const used = Number(session.stats?.usedTokens);
   const total = Number(session.stats?.totalTokens);
   if (!acpSessionId || !Number.isFinite(used) || !Number.isFinite(total) || total <= 0) return;
-  useSystemStore.getState().setContextUsage(acpSessionId, (used / total) * 100);
+  const nextPct = (used / total) * 100;
+  const currentPct = useSystemStore.getState().contextUsageBySession[acpSessionId];
+  if (Number.isFinite(currentPct) && Number(currentPct) > 0 && nextPct <= 0) return;
+  useSystemStore.getState().setContextUsage(acpSessionId, nextPct);
 }
 
 interface SessionLifecycleState {
@@ -129,12 +132,17 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
   fetchStats: async (socket, acpSessionId) => {
     if (!socket) return { error: 'Socket not connected' };
     return new Promise((resolve) => {
-      socket.emit('get_stats', { sessionId: acpSessionId }, (res: StatsResponse) => {
+      const session = get().sessions.find(s => s.acpSessionId === acpSessionId);
+      socket.emit('get_stats', { sessionId: acpSessionId, providerId: session?.provider || null, uiId: session?.id || null }, (res: StatsResponse) => {
         if (res.stats) {
           const used = Number(res.stats.usedTokens);
           const total = Number(res.stats.totalTokens);
           if (Number.isFinite(used) && Number.isFinite(total) && total > 0) {
-            useSystemStore.getState().setContextUsage(acpSessionId, (used / total) * 100);
+            const nextPct = (used / total) * 100;
+            const currentPct = useSystemStore.getState().contextUsageBySession[acpSessionId];
+            if (!(Number.isFinite(currentPct) && Number(currentPct) > 0 && nextPct <= 0)) {
+              useSystemStore.getState().setContextUsage(acpSessionId, nextPct);
+            }
           }
           set(state => ({
             sessions: state.sessions.map(s => s.acpSessionId === acpSessionId ? { ...s, stats: res.stats } : s)

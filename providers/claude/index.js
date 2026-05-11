@@ -19,16 +19,14 @@ let _sessionsWithInitialEmit = new Set(); // Track which sessions we've already 
 
 function _emitCachedContext(sessionId, config) {
   if (!sessionId || _sessionsWithInitialEmit.has(sessionId)) return false;
-  _sessionsWithInitialEmit.add(sessionId);
   const persistedPercent = _sessionContextCache.get(sessionId);
-  if (persistedPercent !== undefined && _emitProviderExtension) {
-    _emitProviderExtension(`${config.protocolPrefix}metadata`, {
-      sessionId,
-      contextUsagePercentage: persistedPercent
-    });
-    return true;
-  }
-  return false;
+  if (persistedPercent === undefined || !_emitProviderExtension) return false;
+  _emitProviderExtension(`${config.protocolPrefix}metadata`, {
+    sessionId,
+    contextUsagePercentage: persistedPercent
+  });
+  _sessionsWithInitialEmit.add(sessionId);
+  return true;
 }
 
 /**

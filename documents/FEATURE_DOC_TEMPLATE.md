@@ -18,6 +18,31 @@ A good Feature Doc means an agent can load it and within seconds have a complete
 
 ---
 
+## Critical Principle: Document Present State Only
+
+**Feature Docs are LIVING DOCUMENTS that describe the system AS IT EXISTS TODAY. They are NOT historical records.**
+
+This means:
+- **Never mention older implementations** — Don't say "The system used to X, but now does Y." Only describe how it works NOW.
+- **Never use past tense** — Say "Sessions are stored in project directories" not "Sessions were stored flat, but are now stored in project directories."
+- **Never compare to previous architectures** — If the system changed, document the current architecture only. Delete old descriptions.
+- **Update line numbers and code snippets regularly** — When code shifts due to additions/removals, update the docs immediately so they stay current.
+- **If a section describes an obsolete pattern**, replace it entirely with the current pattern. Don't keep both for "historical context."
+
+**Why**: Agents rely on Feature Docs as the source of truth for how the system works TODAY. Mixing old and new information creates ambiguity. A confused agent will either waste time on outdated code or implement changes that break the current system.
+
+**Example of what to AVOID:**
+```markdown
+❌ Previously, context state was stored in memory. Now we persist it to disk at <location>.
+```
+
+**Example of what to DO:**
+```markdown
+✅ Context usage state is persisted to disk at <location> and loaded on startup.
+```
+
+---
+
 ## File Naming Convention
 
 ```

@@ -313,11 +313,15 @@ const ChatInput: React.FC = () => {
           )}
         </div>
         {(() => {
-          const pct = activeSession?.acpSessionId ? (contextUsageBySession[activeSession.acpSessionId] || 0) : 0;
-          const color = pct >= 80 ? '#dc2626' : pct >= 60 ? '#eab308' : pct >= 50 ? '#22c55e' : 'rgba(96, 165, 250, 0.5)';
+          const rawPct = activeSession?.acpSessionId ? contextUsageBySession[activeSession.acpSessionId] : undefined;
+          const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(Number(rawPct), 100)) : null;
+          const pctForColor = pct ?? 0;
+          const color = pctForColor >= 80 ? '#dc2626' : pctForColor >= 60 ? '#eab308' : pctForColor >= 50 ? '#22c55e' : 'rgba(96, 165, 250, 0.5)';
           return (
             <div className="context-bar-track">
-              <div className="context-bar-fill" style={{ width: `${Math.min(pct, 100)}%`, backgroundColor: color }} />
+              {pct !== null && (
+                <div className="context-bar-fill" style={{ width: `${pct}%`, backgroundColor: color }} />
+              )}
             </div>
           );
         })()}

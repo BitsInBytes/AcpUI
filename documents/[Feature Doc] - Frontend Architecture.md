@@ -18,7 +18,7 @@ The frontend performs these key responsibilities:
 - **Provider Branding System**: All UI text, icons, model labels, and color scheme are sourced dynamically from the backend's branding.json. No hardcoded strings for provider identity anywhere in the code.
 - **Session Switching**: Tracks open sessions in useChatStore, supports hot-resume (instant switching for memory-resident sessions), and computes session switch state via pure function helper.
 - **Model State Management**: Tracks current model selection per session, available model catalog, and dynamic model options. The currentModelId is the source of truth.
-- **Context Usage Restoration**: `contextUsageBySession` is hydrated from persisted session stats during initial load/session hydration, then kept live via `stats_push` and provider metadata events.
+- **Context Usage Restoration**: `contextUsageBySession` is hydrated from persisted session stats during initial load/session hydration only when totals are valid (`totalTokens > 0`), then kept live via `stats_push` and provider metadata events. Unknown values stay unknown (no forced `0%` fallback) to avoid flicker.
 - **Canvas & Terminal Integration**: Supports Monaco editor for code viewing/editing, integrated canvas terminals with multiple tabs via xterm.js, interactive shell tool terminals inside `ToolStep`, git file list, and diff viewer (SafeDiffEditor).
 - **Sub-Agent & Counsel System**: Displays sub-agents spawned in parallel, shows their tool steps and permissions, and emits parent cancel events when parent is cancelled.
 - **Permission & Hook Workflows**: Shows permission request prompts with approve/deny buttons, tracks tool execution hooks (session_start, pre_tool, post_tool, stop), and emits hook status.

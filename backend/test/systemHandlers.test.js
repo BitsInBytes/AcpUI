@@ -19,7 +19,14 @@ const { mockAcpClient } = vi.hoisted(() => ({
 
 const { mockDb } = vi.hoisted(() => ({
   mockDb: {
-    getSessionByAcpId: vi.fn()
+    getSessionByAcpId: vi.fn(),
+    getSession: vi.fn()
+  }
+}));
+
+const { mockProviderRuntimeManager } = vi.hoisted(() => ({
+  mockProviderRuntimeManager: {
+    getClient: vi.fn()
   }
 }));
 
@@ -39,7 +46,12 @@ vi.mock('../services/logger.js', () => ({
 }));
 
 vi.mock('../database.js', () => ({
-  getSessionByAcpId: mockDb.getSessionByAcpId
+  getSessionByAcpId: mockDb.getSessionByAcpId,
+  getSession: mockDb.getSession
+}));
+
+vi.mock('../services/providerRuntimeManager.js', () => ({
+  default: mockProviderRuntimeManager
 }));
 
 describe('System Handlers', () => {
@@ -55,7 +67,9 @@ describe('System Handlers', () => {
     mockAcpClient.sessionMetadata.clear();
     mockAcpClient.providerId = 'provider-a';
     mockAcpClient.getProviderId.mockReturnValue('provider-a');
+    mockProviderRuntimeManager.getClient.mockReturnValue(mockAcpClient);
     mockDb.getSessionByAcpId.mockResolvedValue(null);
+    mockDb.getSession.mockResolvedValue(null);
     mockFs.existsSync.mockReturnValue(false);
     mockFs.readFileSync.mockReturnValue('');
     mockGetLogFilePath.mockReturnValue('test.log');
@@ -106,7 +120,7 @@ describe('System Handlers', () => {
       const handler = mockSocket.listeners('get_stats')[0];
       await handler({ sessionId }, callback);
 
-      expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith('provider-a', sessionId);
+      expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith(sessionId);
       expect(callback).toHaveBeenCalledWith(expect.objectContaining({
         stats: expect.objectContaining({
           providerId: 'provider-a',
@@ -118,7 +132,7 @@ describe('System Handlers', () => {
       }));
     });
 
-    it('uses default total tokens when persisted stats do not include a total', async () => {
+    it('keeps total tokens at zero when persisted stats do not include a total', async () => {
       const sessionId = 'zero-total-acp';
       mockDb.getSessionByAcpId.mockResolvedValueOnce({
         model: 'stored-model-label',
@@ -136,7 +150,7 @@ describe('System Handlers', () => {
         stats: expect.objectContaining({
           model: 'stored-model-label',
           usedTokens: 12,
-          totalTokens: 1000000
+          totalTokens: 0
         })
       }));
     });
@@ -154,7 +168,7 @@ describe('System Handlers', () => {
           sessionId,
           model: 'Unknown',
           usedTokens: 0,
-          totalTokens: 1000000
+          totalTokens: 0
         })
       }));
     });
@@ -182,7 +196,7 @@ describe('System Handlers', () => {
       const handler = mockSocket.listeners('get_stats')[0];
       await handler({ sessionId }, callback);
 
-      expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith('provider-a', sessionId);
+      expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith(sessionId);
       expect(callback).toHaveBeenCalledWith(expect.objectContaining({
         stats: expect.objectContaining({
           model: 'stored-model-id',
@@ -215,12 +229,48 @@ describe('System Handlers', () => {
       const handler = mockSocket.listeners('get_stats')[0];
       await handler({ sessionId }, callback);
 
-      expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith('provider-a', sessionId);
+      expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith(sessionId);
       expect(callback).toHaveBeenCalledWith(expect.objectContaining({
         stats: expect.objectContaining({
           model: 'stored-model-id',
           usedTokens: 111,
           totalTokens: 5000
+        })
+      }));
+    });
+
+    it('uses provider-scoped runtime metadata when providerId is provided', async () => {
+      const sessionId = 'provider-b-session';
+      const providerBClient = {
+        sessionMetadata: new Map([[
+          sessionId,
+          {
+            model: 'provider-b-model',
+            toolCalls: 9,
+            successTools: 8,
+            startTime: Date.now() - 1500,
+            usedTokens: 333,
+            totalTokens: 999
+          }
+        ]]),
+        getProviderId: vi.fn(() => 'provider-b'),
+        providerId: 'provider-b'
+      };
+      mockProviderRuntimeManager.getClient.mockImplementation((pid) => pid === 'provider-b' ? providerBClient : mockAcpClient);
+
+      const callback = vi.fn();
+      const handler = mockSocket.listeners('get_stats')[0];
+      await handler({ sessionId, providerId: 'provider-b' }, callback);
+
+      expect(mockProviderRuntimeManager.getClient).toHaveBeenCalledWith('provider-b');
+      expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+        stats: expect.objectContaining({
+          providerId: 'provider-b',
+          model: 'provider-b-model',
+          usedTokens: 333,
+          totalTokens: 999,
+          toolCalls: 9,
+          successTools: 8
         })
       }));
     });

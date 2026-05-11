@@ -811,9 +811,10 @@ User clicks footer dropdown (currently shows "Using Sonnet (62%)")
 - **Expected:** User sees placeholder text (e.g., "Engine warming up...") and can't interact until ready.
 
 ### 8. **Context Usage % May Not Exist for All Providers**
-- **Problem:** `contextUsageBySession` is undefined if provider doesn't emit context updates.
-- **Why:** Context reporting is optional per provider.
-- **Fallback:** ModelSelector doesn't show % if undefined (Line 44, ModelSelector.tsx).
+- **Problem:** `contextUsageBySession` may be undefined/unknown even when a session is active.
+- **Why:** Context reporting is optional per provider, and persisted fallback stats can have unknown totals during resume.
+- **Behavior:** Footer context bar renders a neutral empty state when usage is unknown (no forced `0%` fill).
+- **Fallback:** Once valid `used/total` arrives (`total > 0`), UI shows %. Fallback stats paths do not downgrade an already-positive cached value to `0%`.
 
 ### 9. **Paste Handler Requires Clipboard API (Not Supported in Older Browsers)**
 - **Problem:** ClipboardEvent.items or .files may be undefined in IE/old Safari.
@@ -870,7 +871,7 @@ User clicks footer dropdown (currently shows "Using Sonnet (62%)")
 3. **Images look blurry** — Quality 85 is default (Line 68, promptHandlers.js). Increase if needed; accept larger file size.
 4. **Slash dropdown not appearing** — Check that filtered commands exist (Line 112). Hidden commands excluded (Line 109)?
 5. **Model dropdown doesn't close** — Check pointerdown listener (Lines 117-128). Click outside? Click on model-dropdown-item?
-6. **Context % not showing** — Verify provider emits context updates. Check `contextUsageBySession[acpSessionId]` in SystemStore.
+6. **Context % not showing** — Verify provider emits context updates and/or persisted stats have `totalTokens > 0`. If value is unknown, neutral bar state is expected (not `0%`).
 
 ---
 
@@ -882,7 +883,7 @@ The **Chat Input and Prompt Area** is a unified footer component for composing a
 2. **Slash command autocomplete** (arrow keys, Tab/Enter to select) with hidden/visible filtering.
 3. **File attachment system**: paste/drag → HTTP POST to backend → multer disk storage → base64 reading for images.
 4. **Image compression**: sharp.resize(maxDim, fit:'inside') + JPEG quality 85 → ~90% size reduction.
-5. **Model quick-select footer** dropdown from `branding.models.quickAccess`, shows context usage %, disabled when loading.
+5. **Model quick-select footer** dropdown from `branding.models.quickAccess`, shows context usage % when known, disabled when loading.
 6. **Reasoning effort selector** (animated) for models supporting tuning.
 7. **Canvas/Terminal toggles** and merge-fork button (contextual).
 

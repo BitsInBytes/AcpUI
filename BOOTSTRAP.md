@@ -140,6 +140,20 @@ All Feature Docs must follow `documents/FEATURE_DOC_TEMPLATE.md`:
 - **Component reference table** with file paths and exact line numbers
 - **No provider-specific examples in generic docs** — Use pattern language: "A provider must...", not "Claude does..."
 
+### Rule 6: Document Present State Only
+
+**Feature Docs are living documents that describe the system AS IT EXISTS TODAY. They are NOT historical documents.**
+
+When updating Feature Docs:
+- **Never mention how the system "used to work"** — Remove references to older implementations, previous architecture, or deprecated patterns
+- **Never use past tense to describe implementation** — Say "The system does X" not "The system used to do X"
+- **Always describe the current implementation** — If the system changed, describe the new behavior only
+- **Update line numbers and code snippets** when code shifts — This keeps the documentation accurate and current
+- **If a section describes an old pattern**, delete it or replace it with the current pattern. Don't keep both.
+- **Example of what to AVOID**: "Previously, sessions were stored flat. Now they are stored in project-scoped subdirectories..."
+
+**Why this matters**: Agents (and humans) rely on Feature Docs as the source of truth for how the system works TODAY. Outdated information embedded in historical context is more confusing than no information at all. A Feature Doc that mentions "X used to happen" creates ambiguity about what actually happens NOW.
+
 ---
 
 ## 4. Engineering Standards & Patterns

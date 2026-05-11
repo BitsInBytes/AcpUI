@@ -76,6 +76,28 @@ describe('useSessionLifecycleStore', () => {
     expect(useSessionLifecycleStore.getState().sessions[0].stats).toEqual(stats);
   });
 
+  it('fetchStats does not overwrite existing positive context usage with zero percent', async () => {
+    const acpId = 'a1';
+    const stats = { usedTokens: 0, totalTokens: 1000 };
+    mockSocket.emit.mockImplementation((event: string, ...args: any[]) => {
+      const cb = args[args.length - 1];
+      if (event === 'get_stats') cb({ stats });
+    });
+
+    act(() => {
+      useSystemStore.setState({ contextUsageBySession: { [acpId]: 42 } } as any);
+      useSessionLifecycleStore.setState({
+        sessions: [{ id: 's1', acpSessionId: acpId, provider: 'p1' } as any]
+      });
+    });
+
+    await act(async () => {
+      await useSessionLifecycleStore.getState().fetchStats(mockSocket, acpId);
+    });
+
+    expect(useSystemStore.getState().contextUsageBySession[acpId]).toBe(42);
+  });
+
   it('handleNewChat creates session and retries if daemon not ready', () => {
     vi.useFakeTimers();
     let callCount = 0;
@@ -213,6 +235,25 @@ describe('useSessionLifecycleStore', () => {
 
     act(() => {
       useSystemStore.setState({ contextUsageBySession: {} } as any);
+      useSessionLifecycleStore.setState({ sessions: [s1] });
+      useSessionLifecycleStore.getState().handleSessionSelect(mockSocket, 's1');
+    });
+
+    expect(useSystemStore.getState().contextUsageBySession['acp-1']).toBe(25);
+  });
+
+  it('handleSessionSelect does not downgrade positive cached context to zero from persisted stats', () => {
+    const s1 = {
+      id: 's1',
+      acpSessionId: 'acp-1',
+      hasUnreadResponse: false,
+      messages: [{ id: 'm1' }],
+      isWarmingUp: false,
+      stats: { usedTokens: 0, totalTokens: 1000 }
+    } as any;
+
+    act(() => {
+      useSystemStore.setState({ contextUsageBySession: { 'acp-1': 25 } } as any);
       useSessionLifecycleStore.setState({ sessions: [s1] });
       useSessionLifecycleStore.getState().handleSessionSelect(mockSocket, 's1');
     });
