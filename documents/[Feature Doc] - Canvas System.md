@@ -31,21 +31,21 @@ The canvas is a right-side split-screen panel that displays code artifacts and t
 
 ### Flow A: File Written by ACP Tool
 
-1. **Tool Output Processing** — ACP daemon sends a `tool_call` or `tool_call_update` with a filePath field. This goes through acpUpdateHandler → useStreamStore.onStreamEvent (Lines: backend/services/acpUpdateHandler.js:153-274).
+1. **Tool Output Processing** — ACP daemon sends a `tool_call` or `tool_call_update` with a filePath field. This goes through acpUpdateHandler → useStreamStore.onStreamEvent (Function: `handleUpdate`, Lines: 16-283).
 
-2. **processBuffer Detects Completion** — The frontend's useStreamStore.processBuffer loop (Lines: frontend/src/store/useStreamStore.ts:199-402) processes the tool step and checks if status === 'completed' && filePath exists.
+2. **processBuffer Detects Completion** — The frontend's useStreamStore.processBuffer loop (Function: `processBuffer`, Lines: 214-416) processes the tool step and checks if status === 'completed' && filePath exists.
 
-3. **onFileEdited Callback** — processBuffer calls `onFileEdited(filePath)` (Line: frontend/src/store/useStreamStore.ts:302), which is wired from useChatManager → App.tsx (Lines: frontend/src/App.tsx:84-88).
+3. **onFileEdited Callback** — processBuffer calls `onFileEdited(filePath)` (Line: 312), which is wired from useChatManager → App.tsx (Lines: 84-88).
 
-4. **handleFileEdited Triggered** — The callback invokes `handleFileEdited(socket, editedFilePath)` in useCanvasStore (Lines: frontend/src/store/useCanvasStore.ts:113-142).
+4. **handleFileEdited Triggered** — The callback invokes `handleFileEdited(socket, editedFilePath)` in useCanvasStore (Function: `handleFileEdited`, Lines: 111-140).
 
 5. **File Already in Artifacts** — handleFileEdited checks if the edited file matches any watched artifact's filePath (normalized path comparison, Line 119).
 
-6. **Re-read File from Backend** — socket.emit('canvas_read_file', {filePath}) → backend canvasHandlers (Lines: backend/sockets/canvasHandlers.js:52-78) resolves the path, reads file content, infers language from extension.
+6. **Re-read File from Backend** — socket.emit('canvas_read_file', {filePath}) → backend canvasHandlers (Function: `registerCanvasHandlers`, Lines: 7-78) resolves the path, reads file content, infers language from extension.
 
-7. **Artifact Updated** — The read artifact is merged into canvasArtifacts at the same artifact.id with updated content and `lastUpdated: Date.now()` (Lines: frontend/src/store/useCanvasStore.ts:125-138).
+7. **Artifact Updated** — The read artifact is merged into canvasArtifacts at the same artifact.id with updated content and `lastUpdated: Date.now()` (Lines: 125-138).
 
-8. **Glow Animation** — The 3-second glow on the tab is driven by `lastUpdated` being recent (Line: frontend/src/components/CanvasPane/CanvasPane.tsx:220).
+8. **Glow Animation** — The 3-second glow on the tab is driven by `lastUpdated` being recent (Line: 242).
 
 ### Flow B: plan.md Auto-Open
 

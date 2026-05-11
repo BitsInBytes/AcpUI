@@ -45,22 +45,22 @@ if (meta.promptCount === 1 && typeof prompt === 'string') {
 - The ACP daemon processes the user's message and begins streaming the response back via `agent_message_chunk` updates
 
 **Step 3: First Response Chunk Triggers Title Generation**
-- File: `backend/services/acpUpdateHandler.js` (Lines 121–131)
-- On the very first token of the response, the system checks three conditions: `promptCount === 1` (first turn), `!titleGenerated` (not already generated), and `!isSubAgent` (not a sub-agent)
+- File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Lines 126-136)
+- On the very first token of the response, the system checks conditions: `promptCount === 1`, `!titleStarted`, and `!isSubAgent`
 - If all conditions pass, it calls `acpClient.generateTitle()` asynchronously
 ```javascript
-// Lines 129-131 in acpUpdateHandler.js
-if (meta && meta.promptCount === 1 && !meta.titleGenerated && !meta.isSubAgent) {
-  meta.titleGenerated = true;  // Set flag to prevent duplicate generation
-  acpClient.generateTitle(sessionId, meta).catch(err => writeLog(`[TITLE ERR] ${err.message}`));
+// Lines 126-136 in acpUpdateHandler.js
+if (metadata.promptCount === 1 && metadata.lastResponseBuffer.length > 0 && !metadata.titleStarted && !metadata.isSubAgent) {
+  metadata.titleStarted = true;
+  generateTitle(acpClient, sessionId, metadata).catch(() => {});
 }
 ```
 
 **Step 4: Delegate to AcpClient Method**
-- File: `backend/services/acpClient.js` (Lines 383–385)
+- File: `backend/services/acpClient.js` (Function: `generateTitle`, Lines 387-389)
 - The AcpClient has a wrapper method that delegates to the imported `generateTitle()` function from acpTitleGenerator
 ```javascript
-// Lines 383-385 in acpClient.js
+// Lines 387-389 in acpClient.js
 async generateTitle(sessionId, meta) {
   return _generateTitle(this, sessionId, meta);
 }

@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProvider } from '../../backend/services/providerLoader.js';
+import { collectInputObjects, mergeInputObjects } from '../../backend/services/tools/toolInputUtils.js';
+import { matchToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -493,13 +495,16 @@ export function normalizeTool(event, update) {
   title = title.replace(suffixRegex, '');
 
   let toolName = event.toolName || '';
+  const patternMatch = matchToolIdPattern(rawId, config) || matchToolIdPattern(title, config);
 
   // Handle MCP tool identifiers in ID or Title
-  if (rawId.includes('ux_invoke_subagents') || title.toLowerCase().includes('invoke sub agents') || title.toLowerCase() === 'ux_invoke_subagents') {
+  if (patternMatch?.toolName) {
+    toolName = patternMatch.toolName;
+  } else if (title.toLowerCase().includes('invoke sub agents') || title.toLowerCase() === 'ux_invoke_subagents') {
     toolName = 'ux_invoke_subagents';
-  } else if (rawId.includes('ux_invoke_counsel') || title.toLowerCase() === 'ux_invoke_counsel') {
+  } else if (title.toLowerCase() === 'ux_invoke_counsel') {
     toolName = 'ux_invoke_counsel';
-  } else if (rawId.includes('ux_invoke_shell') || title.toLowerCase().startsWith('running:')) {
+  } else if (title.toLowerCase().startsWith('running:')) {
     toolName = 'ux_invoke_shell';
   }
 
@@ -520,7 +525,28 @@ export function normalizeTool(event, update) {
   } else if (toolName === 'ux_invoke_counsel') {
     title = 'Invoke Counsel';
   } else if (toolName === 'ux_invoke_shell') {
-    title = 'Invoke Shell';
+    // Idempotent: if already normalized on a previous normalizeTool call, preserve it
+    if (!title.toLowerCase().startsWith('invoke shell:')) {
+      // 1. Try robust input extraction for a description field
+      const input = mergeInputObjects(collectInputObjects(
+        update?.rawInput,
+        update?.arguments,
+        update?.params,
+        update?.input,
+        update?.toolCall?.arguments
+      ));
+      const shellDesc = input.description;
+
+      if (shellDesc) {
+        title = `Invoke Shell: ${shellDesc}`;
+      } else if (title.toLowerCase().startsWith('running:')) {
+        // 2. Gemini sends "Running: <description>" — extract the description
+        const afterRunning = title.slice('running:'.length).trim();
+        title = afterRunning ? `Invoke Shell: ${afterRunning}` : 'Invoke Shell';
+      } else {
+        title = 'Invoke Shell';
+      }
+    }
   } else if (toolName === 'replace' || toolName === 'edit_file' || rawId.startsWith('replace')) {
     if (title.includes('=>') || title.length > 50) {
       title = 'Editing';
@@ -561,6 +587,76 @@ export function normalizeTool(event, update) {
   }
 
   return { ...event, toolName, title };
+}
+
+export function extractToolInvocation(update = {}, context = {}) {
+  const event = context.event || {};
+  const { config } = getProvider();
+  const normalized = normalizeTool({ ...event }, update);
+  const input = mergeInputObjects(collectInputObjects(
+    update.rawInput,
+    update.arguments,
+    update.params,
+    update.input,
+    update.toolCall?.arguments
+  ));
+  const canonicalName = normalized.toolName || '';
+  const rawName = update.toolName || update.name || update.toolCallId || event.id || update.title || event.title || '';
+  const patternMatch = matchToolIdPattern(rawName, config) ||
+    matchToolIdPattern(update.title || event.title || '', config);
+  const isAcpUiTool = canonicalName === 'ux_invoke_shell' ||
+    canonicalName === 'ux_invoke_subagents' ||
+    canonicalName === 'ux_invoke_counsel';
+
+  // Deep search for description and command if Gemini CLI wraps them in unexpected keys
+  if (isAcpUiTool && (!input.description || !input.command)) {
+    const findDeep = (obj, targetKey) => {
+      if (!obj || typeof obj !== 'object') return null;
+      if (obj[targetKey]) return obj[targetKey];
+      for (const val of Object.values(obj)) {
+        if (val && typeof val === 'object') {
+          const res = findDeep(val, targetKey);
+          if (res) return res;
+        }
+      }
+      return null;
+    };
+
+    let rawArgs = update.arguments || update.rawInput || update.toolCall?.arguments;
+    if (typeof rawArgs === 'string') {
+      try { rawArgs = JSON.parse(rawArgs); } catch {}
+    }
+
+    if (!input.description) {
+      const deepDesc = findDeep(rawArgs, 'description');
+      if (deepDesc) input.description = deepDesc;
+    }
+    if (!input.command && canonicalName === 'ux_invoke_shell') {
+      const deepCmd = findDeep(rawArgs, 'command');
+      if (deepCmd) input.command = deepCmd;
+    }
+  }
+
+  let finalTitle = event.title || update.title || (isAcpUiTool ? '' : normalized.title);
+  if (isAcpUiTool && normalized.title && normalized.title.includes(':')) {
+    finalTitle = normalized.title;
+  } else if (isAcpUiTool && (finalTitle === 'Invoke Shell' || finalTitle === 'Invoke Subagents' || finalTitle === 'Invoke Counsel')) {
+    // If we have a generic title for an AcpUI tool, return empty to allow the resolver to use cached title
+    finalTitle = '';
+  }
+
+  return {
+    toolCallId: update.toolCallId || event.id,
+    kind: isAcpUiTool ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+    rawName,
+    canonicalName,
+    mcpServer: patternMatch?.mcpName || (isAcpUiTool ? config.mcpName : undefined),
+    mcpToolName: patternMatch?.toolName || (isAcpUiTool ? canonicalName : undefined),
+    input,
+    title: finalTitle,
+    filePath: normalized.filePath || event.filePath,
+    category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
+  };
 }
 
 /**

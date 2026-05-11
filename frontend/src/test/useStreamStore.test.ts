@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useStreamStore } from '../store/useStreamStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSystemStore } from '../store/useSystemStore';
+import { useShellRunStore } from '../store/useShellRunStore';
 import { act } from 'react';
 
 describe('useStreamStore (Pure Logic)', () => {
@@ -23,6 +24,7 @@ describe('useStreamStore (Pure Logic)', () => {
         activeSessionId: 's1'
       });
       useSystemStore.setState({ compactingBySession: {}, branding: { models: {} } } as any);
+      useShellRunStore.getState().reset();
     });
   });
 
@@ -126,6 +128,38 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(timeline[1].isCollapsed).toBe(false); // Current tool open
   });
 
+  it('hydrates queued shell tool_start from an existing shell snapshot', () => {
+    act(() => {
+      useShellRunStore.getState().upsertSnapshot({
+        providerId: 'gemini',
+        sessionId: 'a1',
+        runId: 'shell-run-1',
+        status: 'running',
+        description: 'Check git status',
+        command: 'git status --short',
+        cwd: 'D:\\Git\\AcpUI',
+        transcript: ''
+      });
+
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 't1',
+        title: 'Invoke Shell',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const tool = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline![0] as any;
+    expect(tool.event.title).toBe('Invoke Shell: Check git status');
+    expect(tool.event.command).toBe('git status --short');
+    expect(tool.event.cwd).toBe('D:\\Git\\AcpUI');
+    expect(tool.event.shellState).toBe('running');
+  });
+
   it('onStreamEvent merges tool titles correctly', () => {
     act(() => {
       useStreamStore.getState().ensureAssistantMessage('a1');
@@ -180,6 +214,33 @@ describe('useStreamStore (Pure Logic)', () => {
     const tool = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline![0] as any;
     expect(tool.event.shellRunId).toBe('shell-run-1');
     expect(tool.event.output).toBeUndefined();
+  });
+
+  it('preserves Shell V2 description title over later command titles', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 't1',
+        title: 'Invoke Shell: Run test suite',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_end',
+        id: 't1',
+        status: 'completed',
+        title: 'Run shell command: npm run test -- --coverage'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const tool = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline![0] as any;
+    expect(tool.event.title).toBe('Invoke Shell: Run test suite');
   });
 
   it('processBuffer removes Thinking placeholder when real thoughts or tokens arrive', () => {

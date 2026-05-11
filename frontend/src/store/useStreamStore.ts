@@ -1,8 +1,25 @@
 import { create } from 'zustand';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSystemStore } from './useSystemStore';
+import { useShellRunStore } from './useShellRunStore';
 import type { Socket } from 'socket.io-client';
 import type { StreamTokenData, StreamEventData, StreamDoneData, Message } from '../types';
+
+function isShellDescriptionTitle(title?: string) {
+  return /^Invoke Shell:\s*\S/i.test(title || '');
+}
+
+function shellRunPatch(shellRunId?: string) {
+  const snapshot = shellRunId ? useShellRunStore.getState().runs[shellRunId] : undefined;
+  if (!snapshot) return {};
+
+  return {
+    shellState: snapshot.status,
+    ...(snapshot.command ? { command: snapshot.command } : {}),
+    ...(snapshot.cwd ? { cwd: snapshot.cwd } : {}),
+    ...(snapshot.description ? { title: `Invoke Shell: ${snapshot.description}` } : {})
+  };
+}
 
 /**
  * Manages the typewriter rendering pipeline for streamed AI responses.
@@ -250,7 +267,16 @@ export const useStreamStore = create<StreamState>((set, get) => ({
               else if (type === 'tool_start') {
                 for (let i = 0; i < t.length; i++) t[i] = { ...t[i], isCollapsed: true };
                 if (t[0]?.type === 'thought' && t[0].content === '_Thinking..._') t.shift();
-                t.push({ type: 'tool', event: { ...action.data, status: 'in_progress', startTime: Date.now() }, isCollapsed: false });
+                t.push({
+                  type: 'tool',
+                  event: {
+                    ...action.data,
+                    ...shellRunPatch(action.data.shellRunId),
+                    status: 'in_progress',
+                    startTime: Date.now()
+                  },
+                  isCollapsed: false
+                });
               } else if (type === 'tool_end' || type === 'tool_update') {
                 const idx = t.findLastIndex(s => s.type === 'tool' && s.event.id === id);
                 if (idx !== -1) {
@@ -265,7 +291,12 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                     let bestTitle = incomingTitle || existingStep.event.title;
                     const existingTitle = existingStep.event.title || '';
 
-                    if (existingTitle.length > (bestTitle || '').length || (existingTitle.includes(':') && !bestTitle?.includes(':'))) {
+                    if (
+                      (existingStep.event.canonicalName || existingStep.event.toolName) === 'ux_invoke_shell' &&
+                      isShellDescriptionTitle(existingTitle)
+                    ) {
+                      bestTitle = existingTitle;
+                    } else if (existingTitle.length > (bestTitle || '').length || (existingTitle.includes(':') && !bestTitle?.includes(':'))) {
                       bestTitle = existingTitle;
                     }
 
@@ -285,6 +316,10 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                         output: (existingStep.event.shellRunId ? existingStep.event.output : output) || existingStep.event.output,
                         filePath: mergedFilePath,
                         title: bestTitle,
+                        toolName: action.data.toolName || existingStep.event.toolName,
+                        canonicalName: action.data.canonicalName || existingStep.event.canonicalName,
+                        mcpServer: action.data.mcpServer || existingStep.event.mcpServer,
+                        mcpToolName: action.data.mcpToolName || existingStep.event.mcpToolName,
                         toolCategory: action.data.toolCategory || existingStep.event.toolCategory,
                         endTime: status === 'completed' ? Date.now() : existingStep.event.endTime
                       },

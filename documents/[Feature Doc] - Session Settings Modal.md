@@ -31,22 +31,15 @@ The Session Settings Modal is a per-session configuration hub that allows users 
 ### Path A: Opening the Modal
 
 **Step 1: User Clicks Settings Button**
-- File: `frontend/src/components/Sidebar.tsx` (Lines 271, 357, 398, 419)
-- Multiple trigger points:
-  - Provider header settings (line 271): `onSettings={() => setSettingsOpen(true, fork.id)}`
-  - Session item settings (line 357): `onSettings={() => setSettingsOpen(true, session.id)}`
-  - Context menu on session (line 398): `onSettingsSession={(id) => setSettingsOpen(true, id)}`
-  - Session item inline action (line 419): `onSettings={() => setSettingsOpen(true, session.id)}`
+- File: `frontend/src/components/Sidebar.tsx` (Lines 271-422)
+- Multiple trigger points in the sidebar (provider header, session item, context menu) call `setSettingsOpen(true, sessionId)`.
 - File: `frontend/src/components/ChatInput/ChatInput.tsx` (Line 366)
   - Chat header settings button: `onOpenSettings={() => activeSession && setSettingsOpen(true, activeSession.id, 'config')}`
-  - Note: Opens directly to **Config tab** instead of default Info tab
 
 **Step 2: Update UIStore**
-- File: `frontend/src/store/useUIStore.ts` (Lines 77–81)
-- `setSettingsOpen(isOpen, sessionId, initialTab)` sets:
-  - `isSettingsOpen = true`
-  - `settingsSessionId = sessionId` (the UI session ID)
-  - `settingsInitialTab = initialTab || 'session'` (default to Info tab)
+- File: `frontend/src/store/useUIStore.ts` (Function: `setSettingsOpen`, Lines 77-81)
+- `setSettingsOpen(isOpen, sessionId, initialTab)` updates the global modal state.
+
 ```typescript
 // Lines 77-81 in useUIStore.ts
 setSettingsOpen: (isOpen, sessionId = null, initialTab = 'session') => set({
@@ -57,47 +50,29 @@ setSettingsOpen: (isOpen, sessionId = null, initialTab = 'session') => set({
 ```
 
 **Step 3: Render Modal Component**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 29–96)
-- Component reads `isSettingsOpen` and `settingsSessionId` from UIStore
-- If `settingsSessionId` is null, returns `null` (renders nothing)
-- Finds matching session from store using `sessions.find(s => s.id === settingsSessionId)`
-- Gets branding from `useSystemStore.getBranding(session.provider)`
-- Renders modal with overlay and 5 tab buttons (lines 102–131)
+- File: `frontend/src/components/SessionSettingsModal.tsx` (Function: `SessionSettingsModal`, Lines 29-96)
+- Component reads `isSettingsOpen` and `settingsSessionId` from `useUIStore` and renders the 5-tab interface.
 
-**Step 4: Initialize Tab and State**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 83–92)
-- `useEffect` fires when `isOpen` or `settingsInitialTab` changes
-- Resets local state: `activeTab`, `showConfirmDelete`, `rehydrateStatus`, `rehydrateMsg`
-```javascript
-// Lines 83-92 in SessionSettingsModal.tsx
-useEffect(() => {
-  if (isOpen) {
-    setShowConfirmDelete(false);
-    setActiveTab(settingsInitialTab);
-    setRehydrateStatus('idle');
-    setRehydrateMsg('');
-  }
-}, [isOpen, settingsInitialTab]);
-```
+---
 
 ### Path B: Rehydration Flow (The Deep Focus)
 
 **Step 1: User Clicks "Rebuild from JSONL" Button**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 258–262)
-- Condition: Button only enabled if `session.acpSessionId` exists (line 259)
-- Click handler: `handleRehydrate()` (line 49)
+- File: `frontend/src/components/SessionSettingsModal.tsx` (Line 259)
+- Condition: Button only enabled if `session.acpSessionId` exists.
 
 **Step 2: Frontend Emits Rehydrate Event**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 49–71)
-- State updates immediately: `setRehydrateStatus('loading')`
-- Emits socket event: `socket.emit('rehydrate_session', { uiId: session.id }, callback)`
-- Note: Uses **UI session ID**, not ACP session ID
+- File: `frontend/src/components/SessionSettingsModal.tsx` (Function: `handleRehydrate`, Lines 49-71)
+- State updates to `loading`, and the `rehydrate_session` socket event is emitted.
+
 ```javascript
 // Lines 49-71 in SessionSettingsModal.tsx
 const handleRehydrate = () => {
   if (!session?.acpSessionId || !socket) return;
   setRehydrateStatus('loading');
-  socket.emit('rehydrate_session', { uiId: session.id }, (res) => {
+  socket.emit('rehydrate_session', { uiId: session.id }, (res) => { ... });
+};
+```
     if (res.success) {
       setRehydrateStatus('done');
       setRehydrateMsg(`Rebuilt ${res.messageCount} messages from JSONL`);

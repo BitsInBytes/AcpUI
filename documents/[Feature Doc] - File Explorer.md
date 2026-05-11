@@ -34,361 +34,85 @@ A full-screen modal file browser accessible from the ChatHeader. Provides tree-b
 ## How It Works — End-to-End Flow
 
 ### Step 1: ChatHeader Button Click Opens Modal
-**File:** `frontend/src/components/ChatHeader/ChatHeader.tsx` (Lines 47–55)
+**File:** `frontend/src/components/ChatHeader/ChatHeader.tsx` (Lines 50-55)
 
 User clicks the folder icon in the ChatHeader. The button invokes `setFileExplorerOpen(true)` on the Zustand store:
 
 ```typescript
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 49-50)
-<button onClick={() => useUIStore.getState().setFileExplorerOpen(true)} className="icon-button">
+// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 50-55)
+<button
+  onClick={() => useUIStore.getState().setFileExplorerOpen(true)}
+  className="icon-button"
+  title="File Explorer"
+>
   <FolderOpen size={18} />
 </button>
 ```
 
-This sets `isFileExplorerOpen` to `true` in `useUIStore`, triggering a re-render. The button is hidden in popout mode (line 47).
-
 ---
 
-### Step 2: FileExplorer Component Mounts and Initializes
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 14–28)
+### 2. State Initialization & Root Load
+**File:** `frontend/src/components/FileExplorer.tsx` (Function: `FileExplorer`, Lines 16-35; Lines 41-55)
 
-The FileExplorer component conditionally renders when `isFileExplorerOpen` is `true`. Local state is initialized:
+When opened, the component resolves the provider scope and fetches the root directory label from the backend:
 
 ```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 22-28)
-const [tree, setTree] = useState<TreeNode | null>(null);         // Root directory tree
-const [expanded, setExpanded] = useState<Set<string>>(new Set()); // Expanded folder paths
-const [openFile, setOpenFile] = useState<{ path: string; content: string; original: string } | null>(null);
-const [previewMode, setPreviewMode] = useState(false);           // Markdown preview toggle
-const [rootLabel, setRootLabel] = useState('Loading...');
-const [saving, setSaving] = useState(false);                     // Auto-save in progress flag
+// FILE: frontend/src/components/FileExplorer.tsx (Lines 16-35)
+const expandedProviderId = useUIStore(state => state.expandedProviderId);
+const systemProviderId = useSystemStore(state => state.activeProviderId || state.defaultProviderId);
+const providerId = expandedProviderId || systemProviderId;
+// ...
 ```
 
----
-
-### Step 3: useEffect Emits explorer_root to Resolve Provider Home Directory
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 38–56)
-
-When the modal opens (`isFileExplorerOpen` dependency fires), a `useEffect` emits the `explorer_root` socket event:
-
 ```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 38-56)
+// FILE: frontend/src/components/FileExplorer.tsx (Lines 41-55)
 useEffect(() => {
-  if (!isFileExplorerOpen) return;
-  
-  socket.emit('explorer_root', {}, (response: { root: string; error?: string }) => {
-    if (response.error) {
-      logger.error('Failed to get root:', response.error);
-      setRootLabel('Error');
-      return;
-    }
-    setRootLabel(response.root);
-    loadDir('');
-  });
-}, [isFileExplorerOpen]);
+  if (!isOpen || !socket) return;
+  // ...
+  if (providerId) socket.emit('explorer_root', { providerId }, handleRoot);
+  else socket.emit('explorer_root', handleRoot);
+  // ...
+}, [isOpen, socket, providerId, loadDir]);
 ```
-
-The backend responds with the provider's home directory path (from `provider.config.paths.home`). This path becomes the root for all subsequent file operations.
 
 ---
 
-### Step 4: Backend explorer_root Handler Resolves Provider Home
-**File:** `backend/sockets/fileExplorerHandlers.js` (Lines 60–64)
+### 3. Backend Root & Path Safety
+**File:** `backend/sockets/fileExplorerHandlers.js` (Function: `getRoot`, Lines 60-64; Function: `safePath`, Lines 11-16)
 
-The backend receives `explorer_root` and resolves the root directory:
+The backend resolves the root path based on the provider's `home` path and enforces path traversal protection:
 
 ```javascript
 // FILE: backend/sockets/fileExplorerHandlers.js (Lines 60-64)
-socket.on('explorer_root', function (payload, callback) {
-  const providerId = payload?.providerId || null;
-  const root = getRoot(providerId);
-  callback({ root });
-});
-```
-
-The `getRoot()` function (lines 6–9) retrieves the root from the provider's config:
-
-```javascript
-// FILE: backend/sockets/fileExplorerHandlers.js (Lines 6-9)
 function getRoot(providerId = null) {
   const provider = getProvider(providerId);
-  return provider?.config?.paths?.home || '';
+  return provider.config.paths?.home || '';
+}
+```
+
+```javascript
+// FILE: backend/sockets/fileExplorerHandlers.js (Lines 11-16)
+function safePath(requestedPath, providerId = null) {
+  const root = getRoot(providerId);
+  const resolved = path.resolve(root, requestedPath);
+  if (!resolved.startsWith(root)) throw new Error('Path traversal blocked');
+  return resolved;
 }
 ```
 
 ---
 
-### Step 5: Initial Tree Populated via explorer_list (Root Empty String)
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 30–34)
+### 4. Directory Traversal & Lazy Loading
+**File:** `frontend/src/components/FileExplorer.tsx` (Function: `toggleDir`, Lines 57-73)
 
-Once `rootLabel` is set, `loadDir('')` is called, which emits `explorer_list` for the root directory:
-
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 30-34)
-const loadDir = useCallback((dirPath: string) => {
-  socket.emit('explorer_list', { dirPath, providerId: systemStore.activeProviderId }, (response) => {
-    // Build tree node and update state (lines 31-34 detailed below)
-  });
-}, []);
-```
-
-The backend responds with the root directory's files and folders. The frontend initializes the tree with these top-level entries.
+Folders are loaded lazily when expanded to minimize initial data transfer.
 
 ---
 
-### Step 6: Backend explorer_list Handler Lists Directory Contents
-**File:** `backend/sockets/fileExplorerHandlers.js` (Lines 19–35)
+### 5. File Persistence & Auto-Save
+**File:** `frontend/src/components/FileExplorer.tsx` (Function: `handleChange`, Lines 96-105)
 
-The backend receives the directory path and lists its contents:
-
-```javascript
-// FILE: backend/sockets/fileExplorerHandlers.js (Lines 19-35)
-socket.on('explorer_list', (payload, callback) => {
-  try {
-    const { dirPath = '', providerId = null } = payload;
-    const fullPath = safePath(dirPath, providerId);  // LINE 22 - Path traversal check
-    
-    const entries = fs.readdirSync(fullPath).filter(name => !name.startsWith('.')); // LINE 24 - Hide dotfiles
-    const items = entries
-      .map(name => ({
-        name,
-        isDirectory: fs.statSync(path.join(fullPath, name)).isDirectory()
-      }))
-      .sort((a, b) => {
-        if (a.isDirectory !== b.isDirectory) return b.isDirectory - a.isDirectory; // Dirs first
-        return a.name.localeCompare(b.name); // Then alphabetical
-      });
-    
-    callback({ items, path: dirPath });
-  } catch (err) {
-    writeLog(`[EXPLORER ERR] list: ${err.message}`);
-    callback({ items: [], error: err.message });
-  }
-});
-```
-
-**Key security:** Line 22 calls `safePath(dirPath, providerId)` (lines 11–16) which:
-- Resolves the path relative to the provider's root
-- Uses `path.resolve()` to normalize `..` and symlinks
-- **Throws if the resolved path escapes the root** (prevents traversal)
-
----
-
-### Step 7: Frontend Updates Tree State and Renders Lazy-Load Structure
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 30–34)
-
-The frontend receives the items array and builds tree nodes:
-
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 30-34)
-const items = response.items.map(item => ({
-  name: item.name,
-  path: dirPath ? `${dirPath}/${item.name}` : item.name,
-  isDirectory: item.isDirectory,
-  children: item.isDirectory ? [] : undefined,
-  loaded: false // Lazy-load guard
-}));
-```
-
-Each directory is marked `loaded: false`, ensuring children are fetched only on first expansion (lazy-loading).
-
----
-
-### Step 8: User Expands a Folder → toggleDir Emits explorer_list
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 58–74)
-
-When the user clicks a folder icon to expand, `toggleDir()` is invoked:
-
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 58-74)
-const toggleDir = useCallback((nodePath: string) => {
-  const isExpanded = expanded.has(nodePath);
-  
-  if (!isExpanded) {
-    setExpanded(prev => new Set([...prev, nodePath]));
-    
-    // Find the node and check if children are already loaded
-    const node = findNode(tree, nodePath);
-    if (node && !node.loaded) {
-      loadDir(nodePath); // Emit explorer_list for this directory
-      node.loaded = true;
-    }
-  } else {
-    setExpanded(prev => {
-      const next = new Set(prev);
-      next.delete(nodePath);
-      return next;
-    });
-  }
-}, [tree, expanded]);
-```
-
-The `loaded` flag ensures `explorer_list` is emitted only once per folder (lazy-loading optimization).
-
----
-
-### Step 9: User Clicks a File → explorer_read Fetches Content
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 80–86)
-
-When the user clicks a file name, `openFileHandler()` emits `explorer_read`:
-
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 80-86)
-const openFileHandler = useCallback((filePath: string) => {
-  socket.emit('explorer_read', { filePath, providerId: systemStore.activeProviderId }, (response) => {
-    if (response.error) {
-      logger.error('Failed to read file:', response.error);
-      return;
-    }
-    setOpenFile({ path: filePath, content: response.content, original: response.content });
-    setPreviewMode(isMarkdown(filePath));
-  });
-}, []);
-```
-
-The backend reads the file contents and returns it. The frontend stores both `content` (current) and `original` (for dirty detection).
-
----
-
-### Step 10: Backend explorer_read Handler Reads File Content
-**File:** `backend/sockets/fileExplorerHandlers.js` (Lines 37–46)
-
-The backend reads and returns the file's UTF-8 content:
-
-```javascript
-// FILE: backend/sockets/fileExplorerHandlers.js (Lines 37-46)
-socket.on('explorer_read', (payload, callback) => {
-  try {
-    const { filePath, providerId = null } = payload;
-    const fullPath = safePath(filePath, providerId);  // LINE 39 - Path traversal check
-    const content = fs.readFileSync(fullPath, 'utf-8');
-    callback({ content, filePath });
-  } catch (err) {
-    writeLog(`[EXPLORER ERR] read: ${err.message}`);
-    callback({ error: err.message });
-  }
-});
-```
-
----
-
-### Step 11: Frontend Renders Monaco Editor or Markdown Preview
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 112–158)
-
-The file content is displayed in one of two modes:
-
-**Editor Mode** (code files):
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 135-150)
-{!previewMode && (
-  <Editor
-    height="100%"
-    language={getLanguage(openFile.path)}
-    value={openFile.content}
-    onChange={(value) => handleChange(value || '')}
-    theme="vs-dark"
-    options={{ automaticLayout: true, minimap: { enabled: false } }}
-  />
-)}
-```
-
-**Preview Mode** (markdown files):
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 151-158)
-{previewMode && (
-  <ReactMarkdown>
-    {openFile.content}
-  </ReactMarkdown>
-)}
-```
-
-Markdown files default to preview mode (line 89: `setPreviewMode(isMarkdown(filePath))`).
-
----
-
-### Step 12: User Edits File → handleChange Debounces explorer_write
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 97–105)
-
-As the user types, `handleChange()` is invoked on every keystroke:
-
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 97-105)
-const handleChange = useCallback((newContent: string) => {
-  setOpenFile(prev => prev ? { ...prev, content: newContent } : null);
-  
-  // Cancel previous debounce timer
-  if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
-  
-  // Set new timer for 1500ms debounce
-  autoSaveTimerRef.current = setTimeout(() => {
-    if (openFile && openFile.content !== openFile.original) {
-      socket.emit('explorer_write', { filePath: openFile.path, content: newContent, providerId: systemStore.activeProviderId }, (response) => {
-        if (!response.error) {
-          setOpenFile(prev => prev ? { ...prev, original: newContent } : null); // Update original
-          setSaving(false);
-        }
-      });
-    }
-  }, 1500);
-}, [openFile]);
-```
-
-The debounce prevents excessive socket emissions. Every keystroke resets the 1500ms timer.
-
----
-
-### Step 13: Backend explorer_write Handler Persists Changes
-**File:** `backend/sockets/fileExplorerHandlers.js` (Lines 48–58)
-
-Once the debounce timer fires, the backend receives `explorer_write` and writes the file:
-
-```javascript
-// FILE: backend/sockets/fileExplorerHandlers.js (Lines 48-58)
-socket.on('explorer_write', (payload, callback) => {
-  try {
-    const { filePath, content, providerId = null } = payload;
-    const fullPath = safePath(filePath, providerId);  // LINE 50 - Path traversal check
-    fs.writeFileSync(fullPath, content, 'utf-8');
-    callback({ success: true });
-  } catch (err) {
-    writeLog(`[EXPLORER ERR] write: ${err.message}`);
-    callback({ success: false, error: err.message });
-  }
-});
-```
-
----
-
-### Step 14: Frontend Detects Dirty State and Updates Original
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 107–108)
-
-Dirty detection is computed from the open file state:
-
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 107-108)
-const isDirty = openFile ? openFile.content !== openFile.original : false;
-const isMarkdown = openFile ? openFile.path.endsWith('.md') : false;
-```
-
-A visual indicator (●) appears next to the filename when `isDirty` is true (line 161).
-
----
-
-### Step 15: User Closes Modal → Overlay Click Sets isFileExplorerOpen to False
-**File:** `frontend/src/components/FileExplorer.tsx` (Lines 114–122)
-
-Clicking the overlay or close button invokes:
-
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 114-122)
-<div className="modal-overlay" onClick={() => useUIStore.getState().setFileExplorerOpen(false)}>
-  <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-    {/* FileExplorer UI */}
-  </div>
-</div>
-```
-
-This sets `isFileExplorerOpen` to `false`, unmounting the component and clearing state.
+The component includes a debounce timer that auto-saves file changes to the backend after 1.5 seconds of inactivity.
 
 ---
 

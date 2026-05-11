@@ -2,143 +2,12 @@ import { writeLog } from './logger.js';
 import { autoSaveTurn } from './sessionManager.js';
 import { runHooks } from './hookRunner.js';
 import { getProvider, getProviderModule } from './providerLoader.js';
-import { shellRunManager } from './shellRunManager.js';
+import { toolRegistry, toolCallState, resolveToolInvocation, applyInvocationToEvent } from './tools/index.js';
 import { applyConfigOptionsChange, normalizeConfigOptions, normalizeRemovedConfigOptionIds } from './configOptions.js';
 import * as db from '../database.js';
 import * as Diff from 'diff';
 import fs from 'fs';
 import path from 'path';
-
-const SHELL_COMMAND_KEYS = ['command', 'cmd', 'parsed_cmd', 'parsedCmd', 'commandLine', 'command_line', 'script', 'line'];
-const SHELL_CWD_KEYS = ['cwd', 'workdir', 'workingDirectory', 'working_dir', 'folder'];
-
-function parseMaybeJson(value) {
-  if (typeof value !== 'string') return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
-}
-
-function isObject(value) {
-  return value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function pushParsedObject(candidates, value) {
-  const parsed = parseMaybeJson(value);
-  if (!isObject(parsed)) return;
-  candidates.push(parsed);
-
-  const invocation = parseMaybeJson(parsed.invocation);
-  if (isObject(invocation)) {
-    candidates.push(invocation);
-    pushNestedArgs(candidates, invocation);
-  }
-
-  pushNestedArgs(candidates, parsed);
-}
-
-function pushNestedArgs(candidates, obj) {
-  for (const key of ['arguments', 'args', 'params', 'input']) {
-    const parsed = parseMaybeJson(obj[key]);
-    if (isObject(parsed)) candidates.push(parsed);
-  }
-}
-
-function shellCandidateObjects(update, event) {
-  const candidates = [];
-  pushParsedObject(candidates, event);
-  pushParsedObject(candidates, update);
-  pushParsedObject(candidates, update?.rawInput);
-  pushParsedObject(candidates, update?.arguments);
-  pushParsedObject(candidates, update?.params);
-  pushParsedObject(candidates, update?.input);
-  pushParsedObject(candidates, update?.toolCall?.arguments);
-  return candidates;
-}
-
-function firstShellValue(candidates, keys) {
-  for (const candidate of candidates) {
-    for (const key of keys) {
-      const value = candidate[key];
-      if (typeof value === 'string' && value.trim()) return value;
-      if (Array.isArray(value) && value.length > 0) return value.join(' ');
-    }
-  }
-  return '';
-}
-
-function getInvocationToolName(update) {
-  const rawInput = parseMaybeJson(update?.rawInput);
-  const explicitInvocation = parseMaybeJson(rawInput?.invocation || update?.invocation || update?.toolCall);
-  const candidates = [
-    explicitInvocation,
-    rawInput,
-    update
-  ].filter(isObject);
-
-  for (const candidate of candidates) {
-    const toolName = candidate.toolName || candidate.tool || candidate.name;
-    if (isUxInvokeShellToolName(toolName)) return 'ux_invoke_shell';
-  }
-  return '';
-}
-
-function isUxInvokeShellToolName(value) {
-  if (typeof value !== 'string') return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized === 'ux_invoke_shell' ||
-    normalized.endsWith('/ux_invoke_shell') ||
-    normalized.endsWith('_ux_invoke_shell') ||
-    normalized.endsWith('__ux_invoke_shell') ||
-    normalized.endsWith(':ux_invoke_shell');
-}
-
-function isUxShellToolEvent(update, event) {
-  const values = [
-    event.toolName,
-    update.toolName,
-    update.name,
-    update.toolCall?.toolName,
-    update.toolCall?.tool,
-    update.toolCall?.name,
-    getInvocationToolName(update)
-  ].filter(Boolean);
-
-  return values.some(isUxInvokeShellToolName);
-}
-
-function prepareShellRunForToolStart(acpClient, providerId, sessionId, update, eventToEmit) {
-  if (!providerId || !isUxShellToolEvent(update, eventToEmit)) {
-    return eventToEmit;
-  }
-
-  try {
-    shellRunManager.setIo?.(acpClient.io);
-    const candidates = shellCandidateObjects(update, eventToEmit);
-    const command = firstShellValue(candidates, SHELL_COMMAND_KEYS);
-    const prepared = shellRunManager.prepareRun({
-      providerId,
-      sessionId,
-      toolCallId: update.toolCallId,
-      command,
-      cwd: firstShellValue(candidates, SHELL_CWD_KEYS) || null
-    });
-
-    return {
-      ...eventToEmit,
-      shellRunId: prepared.runId,
-      shellInteractive: true,
-      shellState: prepared.status,
-      command: prepared.command,
-      cwd: prepared.cwd
-    };
-  } catch (err) {
-    writeLog(`[SHELL V2] Failed to prepare shell run for ${sessionId}: ${err.message}`);
-    return eventToEmit;
-  }
-}
 
 /**
  * Routes ACP session/update events to the UI via socket.io.
@@ -293,21 +162,32 @@ export async function handleUpdate(acpClient, sessionId, update) {
 
     let eventToEmit = { providerId, sessionId, type: 'tool_start', id: update.toolCallId, title: titleStr, filePath, output: toolOutput };
 
-    // Step 1: Normalize format (provider-specific structure → standard fields)
     eventToEmit = providerModule.normalizeTool(eventToEmit, update);
-
-    // Step 2: Categorize (provider maps its own tools to a category — UI tools are the frontend's concern)
     const category = providerModule.categorizeToolCall(eventToEmit);
     if (category) eventToEmit = { ...eventToEmit, ...category };
 
-    eventToEmit = prepareShellRunForToolStart(acpClient, providerId, sessionId, update, eventToEmit);
+    const invocation = resolveToolInvocation({ providerId, sessionId, update, event: eventToEmit, providerModule, phase: 'start' });
+    eventToEmit = applyInvocationToEvent(eventToEmit, invocation);
+    eventToEmit = toolRegistry.dispatch('start', { acpClient, providerId, sessionId }, invocation, eventToEmit);
+    toolCallState.upsert({
+      providerId,
+      sessionId,
+      toolCallId: update.toolCallId,
+      identity: invocation.identity,
+      input: invocation.input,
+      display: {
+        title: eventToEmit.title,
+        titleSource: eventToEmit.title === invocation.display?.title ? invocation.display?.titleSource : 'tool_handler'
+      },
+      category,
+      filePath: eventToEmit.filePath,
+      toolSpecific: {
+        shellRunId: eventToEmit.shellRunId,
+        invocationId: eventToEmit.invocationId
+      }
+    });
 
     acpClient.io.to('session:' + sessionId).emit('system_event', eventToEmit);
-
-    // Track parent session for tools that spawn sub-agents for room inheritance
-    if (titleStr.includes('ux_invoke_subagents') || titleStr.includes('ux_invoke_counsel')) {
-      acpClient.lastSubAgentParentAcpId = sessionId;
-    }
   }
   else if (update.sessionUpdate === 'tool_call_update') {
     // Ignore intermediate updates that are completely empty
@@ -346,20 +226,6 @@ export async function handleUpdate(acpClient, sessionId, update) {
       if (meta) meta.usedTokens += toolOutput.length / 4;
     }
 
-    let titleToUse = update.title;
-    if (meta) {
-      const toolId = update.toolCallId;
-      if (!meta.toolData) meta.toolData = new Map();
-      if (!meta.toolData.has(toolId)) meta.toolData.set(toolId, {});
-      const tData = meta.toolData.get(toolId);
-      if (filePath) tData.filePath = filePath;
-      if (update.title) tData.title = update.title;
-      
-      // Re-inject if this chunk is generic
-      if (!filePath && tData.filePath) filePath = tData.filePath;
-      if (!titleToUse && tData.title) titleToUse = tData.title;
-    }
-
     let endEvent = { 
       sessionId, 
       providerId,
@@ -368,22 +234,34 @@ export async function handleUpdate(acpClient, sessionId, update) {
       status: update.status, 
       output: toolOutput, 
       filePath,
-      title: titleToUse
+      title: update.title
     };
     
-    // Normalize and categorize again so the UI receives the same metadata
     endEvent = providerModule.normalizeTool(endEvent, update);
     const category = providerModule.categorizeToolCall(endEvent);
     if (category) endEvent = { ...endEvent, ...category };
 
-    // Final safety: if normalization resulted in a generic title but we have a cached better one, use it
-    if (meta && endEvent.title && !endEvent.title.includes(':')) {
-       const cachedTitle = meta.toolData?.get(update.toolCallId)?.title;
-       if (cachedTitle && cachedTitle.length > endEvent.title.length) {
-          // Re-normalize with the better title
-          endEvent = providerModule.normalizeTool({ ...endEvent, title: cachedTitle }, update);
-       }
-    }
+    const phase = update.status ? 'end' : 'update';
+    const invocation = resolveToolInvocation({ providerId, sessionId, update, event: endEvent, providerModule, phase });
+    endEvent = applyInvocationToEvent(endEvent, invocation);
+    endEvent = toolRegistry.dispatch(phase, { acpClient, providerId, sessionId }, invocation, endEvent);
+    toolCallState.upsert({
+      providerId,
+      sessionId,
+      toolCallId: update.toolCallId,
+      identity: invocation.identity,
+      input: invocation.input,
+      display: {
+        title: endEvent.title,
+        titleSource: endEvent.title === invocation.display?.title ? invocation.display?.titleSource : 'tool_handler'
+      },
+      category,
+      filePath: endEvent.filePath,
+      toolSpecific: {
+        shellRunId: endEvent.shellRunId,
+        invocationId: endEvent.invocationId
+      }
+    });
 
     acpClient.io.to('session:' + sessionId).emit('system_event', endEvent);
   }

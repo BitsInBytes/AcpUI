@@ -9,6 +9,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { getProvider } from '../../backend/services/providerLoader.js';
+import { collectInputObjects, mergeInputObjects } from '../../backend/services/tools/toolInputUtils.js';
+import { matchToolIdPattern, replaceToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
 
 // Cache for context usage percentage
 let _emitProviderExtension = null;
@@ -502,26 +504,22 @@ export async function setConfigOption(acpClient, sessionId, optionId, value) {
  * Normalize a tool call event.
  */
 export function normalizeTool(event, update) {
+  const { config } = getProvider();
   let toolName = update?.name || event.id || '';
 
-  // Strip any @ServerName/ MCP prefix (e.g. "@AcpUI/ux_invoke_shell")
-  const mcpPrefixMatch = toolName.match(/^@[^/]+\//);
-  if (mcpPrefixMatch) {
-    toolName = toolName.slice(mcpPrefixMatch[0].length);
-  }
+  const configuredToolMatch = matchToolIdPattern(toolName, config);
+  if (configuredToolMatch?.toolName) toolName = configuredToolMatch.toolName;
 
   // If toolName is still a generic ID, extract from title
   if (toolName.startsWith('tooluse_') || toolName.startsWith('call_') || toolName.startsWith('toolu_')) {
     const title = event.title || '';
-    const titleMcpMatch = title.match(/@[^/]+\//);
-    if (titleMcpMatch) {
-      toolName = title.slice(titleMcpMatch.index + titleMcpMatch[0].length).split(/[\s:,]/)[0];
-    }
+    const titleToolMatch = matchToolIdPattern(title, config);
+    if (titleToolMatch?.toolName) toolName = titleToolMatch.toolName;
   }
 
-  // Clean any @ServerName/ prefix from the display title
+  // Clean configured MCP tool ids from the display title
   if (event.title) {
-    event = { ...event, title: event.title.replace(/@[^/]+\//g, '') };
+    event = { ...event, title: replaceToolIdPattern(event.title, config) };
   }
 
   // Resolve generic tool IDs to standard names (built-in tools without MCP prefix)
@@ -543,6 +541,36 @@ export function normalizeTool(event, update) {
   }
 
   return { ...event, toolName };
+}
+
+export function extractToolInvocation(update = {}, context = {}) {
+  const event = context.event || {};
+  const { config } = getProvider();
+  const normalized = normalizeTool({ ...event }, update);
+  const input = mergeInputObjects(collectInputObjects(
+    update.rawInput,
+    update.arguments,
+    update.params,
+    update.input,
+    update.toolCall?.arguments
+  ));
+  const rawName = update.name || update.toolName || event.toolName || event.title || event.id || '';
+  const title = update.title || event.title || '';
+  const mcpMatch = matchToolIdPattern(rawName, config) || matchToolIdPattern(title, config);
+  const canonicalName = normalized.toolName || '';
+
+  return {
+    toolCallId: update.toolCallId || event.id,
+    kind: mcpMatch ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+    rawName,
+    canonicalName,
+    mcpServer: mcpMatch?.mcpName,
+    mcpToolName: mcpMatch?.toolName,
+    input,
+    title: normalized.title || title,
+    filePath: normalized.filePath || event.filePath,
+    category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
+  };
 }
 
 /**

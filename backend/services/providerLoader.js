@@ -75,6 +75,7 @@ const DEFAULT_MODULE = {
   extractToolOutput: () => undefined,
   extractFilePath: () => undefined,
   extractDiffFromToolCall: () => undefined,
+  extractToolInvocation: () => null,
   normalizeTool: (e) => e,
   categorizeToolCall: () => null,
   parseExtension: () => null,

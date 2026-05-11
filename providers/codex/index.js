@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { getProvider } from '../../backend/services/providerLoader.js';
+import { collectInputObjects, mergeInputObjects } from '../../backend/services/tools/toolInputUtils.js';
+import { matchToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
 
 const MODEL_OPTION_IDS = new Set(['model']);
 const REASONING_OPTION_IDS = new Set(['reasoning_effort', 'effort']);
@@ -515,11 +517,12 @@ export function extractDiffFromToolCall(update, Diff) {
 
 function normalizeToolName(name) {
   if (!name || typeof name !== 'string') return '';
+  const { config } = getProvider();
+  const patternMatch = matchToolIdPattern(name, config);
+  if (patternMatch?.toolName) return patternMatch.toolName.trim().toLowerCase();
+
   const normalized = name
-    .replace(/^mcp__[^_]+__/, '')
     .replace(/^Tool:\s*/i, '')
-    .split('/')
-    .pop()
     .trim()
     .toLowerCase();
 
@@ -530,8 +533,9 @@ function normalizeToolName(name) {
 
 function toolNameFromTitle(title) {
   if (!title || typeof title !== 'string') return '';
-  const toolMatch = title.match(/^Tool:\s*([^/]+)\/(.+)$/i);
-  if (toolMatch) return normalizeToolName(toolMatch[2]);
+  const { config } = getProvider();
+  const patternMatch = matchToolIdPattern(title.replace(/^Tool:\s*/i, ''), config);
+  if (patternMatch?.toolName) return normalizeToolName(patternMatch.toolName);
 
   const lower = title.toLowerCase();
   if (lower.includes('web search')) return 'web_search';
@@ -625,6 +629,37 @@ export function normalizeTool(event, update = {}) {
     ...(toolName ? { toolName } : {}),
     ...(filePath ? { filePath } : {}),
     title: titleForTool(toolName, { ...event, filePath }, update)
+  };
+}
+
+export function extractToolInvocation(update = {}, context = {}) {
+  const event = context.event || {};
+  const normalized = normalizeTool({ ...event }, update);
+  const invocation = invocationFromRaw(update.rawInput);
+  const input = {
+    ...mergeInputObjects(collectInputObjects(
+      update.rawInput,
+      update.arguments,
+      update.params,
+      update.input,
+      update.toolCall?.arguments
+    )),
+    ...(invocation.arguments || {})
+  };
+  const canonicalName = normalized.toolName || '';
+  const rawName = invocation.tool || update.toolName || update.name || event.toolName || update.title || event.title || '';
+
+  return {
+    toolCallId: update.toolCallId || event.id,
+    kind: invocation.server || invocation.tool ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+    rawName,
+    canonicalName,
+    mcpServer: invocation.server,
+    mcpToolName: invocation.tool,
+    input,
+    title: normalized.title || update.title || event.title,
+    filePath: normalized.filePath,
+    category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
   };
 }
 

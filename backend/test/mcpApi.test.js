@@ -71,6 +71,8 @@ describe('MCP API Routes', () => {
     expect(shellTool.description).toContain('user-interactive stdin');
     expect(shellTool.description).toContain('Multiple ux_invoke_shell calls may be invoked concurrently');
     expect(shellTool.description).toContain('terminal becomes read-only after exit');
+    expect(shellTool.inputSchema.properties.description.description).toContain('displayed to the user');
+    expect(shellTool.inputSchema.required).toEqual(['description', 'command']);
     expect(shellTool.annotations).toEqual(expect.objectContaining({
       readOnlyHint: false,
       destructiveHint: true,

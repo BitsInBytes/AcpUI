@@ -10,6 +10,7 @@ vi.mock('../../../backend/services/providerLoader.js', () => ({
     config: {
       protocolPrefix: '_anthropic/',
       mcpName: 'AcpUI',
+      toolIdPattern: 'mcp__{mcpName}__{toolName}',
       clientInfo: { name: 'claude-code', version: '2.1.114' },
       toolCategories: {
         read: { category: 'file_read', isFileOperation: true },
@@ -456,6 +457,24 @@ describe('Claude Provider', () => {
       const normalized = claude.normalizeTool(event);
       expect(normalized.toolName).toBe('read_file');
       expect(normalized.title).toBe('Read File');
+    });
+
+    it('extracts canonical MCP invocation metadata', () => {
+      const invocation = claude.extractToolInvocation(
+        {
+          toolCallId: 't1',
+          rawInput: { description: 'Run tests', command: 'npm test' }
+        },
+        { event: { id: 't1', title: 'mcp__AcpUI__ux_invoke_shell' } }
+      );
+
+      expect(invocation).toEqual(expect.objectContaining({
+        toolCallId: 't1',
+        canonicalName: 'ux_invoke_shell',
+        mcpServer: 'AcpUI',
+        mcpToolName: 'ux_invoke_shell',
+        input: expect.objectContaining({ description: 'Run tests', command: 'npm test' })
+      }));
     });
   });
 

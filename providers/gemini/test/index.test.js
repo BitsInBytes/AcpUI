@@ -11,6 +11,7 @@ vi.mock('../../../backend/services/providerLoader.js', () => {
       config: {
         protocolPrefix: '_gemini/',
         mcpName: 'AcpUI',
+        toolIdPattern: 'mcp_{mcpName}_{toolName}',
         clientInfo: { name: 'AcpUI', version: '1.0.0' },
         toolCategories: {
           read_file: { category: 'file_read', isFileOperation: true },
@@ -299,6 +300,52 @@ describe('Gemini Provider', () => {
       const result = gemini.normalizeTool(event, {});
       expect(result.toolName).toBe('ux_invoke_shell');
       expect(result.title).toBe('Invoke Shell');
+    });
+
+    it('appends description to Invoke Shell title', () => {
+      const update = {
+        toolCallId: 'mcp_AcpUI_ux_invoke_shell-1',
+        arguments: { description: 'Run build', command: 'npm run build' }
+      };
+      const event = { id: 'mcp_AcpUI_ux_invoke_shell-1', title: 'Running: Run build' };
+      const result = gemini.normalizeTool(event, update);
+      expect(result.title).toBe('Invoke Shell: Run build');
+    });
+
+    it('finds nested description for Invoke Shell', () => {
+      const update = {
+        toolCallId: 'mcp_AcpUI_ux_invoke_shell-1',
+        toolCall: { arguments: { description: 'Deep desc' } }
+      };
+      const event = { id: 'mcp_AcpUI_ux_invoke_shell-1', title: 'Invoke Shell' };
+      const result = gemini.normalizeTool(event, update);
+      expect(result.title).toBe('Invoke Shell: Deep desc');
+    });
+
+    it('extracts canonical AcpUI MCP invocation metadata', () => {
+      const invocation = gemini.extractToolInvocation(
+        {
+          toolCallId: 'mcp_AcpUI_ux_invoke_shell-1',
+          arguments: { description: 'Check node', command: 'node -v' }
+        },
+        { event: { id: 'mcp_AcpUI_ux_invoke_shell-1', title: 'node -v' } }
+      );
+
+      expect(invocation).toEqual(expect.objectContaining({
+        canonicalName: 'ux_invoke_shell',
+        mcpServer: 'AcpUI',
+        mcpToolName: 'ux_invoke_shell',
+        input: expect.objectContaining({ description: 'Check node', command: 'node -v' }),
+        title: 'Invoke Shell: Check node'
+      }));
+    });
+
+    it('returns empty title for generic AcpUI tool to allow fallback', () => {
+      const invocation = gemini.extractToolInvocation(
+        { toolCallId: 'mcp_AcpUI_ux_invoke_shell-1' },
+        { event: { id: 'mcp_AcpUI_ux_invoke_shell-1', title: 'Invoke Shell' } }
+      );
+      expect(invocation.title).toBe('');
     });
   });
 

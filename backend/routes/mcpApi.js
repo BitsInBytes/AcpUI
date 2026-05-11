@@ -52,10 +52,11 @@ export default function createMcpApiRoutes(io) {
       }, inputSchema: {
         type: 'object',
         properties: {
+          description: { type: 'string', description: 'A short description (1 sentence, 3-10 words) that will be displayed to the user when this command runs so they can understand the purpose of the command at a glance.' },
           command: { type: 'string', description: 'The shell command to execute' },
           cwd: { type: 'string', description: 'Working directory (absolute path)' },
         },
-        required: ['command'],
+        required: ['description', 'command'],
       }},
       { name: 'ux_invoke_subagents', description: 'Spawn and coordinate multiple AI agents in parallel. Each agent runs as a visible session in the UI. Returns when all agents complete.', inputSchema: {
         type: 'object',

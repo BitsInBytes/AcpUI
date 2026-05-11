@@ -32,19 +32,16 @@ This feature enables parallel exploration of conversations — testing different
 ### Fork Creation Flow
 
 **Step 1: Fork Button Click & Message Index Resolution**
-- **File:** `frontend/src/components/AssistantMessage.tsx` (Lines 75-84)
+- **File:** `frontend/src/components/AssistantMessage.tsx` (Function: `handleFork`, Lines 83-93)
 - User clicks GitFork icon on an assistant message; the component finds that message's index in the session's message array via `findIndex(m => m.id === message.id)`.
 - If the index is found, `useChatStore.getState().handleForkSession()` is invoked with the session ID and message index.
-- The component sets `forking: true` to display a loading overlay (Lines 204-211).
 
 ```javascript
-// FILE: frontend/src/components/AssistantMessage.tsx (Lines 75-84)
+// FILE: frontend/src/components/AssistantMessage.tsx (Lines 83-93)
 const handleFork = () => {
   if (!socket || !activeSessionId || forking) return;
-  const sessions = useSessionLifecycleStore.getState().sessions;
-  const session = sessions.find(s => s.id === activeSessionId);
-  if (!session) return;
-  const msgIndex = session.messages.findIndex(m => m.id === message.id);  // LINE 80
+  // ... finds message index ...
+  const msgIndex = session.messages.findIndex(m => m.id === message.id);
   if (msgIndex === -1) return;
   setForking(true);
   useChatStore.getState().handleForkSession(socket, activeSessionId, msgIndex, () => setForking(false));
@@ -52,46 +49,33 @@ const handleFork = () => {
 ```
 
 **Step 2: Socket Emit & Backend Reception**
-- **File:** `frontend/src/store/useChatStore.ts` (Lines 100-140)
-- `handleForkSession` emits a `fork_session` socket event with `{ uiId: sessionId, messageIndex }` (Line 104).
+- **File:** `frontend/src/store/useChatStore.ts` (Function: `handleForkSession`, Lines 100-140)
+- `handleForkSession` emits a `fork_session` socket event with `{ uiId: sessionId, messageIndex }`.
 
 ```typescript
 // FILE: frontend/src/store/useChatStore.ts (Lines 100-105)
 handleForkSession: (socket, sessionId, messageIndex, onComplete) => {
-  if (!socket) return;
-  const lifecycle = useSessionLifecycleStore.getState();
-  
+  // ...
   socket.emit('fork_session', { uiId: sessionId, messageIndex }, (res: ForkSessionResponse) => {
-    onComplete?.();
-    if (!res?.success || !res.newUiId || !res.newAcpId) return;  // LINE 106
+    // ...
 ```
 
 **Step 3: Backend Fork Session Handler — ACP Session Cloning**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 210-268)
-- Handler fetches the parent session from DB (Line 200), resolves the provider ID (Line 202), and generates new IDs:
-  - `newAcpId = crypto.randomUUID()` — for the ACP daemon's session ID
-  - `newUiId = fork-${Date.now()}` — human-readable UI fork ID (Line 209)
+- **File:** `backend/sockets/sessionHandlers.js` (Function: `socket.on('fork_session')`, Lines 214-268)
+- Handler fetches the parent session from DB, resolves the provider ID, and generates new IDs.
+- The handler calls `providerModule.cloneSession()`, which delegates to the provider to perform provider-specific session file cloning.
 
 ```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 210-224)
+// FILE: backend/sockets/sessionHandlers.js (Lines 214-224)
 socket.on('fork_session', async ({ uiId, messageIndex }, callback) => {
   try {
     const session = await db.getSession(uiId);
-    if (!session) return callback?.({ error: 'Session not found' });
-    const providerId = session.provider || getProvider().id;
-    const runtime = providerRuntimeManager.getRuntime(providerId);
-    const acpClient = runtime.client;
-    const providerModule = await getProviderModule(providerId);
-
-    const crypto = await import('crypto');
+    // ... resolves provider and client ...
     const newAcpId = crypto.randomUUID();
-    const newUiId = `fork-${Date.now()}`;  // LINE 209
-    const oldAcpId = session.acpSessionId;
-
-    providerModule.cloneSession(oldAcpId, newAcpId, Math.ceil((messageIndex + 1) / 2));  // LINE 212
+    const newUiId = `fork-${Date.now()}`;
+    // ... calls cloneSession ...
+    providerModule.cloneSession(oldAcpId, newAcpId, Math.ceil((messageIndex + 1) / 2));
 ```
-
-The handler calls `providerModule.cloneSession()` (Line 212), which delegates to the provider to perform provider-specific session file cloning (e.g., copying `.jsonl`, `.json`, and other session metadata from the parent ACP session to the new fork ACP session).
 
 **Step 4: Copy Attachments**
 - **File:** `backend/sockets/sessionHandlers.js` (Lines 226-229)
@@ -267,7 +251,7 @@ const handleMergeFork = () => {
 ```
 
 **Step 3: Backend Merge Handler — Summary Capture Setup**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 402-417)
+- **File:** `backend/sockets/sessionHandlers.js` (Lines 386-436)
 - Handler validates the fork session has `forkedFrom` (Line 391) and retrieves the parent session (Line 392).
 - A `statsCaptures` buffer is created for the fork's ACP session ID (Line 397) — this will capture the summary text.
 

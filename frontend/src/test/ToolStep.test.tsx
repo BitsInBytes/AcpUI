@@ -146,6 +146,15 @@ describe('ToolStep', () => {
     expect(panel.getAttribute('data-invocation-id')).toBe('inv-test-42');
   });
 
+  it('uses canonicalName to render SubAgentPanel when provider toolName is generic', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ toolName: 'tooluse_123', canonicalName: 'ux_invoke_subagents', invocationId: 'inv-canonical' });
+    render(<ToolStep {...props} />);
+    const panel = screen.getByTestId('sub-agent-panel');
+    expect(panel).toBeInTheDocument();
+    expect(panel.getAttribute('data-invocation-id')).toBe('inv-canonical');
+  });
+
   it('passes invocationId to SubAgentPanel for ux_invoke_counsel', () => {
     const props = defaultProps();
     props.step.event = makeEvent({ toolName: 'ux_invoke_counsel', invocationId: 'inv-counsel-7' });

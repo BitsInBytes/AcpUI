@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getMcpServers, createToolHandlers, getMaxShellResultLines } from '../mcp/mcpServer.js';
 import { clearMcpProxyRegistry, getMcpProxyIdFromServers, resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
+import { toolCallState } from '../services/tools/index.js';
 import EventEmitter from 'events';
 
 // Hoist Mocks
@@ -133,6 +134,7 @@ describe('mcpServer', () => {
     mockAcpClient.sessionMetadata.clear();
     mockAcpClient.stream.statsCaptures.clear();
     mockAcpClient.transport.pendingRequests.clear();
+    toolCallState.clear();
     clearMcpProxyRegistry();
     mockShellRunManager.startPreparedRun.mockResolvedValue({ content: [{ type: 'text', text: 'shell done' }] });
     
@@ -195,6 +197,7 @@ describe('mcpServer', () => {
         acpSessionId: 'acp-1',
         mcpRequestId: 42,
         requestMeta: { toolCallId: 'tool-1' },
+        description: 'Run test suite',
         command: 'npm test',
         cwd: 'D:/repo'
       });
@@ -205,12 +208,25 @@ describe('mcpServer', () => {
         acpSessionId: 'acp-1',
         toolCallId: 'tool-1',
         mcpRequestId: 42,
+        description: 'Run test suite',
         command: 'npm test',
         cwd: 'D:/repo',
         maxLines: getMaxShellResultLines()
       });
       expect(mockPty.spawn).not.toHaveBeenCalled();
       expect(result.content[0].text).toBe('shell done');
+      expect(mockIo.to).toHaveBeenCalledWith('session:acp-1');
+      expect(mockIo.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+        type: 'tool_update',
+        id: 'tool-1',
+        canonicalName: 'ux_invoke_shell',
+        title: 'Invoke Shell: Run test suite'
+      }));
+      expect(toolCallState.get('provider-a', 'acp-1', 'tool-1')).toEqual(expect.objectContaining({
+        identity: expect.objectContaining({ canonicalName: 'ux_invoke_shell', mcpServer: 'TestUI' }),
+        input: expect.objectContaining({ description: 'Run test suite', command: 'npm test', cwd: 'D:/repo' }),
+        display: expect.objectContaining({ title: 'Invoke Shell: Run test suite', titleSource: 'mcp_handler' })
+      }));
     });
 
     it('keeps the MCP tool call pending until shell completion', async () => {

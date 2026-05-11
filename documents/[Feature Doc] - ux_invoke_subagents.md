@@ -44,40 +44,52 @@ The frontend:
 
 ### 1. **Parent Tool Call Event**
 
-The parent agent calls `ux_invoke_subagents` with requests:
+The parent agent calls `ux_invoke_subagents` with requests. Under **Tool System V2**, this call is routed through the canonical tool pipeline:
+
+1. **MCP Handler Registration**: `ux_invoke_subagents` is registered in `backend/mcp/mcpServer.js`.
+2. **State Initialization**: The handler calls `cacheMcpToolInvocation` to store authoritative metadata (input requests, model) in `toolCallState.js`.
+3. **Canonical Identity**: The backend `toolRegistry` dispatches the call to `subAgentToolHandler.js`.
+
+**File:** `backend/services/tools/handlers/subAgentToolHandler.js`
+
+The tool handler now **tracks the parent** by setting the `lastSubAgentParentAcpId` during the `onStart` lifecycle phase:
 
 ```javascript
-// Input to the tool (from the ACP daemon)
-{
-  "tool": "ux_invoke_subagents",
-  "args": {
-    "requests": [
-      { "prompt": "Question 1", "name": "Agent 1" },
-      { "prompt": "Question 2", "name": "Agent 2" }
-    ]
+export const subAgentToolHandler = {
+  onStart(ctx, invocation, event) {
+    // Track parent session for tools that spawn sub-agents for room inheritance
+    ctx.acpClient.lastSubAgentParentAcpId = ctx.sessionId;
+    return {
+      ...event,
+      title: event.title || 'Invoke Subagents',
+      canonicalName: invocation.identity?.canonicalName
+    };
   }
-}
+};
 ```
 
-The backend receives this as a tool call, constructs a `system_event`, and routes to UI:
-
-**File:** `backend/services/acpUpdateHandler.js` (Lines 153-188)
-
-The backend also **tracks the parent**: when a `ux_invoke_subagents` tool completes, it sets:
-
-```javascript
-if (titleStr.includes('ux_invoke_subagents') || titleStr.includes('ux_invoke_counsel')) {
-  acpClient.lastSubAgentParentAcpId = sessionId;  // LINE 187
-}
-```
-
-This is crucial — it lets the backend later correlate sub-agent events to their parent.
+This move from the generic `acpUpdateHandler.js` to a specialized tool handler ensures that sub-agent correlation is tied to the canonical tool identity rather than display string matching.
 
 ---
 
 ### 2. **Sub-Agent Spawn Batch Initialization**
 
-The `ux_invoke_subagents` handler starts:
+The `ux_invoke_subagents` handler in `mcpServer.js` first registers the invocation with the tool state system:
+
+**File:** `backend/mcp/mcpServer.js`
+```javascript
+cacheMcpToolInvocation({
+  io,
+  providerId,
+  acpSessionId,
+  toolCallId: toolCallIdFromMeta(requestMeta),
+  toolName: 'ux_invoke_subagents',
+  input: { requests, model },
+  title: 'Invoke Subagents'
+});
+```
+
+It then delegates to the `subAgentInvocationManager`:
 
 **File:** `backend/mcp/subAgentInvocationManager.js` (Lines 69-317)
 
@@ -1064,3 +1076,28 @@ The ux_invoke_subagents system is a sophisticated orchestration engine that:
 The **critical contract** is `invocationId` — it must be stamped on the parent's ToolStep and used by SubAgentPanel to filter agents. Without it, historical ToolSteps show the wrong agents.
 
 **Why it matters:** Sub-agents enable parallel reasoning, allowing agents to explore multiple approaches and compare results transparently within a single orchestrated request.
+
+---
+
+## Tool System V2 Integration
+
+The sub-agent system is now fully integrated with the **Tool System V2**, which provides a canonical layer for tool identity and state management.
+
+### Canonical Identity
+Sub-agent tools are no longer identified by scanning title strings in the update handler. Instead:
+- **`ux_invoke_subagents`** and **`ux_invoke_counsel`** are registered canonical names.
+- Providers implement `extractToolInvocation()` to map their raw MCP tool naming (e.g., `mcp__AcpUI__ux_invoke_subagents`) to these canonical names.
+- The `toolRegistry` dispatches to `subAgentToolHandler` or `counselToolHandler` based on this canonical identity.
+
+### State Management (`toolCallState`)
+The `toolCallState` service acts as a "sticky" cache for tool metadata:
+- **Authoritative Input**: When an MCP tool starts, the handler in `mcpServer.js` upserts the exact `requests` and `model` arguments into the state.
+- **Title Preservation**: The tool handlers set authoritative titles (e.g., "Invoke Subagents"). These titles are preserved even if the provider later emits a generic title (like "Running Tool").
+- **Persistence**: Metadata survives across intermediate stream updates, ensuring the UI always has access to the tool's canonical identity and input.
+
+### Lifecycle Handlers
+The `subAgentToolHandler` and `counselToolHandler` implement the `onStart` lifecycle method to perform sub-agent-specific initialization:
+- **Parent Tracking**: They set `acpClient.lastSubAgentParentAcpId = sessionId`, which is required by `subAgentInvocationManager` to resolve the `parentUiId`.
+- **Event Enrichment**: They ensure the `system_event` emitted to the UI contains the `canonicalName` and a clean `title`.
+
+This architectural shift decouples sub-agent logic from provider-specific string formats and moves it into a structured, lifecycle-aware registry.

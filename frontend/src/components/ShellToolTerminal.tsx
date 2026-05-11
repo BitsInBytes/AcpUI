@@ -166,26 +166,26 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
   const canStop = Boolean(run && run.status !== 'exited');
   const runRef = useRef<ShellRunSnapshot | null>(run);
   const isRunningRef = useRef(isRunning);
+  const isActiveSessionRef = useRef(isActiveSession);
   const readOnlyHtml = useMemo(
     () => getReadOnlyTerminalHtml(run, event),
     [event, run]
   );
 
-  const [isTerminalReady, setIsTerminalReady] = React.useState(false);
-
   useEffect(() => {
     runRef.current = run;
     isRunningRef.current = isRunning;
-  }, [run, isRunning]);
+    isActiveSessionRef.current = isActiveSession;
+  }, [run, isRunning, isActiveSession]);
 
   useEffect(() => {
-    if (isActiveSession && isRunning && isTerminalReady && xtermRef.current) {
+    if (isActiveSession && isRunning && xtermRef.current) {
       const timer = setTimeout(() => {
         xtermRef.current?.focus();
       }, 50);
       return () => clearTimeout(timer);
     }
-  }, [isActiveSession, isRunning, isTerminalReady]);
+  }, [isActiveSession, isRunning]);
 
   const drainWriteQueue = useCallback(() => {
     const term = xtermRef.current;
@@ -260,7 +260,12 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
 
     xtermRef.current = term;
     fitRef.current = fit;
-    setIsTerminalReady(true);
+
+    if (isActiveSessionRef.current && isRunningRef.current) {
+      setTimeout(() => {
+        term.focus();
+      }, 50);
+    }
 
     let isPasting = false;
     term.attachCustomKeyEventHandler((keyboardEvent) => {

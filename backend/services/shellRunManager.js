@@ -76,6 +76,10 @@ function normalizeCwd(cwd) {
   return cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
 }
 
+function normalizeDescription(description) {
+  return typeof description === 'string' ? description.replace(/\s+/g, ' ').trim() : '';
+}
+
 export class ShellRunManager {
   constructor({
     io = null,
@@ -106,7 +110,7 @@ export class ShellRunManager {
     this.io = io;
   }
 
-  prepareRun({ providerId, sessionId, toolCallId = null, command = '', cwd = null, maxLines = getMaxShellResultLines() }) {
+  prepareRun({ providerId, sessionId, toolCallId = null, description = '', command = '', cwd = null, maxLines = getMaxShellResultLines() }) {
     if (!providerId) throw new Error('providerId is required to prepare a shell run');
     if (!sessionId) throw new Error('sessionId is required to prepare a shell run');
 
@@ -116,6 +120,7 @@ export class ShellRunManager {
       sessionId,
       toolCallId,
       mcpRequestId: null,
+      description: normalizeDescription(description),
       command,
       cwd: cwd,
       maxLines,
@@ -147,6 +152,7 @@ export class ShellRunManager {
     acpSessionId,
     toolCallId = null,
     mcpRequestId = null,
+    description = '',
     command,
     cwd = null,
     maxLines = getMaxShellResultLines()
@@ -154,10 +160,11 @@ export class ShellRunManager {
     const resolvedSessionId = sessionId || acpSessionId;
     let run = this.findPreparedRun({ providerId, sessionId: resolvedSessionId, toolCallId, command, cwd });
     if (!run) {
-      const prepared = this.prepareRun({ providerId, sessionId: resolvedSessionId, toolCallId, command, cwd, maxLines });
+      const prepared = this.prepareRun({ providerId, sessionId: resolvedSessionId, toolCallId, description, command, cwd, maxLines });
       run = this.runs.get(prepared.runId);
     }
 
+    run.description = normalizeDescription(description) || run.description;
     run.command = run.command || command;
     run.cwd = normalizeCwd(cwd || run.cwd);
     run.maxLines = maxLines || run.maxLines;
@@ -374,6 +381,7 @@ export class ShellRunManager {
       toolCallId: run.toolCallId,
       mcpRequestId: run.mcpRequestId,
       status: run.status,
+      description: run.description,
       command: run.command,
       cwd: run.cwd,
       transcript: run.transcript,

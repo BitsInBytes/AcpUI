@@ -37,64 +37,32 @@ The provider system orchestrates a complex sequence from server startup through 
 
 ### 1. Server Initialization & Provider Registry Load
 
-**File:** `backend/server.js` (startup), `backend/services/providerRegistry.js:84–124` (buildRegistry)
+**File:** `backend/server.js` (startup), `backend/services/providerRegistry.js` (Function: `buildRegistry`, Lines 110-160)
 
-When the AcpUI backend starts, `server.js` calls `providerRuntimeManager.init(io, serverBootId)`. This triggers the registry load: `buildRegistry()` reads `configuration/providers.json`, validates each provider entry (checks that the path exists and contains `provider.json`), normalizes provider IDs (lowercased, stripped of special chars), and sorts by order with the default provider first.
+When the AcpUI backend starts, `server.js` calls `providerRuntimeManager.init(io, serverBootId)`. This triggers the registry load: `buildRegistry()` reads `configuration/providers.json`, validates each provider entry, and normalizes provider IDs.
 
-```json
-// FILE: configuration/providers.json (Example)
-{
-  "defaultProviderId": "provider-a",
-  "providers": [
-    { "id": "provider-a", "path": "./providers/provider-a", "enabled": true },
-    { "id": "provider-b", "path": "./providers/provider-b", "enabled": true },
-    { "id": "provider-c", "path": "./providers/provider-c", "enabled": true }
-  ]
-}
-```
-
-**Critical Contract:** If a provider is disabled (`enabled: false`) or missing from the registry, it cannot be used. The default provider must exist and be enabled.
+---
 
 ### 2. Provider Configuration & Module Cache
 
-**File:** `backend/services/providerLoader.js:26–68` (getProvider), `backend/services/providerLoader.js:108–129` (getProviderModule)
+**File:** `backend/services/providerLoader.js` (Function: `getProvider`, Lines 26-68; Function: `getProviderModule`, Lines 108-129)
 
 For each registered provider, `getProvider(providerId)` loads three JSON files from the provider directory and merges them:
 
 ```javascript
 // FILE: backend/services/providerLoader.js (Lines 26-68)
 export function getProvider(providerId) {
-  const resolvedId = resolveProviderIdWithContext(providerId);
-  if (cachedProviders.has(resolvedId)) return cachedProviders.get(resolvedId);
-
-  const entry = getProviderEntry(resolvedId);
-  const basePath = entry.basePath || path.resolve(__dirname, '..', '..', entry.path);
-  const modulePath = path.join(basePath, 'index.js');
-
-  let providerData = JSON.parse(fs.readFileSync(path.join(basePath, 'provider.json'), 'utf8'));
-  let brandingData = {};
+  // ... resolvedId ...
+  let providerData;
   try {
-    brandingData = JSON.parse(fs.readFileSync(path.join(basePath, 'branding.json'), 'utf8'));
-  } catch { /* optional */ }
-
-  let userData = {};
-  try {
-    userData = JSON.parse(fs.readFileSync(path.join(basePath, 'user.json'), 'utf8'));
-  } catch { /* optional */ }
-
-  const { title, ...brandingFields } = brandingData;
+    providerData = JSON.parse(fs.readFileSync(path.join(basePath, 'provider.json'), 'utf8'));
+  } catch (err) {
+    // ... error handling ...
+  }
+  // ... load branding.json and user.json ...
   const config = {
-    providerId: resolvedId,
-    providerPath: entry.path,
-    basePath,
-    ...providerData,      // Merges provider.json
-    ...userData,          // Overrides with user.json
-    title,
-    branding: brandingFields,
+    // ... merge providerData, userData, branding ...
   };
-
-  const provider = { id: resolvedId, config, modulePath, basePath, path: entry.path };
-  cachedProviders.set(resolvedId, provider);
   return provider;
 }
 ```
@@ -136,7 +104,7 @@ All functions exported from the provider's `index.js` are wrapped in `bindProvid
 
 ### 3. ACP Client Creation & Daemon Spawn
 
-**File:** `backend/services/providerRuntimeManager.js:14–46` (init), `backend/services/acpClient.js:85–223` (start)
+**File:** `backend/services/providerRuntimeManager.js:14–46` (init), `backend/services/acpClient.js:85–188` (start)
 
 For each registered provider, a new `AcpClient` instance is created:
 
@@ -219,7 +187,7 @@ this.acpProcess.stdout.on('data', (data) => {
 
 ### 4. Handshake & Provider-Owned Initialization
 
-**File:** `backend/services/acpClient.js:197–224` (performHandshake)
+**File:** `backend/services/acpClient.js:190–218` (performHandshake)
 
 After the daemon process starts, `performHandshake()` waits 2 seconds for stdout to settle, then calls the provider's `performHandshake(client)` function:
 
@@ -396,7 +364,7 @@ export function getMcpServers(providerId) {
 
 ### 7. Message Interception & Routing
 
-**File:** `backend/services/acpClient.js:225–252` (handleAcpMessage)
+**File:** `backend/services/acpClient.js:219–253` (handleAcpMessage)
 
 Every message from the daemon goes through the provider's `intercept()` function before routing:
 
@@ -2098,3 +2066,50 @@ The provider system is AcpUI's pluggable adapter architecture. It decouples the 
 Implementing a new provider requires understanding these contracts, writing the four config files, implementing the `index.js` functions, and registering in `configuration/providers.json`. The backend and frontend remain completely agnostic to provider-specific logic; all complexity lives in the provider module.
 
 For agents reading this guide: you have the complete architecture, exact file paths, line numbers, function signatures, and patterns for implementation. You can now implement a provider from scratch, debug provider issues, or understand how any provider-specific behavior is routed through the system.
+## Tool Invocation V2 Contract
+
+ACP tool routing now uses a canonical tool invocation layer instead of asking the
+generic ACP update handler to infer AcpUI tool identity from display strings.
+
+Each provider must export `extractToolInvocation(update, context)`. This function is
+provider-owned: it parses that provider's raw tool naming conventions and returns a
+canonical tool invocation object.
+
+The provider's `provider.json` `toolIdPattern` is the source of truth for the MCP tool id
+shape. Provider code should read that value instead of hard-coding prefixes such as
+`mcp__...`, `mcp_...`, or `@.../...`. The generic `toolIdPattern` helper only compiles the
+configured placeholder pattern; it does not define provider-specific MCP formats.
+
+Expected return shape:
+
+```javascript
+{
+  toolCallId,
+  kind,          // "acpui_mcp", "mcp", "provider_builtin", or "unknown"
+  rawName,
+  canonicalName,
+  mcpServer,
+  mcpToolName,
+  input,
+  title,
+  filePath,
+  category
+}
+```
+
+The generic backend pipeline is:
+
+1. `normalizeUpdate(update)` handles provider-specific update shape.
+2. `normalizeTool(event, update)` preserves legacy display/category behavior.
+3. `extractToolInvocation(update, context)` returns canonical identity and input.
+4. `toolInvocationResolver` merges provider data with cached sticky metadata.
+5. `toolRegistry` dispatches AcpUI-owned tools by canonical name.
+6. `acpUpdateHandler` emits the normalized `system_event`.
+
+`acpUpdateHandler.js` should not contain direct checks for AcpUI UX MCP tool names or
+title substrings. Add new UX MCP tool behavior through the backend tool registry and a
+provider extraction fixture.
+
+Provider-specific string parsing belongs in the provider adapter or provider-local helper
+tests. Generic helpers may parse JSON/nested argument objects, but they must not decide
+which provider or MCP tool a string represents.

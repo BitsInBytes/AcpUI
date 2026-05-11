@@ -76,6 +76,14 @@ export function useChatManager(
       }));
     };
 
+    const shellRunSnapshotPatch = (snapshot: ShellRunSnapshot, status = snapshot.status): Partial<SystemEvent> => ({
+      shellRunId: snapshot.runId,
+      shellState: status,
+      command: snapshot.command,
+      cwd: snapshot.cwd,
+      ...(snapshot.description ? { title: `Invoke Shell: ${snapshot.description}` } : {})
+    });
+
     // Pending sub-agents — session created lazily on first token
     const pendingSubAgents = new Map<string, { providerId: string; acpSessionId: string; uiId: string; index: number; name: string; prompt: string; agent: string; parentSessionId: string; parentUiId: string; model: string }>();
 
@@ -180,34 +188,20 @@ export function useChatManager(
     socket.on('shell_run_prepared', (snapshot: ShellRunSnapshot) => {
       if (!snapshot?.runId) return;
       useShellRunStore.getState().upsertSnapshot(snapshot);
-      patchShellRunToolStep(snapshot.runId, {
-        shellRunId: snapshot.runId,
-        shellState: snapshot.status,
-        command: snapshot.command,
-        cwd: snapshot.cwd
-      });
+      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot));
     });
 
     socket.on('shell_run_snapshot', (snapshot: ShellRunSnapshot) => {
       if (!snapshot?.runId) return;
       useShellRunStore.getState().upsertSnapshot(snapshot);
-      patchShellRunToolStep(snapshot.runId, {
-        shellRunId: snapshot.runId,
-        shellState: snapshot.status,
-        command: snapshot.command,
-        cwd: snapshot.cwd
-      });
+      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot));
     });
 
     socket.on('shell_run_started', (snapshot: ShellRunSnapshot) => {
       if (!snapshot?.runId) return;
       const started = { ...snapshot, status: snapshot.status || 'running' } as ShellRunSnapshot;
       useShellRunStore.getState().markStarted(started);
-      patchShellRunToolStep(snapshot.runId, { 
-        shellState: started.status,
-        command: started.command,
-        cwd: started.cwd
-      });
+      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(started, started.status));
     });
 
     socket.on('shell_run_output', (data: { providerId: string; sessionId: string; runId: string; chunk: string; maxLines?: number }) => {

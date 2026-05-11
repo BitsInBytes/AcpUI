@@ -17,7 +17,8 @@ Gemini implements all required provider contract functions:
 - **extractToolOutput()** — Multi-stage lookup for tool output. Fixes `read_file` by reading from disk directly. Reconstructs dropped structured outputs (like `list_directory`) using cached arguments.
 - **extractFilePath()** — Fallback chain to find paths in `locations` arrays, `content` arrays, and parsed JSON `arguments`.
 - **extractDiffFromToolCall()** — Extracts unified diffs or raw text from write/edit operations so they are syntax-highlighted in the UI immediately.
-- **normalizeTool()** — Maps raw ACP `kind` enums (`read`, `edit`, `search`) to UI tool categories. Synthesizes human-readable titles when missing and appends target paths for visibility.
+- **extractToolInvocation()** — **V2 Tool Routing**: Extracts canonical identity using `toolIdPattern` (`mcp_{mcpName}_{toolName}`) and uses `findDeep` to recover `description` and `command` from nested Gemini arguments.
+- **normalizeTool()** — Maps raw ACP `kind` enums (`read`, `edit`, `search`) to UI tool categories. Synthesizes human-readable titles, extracts shell descriptions from `"Running: <desc>"` labels, and appends target paths.
 - **categorizeToolCall()** — Maps Gemini's standardized tool names to UI categories (`file_read`, `shell`, etc.).
 - **parseExtension()** — Routes Gemini's protocol extensions (e.g. `metadata` for Context % and `provider_status` for Quota %).
 - **prepareAcpEnvironment()** — Initializes background OAuth Quota fetching if enabled in `user.json`.
@@ -107,11 +108,50 @@ export async function performHandshake(acpClient) {
 
 ---
 
-## Tool Pipeline — Reconstructing Dropped Outputs
+## Tool Pipeline — V2 Routing and Output Reconstruction
 
-The Gemini CLI aggressively summarizes or drops structured tool outputs (like directory listings or search results) to save context tokens. The AcpUI provider actively combats this to ensure the user sees accurate data.
+Gemini's tool handling uses the V2 Tool Invocation system to resolve canonical identities before combatting the CLI's aggressive output summarization.
 
-### 1. Argument Caching (intercept)
+### 1. V2 Tool Invocation Routing
+
+**File:** `providers/gemini/index.js` (Lines 589–653)
+
+Gemini implements `extractToolInvocation()` to provide authoritative metadata. It uses `toolIdPattern` (`mcp_{mcpName}_{toolName}`) to resolve the canonical tool name. Because Gemini CLI sometimes wraps tool arguments in unexpected nested keys, this function includes a `findDeep` helper to recover `description` and `command` for the backend registry.
+
+```javascript
+export function extractToolInvocation(update = {}, context = {}) {
+  // ... (collects input objects)
+
+  // Deep search for description and command if Gemini CLI wraps them in unexpected keys
+  if (isAcpUiTool && (!input.description || !input.command)) {
+    const findDeep = (obj, targetKey) => {
+      if (!obj || typeof obj !== 'object') return null;
+      if (obj[targetKey]) return obj[targetKey];
+      for (const val of Object.values(obj)) {
+        const res = findDeep(val, targetKey);
+        if (res) return res;
+      }
+      return null;
+    };
+    // ...
+  }
+
+  return {
+    toolCallId: update.toolCallId || event.id,
+    kind: isAcpUiTool ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+    rawName,
+    canonicalName,
+    mcpServer: patternMatch?.mcpName || (isAcpUiTool ? config.mcpName : undefined),
+    mcpToolName: patternMatch?.toolName || (isAcpUiTool ? canonicalName : undefined),
+    input,
+    title: event.title || update.title || (isAcpUiTool ? '' : normalized.title),
+    filePath: normalized.filePath || event.filePath,
+    category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
+  };
+}
+```
+
+### 2. Argument Caching (intercept)
 
 **File:** `providers/gemini/index.js` (Lines 94-99)
 
@@ -283,8 +323,9 @@ Unlike other providers, Gemini does not physically truncate the JSONL file when 
 | 205–302 | extractToolOutput() | Extracts from `result` / `content`, fixes `read_file` disk reads, reconstructions. |
 | 314–343 | extractFilePath() | Extracts file paths from locations, content arrays, or parsed JSON args. |
 | 355–385 | extractDiffFromToolCall() | Pulls unified diff patches from Write/Edit tools for live rendering. |
-| 413–487 | normalizeTool() | Maps `kind` enums, synthesizes titles, strips MCP prefixes. |
+| 413–487 | normalizeTool() | Maps `kind` enums, synthesizes titles, extracts shell descriptions from `"Running: <desc>"` labels, strips MCP prefixes. |
 | 492–513 | categorizeToolCall() | Routes AcpUI MCP tools and standard categories. |
+| 589–653 | extractToolInvocation() | **V2 Tool Routing**: Canonical identity extraction; uses `findDeep` to recover `description` and `command` from nested Gemini arguments. |
 | 592–614 | parseExtension() | Maps `{prefix}commands/available`, `{prefix}metadata`, and `{prefix}provider/status`. |
 | 610-631 | prepareAcpEnvironment() | Bootstraps background quota polling if allowed. |
 | 660–696 | findSessionDir() / getShortId() | Resolves Gemini's deep project-hash directory structure. |

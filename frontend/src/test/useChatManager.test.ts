@@ -98,6 +98,7 @@ describe('useChatManager hook', () => {
         sessionId: 'acp-1',
         runId: 'shell-run-1',
         status: 'running',
+        description: 'Run test suite',
         command: 'npm test',
         cwd: 'D:/repo',
         transcript: '$ npm test\n'
@@ -125,6 +126,7 @@ describe('useChatManager hook', () => {
 
     const toolStep = (useSessionLifecycleStore.getState().sessions[0].messages[0] as any).timeline[0];
     expect(toolStep.event.shellState).toBe('exited');
+    expect(toolStep.event.title).toBe('Invoke Shell: Run test suite');
     expect(toolStep.event.command).toBe('npm test');
     expect(toolStep.event.cwd).toBe('D:/repo');
     expect(toolStep.event.output).toBe('PASS');

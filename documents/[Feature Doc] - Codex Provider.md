@@ -14,6 +14,7 @@ The Codex provider connects AcpUI to the `codex-acp` executable. The main implem
 - Finds, clones, archives, restores, and parses recursive Codex rollout JSONL files.
 - **Fetches background quota status** on startup, turn completion, and 30s poll.
 - **Manages automatic OAuth token refresh** by deriving `client_id` from JWT access tokens in `auth.json`.
+- **Extracts canonical tool identity** via `extractToolInvocation()` using `toolIdPattern` (`{mcpName}/{toolName}`).
 - **Tracks active prompts** to only poll quota while the daemon is actively processing messages.
 - **Replays persisted context usage** through `emitCachedContext(sessionId)` when the backend loads or hot-resumes a session.
 
@@ -42,11 +43,11 @@ The Codex provider connects AcpUI to the `codex-acp` executable. The main implem
 
 3. **Environment Preparation**
 
-   `providers/codex/index.js:454` injects configured `CODEX_API_KEY` or `OPENAI_API_KEY` into the child environment. It also supports `noBrowser`.
+   `providers/codex/index.js` (Function: `prepareAcpEnvironment`, Line: 344) injects configured `CODEX_API_KEY` or `OPENAI_API_KEY` into the child environment. It also supports `noBrowser`.
 
 4. **Handshake**
 
-   `providers/codex/index.js:473` sends:
+   `providers/codex/index.js` (Function: `performHandshake`, Line: 430) sends:
 
    ```json
    {
@@ -60,23 +61,23 @@ The Codex provider connects AcpUI to the `codex-acp` executable. The main implem
 
 5. **Session Creation**
 
-   `backend/sockets/sessionHandlers.js:330-332` sends `session/new` with `cwd`, AcpUI MCP server config, and provider session params.
+   `backend/sockets/sessionHandlers.js` (Lines 214-268) sends `session/new` with `cwd`, AcpUI MCP server config, and provider session params.
 
 6. **Initial Model And Config Capture**
 
-   `backend/sockets/sessionHandlers.js:37` calls `captureModelState`. The helper captures both model state and normalized config options. The normalization hook is `backend/services/sessionManager.js:65`.
+   `backend/sockets/sessionHandlers.js` (Function: `captureModelState`) calls `captureModelState`. The helper captures both model state and normalized config options.
 
 7. **Config Option Updates**
 
-   `providers/codex/index.js:65` filters `model` and marks `reasoning_effort`. `providers/codex/index.js:96` converts `config_option_update` into `_codex/config_options`.
+   `providers/codex/index.js` (Function: `intercept`, Line: 178) filters `model` and marks `reasoning_effort`. `providers/codex/index.js` (Line 202) converts `config_option_update` into `_codex/config_options`.
 
 8. **Slash Commands**
 
-   `providers/codex/index.js:96` also converts `available_commands_update` to `_codex/commands/available` and prefixes `/`.
+   `providers/codex/index.js` (Function: `intercept`, Line: 163) also converts `available_commands_update` to `_codex/commands/available` and prefixes `/`.
 
 9. **Tool Calls**
 
-   `providers/codex/index.js:198` extracts output from ACP content blocks or Codex raw output. `providers/codex/index.js:399` normalizes Codex tool titles like `Tool: AcpUI/ux_invoke_shell`.
+   `providers/codex/index.js` (Function: `extractToolOutput`, Line: 116) extracts output from ACP content blocks or Codex raw output. `providers/codex/index.js` (Function: `extractToolInvocation`, Line: 302) implements `extractToolInvocation()` to resolve canonical identity and input using `toolIdPattern` (e.g. `{mcpName}/{toolName}`). `normalizeTool()` uses the same pattern to strip `Tool: AcpUI/` prefixes for display.
 
 10. **Session Files**
 
@@ -86,11 +87,11 @@ The Codex provider connects AcpUI to the `codex-acp` executable. The main implem
 
 11. **Quota & OAuth Management**
 
-    `providers/codex/index.js:500` starts background fetching in `prepareAcpEnvironment()`.
+    `providers/codex/index.js` (Line 365) starts background fetching in `prepareAcpEnvironment()`.
     - **Initial Load:** Fetches quota immediately on boot and emits `_codex/provider/status`.
-    - **Reactive Refresh:** `fetchCodexQuota()` (Lines 769-793) implements a retry loop. On 401, it reads `auth.json`, refreshes the token, saves it, and retries.
-    - **Client ID Derivation:** `extractClientIdFromAccessToken()` (Lines 840-854) decodes the JWT `access_token` from `auth.json` to find the `client_id` automatically.
-    - **Poll Control:** `intercept()` (Lines 220-336) tracks `_activePromptCount`. Polling only occurs when at least one prompt is in-flight and stops when all turns end.
+    - **Reactive Refresh:** `fetchCodexQuota()` (Lines 430-456) implements a retry loop. On 401, it reads `auth.json`, refreshes the token, saves it, and retries.
+    - **Client ID Derivation:** `extractClientIdFromAccessToken()` (Lines 506-516) decodes the JWT `access_token` from `auth.json` to find the `client_id` automatically.
+    - **Poll Control:** `intercept()` (Lines 116-248) tracks `_activePromptCount`. Polling only occurs when at least one prompt is in-flight and stops when all turns end.
 
 ## Architecture Diagram
 
@@ -183,6 +184,7 @@ Frontend receives:
 | `providers/codex/index.js` | `getMcpServerMeta` | Injects MCP timeout overrides into server config `_meta` when `acpSupportsMcpTimeouts` is enabled |
 | `providers/codex/index.js` | `emitCachedContext` | Emits cached `{protocolPrefix}metadata` context usage after session load or hot-resume |
 | `providers/codex/index.js` | `setConfigOption` | Routes mode/model/reasoning changes |
+| `providers/codex/index.js` | `extractToolInvocation` | V2 canonical tool identity extraction |
 | `providers/codex/index.js` | `getSessionPaths`, `cloneSession`, `parseSessionHistory` | Rollout lifecycle |
 | `backend/sockets/sessionHandlers.js` | `captureModelState` | Captures response-time config options |
 | `backend/services/sessionManager.js` | `normalizeProviderConfigOptions` | Shared provider config normalization |

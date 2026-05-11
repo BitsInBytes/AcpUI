@@ -77,6 +77,7 @@ describe('shellRunManager', () => {
       providerId: 'provider-a',
       sessionId: 'acp-1',
       toolCallId: 'tool-1',
+      description: ' Run   test suite ',
       command: 'npm test',
       cwd: 'D:/repo',
       maxLines: 5
@@ -87,6 +88,7 @@ describe('shellRunManager', () => {
       sessionId: 'acp-1',
       toolCallId: 'tool-1',
       status: 'pending',
+      description: 'Run test suite',
       command: 'npm test',
       cwd: 'D:/repo',
       maxLines: 5
@@ -102,6 +104,7 @@ describe('shellRunManager', () => {
       providerId: 'provider-a',
       sessionId: 'acp-1',
       toolCallId: 'tool-1',
+      description: 'Initial description',
       command: 'npm test',
       cwd: 'D:/repo',
       maxLines: 10
@@ -112,6 +115,7 @@ describe('shellRunManager', () => {
       sessionId: 'acp-1',
       toolCallId: 'tool-1',
       mcpRequestId: 42,
+      description: 'Run test suite',
       command: 'npm test',
       cwd: 'D:/repo'
     });
@@ -127,7 +131,8 @@ describe('shellRunManager', () => {
       rows: 30
     }));
     expect(ioMock.room.emit).toHaveBeenCalledWith('shell_run_started', expect.objectContaining({
-      runId: prepared.runId
+      runId: prepared.runId,
+      description: 'Run test suite'
     }));
     expect(ioMock.room.emit).toHaveBeenCalledWith('shell_run_output', expect.objectContaining({
       runId: prepared.runId,

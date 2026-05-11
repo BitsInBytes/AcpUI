@@ -47,10 +47,10 @@ The system has **three components**:
 
 ### 1. **Backend Tool Handlers** (`backend/mcp/mcpServer.js`)
 
-Where the actual tool logic lives. These are plain async functions that receive `{ command, args, providerId, ... }` and resolve with `{ content: [{ type: 'text', text: '...' }] }` or throw errors.
+Where the actual tool logic lives. These are plain async functions that receive `{ description, command, args, providerId, ... }` and resolve with `{ content: [{ type: 'text', text: '...' }] }` or throw errors.
 ```javascript
 // FILE: backend/mcp/mcpServer.js (Lines 70-85)
-tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
   // Delegate to shellRunManager for interactive terminal execution.
 };
 
@@ -109,7 +109,7 @@ router.get('/tools', (req, res) => {
     { 
       name: 'ux_invoke_shell', 
       description: 'Execute a shell command in a real terminal with live streaming output and user-interactive stdin while the process is running...',
-      inputSchema: { type: 'object', properties: { command: {...}, cwd: {...} }, required: ['command'] }
+      inputSchema: { type: 'object', properties: { description: {...}, command: {...}, cwd: {...} }, required: ['description', 'command'] }
     },
     { 
       name: 'ux_invoke_subagents',
@@ -415,9 +415,10 @@ const toolList = [
       type: 'object',
       properties: {
         command: { type: 'string', description: '...' },
+        description: { type: 'string', description: 'Short user-facing run description for the tool header.' },
         cwd: { type: 'string', description: '...' },
       },
-      required: ['command'],
+      required: ['description', 'command'],
     }
   },
   // ... more tools
@@ -433,7 +434,7 @@ res.json({ tools: toolList, serverName });
 export function createToolHandlers(io) {
   const tools = {};
 
-  tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {  // LINE 70
+  tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {  // LINE 70
     // Interactive implementation via shellRunManager
   };
 
@@ -452,7 +453,7 @@ export function createToolHandlers(io) {
 ### The Contract
 
 1. **Tool name must match:** `inputSchema` in GET /tools and `tools[name]` in createToolHandlers
-2. **Input properties must match:** What's in `inputSchema.properties` must be passable to the handler
+2. **Input properties must match:** What's in `inputSchema.properties` must be passable to the handler. For `ux_invoke_shell`, `description` is required and must flow into `ShellRunManager` snapshots so the UI can render `Invoke Shell: <description>`.
 3. **Required fields must match:** Fields marked `required: true` in schema must be the handler's required params
 
 ### Why It Breaks
@@ -738,3 +739,41 @@ The AcpUI MCP server is a clean two-process design:
 2. Add schema to `mcpApi.js:GET /tools`
 3. Add tests
 4. Verify no lint errors and tests pass
+## Tool Invocation State Integration
+
+AcpUI MCP handlers are authoritative for their own tool arguments. When a handler receives
+provider/session/tool-call metadata, it upserts canonical tool metadata into
+`backend/services/tools/toolCallState.js`.
+
+For example, `ux_invoke_shell` stores:
+
+```javascript
+{
+  identity: {
+    kind: "acpui_mcp",
+    canonicalName: "ux_invoke_shell",
+    mcpServer,
+    mcpToolName: "ux_invoke_shell"
+  },
+  input: { description, command, cwd },
+  display: {
+    title: "Invoke Shell: <description>",
+    titleSource: "mcp_handler"
+  }
+}
+```
+
+The ACP stream may report the `tool_call` before or after the MCP handler runs. Both paths
+merge through the same tool state cache, keyed by provider id, ACP session id, and tool call
+id when available. This prevents the ACP update handler from scraping shell descriptions,
+commands, or sub-agent identity from provider display titles.
+
+Future AcpUI UX MCP tools should:
+
+1. Add the MCP schema in `backend/routes/mcpApi.js`.
+2. Add the handler in `backend/mcp/mcpServer.js`.
+3. Upsert authoritative tool metadata into `toolCallState` when request metadata includes a
+   tool call id.
+4. Add a backend tool registry handler for UX-specific lifecycle behavior.
+5. Add provider `extractToolInvocation` fixtures only for providers whose raw ACP stream
+   needs provider-owned parsing.

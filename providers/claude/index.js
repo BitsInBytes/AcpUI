@@ -3,6 +3,8 @@ import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { getProvider } from '../../backend/services/providerLoader.js';
+import { collectInputObjects, mergeInputObjects } from '../../backend/services/tools/toolInputUtils.js';
+import { matchToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
 import { getLatestClaudeQuota, startClaudeQuotaProxy } from './quotaProxy.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -331,14 +333,15 @@ export function normalizeTool(event, update) {
   const { config } = getProvider();
   
   let toolName = update?.kind || update?._meta?.claudeCode?.toolName || '';
-  
-  // The MCP tool name sometimes comes through in the title, not the id
+
+  // The MCP tool name sometimes comes through in the title, not the id.
+  // Also try matching the raw toolName itself (kind / _meta) so that extraction works
+  // even when event.title is already a human-readable label like "Invoke Shell".
   const targetString = event.title || '';
-  const mcpPrefix = `mcp__${config.mcpName}__`;
-  
-  if (targetString.toLowerCase().startsWith(mcpPrefix.toLowerCase())) {
-    toolName = targetString.slice(mcpPrefix.length);
-  }
+  const titlePatternMatch = matchToolIdPattern(targetString, config);
+  const kindPatternMatch = !titlePatternMatch ? matchToolIdPattern(toolName, config) : null;
+  const patternMatch = titlePatternMatch || kindPatternMatch;
+  if (patternMatch?.toolName) toolName = patternMatch.toolName;
 
   // Fallback if neither kind nor title had the toolName
   if (!toolName && event.id) {
@@ -361,7 +364,7 @@ export function normalizeTool(event, update) {
     toolName = toolName.toLowerCase();
     
     // If the title is missing or just the MCP prefix name, make it human-readable
-    if (!title || targetString.toLowerCase().startsWith(mcpPrefix.toLowerCase())) {
+    if (!title || patternMatch) {
       const UX_TOOL_TITLES = { ux_invoke_shell: 'Invoke Shell', ux_invoke_subagents: 'Invoke Subagents', ux_invoke_counsel: 'Invoke Counsel' };
       title = UX_TOOL_TITLES[toolName] || toolName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
     }
@@ -398,6 +401,48 @@ export function normalizeTool(event, update) {
   }
 
   return { ...event, toolName, title };
+}
+
+export function extractToolInvocation(update = {}, context = {}) {
+  const event = context.event || {};
+  const { config } = getProvider();
+  const input = mergeInputObjects(collectInputObjects(
+    update.rawInput,
+    update.arguments,
+    update.params,
+    update.input,
+    update.toolCall?.arguments
+  ));
+
+  // Match the raw MCP tool id against the pattern to resolve canonical identity.
+  // Prefer raw update fields (which always carry the original daemon tool id) over the
+  // already-normalised event title (which may be "Invoke Shell" at this point).
+  // Fall back to event.title only when none of the update fields carry the raw id — this
+  // covers the case where extractToolInvocation is called directly (e.g. in tests) with an
+  // event whose title IS the raw MCP id rather than a human-readable label.
+  const rawId = update.title || update.kind || update?._meta?.claudeCode?.toolName || event.title || '';
+  const patternMatch = matchToolIdPattern(rawId, config);
+  const isMcpTitle = Boolean(patternMatch);
+
+  // canonicalName: prefer the pattern-extracted tool name over event.toolName.
+  // event.toolName was set by normalizeTool() in acpUpdateHandler before this call,
+  // but it may also still carry the raw MCP id when the title didn't match the pattern.
+  // Falling back to event.toolName handles provider-builtin tools that have no pattern.
+  const canonicalName = patternMatch?.toolName || event.toolName || '';
+
+  return {
+    toolCallId: update.toolCallId || event.id,
+    kind: isMcpTitle ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+    rawName: update.kind || update?._meta?.claudeCode?.toolName || rawId || event.toolName || '',
+    canonicalName,
+    mcpServer: patternMatch?.mcpName,
+    mcpToolName: patternMatch?.toolName,
+    input,
+    // Use the already-normalised title from the event (set by normalizeTool in acpUpdateHandler).
+    title: event.title || update.title || '',
+    filePath: event.filePath,
+    category: categorizeToolCall({ ...event, toolName: canonicalName }) || {}
+  };
 }
 
 /**

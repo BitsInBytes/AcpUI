@@ -17,7 +17,8 @@ Claude implements all required provider contract functions:
 - **extractToolOutput()** — Multi-stage lookup for tool output in various Claude data shapes
 - **extractFilePath()** — 5-step detection for file paths in tool metadata
 - **extractDiffFromToolCall()** — Extracts unified diffs from tool output
-- **normalizeTool()** — Strips MCP prefix and applies tool name aliases
+- **extractToolInvocation()** — **V2 Tool Routing**: Extracts canonical identity and arguments using `toolIdPattern`
+- **normalizeTool()** — Strips MCP prefix using pattern and applies tool name aliases
 - **categorizeToolCall()** — Maps Claude's tool names to UI categories
 - **parseExtension()** — Routes Claude's `_anthropic/` protocol extensions
 - **prepareAcpEnvironment()** — **Unique to Claude**: Starts the quota proxy and injects `ANTHROPIC_BASE_URL`
@@ -436,27 +437,65 @@ if (
 
 ## Tool Pipeline — How Claude Tools Are Normalized
 
-Claude's tool handling involves several transformations:
+Claude's tool handling uses the V2 Tool Invocation system, which separates display normalization from canonical identity resolution.
 
-### 1. Tool ID Pattern Detection
+### 1. V2 Tool Invocation Routing
 
-**File:** `providers/claude/index.js` (Lines 232–237)
+**File:** `providers/claude/index.js` (Lines 406–445)
 
-Claude's tools come through with a title like `mcp__AcpUI__ux_invoke_shell` (note the **DOUBLE underscore**):
+Claude implements `extractToolInvocation()` to provide authoritative metadata for the backend tool registry. It uses `toolIdPattern` from `provider.json` to resolve the canonical tool name.
 
 ```javascript
-// FILE: providers/claude/index.js (Lines 232-237)
-const targetString = event.title || '';
-const mcpPrefix = `mcp__${config.mcpName}__`;  // Becomes "mcp__AcpUI__"
+export function extractToolInvocation(update = {}, context = {}) {
+  const event = context.event || {};
+  const { config } = getProvider();
+  const input = mergeInputObjects(collectInputObjects(
+    update.rawInput,
+    update.arguments,
+    update.params,
+    update.input,
+    update.toolCall?.arguments
+  ));
 
-if (targetString.toLowerCase().startsWith(mcpPrefix.toLowerCase())) {
-  toolName = targetString.slice(mcpPrefix.length);  // Strip prefix to get "ux_invoke_shell"
+  // Match the raw MCP tool id against the pattern to resolve canonical identity.
+  const rawId = update.title || update.kind || update?._meta?.claudeCode?.toolName || event.title || '';
+  const patternMatch = matchToolIdPattern(rawId, config);
+  const canonicalName = patternMatch?.toolName || event.toolName || '';
+
+  return {
+    toolCallId: update.toolCallId || event.id,
+    kind: patternMatch ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+    rawName: update.kind || update?._meta?.claudeCode?.toolName || rawId || event.toolName || '',
+    canonicalName,
+    mcpServer: patternMatch?.mcpName,
+    mcpToolName: patternMatch?.toolName,
+    input,
+    title: event.title || update.title || '',
+    filePath: event.filePath,
+    category: categorizeToolCall({ ...event, toolName: canonicalName }) || {}
+  };
 }
 ```
 
-**Critical:** This is a DOUBLE underscore. Single underscore patterns (used by other daemons) will not match.
+### 2. Tool ID Pattern Detection
 
-### 2. Tool Name Aliases
+**File:** `providers/claude/index.js` (Lines 336–341)
+
+Claude's tools come through with identifiers matching the pattern `mcp__{mcpName}__{toolName}` (note the **DOUBLE underscore**). `normalizeTool()` uses `matchToolIdPattern` to strip this prefix for display:
+
+```javascript
+// FILE: providers/claude/index.js (Lines 336-341)
+const targetString = event.title || '';
+const titlePatternMatch = matchToolIdPattern(targetString, config);
+const kindPatternMatch = !titlePatternMatch ? matchToolIdPattern(toolName, config) : null;
+const patternMatch = titlePatternMatch || kindPatternMatch;
+
+if (patternMatch?.toolName) toolName = patternMatch.toolName;
+```
+
+**Critical:** The `toolIdPattern` in `provider.json` is the source of truth. For Claude, this is `mcp__{mcpName}__{toolName}`.
+
+### 3. Tool Name Aliases
 
 **File:** `providers/claude/index.js` (Lines 246–249)
 
@@ -1350,6 +1389,7 @@ export function parseExtension(method, params) {
 | 137–157 | extractClaudeToolResponse() helper | Recursive response parsing |
 | 162–201 | extractFilePath() | 5-step file path detection |
 | 206–221 | extractDiffFromToolCall() | Diff extraction |
+| 406–445 | extractToolInvocation() | V2 canonical tool identity extraction |
 | 226–297 | normalizeTool() | Tool normalization and title construction |
 | 232–237 | mcpPrefix detection | Strip `mcp__AcpUI__` prefix |
 | 246–249 | Tool name aliases | 'read' → 'read_file', etc. |

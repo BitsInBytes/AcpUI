@@ -45,19 +45,16 @@ The sidebar displays:
 ## How It Works — End-to-End Flow
 
 ### 1. App Boot & Socket Hydration
-**File:** `frontend/src/hooks/useSocket.ts` (Lines 28-61)
+**File:** `frontend/src/hooks/useSocket.ts` (Lines 42-56)
 
 When the frontend starts, `useSocket.ts` establishes a Socket.IO connection and receives provider metadata:
 
 ```typescript
-// FILE: frontend/src/hooks/useSocket.ts (Lines 28-56)
+// FILE: frontend/src/hooks/useSocket.ts (Lines 42-56)
 socket.on('providers', (payload) => {
-  useSystemStore.setState({ 
-    providers: payload.providers,
-    defaultProviderId: payload.defaultProviderId,
-    orderedProviderIds: payload.providers.map(p => p.providerId)
-  });
+  useSystemStore.getState().setProviders(payload.defaultProviderId || null, payload.providers || []);
 });
+```
 
 socket.on('branding', (payload) => {
   useSystemStore.setState({ branding: payload });

@@ -37,32 +37,20 @@ A soft-delete system that moves inactive sessions into an archive while preservi
 ## How It Works — End-to-End Flow
 
 ### Step 1: User Right-Clicks Session → Removes with Archive (Default)
-**File:** `frontend/src/components/Sidebar.tsx` (Lines 184–210)
+**File:** `frontend/src/components/Sidebar.tsx` (Function: `handleRemoveSession`, Lines 184-210)
 
 User right-clicks a session and selects "Delete" (or via keyboard shortcut). The Sidebar invokes:
 
 ```typescript
 // FILE: frontend/src/components/Sidebar.tsx (Lines 184-210)
 const handleRemoveSession = (sessionId: string) => {
-  const deletePermanent = useSystemStore.getState().deletePermanent;
-  const isSubAgent = sessions.find(s => s.id === sessionId)?.isSubAgent;
-  
-  if (deletePermanent || isSubAgent) {
-    // Permanent delete
-    socket.emit('delete_session', { providerId, uiId: sessionId });  // LINE 188
+  // ... determines if permanent delete or archive ...
+  if (deletePermanent || session?.isSubAgent) {
+    socket.emit('delete_session', { uiId: sessionId });
   } else {
-    // Archive (default)
-    socket.emit('archive_session', { providerId, uiId: sessionId });  // LINE 191
+    socket.emit('archive_session', { ...payload, uiId: sessionId });
   }
-  
-  // Recursively remove descendants from local state
-  const descendants = findDescendants(sessionId);  // LINE 193-209
-  descendants.forEach(d => {
-    socket.emit('archive_session', { providerId, uiId: d.id });
-  });
-  
-  // Remove all from Zustand store
-  setSessions(sessions.filter(s => ![sessionId, ...descendants.map(d => d.id)].includes(s.id)));
+  // ... recursively removes descendants from local state ...
 };
 ```
 

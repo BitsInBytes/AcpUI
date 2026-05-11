@@ -10,6 +10,7 @@ const requiredExports = [
   'extractToolOutput',
   'extractFilePath',
   'extractDiffFromToolCall',
+  'extractToolInvocation',
   'normalizeTool',
   'categorizeToolCall',
   'parseExtension',

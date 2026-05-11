@@ -8,6 +8,8 @@ vi.mock('../../../backend/services/providerLoader.js', () => ({
   getProvider: () => ({
     config: {
       protocolPrefix: '_kiro.dev/',
+      mcpName: 'AcpUI',
+      toolIdPattern: '@{mcpName}/{toolName}',
       clientInfo: { name: 'AcpUI', version: '1.0.0' },
       paths: {
         sessions: '/mock/sessions',
@@ -305,6 +307,25 @@ describe('Kiro Provider', () => {
       const update = { name: 'spawn_helpers' };
       const normalized = kiro.normalizeTool(event, update);
       expect(normalized.title).toBe('Spawn Helpers');
+    });
+
+    it('extracts canonical MCP invocation metadata from Kiro names', () => {
+      const invocation = kiro.extractToolInvocation(
+        {
+          toolCallId: 'tooluse_1',
+          name: '@AcpUI/ux_invoke_shell',
+          arguments: { description: 'Run tests', command: 'npm test' }
+        },
+        { event: { id: 'tooluse_1', title: 'Running: @AcpUI/ux_invoke_shell' } }
+      );
+
+      expect(invocation).toEqual(expect.objectContaining({
+        toolCallId: 'tooluse_1',
+        canonicalName: 'ux_invoke_shell',
+        mcpServer: 'AcpUI',
+        mcpToolName: 'ux_invoke_shell',
+        input: expect.objectContaining({ description: 'Run tests', command: 'npm test' })
+      }));
     });
   });
 

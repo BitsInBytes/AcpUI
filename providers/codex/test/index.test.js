@@ -9,6 +9,7 @@ const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
     protocolPrefix: '_codex/',
     mcpName: 'AcpUI',
+    toolIdPattern: '{mcpName}/{toolName}',
     clientInfo: { name: 'AcpUI', version: '1.0.0' },
     authMethod: 'auto',
     toolCategories: {
@@ -630,6 +631,31 @@ describe('Codex Provider', () => {
       expect(codex.categorizeToolCall(event)).toEqual({ category: 'shell', isShellCommand: true });
     });
 
+    it('extracts canonical tool invocation metadata from Codex MCP raw input', () => {
+      const invocation = codex.extractToolInvocation(
+        {
+          toolCallId: 't1',
+          title: 'Tool: AcpUI/ux_invoke_shell',
+          rawInput: {
+            invocation: {
+              server: 'AcpUI',
+              tool: 'ux_invoke_shell',
+              arguments: { description: 'Run tests', command: 'npm test', cwd: 'D:/repo' }
+            }
+          }
+        },
+        { event: { id: 't1', title: 'Tool: AcpUI/ux_invoke_shell' } }
+      );
+
+      expect(invocation).toEqual(expect.objectContaining({
+        toolCallId: 't1',
+        canonicalName: 'ux_invoke_shell',
+        mcpServer: 'AcpUI',
+        mcpToolName: 'ux_invoke_shell',
+        input: expect.objectContaining({ description: 'Run tests', command: 'npm test', cwd: 'D:/repo' })
+      }));
+    });
+
     it('normalizes legacy and MCP tool names correctly', () => {
       const toolStart = { type: 'tool_start', id: 't1' };
 
@@ -647,9 +673,9 @@ describe('Codex Provider', () => {
       expect(editEvent.toolName).toBe('edit_file');
       expect(editEvent.title).toBe('Edit file: file.txt');
 
-      // Case 3: MCP prefixed name
+      // Case 3: configured MCP tool id pattern
       const mcpEvent = codex.normalizeTool(toolStart, {
-        rawInput: { invocation: { server: 'custom', tool: 'mcp__server__tool_name' } }
+        rawInput: { invocation: { server: 'custom', tool: 'custom/tool_name' } }
       });
       expect(mcpEvent.toolName).toBe('tool_name');
     });

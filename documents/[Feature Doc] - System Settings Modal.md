@@ -34,14 +34,14 @@ A five-tab configuration hub accessible from the ChatHeader. Provides controls f
 ## How It Works — End-to-End Flow
 
 ### Step 1: ChatHeader Settings Button Opens Modal
-**File:** `frontend/src/components/ChatHeader/ChatHeader.tsx` (Lines 56–62)
+**File:** `frontend/src/components/ChatHeader/ChatHeader.tsx` (Lines 56-62)
 
 User clicks the settings icon in the ChatHeader:
 
 ```typescript
 // FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 56-62)
 <button
-  onClick={() => useUIStore.getState().setSystemSettingsOpen(true)}  // LINE 57
+  onClick={() => useUIStore.getState().setSystemSettingsOpen(true)}
   className="icon-button"
   title="System Settings"
 >
@@ -49,63 +49,27 @@ User clicks the settings icon in the ChatHeader:
 </button>
 ```
 
-This directly calls `setSystemSettingsOpen(true)` on the store without a hook.
+---
+
+### 2. Modal Opens and useEffect Triggers Config Fetch
+**File:** `frontend/src/components/SystemSettingsModal.tsx` (Function: `SystemSettingsModal`, Lines 1-35)
+
+The modal mounts when `isSystemSettingsOpen` becomes `true`. A `useEffect` fires to fetch audio devices and configuration files from the backend.
 
 ---
 
-### Step 2: Modal Opens and useEffect Triggers Config Fetch
-**File:** `frontend/src/components/SystemSettingsModal.tsx` (Lines 1–35)
-
-The modal mounts when `isSystemSettingsOpen` becomes `true`. A `useEffect` dependency fires:
-
-```typescript
-// FILE: frontend/src/components/SystemSettingsModal.tsx (Lines 32-67)
-useEffect(() => {
-  if (!isOpen) return;
-  
-  // Fetch all config on modal open
-  socket.emit('get_env', (response) => {
-    setEnvVars(response.vars || {});
-    setEnvLoading(false);
-  });
-  
-  socket.emit('get_workspaces_config', (response) => {
-    setWsConfig(response.content);
-  });
-  
-  socket.emit('get_commands_config', (response) => {
-    setCmdConfig(response.content);
-  });
-  
-  socket.emit('get_provider_config', { providerId: systemProviderId }, (response) => {
-    setUserConfig(response.content);
-  });
-}, [isOpen]);
-```
-
-All four config types are fetched **in parallel** on modal open (no waiting between requests).
-
----
-
-### Step 3: Backend Handlers Respond with Config Contents
+### 3. Backend Handlers Respond with Config Contents
 
 #### 3a. `get_env` Handler
-**File:** `backend/sockets/systemSettingsHandlers.js` (Lines 23–39)
+**File:** `backend/sockets/systemSettingsHandlers.js` (Function: `socket.on('get_env')`, Lines 23-39)
 
 ```javascript
 // FILE: backend/sockets/systemSettingsHandlers.js (Lines 23-39)
 socket.on('get_env', (callback) => {
   try {
-    const content = fs.readFileSync(ENV_PATH, 'utf-8');  // LINE 25 - Reads .env
-    const vars = {};
-    content.split('\n').forEach(line => {
-      const [key, value] = line.split('=');  // LINE 28 - Parse key=value
-      if (key && key.trim()) vars[key.trim()] = value?.trim() || '';
-    });
-    callback({ vars });
-  } catch (err) {
-    callback({ error: err.message });
-  }
+    const content = fs.readFileSync(ENV_PATH, 'utf-8');
+    // ... parses .env and returns vars ...
+  } catch (err) { ... }
 });
 ```
 

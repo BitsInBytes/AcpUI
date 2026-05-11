@@ -190,6 +190,7 @@ describe('providerLoader', () => {
     expect(mod.extractToolOutput()).toBeUndefined();
     expect(mod.extractFilePath()).toBeUndefined();
     expect(mod.extractDiffFromToolCall()).toBeUndefined();
+    expect(mod.extractToolInvocation()).toBeNull();
     expect(mod.normalizeTool(event)).toBe(event);
     expect(mod.categorizeToolCall()).toBeNull();
     expect(mod.parseExtension()).toBeNull();

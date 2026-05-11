@@ -186,6 +186,9 @@ export interface SystemEvent {
   filePath?: string;
   toolCategory?: string;
   toolName?: string;
+  canonicalName?: string;
+  mcpServer?: string;
+  mcpToolName?: string;
   isShellCommand?: boolean;
   isFileOperation?: boolean;
   _fallbackOutput?: string;

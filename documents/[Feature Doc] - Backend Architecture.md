@@ -16,7 +16,7 @@ The backend performs these key responsibilities:
 - **Session Orchestration**: Creates, loads, forks, and merges chat sessions; persists them to SQLite with model metadata, configuration options, and attachment references
 - **ACP Protocol Handling**: Implements JSON-RPC 2.0 handshake with ACP daemons, routes session updates, manages permissions, and forwards provider-specific extensions
 - **Socket.IO Gateway**: Emits real-time events (tokens, thoughts, tool calls, permissions) to the frontend; multiplexes all connections through provider context isolation
-- **MCP Tool System**: Spawns a stdio MCP proxy per ACP session that forwards tool calls (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) to backend handlers. Shell commands are managed by `ShellRunManager` and sub-agent coordination is driven by `SubAgentInvocationManager`; keeps all orchestration centralized
+- **Tool System V2**: Centralized tool orchestration using `toolRegistry`, `toolCallState`, and `toolInvocationResolver`. It dispatches lifecycle events (`onStart`, `onUpdate`, `onEnd`) to specific handlers (shell, subagents, counsel). This layer merges authoritative MCP handler metadata with provider-specific extraction, ensuring consistent titles (e.g., `Invoke Shell: <description>`) and robust state management.
 - **Stream & State Management**: Buffers output chunks, manages streaming saves, handles permission workflows, and enforces session isolation via AsyncLocalStorage
 - **Database Persistence**: Stores sessions, folders, canvas artifacts, notes, and dynamic model state in SQLite with provider scoping and cascade delete protection
 
@@ -314,12 +314,31 @@ function handleUpdate(update) {
       // (Lines 100-123)
       break;
     case 'tool_call':
-      // Extract file path, normalize tool data, emit system_event
-      // (Lines 150-181)
+      // Normalize and categorize (provider-specific → standard)
+      eventToEmit = providerModule.normalizeTool(eventToEmit, update);
+      const category = providerModule.categorizeToolCall(eventToEmit);
+
+      // Tool System V2: Resolve identity and dispatch to registry
+      const invocation = resolveToolInvocation({ ... });
+      eventToEmit = applyInvocationToEvent(eventToEmit, invocation);
+      eventToEmit = toolRegistry.dispatch('start', ctx, invocation, eventToEmit);
+
+      // Persist sticky state
+      toolCallState.upsert({ ... });
+
+      io.emit('system_event', eventToEmit);
       break;
     case 'tool_call_update':
-      // Merge output with cached metadata, emit tool_end/tool_update
-      // (Lines 183-256)
+      // Resolve phase (update or end) and dispatch to registry
+      const phase = update.status ? 'end' : 'update';
+      const inv = resolveToolInvocation({ ..., phase });
+      endEvent = applyInvocationToEvent(endEvent, inv);
+      endEvent = toolRegistry.dispatch(phase, ctx, inv, endEvent);
+
+      // Update sticky state
+      toolCallState.upsert({ ... });
+
+      io.emit('system_event', endEvent);
       break;
     case 'usage_update':
       // Update token counts, emit stats_push
@@ -333,7 +352,7 @@ function handleUpdate(update) {
 }
 ```
 
-Each update type is handled differently. Tool outputs are normalized (sticky metadata ensures tool outputs link to the correct file context). Tokens are buffered for the adaptive typewriter renderer.
+Each update type is handled differently. Tool System V2 ensures tool identity and metadata (like shell descriptions) are preserved across the lifecycle by merging provider extraction with authoritative MCP handler state. Tokens are buffered for the adaptive typewriter renderer.
 
 ---
 
@@ -447,44 +466,25 @@ When a provider implements `emitCachedContext(sessionId)`, the backend calls it 
 
 ---
 
-### 12. MCP Tool Execution via Stdio Proxy
-**File:** `backend/mcp/mcpServer.js` (Lines 61-300) & `backend/mcp/stdio-proxy.js` (Lines 40-72)
+### 12. Tool Execution via Tool System V2
+**File:** `backend/mcp/mcpServer.js` (Lines 61-300) & `backend/services/tools/index.js`
 
-When the ACP daemon calls a tool, the stdio proxy forwards the call to the backend HTTP API:
-
-```javascript
-// FILE: backend/mcp/stdio-proxy.js
-async function runProxy() {
-  const tools = await backendFetch(`/api/mcp/tools?providerId=${providerId}&proxyId=${proxyId}`);
-  const server = new Server({ name: serverName, ... });
-  
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const result = await backendFetch('/api/mcp/tool-call', {
-      method: 'POST',
-      body: JSON.stringify({
-        tool: req.params.name,
-        args: req.params.arguments,
-        providerId,
-        proxyId,
-        mcpRequestId,
-        requestMeta
-      })
-    });
-    return result;
-  });
-}
-```
-
-The backend handler processes the tool in `backend/mcp/mcpServer.js`. `ux_invoke_shell` uses the interactive `shellRunManager`:
+When the ACP daemon calls a tool, the stdio proxy forwards the call to the backend. The backend now uses a centralized tool system to manage execution:
 
 ```javascript
 // FILE: backend/mcp/mcpServer.js (Lines 70-85)
-tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
   if (providerId && acpSessionId) {
+    const title = description ? `Invoke Shell: ${description}` : 'Invoke Shell';
+
+    // Authoritative state upsert
+    cacheMcpToolInvocation({ io, providerId, acpSessionId, toolCallId, toolName: 'ux_invoke_shell', input: { description, command, cwd }, title });
+
     return shellRunManager.startPreparedRun({
       providerId,
       acpSessionId,
       mcpRequestId,
+      description,
       command,
       cwd,
       maxLines
@@ -493,7 +493,39 @@ tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequ
 };
 ```
 
-The tool is executed in the backend Node.js process (not the proxy). `backend/services/shellRunManager.js` owns the PTY lifecycle, sanitizes Windows PowerShell startup terminal controls before transcript streaming, and emits `shell_run_started`, `shell_run_output`, and `shell_run_exit` to `session:${sessionId}`. The MCP tool call remains blocked until the process exits or the user terminates it.
+The tool is executed in the backend Node.js process. The **Tool System V2** (located in `backend/services/tools/`) manages the lifecycle:
+
+1.  **`toolRegistry`**: Dispatches `onStart`, `onUpdate`, and `onEnd` events to canonical tool handlers (e.g., `shellToolHandler`).
+2.  **`toolCallState`**: A singleton cache that tracks tool state by `providerId::sessionId::toolCallId`. It handles merging inputs and deciding which title is "authoritative" (e.g., an MCP-provided description wins over a generic provider title).
+3.  **`toolInvocationResolver`**: Merges raw provider updates with the cached state to produce a canonical `invocation` object.
+4.  **`toolIdPattern`**: Allows providers to define how MCP tool IDs are formatted (e.g., `mcp__{mcpName}__{toolName}`), allowing the system to automatically extract the canonical tool name.
+
+`ux_invoke_shell` uses the interactive `shellRunManager`, which now includes the `description` in snapshots, allowing the UI to render `Invoke Shell: <description>` even before the shell process has fully started.
+
+---
+
+## Tool System V2 — Canonical Tool Orchestration
+
+AcpUI V2 introduces a canonical layer for tool management, moving logic out of the generic `acpUpdateHandler` and into specialized services.
+
+### Core Components
+
+| Component | Responsibility |
+|-----------|----------------|
+| `toolRegistry.js` | Maps canonical tool names (`ux_invoke_shell`) to lifecycle handlers. |
+| `toolCallState.js` | Maintains a "sticky" record of every tool call in a session. Tracks inputs, authoritative titles, and tool-specific metadata (like `shellRunId`). |
+| `toolInvocationResolver.js` | Logic for merging provider-extracted data with cached state. Handles title priority (MCP > Provider > Generic). |
+| `toolIdPattern.js` | Regex-based matching for provider tool naming conventions. |
+| `handlers/` | Specific logic for `shell`, `subagents`, and `counsel`. |
+
+### Lifecycle Flow
+
+1.  **Extraction**: `acpUpdateHandler` calls `providerModule.extractToolInvocation()`.
+2.  **Resolution**: `toolInvocationResolver` merges this with `toolCallState` to find the canonical identity.
+3.  **Dispatch**: `toolRegistry` calls `onStart/onUpdate/onEnd` on the matched handler.
+4.  **Emit**: The resulting normalized event is emitted to the frontend.
+
+This architecture ensures that tool-specific behavior (like spawning a sub-agent or preparing a shell run) is decoupled from the message streaming logic.
 
 ---
 
@@ -932,11 +964,12 @@ Assistant Message (turn_end)
 | `providerLoader.js` | `getProvider(providerId)` | 26-68 | Load provider config + module |
 | | `getProviderModule(providerId)` | 108-129 | Async import + merge with defaults |
 | | `runWithProvider(providerId, fn)` | 21-24 | Run fn in provider context |
-| `acpUpdateHandler.js` | `handleUpdate(update)` | 16-283 | Route by update type |
+| `acpUpdateHandler.js` | `handleUpdate(update)` | 16-283 | Route by update type; delegates to Tool System V2 for tools |
 | | Config option handler | 30-66 | Normalize, merge, save, and emit provider settings |
-| | Agent message handler | 100-123 | Buffer text, emit token socket |
-| | Tool call handler | 150-181 | Normalize tool data, emit system_event |
-| | Tool update handler | 183-256 | Merge output, emit tool_end |
+| `toolRegistry.js` | `toolRegistry.dispatch()` | 1-29 | Dispatch tool lifecycle events to specific handlers |
+| `toolCallState.js` | `toolCallState.upsert()` | 1-131 | Maintain authoritative and sticky tool state |
+| `toolInvocationResolver.js` | `resolveToolInvocation()` | 1-106 | Merge provider extraction with cached tool state |
+| `toolIdPattern.js` | `matchToolIdPattern()` | 1-61 | Match provider-specific MCP tool ID patterns |
 | `modelOptions.js` | `extractModelState()` | 48-68 | Combine available + current models |
 | | `resolveModelSelection()` | 82-109 | Resolve string selection → modelId |
 | `sessionManager.js` | `loadSessionIntoMemory()` | 177-253 | Hot-load session into memory |
@@ -1049,16 +1082,11 @@ runWithProvider(providerId, async () => {
 ---
 
 ### 7. Tool Metadata is "Sticky"
-**What breaks:** When a tool output is updated (tool_call_update), the file context is lost.
+**What breaks:** When a tool output is updated (tool_call_update), the file context or description is lost.
 
-**Why:** The tool metadata (file path, title) is stored in `sessionMetadata.toolData` during tool handling (Lines 153-274 in acpUpdateHandler.js) and attached to the `system_event`. Later updates (tool_call_update) must preserve this metadata.
+**Why:** Tool metadata (file path, title, input) must persist across multiple updates. In Tool System V2, `toolCallState.js` handles this by merging new updates into the cached state for that `toolCallId`. It also uses a priority system to ensure that high-quality titles (like an MCP description) aren't overwritten by generic provider titles.
 
-**How to avoid:** When processing `tool_call_update`, merge with the cached metadata, don't replace it. Example:
-```javascript
-const cached = metadata.toolCalls.get(toolCallId);
-const merged = { ...cached, output: newOutput };
-metadata.toolCalls.set(toolCallId, merged);
-```
+**How to avoid:** Use `toolCallState.upsert()` to manage tool state. The `toolInvocationResolver` automatically merges provider-extracted data with the cached "sticky" state.
 
 ---
 

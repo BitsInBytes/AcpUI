@@ -95,18 +95,14 @@ const activeSession = sessions.find(s => s.id === activeSessionId);
 
 ---
 
-### Step 4: Agent Completes Work in Background Session → Backend Emits `token_done`
-**File:** `backend/sockets/promptHandlers.js` (Lines 19, 33, 127, 143)
+### 1. Backend Turn Completion
+**File:** `backend/sockets/promptHandlers.js` (Function: `registerPromptHandlers`, Lines 19, 33, 127, 143)
 
-The backend emits `token_done` when a session completes (success or error):
+The backend emits `token_done` when an agent finishes its response. This event includes the `sessionId`, which the frontend uses to determine if a notification is needed.
 
 ```javascript
-// FILE: backend/sockets/promptHandlers.js (Line 127)
-io.to('session:' + sessionId).emit('token_done', { 
-  providerId: resolvedProviderId, 
-  sessionId,  // ACP session ID
-  error: false  // Optional error flag
-});
+// FILE: backend/sockets/promptHandlers.js (Lines 19, 33, 127, 143)
+io.to('session:' + sessionId).emit('token_done', { providerId, sessionId, ... });
 ```
 
 **Emission points:**

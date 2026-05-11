@@ -16,9 +16,10 @@ interface ToolStepProps {
 }
 
 const getFilePathFromEvent = (event: SystemEvent): string | undefined => {
+  const toolIdentity = event.canonicalName || event.toolName;
   // UI-owned tools — checked here before asking the provider
-  if (event.toolName === 'ux_invoke_shell') return undefined;
-  if (event.toolName === 'ux_invoke_subagents') return undefined;
+  if (toolIdentity === 'ux_invoke_shell') return undefined;
+  if (toolIdentity === 'ux_invoke_subagents') return undefined;
 
   // Provider-categorized tools
   if (event.isShellCommand) return undefined;
@@ -73,6 +74,7 @@ const getFilePathFromEvent = (event: SystemEvent): string | undefined => {
 
 const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpenInCanvas, markdownComponents }) => {
   const filePath = getFilePathFromEvent(step.event);
+  const toolIdentity = step.event.canonicalName || step.event.toolName;
   const elapsed = useElapsed(step.event.startTime, step.event.endTime);
   const outputContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -123,7 +125,7 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
             {/* SubAgentPanel renders inline for tools that spawn sub-agents.
                 invocationId is stamped onto the SystemEvent by the sub_agents_starting handler
                 so this ToolStep always shows its own specific batch of agents. */}
-            {(step.event.toolName === 'ux_invoke_subagents' || step.event.toolName === 'ux_invoke_counsel') && (
+            {(toolIdentity === 'ux_invoke_subagents' || toolIdentity === 'ux_invoke_counsel') && (
               <SubAgentPanel invocationId={step.event.invocationId} />
             )}
           </motion.div>

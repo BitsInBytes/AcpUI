@@ -17,7 +17,8 @@ Kiro implements all required provider contract functions:
 - **extractToolOutput()** — Extracts tool output from rawOutput.items array
 - **extractFilePath()** — Multi-step detection from locations, content, or arguments
 - **extractDiffFromToolCall()** — Extracts diffs from content array or rawInput
-- **normalizeTool()** — Strips `@ServerName/` MCP prefix and resolves generic tool IDs to standard names
+- **extractToolInvocation()** — **V2 Tool Routing**: Extracts canonical identity using `toolIdPattern` (`@{mcpName}/{toolName}`)
+- **normalizeTool()** — Strips `@ServerName/` MCP prefix using pattern and resolves generic tool IDs to standard names
 - **categorizeToolCall()** — Maps Kiro's tool names to UI categories
 - **parseExtension()** — Routes Kiro's `_kiro.dev/` protocol extensions
 - **emitCachedContext()** — Replays persisted context usage when the backend loads or hot-resumes a session
@@ -271,66 +272,81 @@ export function intercept(payload) {
 
 ## Tool Pipeline — How Kiro Tools Are Normalized
 
-Kiro's tools are complex because:
-1. Tool IDs can be generic (`tooluse_123`, `call_456`) or MCP-named (`@AcpUI/ux_invoke_shell`)
-2. The MCP prefix uses a single `@` symbol
-3. Tool names must be resolved from title text if the ID is generic
+Kiro's tool handling uses the V2 Tool Invocation system, resolving canonical identities before display normalization.
 
-### 1. Tool ID Pattern Detection
+### 1. V2 Tool Invocation Routing
 
-**File:** `providers/kiro/index.js` (Lines 389–396)
+**File:** `providers/kiro/index.js` (Lines 546–575)
 
-Strip the MCP server name prefix:
+Kiro implements `extractToolInvocation()` to provide authoritative metadata for the backend tool registry. It uses `toolIdPattern` (`@{mcpName}/{toolName}`) from `provider.json` to resolve the canonical tool name.
 
 ```javascript
-// FILE: providers/kiro/index.js (Lines 389-396)
-export function normalizeTool(event, update) {
-  let toolName = update?.name || event.id || '';
+export function extractToolInvocation(update = {}, context = {}) {
+  const event = context.event || {};
+  const { config } = getProvider();
+  const normalized = normalizeTool({ ...event }, update);
+  const input = mergeInputObjects(collectInputObjects(
+    update.rawInput,
+    update.arguments,
+    update.params,
+    update.input,
+    update.toolCall?.arguments
+  ));
+  const rawName = update.name || update.toolName || event.toolName || event.title || event.id || '';
+  const title = update.title || event.title || '';
+  const mcpMatch = matchToolIdPattern(rawName, config) || matchToolIdPattern(title, config);
+  const canonicalName = normalized.toolName || '';
 
-  // Strip any @ServerName/ MCP prefix (e.g. "@AcpUI/ux_invoke_shell")
-  const mcpPrefixMatch = toolName.match(/^@[^/]+\//);  // LINE 393: Match @ServerName/ pattern
-  if (mcpPrefixMatch) {
-    toolName = toolName.slice(mcpPrefixMatch[0].length);  // LINE 395: Extract tool name
-  }
-  // ...
+  return {
+    toolCallId: update.toolCallId || event.id,
+    kind: mcpMatch ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+    rawName,
+    canonicalName,
+    mcpServer: mcpMatch?.mcpName,
+    mcpToolName: mcpMatch?.toolName,
+    input,
+    title: normalized.title || title,
+    filePath: normalized.filePath || event.filePath,
+    category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
+  };
 }
 ```
 
-**Pattern:** `@ServerName/toolName` — the prefix is anything between `@` and `/`.
+### 2. Tool ID Pattern Detection
 
-### 2. Resolve Generic Tool IDs from Title
+**File:** `providers/kiro/index.js` (Lines 506–510)
 
-**File:** `providers/kiro/index.js` (Lines 398–421)
-
-If the tool ID is generic (`tooluse_`, `call_`, `toolu_`), extract the tool name from the title:
+Kiro's tools use identifiers matching the pattern `@{mcpName}/{toolName}` (e.g. `@AcpUI/ux_invoke_shell`). `normalizeTool()` uses `matchToolIdPattern` and `replaceToolIdPattern` to manage these identifiers:
 
 ```javascript
-// FILE: providers/kiro/index.js (Lines 398-421)
-// If toolName is still a generic ID, extract from title
+// FILE: providers/kiro/index.js (Lines 506-510)
+const configuredToolMatch = matchToolIdPattern(toolName, config);
+if (configuredToolMatch?.toolName) toolName = configuredToolMatch.toolName;
+
+// Clean configured MCP tool ids from the display title (Line 521)
+if (event.title) {
+  event = { ...event, title: replaceToolIdPattern(event.title, config) };
+}
+```
+
+### 3. Resolve Generic Tool IDs from Title
+
+**File:** `providers/kiro/index.js` (Lines 512–534)
+
+If the tool ID is still generic after pattern matching, Kiro extracts from the title:
+
+```javascript
+// FILE: providers/kiro/index.js (Lines 512-534)
 if (toolName.startsWith('tooluse_') || toolName.startsWith('call_') || toolName.startsWith('toolu_')) {
   const title = event.title || '';
-  const titleMcpMatch = title.match(/@[^/]+\//);
-  if (titleMcpMatch) {
-    // Extract tool name from title after MCP prefix
-    toolName = title.slice(titleMcpMatch.index + titleMcpMatch[0].length).split(/[\s:,]/)[0];
-  }
-}
-
-// Resolution by title text content (LINE 413-421)
-if (toolName.startsWith('call_') || toolName.startsWith('toolu_') || toolName.startsWith('tooluse_')) {
-  const titleLower = (event.title || '').toLowerCase();
-  if (titleLower.includes('bash')) toolName = 'bash';
-  else if (titleLower.includes('directory')) toolName = 'list_directory';
-  else if (titleLower.includes('read_file_parallel')) toolName = 'read_file_parallel';
-  else if (titleLower.includes('read')) toolName = 'read_file';
-  else if (titleLower.includes('write')) toolName = 'write_file';
-  else if (titleLower.includes('replace')) toolName = 'replace';
+  const titleToolMatch = matchToolIdPattern(title, config);
+  if (titleToolMatch?.toolName) toolName = titleToolMatch.toolName;
 }
 ```
 
-**Key:** If the tool name is generic, search the title for keywords to resolve the actual tool.
+**Key:** If the tool name is generic, Kiro uses the configured pattern to resolve it from the display title.
 
-### 3. Clean Title and Format
+### 4. Clean Title and Format
 
 **File:** `providers/kiro/index.js` (Lines 407–431)
 
@@ -912,6 +928,7 @@ export function buildSessionParams(_agent) {
 | 371–382 | setConfigOption() | Set model only |
 | 389–431 | normalizeTool() | Strip MCP prefix, resolve generic IDs, format title |
 | 436–450 | categorizeToolCall() | Tool categorization |
+| 546–575 | extractToolInvocation() | V2 canonical tool identity extraction |
 | 455–566 | parseSessionHistory() | JSONL to Unified Timeline |
 
 ### Configuration Files

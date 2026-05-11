@@ -13,6 +13,7 @@ The typewriter system decouples network message arrival from UI render rate, fee
 - Drains on a 32ms timer with adaptive speed (buffers >500 chars flush fully, <100 chars drain at 1/5 speed)
 - Three-phase processing: events (immediate), thoughts (typewriter), tokens (typewriter)
 - Detects file edits and plan.md creation to trigger canvas callbacks
+- useChatManager and useStreamStore handle shell description updates and use canonicalName for tool identification
 - Preserves shell output (`$ ` prefix) across tool updates
 - Injects `RESPONSE_DIVIDER` between tool output and subsequent prose (only when backtick count is even)
 
@@ -41,11 +42,11 @@ The typewriter system decouples network message arrival from UI render rate, fee
 
 1. **ACP Daemon Sends Token** — Backend receives `session/update` with type `agent_message_chunk` containing text token.
 
-2. **Socket Listener Dispatches** — `useChatManager` socket listener (Lines: frontend/src/hooks/useChatManager.ts:~190-210) receives the message and calls `useStreamStore.getState().onStreamToken(data)` (frontend/src/store/useStreamStore.ts:95).
+2. **Socket Listener Dispatches** — `useChatManager` socket listener (Lines: 103-160) receives the message and calls `useStreamStore.getState().onStreamToken(data)` (frontend/src/store/useStreamStore.ts:108-132).
 
-3. **Token Queued** — `onStreamToken` (Lines: 95-121) enqueues a queue entry `{type:'token', data: prefix+text}` and sets `isTyping: true` on the session. The prefix includes `RESPONSE_DIVIDER` if the previous item was an event (Lines: 101-106): only injected when backtick count in existing content is even (no open code fence).
+3. **Token Queued** — `onStreamToken` (Function: `onStreamToken`, Lines: 108-132) enqueues a queue entry `{type:'token', data: prefix+text}` and sets `isTyping: true` on the session.
 
-4. **processBuffer Processes Phase 3** — `useStreamStore.processBuffer` runs on 32ms timer (frontend/src/store/useStreamStore.ts:199-402). Phase 1 handles events (immediate), Phase 2 drains thoughts with adaptive speed. Phase 3 (Lines: 351-386) drains token queue:
+4. **processBuffer Processes Phase 3** — `useStreamStore.processBuffer` runs on 32ms timer (Function: `processBuffer`, Lines: 214-416). Phase 1 handles events (immediate), Phase 2 drains thoughts with adaptive speed. Phase 3 (Lines: 360-405) drains token queue.
    - Calculate adaptive rate: `bufLen > 500 ? bufLen : bufLen > 100 ? ceil(bufLen/3) : max(1, ceil(bufLen/5))` (Line: 361)
    - Extract `nextChars = batchedText.substring(0, charsPerTick)` (Line: 362)
    - Push remaining back onto queue if needed (Line: 365)
@@ -77,7 +78,12 @@ The typewriter system decouples network message arrival from UI render rate, fee
 
 5. **tool_update Arrives** — Event with status 'in_progress' but new output. Phase 1 finds existing tool step by id (Lines: 256-257) and merges output (Lines: 286). **Key logic:** If existing output starts with `$ ` (shell streaming), the new output does NOT overwrite (Line: 286): `(existingStep.event.output?.startsWith('$ ') ? existingStep.event.output : output)`. This preserves live shell output.
 
-6. **Tool Title Resolution** — If title changes, picks the best one (Lines: 266-279). Priority: longest/most detailed title, then prefer titles with colons (filename:args format), fall back to appending filename from filePath. This ensures `Running read_file: /path/to/file` is preferred over just `Running read_file`.
+6. **Tool Title Resolution** — If title changes, picks the best one (Lines: 266-279). Priority:
+   - For `ux_invoke_shell`, prefer `Invoke Shell: <description>` (from `snapshot.description`) if present.
+   - Otherwise, prefer longer/most detailed title.
+   - Prefer titles with colons (filename:args format).
+   - Fall back to appending filename from filePath.
+   This ensures `Invoke Shell: Run test suite` is preferred over a generic `Invoke Shell` or provider-specific command string.
 
 7. **_fallbackOutput Cached** — On first tool_update with output, cache as `_fallbackOutput` (Lines: 296-297). Used later during JSONL rehydration if browser reload happens mid-stream.
 
@@ -210,6 +216,9 @@ export interface SystemEvent {
   filePath?: string;               // Path if this is a file operation
   toolCategory?: string;           // e.g., 'file_read', 'file_edit', 'glob'
   toolName?: string;               // e.g., 'ux_invoke_shell', 'ux_invoke_subagents'
+  canonicalName?: string;          // Authoritative tool name
+  mcpServer?: string;              // MCP server name
+  mcpToolName?: string;            // MCP specific tool name
   isShellCommand?: boolean;        // True if this is a shell command
   _fallbackOutput?: string;        // Cached output for JSONL rehydration
   startTime?: number;              // Timestamp when tool started
@@ -355,12 +364,13 @@ Tool output is rendered with intelligent fallbacks:
 | **ChatMessage** | frontend/src/components/ChatMessage.tsx | 89-183 | Routes to UserMessage or AssistantMessage; manages collapse state + manuallyToggled Set; defines CodeBlock for syntax highlighting |
 | **UserMessage** | frontend/src/components/UserMessage.tsx | 11-40 | Renders user content + attachments (images, files); uses ReactMarkdown with custom components |
 | **AssistantMessage** | frontend/src/components/AssistantMessage.tsx | 50-216 | Renders assistant messages with unified timeline; maps TimelineStep to ToolStep/PermissionStep/MemoizedMarkdown; handles copy all, fork, error rendering |
-| **ToolStep** | frontend/src/components/ToolStep.tsx | 83-143 | Renders tool execution step; detectsFilePath for canvas hoist button; renders renderToolOutput; shows ToolSubAgentPanel if ux_invoke_subagents |
+| **ToolStep** | frontend/src/components/ToolStep.tsx | 83-143 | Renders tool execution step; uses `canonicalName` for UI behavior (e.g., `SubAgentPanel`); detectsFilePath for canvas hoist button; renders renderToolOutput; shows ToolSubAgentPanel if ux_invoke_subagents |
 | **PermissionStep** | frontend/src/components/PermissionStep.tsx | 12-47 | Renders permission request with option buttons; disables after response |
 | **MemoizedMarkdown** | frontend/src/components/MemoizedMarkdown.tsx | 87-123 | Parses content with mdast; splits into settled + active blocks; memoizes settled, streams active |
 | **MemoizedBlock** | frontend/src/components/MemoizedMarkdown.tsx | 16-23 | React.memo wrapper; never re-renders if content unchanged |
 | **renderToolOutput** | frontend/src/components/renderToolOutput.tsx | 49-161 | Priority renderer for tool output (diff > ANSI > JSON > file > plain) |
 | **CodeBlock** | frontend/src/components/ChatMessage.tsx | 44-87 | Syntax highlighting for code in markdown; Copy button + Canvas button (if canvas open) |
+| **ShellToolTerminal** | frontend/src/components/ShellToolTerminal.tsx | — | Interactive shell xterm renderer; auto-focuses active session terminals; sanitized ANSI-colored read-only transcript |
 
 ### Frontend Stores & Hooks
 

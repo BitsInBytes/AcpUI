@@ -20,12 +20,60 @@ import { subAgentInvocationManager } from './subAgentInvocationManager.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
 import { createMcpProxyBinding } from './mcpProxyRegistry.js';
 import { shellRunManager } from '../services/shellRunManager.js';
+import { toolCallState } from '../services/tools/index.js';
 
 const DEFAULT_MAX_SHELL_RESULT_LINES = 1000;
 
 export function getMaxShellResultLines(env = process.env) {
   const parsed = Number.parseInt(env.MAX_SHELL_RESULT_LINES || '', 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_SHELL_RESULT_LINES;
+}
+
+function toolCallIdFromMeta(requestMeta) {
+  return requestMeta?.toolCallId || requestMeta?.tool_call_id || requestMeta?.callId || null;
+}
+
+function mcpServerName(providerId) {
+  try {
+    return getProvider(providerId).config.mcpName || 'AcpUI';
+  } catch {
+    return 'AcpUI';
+  }
+}
+
+function cacheMcpToolInvocation({ io, providerId, acpSessionId, toolCallId, toolName, input, title }) {
+  if (!providerId || !acpSessionId || !toolCallId) return;
+  toolCallState.upsert({
+    providerId,
+    sessionId: acpSessionId,
+    toolCallId,
+    identity: {
+      kind: 'acpui_mcp',
+      canonicalName: toolName,
+      rawName: toolName,
+      mcpServer: mcpServerName(providerId),
+      mcpToolName: toolName
+    },
+    input,
+    display: {
+      title,
+      titleSource: 'mcp_handler'
+    }
+  });
+
+  if (io && title) {
+    io.to?.(`session:${acpSessionId}`)?.emit?.('system_event', {
+      providerId,
+      sessionId: acpSessionId,
+      type: 'tool_update',
+      id: toolCallId,
+      toolName,
+      canonicalName: toolName,
+      mcpServer: mcpServerName(providerId),
+      mcpToolName: toolName,
+      title
+    });
+  }
 }
 
 /**
@@ -61,12 +109,22 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
 export function createToolHandlers(io) {
   const tools = {};
 
-  tools.ux_invoke_shell = async ({ command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+  tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
     const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
     const maxLines = getMaxShellResultLines();
 
     if (providerId && acpSessionId) {
-      const toolCallId = requestMeta?.toolCallId || requestMeta?.tool_call_id || requestMeta?.callId || null;
+      const toolCallId = toolCallIdFromMeta(requestMeta);
+      const title = description ? `Invoke Shell: ${description}` : 'Invoke Shell';
+      cacheMcpToolInvocation({
+        io,
+        providerId,
+        acpSessionId,
+        toolCallId,
+        toolName: 'ux_invoke_shell',
+        input: { description, command, cwd: workingDir },
+        title
+      });
       shellRunManager.setIo?.(io);
       writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
       return shellRunManager.startPreparedRun({
@@ -74,6 +132,7 @@ export function createToolHandlers(io) {
         acpSessionId,
         toolCallId,
         mcpRequestId,
+        description,
         command,
         cwd: workingDir,
         maxLines
@@ -84,7 +143,18 @@ export function createToolHandlers(io) {
     return { content: [{ type: 'text', text: 'Error: Shell execution context unavailable' }] };
   };
 
-  tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {
+  tools.ux_invoke_subagents = async ({ requests, model, providerId, acpSessionId, requestMeta, skipToolState = false }) => {
+    if (!skipToolState) {
+      cacheMcpToolInvocation({
+        io,
+        providerId,
+        acpSessionId,
+        toolCallId: toolCallIdFromMeta(requestMeta),
+        toolName: 'ux_invoke_subagents',
+        input: { requests, model },
+        title: 'Invoke Subagents'
+      });
+    }
     subAgentInvocationManager.setIo(io);
     return subAgentInvocationManager.runInvocation({ requests, model, providerId });
   };
@@ -101,7 +171,7 @@ export function createToolHandlers(io) {
    * Delegates to ux_invoke_subagents so counsel agents get the same session lifecycle,
    * UI visibility, and cleanup as any other sub-agent.
    */
-  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId }) => {
+  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId, acpSessionId, requestMeta }) => {
     const config = loadCounselConfig();
     // Core agents (e.g. Advocate, Critic, Pragmatist) are always spawned
     const agents = [...(config.core || [])];
@@ -123,7 +193,16 @@ export function createToolHandlers(io) {
     }));
 
     // Delegate to ux_invoke_subagents — reuses all sub-agent infrastructure
-    return tools.ux_invoke_subagents({ requests, providerId });
+    cacheMcpToolInvocation({
+      io,
+      providerId,
+      acpSessionId,
+      toolCallId: toolCallIdFromMeta(requestMeta),
+      toolName: 'ux_invoke_counsel',
+      input: { question, architect, performance, security, ux },
+      title: 'Invoke Counsel'
+    });
+    return tools.ux_invoke_subagents({ requests, providerId, acpSessionId, requestMeta, skipToolState: true });
   };
 
   return tools;

@@ -11,6 +11,7 @@ export interface ShellRunSnapshot {
   toolCallId?: string | null;
   mcpRequestId?: string | number | null;
   status: ShellRunStatus;
+  description?: string;
   command?: string;
   cwd?: string;
   transcript?: string;

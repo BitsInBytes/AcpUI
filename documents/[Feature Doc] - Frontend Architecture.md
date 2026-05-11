@@ -109,87 +109,55 @@ const { name, shortName, color } = useSystemStore(s => s.getBranding(providerId)
 
 ---
 
-### 3. Session Load & Chat History
-**File:** `frontend/src/store/useChatStore.ts` (Lines 30-89)
+### 1. Store Composition (The Hub)
+**File:** `frontend/src/store/useChatStore.ts` (Function: `useChatStore`, Lines 29-92)
 
-When the user selects a session or the app loads, `handleSubmit()` (and related actions) initialize the chat:
+`useChatStore` acts as the primary coordinator for complex user actions (submitting prompts, forking sessions, responding to permissions). It does not hold state directly but orchestrates changes across `useSessionLifecycleStore`, `useInputStore`, and `useStreamStore`.
 
 ```typescript
-// FILE: frontend/src/store/useChatStore.ts (Lines 21-27)
-interface ChatState {
-  sessions: SessionItem[];
-  selectedSessionId: string | null;
-  messages: StreamMessage[];     // Timeline of all messages
-  currentMessage: StreamMessage; // Active assistant response being built
-  permissions: PermissionRequest[];
-}
-
-// Lines 30-89
-handleSubmit: async (payload) => {
-  if (!selectedSessionId) {
-    // Create new session via socket
-    socket.emit('create_session', { providerId, cwd, agent });
-  } else {
-    // Load existing session via socket
-    socket.emit('get_session_history', { sessionId, providerId });
-    
-    // Populate messages from backend response
-    set(state => ({
-      messages: response.messages,
-      currentMessage: response.currentMessage
-    }));
-  }
-}
+// FILE: frontend/src/store/useChatStore.ts (Lines 29-92)
+export const useChatStore = create<ChatState>((_set, get) => ({
+  handleSubmit: (socket, overridePrompt, attachmentsOverride) => {
+    // ... orchestrates state across stores and emits 'prompt' ...
+  },
+  // ...
+}));
 ```
-
-The session's messages array is populated from the backend, which reconstructs the timeline from SQLite + JSONL. The `currentMessage` is reset to empty, ready for new streaming input.
 
 ---
 
-### 4. Socket Listener Setup & Event Binding
-**File:** `frontend/src/hooks/useChatManager.ts` (Lines 62-508)
+### 2. Event Dispatching & Management
+**File:** `frontend/src/hooks/useChatManager.ts` (Function: `useChatManager`, Lines 67-340)
 
-In a useEffect, the `useChatManager()` hook attaches Socket.IO event listeners for all streaming events:
+`useChatManager` is the central socket event hub. It establishes listeners for all real-time events (`token`, `system_event`, `thought`, `stats_push`, `sub_agent_started`) and dispatches them to specialized stores.
 
 ```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 62-508)
-useEffect(() => {
-  const socket = getSocket();
-  
-  socket.on('token', (event) => {
-    wrapped_onStreamToken(event);
-  });
-  
-  socket.on('thought', (event) => {
-    useStreamStore.getState().onStreamThought(event);
-  });
-  
-  socket.on('system_event', (event) => {
-    useStreamStore.getState().onStreamEvent(event);
-  });
-  
-  socket.on('permission_request', (event) => {
-    useChatStore.getState().addPermission(event);
-  });
-
-  socket.on('shell_run_output', (event) => {
-    // Shell terminal output routing by shellRunId
-    // Append terminal output to useShellRunStore
-  });
-  
-  socket.on('sub_agent_started', (event) => {
-    // Lines 325-359: Register sub-agent in store
-  });
-  
-  return () => {
-    socket.off('token', ...);
-    socket.off('thought', ...);
-    // Cleanup all listeners
-  };
-}, []);
+// FILE: frontend/src/hooks/useChatManager.ts (Lines 67-340)
+export function useChatManager(...) {
+  // ... socket listeners setup ...
+  socket.on('token', wrappedOnStreamToken);
+  socket.on('system_event', onStreamEvent);
+  // ...
+}
 ```
 
-All events funnel through `useStreamStore`, which acts as the central normalizing hub for the Unified Timeline.
+---
+
+### 3. Adaptive Typewriter Rendering
+**File:** `frontend/src/store/useStreamStore.ts` (Function: `processBuffer`, Lines 205-373; Lines 343-347)
+
+The typewriter system decouples network chunk arrival from UI rendering. It maintains per-session token queues and processes them on a 32ms interval to ensure smooth, readable text flow even during high-burst network updates.
+
+---
+
+### 4. Component Composition (React Tree)
+**File:** `frontend/src/App.tsx` (Lines 19-31)
+
+The UI is built using a recursive composition of specialized components:
+- `Sidebar`: Navigable session/folder tree.
+- `MessageList`: Animated typewriter-backed chat timeline.
+- `CanvasPane`: Sidecar for code artifacts and terminals.
+- `ChatInput`: Multi-modal prompt submission area.
 
 ---
 
@@ -242,9 +210,10 @@ processBuffer: () => {
       if (event.type === 'tool_start') {
         state.currentMessage.steps.push(event);
       } else if (event.type === 'tool_update') {
-        // Merge output with existing step
+        // Merge output and description with existing step
         const step = state.currentMessage.steps.find(s => s.id === event.id);
         step.output = event.output;
+        if (event.title) step.title = event.title; // e.g. shell description updates
       } else if (event.type === 'permission') {
         state.pendingPermission = event;
       }
@@ -582,6 +551,9 @@ interface ThoughtStep extends TimelineStep {
 interface ToolStep extends TimelineStep {
   type: 'tool';
   toolName: string;
+  canonicalName?: string; // Authoritative tool name
+  mcpServer?: string;     // MCP server name
+  mcpToolName?: string;   // MCP specific tool name
   input: object;
   status: 'pending' | 'complete' | 'error';
   output: string;
@@ -829,13 +801,13 @@ The text appears instantly (re-rendered on next frame). If more tokens arrive wh
 | `ChatMessage.tsx` | `ChatMessage` | Router: delegates to UserMessage or AssistantMessage |
 | `UserMessage.tsx` | `UserMessage` | User bubble with image thumbnails |
 | `AssistantMessage.tsx` | `AssistantMessage` | Timeline rendering, collapse, turn timer |
-| `ToolStep.tsx` | `ToolStep` | Tool call display; renders `ShellToolTerminal` when `shellRunId` exists |
+| `ToolStep.tsx` | `ToolStep` | Tool call display; uses `canonicalName` for UI behavior (e.g., `SubAgentPanel`); renders `ShellToolTerminal` when `shellRunId` exists |
 | `PermissionStep.tsx` | `PermissionStep` | Permission request with action buttons |
 | `renderToolOutput.tsx` | Various renders | Syntax highlighting, JSON, ANSI, diffs |
 | `MemoizedMarkdown.tsx` | `MemoizedMarkdown` | Memoized block rendering for streaming |
 | `Terminal.tsx` | `Terminal` | Canvas terminal xterm.js integration |
-| `ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive shell xterm renderer with callback-paced writes for active runs; sanitized ANSI-colored read-only transcript renderer after exit, including a guard for stripped startup cursor-control blank rows |
-| `SubAgentPanel.tsx" | `SubAgentPanel` | Sub-agent cards |
+| `ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive shell xterm renderer with callback-paced writes; auto-focuses active session terminals; sanitized ANSI-colored read-only transcript |
+| `SubAgentPanel.tsx` | `SubAgentPanel` | Sub-agent cards |
 | `Sidebar.tsx` | `Sidebar` | Session list, folders, workspaces |
 | `SessionItem.tsx` | `SessionItem` | Session row with actions |
 | `FolderItem.tsx` | `FolderItem` | Recursive folder with drag & drop |
@@ -985,10 +957,16 @@ if (event.sessionId === parentSessionId) {
 ```typescript
 // ✅ Correct
 const step = currentMessage.steps.find(s => s.id === toolCallId);
-step.output = newOutput;  // Keep filePath, title intact
+step.output = newOutput;
+// Preserve sticky fields
+step.filePath = newFilePath || step.filePath;
+step.title = newTitle || step.title;
+step.canonicalName = newCanonicalName || step.canonicalName;
+step.mcpServer = newMcpServer || step.mcpServer;
+step.mcpToolName = newMcpToolName || step.mcpToolName;
 
 // ❌ Wrong
-const step = { toolCallId, output: newOutput };  // Lost filePath, title
+const step = { toolCallId, output: newOutput };  // Lost filePath, title, canonicalName
 currentMessage.steps[index] = step;
 ```
 

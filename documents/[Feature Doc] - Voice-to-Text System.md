@@ -52,21 +52,15 @@ const onMicClick = () => {
 
 Clicking the mic button calls `startRecording()` (from `useVoice` hook) or `stopRecording()` if already recording.
 
-### 3. useVoice Hook Requests Microphone Permissions
-**File:** `frontend/src/hooks/useVoice.ts` (Lines 36-47)
+### 1. Audio Capture (WavRecorder)
+**File:** `frontend/src/hooks/useVoice.ts` (Function: `useVoice`, Lines 36-47; Lines 49-77)
+
+The `useVoice` hook manages the `WavRecorder` instance. It handles starting and stopping the recording, capturing the audio blob, and converting it to an `ArrayBuffer` for socket transmission.
 
 ```typescript
+// FILE: frontend/src/hooks/useVoice.ts (Lines 36-47)
 const startRecording = useCallback(async () => {
-  try {
-    if (!recorderRef.current) {
-      recorderRef.current = new WavRecorder();  // LINE 39
-    }
-    await recorderRef.current.start(selectedAudioDevice);  // LINE 41
-    setIsRecording(true);  // LINE 42
-    voiceStartTimeRef.current = Date.now();  // LINE 43
-  } catch (e) {
-    console.error('Failed to start recording:', e);
-  }
+  // ... initializes WavRecorder and starts capture ...
 }, [selectedAudioDevice, setIsRecording]);
 ```
 

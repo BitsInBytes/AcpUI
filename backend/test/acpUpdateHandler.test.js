@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleUpdate } from '../services/acpUpdateHandler.js';
+import { toolCallState } from '../services/tools/index.js';
 
 // Hoist Mocks
 const { mockProviderModule, mockShellRunManager } = vi.hoisted(() => ({
@@ -13,6 +14,7 @@ const { mockProviderModule, mockShellRunManager } = vi.hoisted(() => ({
         }),
         extractFilePath: vi.fn(),
         extractDiffFromToolCall: vi.fn(),
+        extractToolInvocation: vi.fn(),
         normalizeTool: vi.fn(e => e),
         categorizeToolCall: vi.fn(),
         normalizeConfigOptions: vi.fn(options => Array.isArray(options) ? options : []),
@@ -71,11 +73,13 @@ describe('acpUpdateHandler', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    toolCallState.clear();
     client = makeClient();
     client.sessionMetadata.set(sid, { toolCalls: 0, usedTokens: 0 });
     mockProviderModule.normalizeUpdate.mockImplementation(u => u);
     mockProviderModule.normalizeTool.mockImplementation(e => e);
     mockProviderModule.categorizeToolCall.mockReturnValue(undefined);
+    mockProviderModule.extractToolInvocation.mockReturnValue(null);
     mockProviderModule.normalizeConfigOptions.mockImplementation(options => Array.isArray(options) ? options : []);
     mockShellRunManager.prepareRun.mockReturnValue({
       runId: 'shell-run-test',
@@ -144,6 +148,14 @@ describe('acpUpdateHandler', () => {
       client.providerId = 'test-provider';
       mockProviderModule.normalizeTool.mockImplementation(e => ({ ...e, toolName: 'ux_invoke_shell' }));
       mockProviderModule.categorizeToolCall.mockReturnValue({ category: 'shell', isShellCommand: true });
+      mockProviderModule.extractToolInvocation.mockReturnValue({
+        canonicalName: 'ux_invoke_shell',
+        mcpServer: 'AcpUI',
+        mcpToolName: 'ux_invoke_shell',
+        input: { description: 'Run test suite', command: 'npm test', cwd: 'D:/repo' },
+        title: 'Invoke Shell: Run test suite',
+        category: { category: 'shell', isShellCommand: true }
+      });
 
       await handleUpdate(client, sid, {
         sessionUpdate: 'tool_call',
@@ -153,7 +165,7 @@ describe('acpUpdateHandler', () => {
           invocation: {
             server: 'AcpUI',
             tool: 'ux_invoke_shell',
-            arguments: { command: 'npm test', cwd: 'D:/repo' }
+            arguments: { description: 'Run test suite', command: 'npm test', cwd: 'D:/repo' }
           }
         }
       });
@@ -163,6 +175,7 @@ describe('acpUpdateHandler', () => {
         providerId: 'test-provider',
         sessionId: sid,
         toolCallId: 't1',
+        description: 'Run test suite',
         command: 'npm test',
         cwd: 'D:/repo'
       });
@@ -173,7 +186,91 @@ describe('acpUpdateHandler', () => {
         shellState: 'pending',
         command: 'npm test',
         cwd: 'D:/repo',
-        title: 'Tool: AcpUI/ux_invoke_shell'
+        title: 'Invoke Shell: Run test suite'
+      }));
+  });
+
+  it('preserves a shell description title after provider normalization on updates', async () => {
+      client.providerId = 'test-provider';
+      mockProviderModule.normalizeTool.mockImplementation(e => ({
+        ...e,
+        toolName: 'ux_invoke_shell',
+        title: e.type === 'tool_start' ? e.title : 'Invoke Shell'
+      }));
+      mockProviderModule.extractToolInvocation.mockReturnValue({
+        canonicalName: 'ux_invoke_shell',
+        mcpServer: 'AcpUI',
+        mcpToolName: 'ux_invoke_shell',
+        input: { description: 'Run test suite', command: 'npm test', cwd: 'D:/repo' },
+        title: 'Invoke Shell: Run test suite',
+        category: { category: 'shell', isShellCommand: true }
+      });
+
+      await handleUpdate(client, sid, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 't1',
+        title: 'Tool: AcpUI/ux_invoke_shell',
+        rawInput: {
+          invocation: {
+            server: 'AcpUI',
+            tool: 'ux_invoke_shell',
+            arguments: { description: 'Run test suite', command: 'npm test', cwd: 'D:/repo' }
+          }
+        }
+      });
+
+      await handleUpdate(client, sid, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 't1',
+        status: 'completed',
+        title: 'Invoke Shell'
+      });
+
+      const systemEvents = client.io.emit.mock.calls.filter(c => c[0] === 'system_event');
+      const lastEmit = systemEvents.at(-1)[1];
+      expect(lastEmit).toEqual(expect.objectContaining({
+        type: 'tool_end',
+        title: 'Invoke Shell: Run test suite'
+      }));
+  });
+
+  it('updates shell title when provider exposes description after tool start', async () => {
+      client.providerId = 'test-provider';
+      mockProviderModule.normalizeTool.mockImplementation(e => ({ ...e, toolName: 'ux_invoke_shell', title: e.title || 'Invoke Shell' }));
+      mockProviderModule.extractToolInvocation
+        .mockReturnValueOnce({
+          canonicalName: 'ux_invoke_shell',
+          mcpServer: 'AcpUI',
+          mcpToolName: 'ux_invoke_shell',
+          input: {},
+          title: 'Invoke Shell'
+        })
+        .mockReturnValueOnce({
+          canonicalName: 'ux_invoke_shell',
+          mcpServer: 'AcpUI',
+          mcpToolName: 'ux_invoke_shell',
+          input: { description: 'Inspect logs', command: 'npm run logs' },
+          title: 'Invoke Shell'
+        });
+
+      await handleUpdate(client, sid, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 't1',
+        title: 'Invoke Shell'
+      });
+
+      await handleUpdate(client, sid, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 't1',
+        title: 'Invoke Shell',
+        rawInput: { description: 'Inspect logs', command: 'npm run logs' }
+      });
+
+      const systemEvents = client.io.emit.mock.calls.filter(c => c[0] === 'system_event');
+      const lastEmit = systemEvents.at(-1)[1];
+      expect(lastEmit).toEqual(expect.objectContaining({
+        type: 'tool_update',
+        title: 'Invoke Shell: Inspect logs'
       }));
   });
 
@@ -330,7 +427,14 @@ describe('acpUpdateHandler', () => {
   });
 
   it('assigns lastSubAgentParentAcpId for sub-agent spawning tools', async () => {
-    const update = { sessionUpdate: 'tool_call', title: 'ux_invoke_subagents', toolCallId: 't1' };
+    mockProviderModule.normalizeTool.mockImplementation(e => ({ ...e, toolName: 'ux_invoke_subagents' }));
+    mockProviderModule.extractToolInvocation.mockReturnValue({
+      canonicalName: 'ux_invoke_subagents',
+      mcpServer: 'AcpUI',
+      mcpToolName: 'ux_invoke_subagents',
+      title: 'Invoke Subagents'
+    });
+    const update = { sessionUpdate: 'tool_call', title: 'Invoke Subagents', toolCallId: 't1' };
     await handleUpdate(client, sid, update);
     expect(client.lastSubAgentParentAcpId).toBe(sid);
   });
