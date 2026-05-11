@@ -215,6 +215,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
     const { sessions } = get();
     const session = sessions.find(s => s.id === uiId);
     if (!session) return;
+    maybeHydrateContextUsage(session);
     const contextUsageBySession = useSystemStore.getState().contextUsageBySession;
     const hasCachedContext = session.acpSessionId
       ? Object.prototype.hasOwnProperty.call(contextUsageBySession, session.acpSessionId)
@@ -234,6 +235,8 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
 
   hydrateSession: (socket, uiId) => {
     if (!socket) return;
+    const session = get().sessions.find(s => s.id === uiId);
+    if (session) maybeHydrateContextUsage(session);
     set(state => ({
       sessions: state.sessions.map(s => s.id === uiId ? { ...s, isWarmingUp: true } : s)
     }));

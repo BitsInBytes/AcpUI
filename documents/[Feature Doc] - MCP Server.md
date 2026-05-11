@@ -632,7 +632,7 @@ After making changes:
 | `backend/routes/mcpApi.js` | `GET /tools` | 34-97 | Return tool schemas and server name |
 | | `POST /tool-call` | 103-132 | Execute tool handler, disable timeouts, return result |
 | `backend/mcp/mcpProxyRegistry.js` | proxy binding helpers | 1-78 | Correlate stdio proxy ids to provider/session context |
-| `backend/services/shellRunManager.js` | `ShellRunManager` | 79-413 | Interactive PTY lifecycle, startup control sanitation, and final-result formatting |
+| `backend/services/shellRunManager.js` | `ShellRunManager` | 113-460 | Interactive PTY lifecycle, startup control sanitation, and final-result formatting |
 | `backend/services/sessionManager.js` | `getMcpServers(providerId, { acpSessionId })` | 28-44 | Returns MCP server config for user sessions (includes proxy id env) |
 
 ---

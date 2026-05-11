@@ -135,6 +135,39 @@ describe('useSessionLifecycleStore', () => {
     expect(session.acpSessionId).toBe('a-resumed');
   });
 
+  it('hydrateSession hydrates context usage from existing session stats before history load', () => {
+    const history = {
+      messages: [],
+      provider: 'p1',
+      acpSessionId: 'old-acp'
+    };
+
+    mockSocket.emit.mockImplementation((event: string, ...args: any[]) => {
+      const cb = args[args.length - 1];
+      if (event === 'get_session_history') {
+        cb({ session: history });
+      }
+      if (event === 'create_session') {
+        cb({ sessionId: 'a-resumed' });
+      }
+    });
+
+    act(() => {
+      useSystemStore.setState({ contextUsageBySession: {} } as any);
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'old-acp',
+          isWarmingUp: false,
+          stats: { usedTokens: 400, totalTokens: 1000 }
+        } as any]
+      });
+      useSessionLifecycleStore.getState().hydrateSession(mockSocket, 's1');
+    });
+
+    expect(useSystemStore.getState().contextUsageBySession['old-acp']).toBe(40);
+  });
+
   it('handleDeleteSession removes session and emits archive_session by default', () => {
     const s1 = { id: 's1', name: 'S1', messages: [], model: 'balanced' as const, isTyping: false, isWarmingUp: false, acpSessionId: 'a1', provider: 'p1' };
     act(() => {
@@ -166,6 +199,25 @@ describe('useSessionLifecycleStore', () => {
     const state = useSessionLifecycleStore.getState();
     expect(state.activeSessionId).toBe('s1');
     expect(state.sessions[0].hasUnreadResponse).toBe(false);
+  });
+
+  it('handleSessionSelect hydrates context usage from persisted session stats', () => {
+    const s1 = {
+      id: 's1',
+      acpSessionId: 'acp-1',
+      hasUnreadResponse: false,
+      messages: [{ id: 'm1' }],
+      isWarmingUp: false,
+      stats: { usedTokens: 250, totalTokens: 1000 }
+    } as any;
+
+    act(() => {
+      useSystemStore.setState({ contextUsageBySession: {} } as any);
+      useSessionLifecycleStore.setState({ sessions: [s1] });
+      useSessionLifecycleStore.getState().handleSessionSelect(mockSocket, 's1');
+    });
+
+    expect(useSystemStore.getState().contextUsageBySession['acp-1']).toBe(25);
   });
 
   it('handleTogglePin sorts sessions with pins first', () => {

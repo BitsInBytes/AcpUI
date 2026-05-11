@@ -89,17 +89,27 @@ The `expandedFolderIds` are already loaded from localStorage (Lines 21-26) when 
 ---
 
 ### 3. Session List Load
-**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 99-104)
+**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 99-113)
 
 The `handleInitialLoad` action populates the session list from the backend:
 
 ```typescript
-// FILE: frontend/src/store/useSessionLifecycleStore.ts (Lines 99-104)
-const response = await socket.emitAsync('load_sessions', { providerId });
-set(state => ({
-  sessions: response.sessions,
-  sessionNotes: buildNoteMap(response.notes)
-}));
+// FILE: frontend/src/store/useSessionLifecycleStore.ts (Lines 99-113)
+socket.emit('load_sessions', (res: LoadSessionsResponse) => {
+  if (res && res.sessions) {
+    const notesMap: Record<string, boolean> = {};
+    res.sessions.forEach((s: ChatSession & { hasNotes?: boolean }) => {
+      if (s.hasNotes) notesMap[s.id] = true;
+    });
+    set({
+      sessions: res.sessions.map((s: ChatSession) => applyModelState(
+        { ...s, isTyping: false, isWarmingUp: false },
+        { currentModelId: s.currentModelId, modelOptions: s.modelOptions }
+      )),
+      sessionNotes: notesMap
+    });
+  }
+});
 ```
 
 Each session object contains flags like `isPinned`, `folderId`, `forkedFrom`, `isSubAgent` that control its rendering.
@@ -395,20 +405,34 @@ This prevents empty "warming up" tabs for sub-agents that don't immediately prod
 ---
 
 ### 12. User Selection & Unread Clear
-**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 205-210)
+**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 214-234)
 
 When the user clicks a session, `handleSessionSelect` clears the unread flag:
 
 ```typescript
-// FILE: frontend/src/store/useSessionLifecycleStore.ts (Lines 205-210)
+// FILE: frontend/src/store/useSessionLifecycleStore.ts (Lines 214-234)
 handleSessionSelect: (socket, uiId) => {
+  const { sessions } = get();
+  const session = sessions.find(s => s.id === uiId);
+  if (!session) return;
+  maybeHydrateContextUsage(session);
+  const contextUsageBySession = useSystemStore.getState().contextUsageBySession;
+  const hasCachedContext = session.acpSessionId
+    ? Object.prototype.hasOwnProperty.call(contextUsageBySession, session.acpSessionId)
+    : false;
+
   set(state => ({
     activeSessionId: uiId,
     sessions: state.sessions.map(s =>
       s.id === uiId ? { ...s, hasUnreadResponse: false } : s
     )
   }));
-  socket.emit('watch_session', { sessionId: uiId });
+
+  if (session.acpSessionId && !session.isWarmingUp && session.messages.length > 0) {
+    if (!hasCachedContext) get().hydrateSession(socket, uiId);
+    return;
+  }
+  get().hydrateSession(socket, uiId);
 };
 ```
 
@@ -436,7 +460,7 @@ The `.unread` CSS class is removed from the session, and the session gets `.acti
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │ Zustand Stores (State Management)                           ││
 │  │                                                              ││
-│  │ useSessionLifecycleStore (Line 35-62)                       ││
+│  │ useSessionLifecycleStore (Line 43-70)                       ││
 │  │ ├─ sessions[] {id, name, isPinned, isTyping, ...}          ││
 │  │ ├─ activeSessionId                                          ││
 │  │ ├─ sessionNotes {id: hasNotes}                              ││
@@ -514,9 +538,9 @@ interface ChatSession {
 1. **`folderId` must exist:** If a session has `folderId: "folder-123"`, that folder must exist in `useFolderStore.folders`. If not, the session disappears from sidebar.
 2. **`forkedFrom` implies nesting:** If `forkedFrom: "parent-id"`, the session renders as a child of `parent-id` via `renderChildren()`, not as a root session.
 3. **`isSubAgent` controls behavior:** Sub-agent sessions have restricted actions (no pin, rename, settings). Icons are always bot (green).
-4. **`isPinned` affects sort:** Pinned sessions sort first, then unpinned (controlled in `handleTogglePin`, line 296-302).
+4. **`isPinned` affects sort:** Pinned sessions sort first, then unpinned (controlled in `handleTogglePin`, line 320-327).
 5. **`isTyping` triggers animation:** Without this flag set, the `.typing` class never applies, and `breatheGlow` never plays.
-6. **`hasUnreadResponse` persists:** Set by backend on `token_done`, cleared by `handleSessionSelect` (line 207).
+6. **`hasUnreadResponse` persists:** Set by backend on `token_done`, cleared by `handleSessionSelect` (line 226).
 
 ### Folder Expansion State
 
@@ -680,7 +704,7 @@ Each nesting level adds indentation: folders at 16px per level, sessions at 12px
 
 | Store | File | Lines | Fields (Sidebar) |
 |-------|------|-------|------------------|
-| `useSessionLifecycleStore` | `useSessionLifecycleStore.ts` | 35-71 | `sessions[]`, `activeSessionId`, `sessionNotes {id: hasNotes}` |
+| `useSessionLifecycleStore` | `useSessionLifecycleStore.ts` | 72-79 | `sessions[]`, `activeSessionId`, `sessionNotes {id: hasNotes}` |
 | `useFolderStore` | `useFolderStore.ts` | 6-17 | `folders[]`, `expandedFolderIds` (localStorage: `acpui-expanded-folders`) |
 | `useUIStore` | `useUIStore.ts` | 5-41 | `isSidebarOpen`, `isSidebarPinned` (localStorage: `isSidebarPinned`), `expandedProviderId` |
 | `useSystemStore` | `useSystemStore.ts` | 12-72 | `orderedProviderIds`, `providersById`, `workspaceCwds`, `branding`, `slashCommands` |
@@ -771,7 +795,7 @@ Each nesting level adds indentation: folders at 16px per level, sessions at 12px
 ### 9. Pinned Sessions Re-Sort on handleTogglePin
 **What breaks:** Pinned sessions don't move to the top, sort order is wrong.
 
-**Why:** `handleTogglePin` (Line 296-302 in `useSessionLifecycleStore.ts`) mutates the `isPinned` flag and re-sorts `sessions[]`. If this sort logic is missing, pinning has no visual effect on order.
+**Why:** `handleTogglePin` (Line 320-327 in `useSessionLifecycleStore.ts`) mutates the `isPinned` flag and re-sorts `sessions[]`. If this sort logic is missing, pinning has no visual effect on order.
 
 **How to verify:** Check that `handleTogglePin` includes:
 ```typescript

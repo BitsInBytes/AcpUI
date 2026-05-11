@@ -194,12 +194,12 @@ if (res.success) {
 - Change handler: `handleSessionModelChange(socket, session.id, e.target.value)`
 
 **Step 2: Store Applies Optimistic Update**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 320–343)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 345–369)
 - Gets current session and branding
 - Resolves model ID from selection value: `getModelIdForSelection(model, providerModels)`
 - **Immediately updates local state** (optimistic):
 ```typescript
-// Lines 325-327 in useSessionLifecycleStore.ts
+// Lines 350-352 in useSessionLifecycleStore.ts
 set(state => ({
   sessions: state.sessions.map(s => s.id === uiId ? applyModelState(s, { model, currentModelId }) : s)
 }));
@@ -207,7 +207,7 @@ set(state => ({
 - UI reflects change instantly (no loading spinner)
 
 **Step 3: Emit Socket Event**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 329–342)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 355–367)
 - Sends to backend: `socket.emit('set_session_model', { uiId, model }, callback)`
 - Backend processes change in background
 
@@ -227,11 +227,11 @@ await db.saveSession(session);
 - Returns callback with updated state
 
 **Step 5: Callback Reconciles State**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 330–342)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 355–367)
 - Callback updates store with backend's authoritative model state
 - If model change succeeded, UI is already correct; if it failed, this reconciliation corrects it
 ```typescript
-// Lines 332-341 in useSessionLifecycleStore.ts
+// Lines 357-366 in useSessionLifecycleStore.ts
 socket.emit('set_session_model', { uiId, model }, (res) => {
   if (!res || res.error) return;
   set(state => ({
@@ -255,11 +255,11 @@ socket.emit('set_session_model', { uiId, model }, (res) => {
 - All call: `handleSetSessionOption(socket, session.id, opt.id, newValue)`
 
 **Step 2: Store Updates Optimistically**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 355–368)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 380–394)
 - Finds option in `session.configOptions` and updates its `currentValue`
 - UI updates immediately without waiting for backend
 ```typescript
-// Lines 359-365 in useSessionLifecycleStore.ts
+// Lines 385-389 in useSessionLifecycleStore.ts
 set(state => ({
   sessions: state.sessions.map(s => {
     if (s.id !== uiId) return s;
@@ -270,7 +270,7 @@ set(state => ({
 ```
 
 **Step 3: Emit Socket Event (No Callback)**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 367)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 392)
 - **Fire-and-forget**: `socket.emit('set_session_option', { uiId, optionId, value });`
 - No callback specified (unlike model change)
 
@@ -397,12 +397,12 @@ session.messages = jsonlMessages;  // DESTRUCTIVE replacement
 - **What it means:** Users see the change immediately; backend processes asynchronously
 - **Why it matters:** No loading spinners; responsive UX; handles network lag gracefully
 - **Breaking point:** Code that waits for callback before updating UI will feel laggy
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 325–342)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 350–367)
 ```typescript
-// Line 325: Update immediately
+// Line 350: Update immediately
 set(state => ({ sessions: state.sessions.map(...applyModelState...) }));
 
-// Lines 329+: Emit and reconcile asynchronously
+// Lines 355+: Emit and reconcile asynchronously
 socket.emit('set_session_model', { uiId, model }, (res) => {
   // Update again if backend differs
   set(state => ({ sessions: state.sessions.map(...) }));
@@ -414,7 +414,7 @@ socket.emit('set_session_model', { uiId, model }, (res) => {
 - **What it means:** UI updates optimistically; backend applies in background; no two-way synchronization
 - **Why it matters:** Simpler pattern for simple boolean/select changes that rarely fail
 - **Breaking point:** Code expecting an error response will crash or hang
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 367)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 392)
 ```typescript
 socket.emit('set_session_option', { uiId, optionId, value });  // No callback
 ```
@@ -580,8 +580,8 @@ MessageList re-renders with fresh messages
 | `frontend/src/components/SessionSettingsModal.tsx` | 283–316 | Export tab | Path input + export button |
 | `frontend/src/components/SessionSettingsModal.tsx` | 319–340 | Delete tab | Delete confirmation |
 | `frontend/src/store/useUIStore.ts` | 77–81 | `setSettingsOpen()` | Manage modal visibility & session selection |
-| `frontend/src/store/useSessionLifecycleStore.ts` | 320–343 | `handleSessionModelChange()` | Model selection logic |
-| `frontend/src/store/useSessionLifecycleStore.ts` | 355–368 | `handleSetSessionOption()` | Provider option changes |
+| `frontend/src/store/useSessionLifecycleStore.ts` | 345–369 | `handleSessionModelChange()` | Model selection logic |
+| `frontend/src/store/useSessionLifecycleStore.ts` | 380–394 | `handleSetSessionOption()` | Provider option changes |
 | `frontend/src/hooks/useSocket.ts` | 78–85 | `'session_model_options'` listener | Passive model option updates from backend |
 | `frontend/src/components/Sidebar.tsx` | 271, 357, 398, 419 | Settings triggers | Open modal from sidebar |
 | `frontend/src/components/ChatInput/ChatInput.tsx` | 366 | Settings trigger | Open modal to Config tab from header |

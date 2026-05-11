@@ -92,7 +92,7 @@ Example `providers.json`:
   "defaultProviderId": "provider-a",
   "providers": [
     { "id": "provider-a", "path": "providers/provider-a", "label": "Provider A" },
-    { "id": "codex", "path": "providers/codex", "label": "Codex", "enabled": false }
+    { "id": "provider-b", "path": "providers/provider-b", "label": "Provider B", "enabled": false }
   ]
 }
 ```

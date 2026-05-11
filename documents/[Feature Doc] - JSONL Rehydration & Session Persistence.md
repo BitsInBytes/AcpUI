@@ -37,12 +37,12 @@ Session persistence in AcpUI is a **dual-source system** where SQLite DB is the 
 - Socket waits for 'ready' event before proceeding
 
 **Step 2: Engine Ready & Initial Load**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 86–118)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 94–127)
 - On first socket connection, `handleInitialLoad()` is called
 - Checks `isInitiallyLoaded` flag to prevent duplicate calls
 
 **Step 3: Emit load_sessions**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 91)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 99)
 - Frontend emits: `socket.emit('load_sessions', callback)`
 - Backend handler at `sessionHandlers.js:81` receives it
 
@@ -75,12 +75,12 @@ socket.on('load_sessions', async (...args) => {
 ```
 
 **Step 5: Frontend Updates Zustand Store**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 93–104)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 106–113)
 - Maps each session through `applyModelState()` to normalize model display
 - Sets `isUrlSyncReady = true` to enable URL navigation
 - Checks for `?s=sessionId` URL param and auto-selects that session
 ```typescript
-// Lines 93-104 in useSessionLifecycleStore.ts
+// Lines 106-113 in useSessionLifecycleStore.ts
 set({
   sessions: res.sessions.map((s: ChatSession) => applyModelState(
     { ...s, isTyping: false, isWarmingUp: false },
@@ -99,11 +99,11 @@ set({
 ### Flow B: Session Select + Load (session/load + Drain)
 
 **Step 1: User Selects Session from Sidebar**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 111)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 214–234)
 - `handleSessionSelect(socket, sessionId)` is called
 
 **Step 2: Emit watch_session**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 115)
+- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 281)
 - Frontend emits: `socket.emit('watch_session', { sessionId: session.acpSessionId })`
 - Joins a broadcast room for that session's ACP ID
 
@@ -599,9 +599,9 @@ Context usage metadata (`used_tokens` / `total_tokens`) is persisted on the sess
 
 | File | Lines | Function | Purpose |
 |------|-------|----------|---------|
-| `frontend/src/store/useSessionLifecycleStore.ts` | 86–118 | `handleInitialLoad()` | Boot: emit load_sessions, populate store |
+| `frontend/src/store/useSessionLifecycleStore.ts` | 94–127 | `handleInitialLoad()` | Boot: emit load_sessions, populate store |
 | `frontend/src/hooks/useSocket.ts` | 78–85 | `session_model_options` listener | Receive model updates from backend |
-| `frontend/src/store/useSessionLifecycleStore.ts` | 119+ | `handleSessionSelect()` | Emit watch_session |
+| `frontend/src/store/useSessionLifecycleStore.ts` | 214+ | `handleSessionSelect()` | Select active session and trigger hydration/watch flow |
 | `frontend/src/components/SessionSettingsModal.tsx` | 49–71 | `handleRehydrate()` | Emit rehydrate_session |
 
 ### Database

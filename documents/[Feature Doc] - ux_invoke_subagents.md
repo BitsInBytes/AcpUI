@@ -972,7 +972,7 @@ If `models.subAgent` is undefined, it falls back to `models.default`. Ensure you
 
 ### 7. **MCP Retries Must Not Spawn A Second Batch**
 
-`ux_invoke_subagents` is non-idempotent at the side-effect level: it creates new ACP sessions. Codex and other MCP clients may retry a tool call if the result is lost, delayed, or timed out upstream. The backend therefore deduplicates calls by a scoped idempotency key:
+`ux_invoke_subagents` is non-idempotent at the side-effect level: it creates new ACP sessions. Some MCP clients may retry a tool call if the result is lost, delayed, or timed out upstream. The backend therefore deduplicates calls by a scoped idempotency key:
 
 - Prefer `providerId + parent ACP session + tool name + mcpRequestId`
 - Fall back to `requestMeta.toolCallId` when available

@@ -158,6 +158,72 @@ describe('System Handlers', () => {
         })
       }));
     });
+
+    it('backfills persisted stats when loaded metadata has zero token counts', async () => {
+      const sessionId = 'hot-session-zero-tokens';
+      mockAcpClient.sessionMetadata.set(sessionId, {
+        model: 'runtime-model',
+        toolCalls: 3,
+        successTools: 2,
+        startTime: Date.now() - 5000,
+        usedTokens: 0,
+        totalTokens: 0
+      });
+      mockDb.getSessionByAcpId.mockResolvedValueOnce({
+        model: 'stored-model',
+        currentModelId: 'stored-model-id',
+        stats: {
+          usedTokens: 900,
+          totalTokens: 3000
+        }
+      });
+
+      const callback = vi.fn();
+      const handler = mockSocket.listeners('get_stats')[0];
+      await handler({ sessionId }, callback);
+
+      expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith('provider-a', sessionId);
+      expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+        stats: expect.objectContaining({
+          model: 'stored-model-id',
+          usedTokens: 900,
+          totalTokens: 3000
+        })
+      }));
+    });
+
+    it('backfills only missing token fields and preserves non-zero in-memory values', async () => {
+      const sessionId = 'partial-backfill-acp';
+      mockAcpClient.sessionMetadata.set(sessionId, {
+        model: 'runtime-model',
+        toolCalls: 1,
+        successTools: 1,
+        startTime: Date.now() - 2000,
+        usedTokens: 111,
+        totalTokens: 0
+      });
+      mockDb.getSessionByAcpId.mockResolvedValueOnce({
+        model: 'stored-model',
+        currentModelId: 'stored-model-id',
+        stats: {
+          usedTokens: 999,
+          totalTokens: 5000
+        }
+      });
+
+      const callback = vi.fn();
+      const handler = mockSocket.listeners('get_stats')[0];
+      await handler({ sessionId }, callback);
+
+      expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith('provider-a', sessionId);
+      expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+        stats: expect.objectContaining({
+          model: 'stored-model-id',
+          usedTokens: 111,
+          totalTokens: 5000
+        })
+      }));
+    });
   });
 
   describe('get_logs', () => {

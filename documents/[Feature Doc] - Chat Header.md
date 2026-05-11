@@ -282,7 +282,7 @@ setSystemSettingsOpen(true)
 | `frontend/src/hooks/useSocket.ts` | `'ready'`, `'workspace_cwds'`, `'providers'`, `'branding'` listeners | 31-45, 47-56 | Hydrates store state consumed by header |
 | `frontend/src/store/useSystemStore.ts` | `setProviders`, `setProviderBranding`, `setWorkspaceCwds`, `getBranding` | 114-147, 174, 178-184 | Provider/session display metadata source |
 | `frontend/src/store/useUIStore.ts` | `setSidebarOpen`, `setSystemSettingsOpen`, `setFileExplorerOpen` | 65, 82, 84 | UI action state toggles |
-| `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId` | 35-37, 64-67 | Session selection source |
+| `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId` | 44-46, 72-79 | Session selection source |
 | `frontend/src/App.tsx` | `<ChatHeader />`, `<SystemSettingsModal />`, `<FileExplorer />` | 218, 248-250 | Root composition and modal mounting |
 | `frontend/src/PopOutApp.tsx` | `popoutSessionId`, `<ChatHeader />` | 26, 110 | Detached-window context where header hides controls |
 

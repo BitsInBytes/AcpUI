@@ -178,7 +178,7 @@ Frontend receives:
 ---
 
 ### 5. MCP Handler Starts the Prepared Run
-**File:** `backend/mcp/mcpServer.js` (Lines 74-83) + `backend/services/shellRunManager.js` (Lines 144-235)
+**File:** `backend/mcp/mcpServer.js` (Lines 74-83) + `backend/services/shellRunManager.js` (Lines 147-277)
 
 When the ACP daemon calls `ux_invoke_shell`, the tool handler invokes:
 
@@ -199,7 +199,7 @@ return shellRunManager.startPreparedRun({
 `startPreparedRun()` finds the prepared run by `toolCallId` (or command/cwd fallback):
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 144-166)
+// FILE: backend/services/shellRunManager.js (Lines 195-205)
 let run = this.findPreparedRun({ providerId, sessionId: resolvedSessionId, toolCallId, command, cwd });
 if (!run) {
   const prepared = this.prepareRun({ providerId, sessionId: resolvedSessionId, toolCallId, description, command, cwd, maxLines });
@@ -211,7 +211,7 @@ run.description = normalizeDescription(description) || run.description;
 Then calls `startRun(run)` which spawns the PTY:
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 193-235)
+// FILE: backend/services/shellRunManager.js (Lines 234-277)
 startRun(run) {
   if (run.status !== 'pending') {
     throw new Error(`Shell run ${run.runId} cannot start from status ${run.status}`);
@@ -230,7 +230,7 @@ startRun(run) {
     run.reject = reject;
 
     try {
-      const { shell, args } = buildShellInvocation(run.command, this.platform);
+      const { shell, args } = buildShellInvocation(run.command, this.platform, this.pwshAvailable);
       run.pty = this.pty.spawn(shell, args, {
         name: 'xterm-256color',
         cols: 120,
@@ -258,21 +258,24 @@ startRun(run) {
 }
 ```
 
-**Platform-specific invocation** (Lines 64-72):
-- **Windows**: `powershell.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"`
+**Platform-specific invocation** (Lines 90-102):
+- **Windows (pwsh available)**: `pwsh.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"` — PowerShell 7+, supports `&&` pipeline-chain operator
+- **Windows (pwsh not available)**: `powershell.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"` — Windows PowerShell 5.x fallback
 - **Unix**: `bash -c <command>`
+
+`detectPwsh()` runs `spawnSync('pwsh', ['--version'])` once at `ShellRunManager` construction time to determine which shell to use. It returns false immediately if `pwsh` is not installed (ENOENT), or within ~100ms if it is. The result is stored as `this.pwshAvailable` and passed to `buildShellInvocation()` on every `startRun` call. Pass `pwshAvailable: true/false` to the constructor to override auto-detection (used in tests).
 
 The function **blocks** until the PTY exits, awaiting `run.resolve()` which is called in `finalizeRun()`.
 
 ---
 
 ### 6. PTY Output Streams to Frontend via Socket.IO
-**File:** `backend/services/shellRunManager.js` (Lines 238-259)
+**File:** `backend/services/shellRunManager.js` (Lines 279-300)
 
 As the PTY writes data, `appendOutput()` is called:
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 238-259)
+// FILE: backend/services/shellRunManager.js (Lines 279-300)
 appendOutput(run, chunk, { includeInRaw = true } = {}) {
   if (!chunk) return;
   let outputChunk = chunk;
@@ -501,7 +504,7 @@ socket.on('shell_run_input', (payload = {}, callback) => {
 Handler calls `shellRunManager.writeInput()`:
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 261-269)
+// FILE: backend/services/shellRunManager.js (Lines 302-310)
 writeInput(runId, data) {
   const run = this.runs.get(runId);
   if (!run || run.status !== 'running' || !run.pty) return false;
@@ -518,12 +521,12 @@ The data is written directly to the PTY, where the shell process reads it as std
 ---
 
 ### 10. PTY Exit and Finalization
-**File:** `backend/services/shellRunManager.js` (Lines 300-338)
+**File:** `backend/services/shellRunManager.js` (Lines 348-386)
 
 When the PTY exits (either naturally or via kill), `finalizeRun()` is called:
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 300-338)
+// FILE: backend/services/shellRunManager.js (Lines 348-386)
 finalizeRun(run, exitCode, forcedReason = null, err = null) {
   if (run.status === 'exited') return;
   if (run.inactivityTimer) {
@@ -565,12 +568,12 @@ finalizeRun(run, exitCode, forcedReason = null, err = null) {
 }
 ```
 
-**Reason detection** (Lines 307-312):
+**Reason detection** (Lines 356-360):
 - If user sent Ctrl+C within 1.5s of exit → `user_terminated`
 - Otherwise, exit code 0 → `completed`, non-zero → `failed`
 - Can be forced to `timeout`, `error`, etc.
 
-**Final text formatting** (Lines 351-365):
+**Final text formatting** (Lines 399-413):
 ```javascript
 formatFinalText(run, reason, exitCode, err = null) {
   if (err) return `Error: ${err.message}`;
@@ -1035,21 +1038,21 @@ npm ERR! code ENOENT
 
 | File | Function/Class | Lines | Purpose |
 |------|---|---|---|
-| `backend/services/shellRunManager.js` | `ShellRunManager` (class) | 79-103 | Owns PTY lifecycle, manages concurrent runs |
-| | `prepareRun()` | 109-141 | Create pending run before MCP execution |
-| | `startPreparedRun()` | 144-166 | Find prepared run or create new, merge MCP description, then start |
-| | `findPreparedRun()` | 169-190 | Locate run by toolCallId or command+cwd |
-| | `startRun()` | 193-235 | Spawn PTY, setup listeners, return promise |
-| | `appendOutput()` | 238-259 | Sanitize startup control noise, buffer chunk, emit shell_run_output |
-| | `writeInput()` | 261-269 | Write data to pty.stdin, detect Ctrl+C |
-| | `resizeRun()` | 271-276 | Resize PTY to cols/rows |
-| | `killRun()` | 278-289 | Kill PTY, mark as exiting |
-| | `resetInactivityTimer()` | 291-298 | Set 30-min inactivity timeout |
-| | `finalizeRun()` | 300-338 | Mark exited, format result, resolve promise |
-| | `formatFinalText()` | 351-365 | Generate final text based on reason |
-| | `snapshot()` | 367-384 | Return immutable snapshot of run, including description |
-| | `getSnapshotsForSession()` | 386-390 | Get all snapshots for a session |
-| | `emit()` | 392-400 | Emit socket event to session room |
+| `backend/services/shellRunManager.js` | `ShellRunManager` (class) | 113-141 | Owns PTY lifecycle, manages concurrent runs |
+| | `prepareRun()` | 147-181 | Create pending run before MCP execution |
+| | `startPreparedRun()` | 183-208 | Find prepared run or create new, merge MCP description, then start |
+| | `findPreparedRun()` | 210-232 | Locate run by toolCallId or command+cwd |
+| | `startRun()` | 234-277 | Spawn PTY, setup listeners, return promise |
+| | `appendOutput()` | 279-300 | Sanitize startup control noise, buffer chunk, emit shell_run_output |
+| | `writeInput()` | 302-310 | Write data to pty.stdin, detect Ctrl+C |
+| | `resizeRun()` | 312-324 | Resize PTY to cols/rows (returns false on Windows deferred-resize race) |
+| | `killRun()` | 326-337 | Kill PTY, mark as exiting |
+| | `resetInactivityTimer()` | 339-346 | Set 30-min inactivity timeout |
+| | `finalizeRun()` | 348-386 | Mark exited, format result, resolve promise |
+| | `formatFinalText()` | 399-413 | Generate final text based on reason |
+| | `snapshot()` | 415-433 | Return immutable snapshot of run, including description |
+| | `getSnapshotsForSession()` | 435-439 | Get all snapshots for a session |
+| | `emit()` | 441-450 | Emit socket event to session room |
 | `backend/services/acpUpdateHandler.js` | `isUxInvokeShellToolName()` | 75-81 | Check if string matches ux_invoke_shell patterns |
 | | `isUxShellToolEvent()` | 93-102 | Check if tool_call is ux_invoke_shell |
 | | `prepareShellRunForToolStart()` | 104-142 | Prepare run on tool_call, extract cmd/cwd/description |
@@ -1082,11 +1085,12 @@ npm ERR! code ENOENT
 
 | File | Function | Purpose | Lines |
 |------|---|---|---|
-| `backend/services/shellRunManager.js` | `getMaxShellResultLines()` | Read MAX_SHELL_RESULT_LINES env var | 20-23 |
-| | `trimShellOutputLines()` | Keep only last N lines of output | 29-38 |
-| | `sanitizeShellOutputChunk()` | Remove PowerShell startup terminal noise before streaming | 40-54 |
-| | `buildShellInvocation()` | Platform-specific shell command | 64-72 |
-| | `normalizeCwd()` | Resolve working directory | 75-77 |
+| `backend/services/shellRunManager.js` | `detectPwsh()` | Sync check for PowerShell 7+ (pwsh) availability | 28-44 |
+| | `getMaxShellResultLines()` | Read MAX_SHELL_RESULT_LINES env var | 46-49 |
+| | `trimShellOutputLines()` | Keep only last N lines of output | 55-64 |
+| | `sanitizeShellOutputChunk()` | Remove PowerShell startup terminal noise before streaming | 66-79 |
+| | `buildShellInvocation()` | Platform-specific shell command; picks pwsh.exe vs powershell.exe | 90-102 |
+| | `normalizeCwd()` | Resolve working directory | 105-107 |
 | `frontend/src/store/useShellRunStore.ts` | `trimShellTranscript()` | Keep only last N lines of transcript | 30-43 |
 | | `pruneShellRuns()` | Keep at most 50 runs, prioritize active | 45-55 |
 | `frontend/src/components/ShellToolTerminal.tsx` | `stripAnsi()` | Remove ANSI escape codes | 18-24 |
@@ -1242,7 +1246,7 @@ Located in `frontend/src/test/`:
 1. **Understand the lifecycle** — Read Section "How It Works — End-to-End Flow" (Steps 1-12)
 2. **Check the contract** — Read "The Critical Contract" section to understand run states and concurrency
 3. **Identify the layer** — Is your feature:
-   - **Backend PTY management?** → `ShellRunManager` (Lines 79-410 in shellRunManager.js)
+   - **Backend PTY management?** → `ShellRunManager` (Lines 113-460 in shellRunManager.js)
    - **Tool preparation?** → `acpUpdateHandler.prepareShellRunForToolStart()` (Lines 104-142)
    - **Socket routing?** → `shellRunHandlers.js` (Lines 26-84)
    - **Frontend rendering?** → `ShellToolTerminal.tsx` (Lines 18-359)

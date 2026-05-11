@@ -59,12 +59,12 @@ const handleRemoveSession = (sessionId: string) => {
 ---
 
 ### Step 2: Frontend Emits `archive_session` with Session UI ID
-**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 277–293)
+**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 302–318)
 
 After user interaction, the socket emits:
 
 ```typescript
-// FILE: frontend/src/store/useSessionLifecycleStore.ts (Lines 283)
+// FILE: frontend/src/store/useSessionLifecycleStore.ts (Line 308)
 socket.emit('archive_session', { providerId: session.provider, uiId });
 ```
 
@@ -602,7 +602,7 @@ Filter out existing IDs, add new sessions to state
 | | `handleDeleteArchive()` | 176–182 | Emit `delete_archive`, update local list |
 | | `handleRemoveSession()` | 184–210 | Check `deletePermanent` flag, emit `archive_session` or `delete_session` |
 | | Archive modal render | 450–460 | Conditionally show ArchiveModal |
-| `frontend/src/store/useSessionLifecycleStore.ts` | `handleDeleteSession()` | 277–293 | Emit `archive_session` or `delete_session` based on settings |
+| `frontend/src/store/useSessionLifecycleStore.ts` | `handleDeleteSession()` | 302–318 | Emit `archive_session` or `delete_session` based on settings |
 | `frontend/src/test/ArchiveModal.test.tsx` | Test suite | Full file | 5 test cases (render, search, restore, delete, empty state) |
 
 ### Backend Files
@@ -848,4 +848,3 @@ The **Session Archiving** system is a soft-delete mechanism that preserves compl
 **Critical contract:** Archive folders contain `session.json` metadata; restore always generates new IDs and merges with existing sessions (never replaces); descendants are deleted (not archived) when parent archived.
 
 **Why agents should care:** Archiving is the default deletion path (unless `deletePermanent` is true); understanding cascade logic, restore merge strategy, and provider module contracts allows you to extend archiving to new features (e.g., archive entire folders, batch restore), debug data loss issues, or implement custom retention policies without re-reading the entire codebase.
-

@@ -6,16 +6,24 @@ import * as db from '../database.js';
 export default function registerSystemHandlers(io, socket) {
   socket.on('get_stats', async ({ sessionId }, callback) => {
     const providerId = acpClient.getProviderId?.() || acpClient.providerId;
-    const meta = acpClient.sessionMetadata.get(sessionId) || {
+    const existingMeta = acpClient.sessionMetadata.get(sessionId);
+    const meta = existingMeta || {
       model: 'Unknown', toolCalls: 0, successTools: 0, startTime: Date.now(), usedTokens: 0, totalTokens: 0
     };
-    if (!acpClient.sessionMetadata.get(sessionId)) {
+    const needsPersistedStats = !existingMeta
+      || Number(meta.usedTokens || 0) <= 0
+      || Number(meta.totalTokens || 0) <= 0;
+    if (needsPersistedStats) {
       try {
         const dbSession = await db.getSessionByAcpId(providerId, sessionId);
         if (dbSession?.stats) {
           meta.model = dbSession.currentModelId || dbSession.model || meta.model;
-          meta.usedTokens = Number(dbSession.stats.usedTokens || 0);
-          meta.totalTokens = Number(dbSession.stats.totalTokens || 0);
+          if (Number(meta.usedTokens || 0) <= 0) {
+            meta.usedTokens = Number(dbSession.stats.usedTokens || 0);
+          }
+          if (Number(meta.totalTokens || 0) <= 0) {
+            meta.totalTokens = Number(dbSession.stats.totalTokens || 0);
+          }
         }
       } catch {
         // best-effort DB fallback only

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ShellRunManager,
+  detectPwsh,
   getMaxShellResultLines,
   isShellV2Enabled,
   sanitizeShellOutputChunk,
@@ -50,7 +51,8 @@ describe('shellRunManager', () => {
       }),
       clearTimeoutFn: vi.fn(),
       inactivityTimeoutMs: 100,
-      platform: 'win32'
+      platform: 'win32',
+      pwshAvailable: false
     });
   });
 
@@ -217,6 +219,22 @@ describe('shellRunManager', () => {
     expect(manager.resizeRun(prepared.runId, 100, 40)).toBe(false);
   });
 
+  it('returns false and does not throw if pty throws during deferred resize (race condition)', async () => {
+    const prepared = manager.prepareRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'quick' });
+    const promise = manager.startPreparedRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'quick' });
+
+    // Simulate node-pty deferring the resize on Windows: the PTY throws after the status
+    // check passes but before the deferred WindowsPtyAgent.resize() call fires.
+    ptyMock.proc.resize.mockImplementation(() => {
+      throw new Error('Cannot resize a pty that has already exited');
+    });
+
+    expect(manager.resizeRun(prepared.runId, 100, 40)).toBe(false);
+
+    ptyMock.proc.exitCb({ exitCode: 0 });
+    await promise;
+  });
+
   it('returns rendered transcript plus user termination message on hard kill', async () => {
     const prepared = manager.prepareRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'long' });
     const promise = manager.startPreparedRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'long' });
@@ -293,5 +311,84 @@ describe('shellRunManager', () => {
     expect(manager.getSnapshotsForSession(null, 'acp-1')).toEqual([
       expect.objectContaining({ runId: prepared.runId })
     ]);
+  });
+});
+
+describe('detectPwsh', () => {
+  it('returns false on non-windows platforms', () => {
+    expect(detectPwsh('linux')).toBe(false);
+    expect(detectPwsh('darwin')).toBe(false);
+  });
+
+  it('returns true on windows when pwsh --version exits 0', () => {
+    const spawnSyncFn = vi.fn(() => ({ status: 0 }));
+    expect(detectPwsh('win32', spawnSyncFn)).toBe(true);
+    expect(spawnSyncFn).toHaveBeenCalledWith('pwsh', ['--version'], expect.objectContaining({
+      timeout: 3000,
+      stdio: 'ignore',
+      windowsHide: true
+    }));
+  });
+
+  it('returns false on windows when pwsh exits non-zero', () => {
+    const spawnSyncFn = vi.fn(() => ({ status: 1 }));
+    expect(detectPwsh('win32', spawnSyncFn)).toBe(false);
+  });
+
+  it('returns false on windows when spawn throws', () => {
+    const spawnSyncFn = vi.fn(() => { throw new Error('ENOENT'); });
+    expect(detectPwsh('win32', spawnSyncFn)).toBe(false);
+  });
+});
+
+describe('shellRunManager — pwsh.exe invocation', () => {
+  let ptyMock;
+  let ioMock;
+  let manager;
+
+  beforeEach(() => {
+    ptyMock = createPtyMock();
+    ioMock = createIoMock();
+    manager = new ShellRunManager({
+      io: ioMock.io,
+      ptyModule: ptyMock.ptyModule,
+      log: vi.fn(),
+      now: () => 1000,
+      setTimeoutFn: vi.fn((cb) => cb),
+      clearTimeoutFn: vi.fn(),
+      inactivityTimeoutMs: 100,
+      platform: 'win32',
+      pwshAvailable: true
+    });
+  });
+
+  it('spawns pwsh.exe instead of powershell.exe when pwsh is available', async () => {
+    const prepared = manager.prepareRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'npm test' });
+    const promise = manager.startPreparedRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'npm test' });
+
+    expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('pwsh.exe', [
+      '-NoProfile',
+      '-Command',
+      '$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; npm test'
+    ], expect.objectContaining({ name: 'xterm-256color' }));
+
+    ptyMock.proc.exitCb({ exitCode: 0 });
+    await promise;
+    expect(manager.snapshot(prepared.runId)).toEqual(expect.objectContaining({ status: 'exited' }));
+  });
+
+  it('supports && chaining commands (the primary motivation for pwsh)', async () => {
+    const command = 'cd D:\\repo && npm install';
+    manager.prepareRun({ providerId: 'provider-a', sessionId: 'acp-1', command });
+    const promise = manager.startPreparedRun({ providerId: 'provider-a', sessionId: 'acp-1', command });
+
+    expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('pwsh.exe', [
+      '-NoProfile',
+      '-Command',
+      `$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`
+    ], expect.anything());
+
+    ptyMock.proc.exitCb({ exitCode: 0 });
+    await promise;
   });
 });

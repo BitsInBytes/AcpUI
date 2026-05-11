@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import * as childProcess from 'child_process';
 import pty from 'node-pty';
 import { writeLog } from './logger.js';
 
@@ -16,6 +17,31 @@ const POWERSHELL_SESSION_MODE_SEQUENCE = /\x1b\[\?(?:25|1004|9001)[hl]/g;
 // eslint-disable-next-line no-control-regex
 const STARTUP_SCREEN_CONTROL_SEQUENCE = /\x1b\[(?:[0-9;]*[HfJX]|m)/g;
 const LEADING_BLANK_ROWS = /^(?:[ \t]*\r?\n)+/;
+
+/**
+ * Returns true if PowerShell 7+ (pwsh) is available on this machine.
+ * pwsh supports the && pipeline-chain operator that most AI models assume,
+ * whereas Windows PowerShell 5 (powershell.exe) does not.
+ * Detection is synchronous and fast: spawnSync returns immediately with ENOENT
+ * when pwsh is not installed, and pwsh --version exits in <100 ms when it is.
+ */
+export function detectPwsh(platform = process.platform, spawnSyncFn = null) {
+  if (platform !== 'win32') return false;
+  try {
+    const runner = typeof spawnSyncFn === 'function'
+      ? spawnSyncFn
+      : (typeof childProcess.spawnSync === 'function' ? childProcess.spawnSync : null);
+    if (!runner) return false;
+    const result = runner('pwsh', ['--version'], {
+      timeout: 3000,
+      stdio: 'ignore',
+      windowsHide: true
+    });
+    return result.status === 0;
+  } catch {
+    return false;
+  }
+}
 
 export function getMaxShellResultLines(env = process.env) {
   const parsed = Number.parseInt(env.MAX_SHELL_RESULT_LINES || '', 10);
@@ -61,10 +87,14 @@ function createRunId() {
   return `shell-run-${randomUUID()}`;
 }
 
-function buildShellInvocation(command, platform = process.platform) {
+function buildShellInvocation(command, platform = process.platform, usePwsh = false) {
   if (platform === 'win32') {
+    // Use pwsh (PowerShell 7+) when available — it supports the && pipeline-chain
+    // operator that AI models commonly generate. Fall back to powershell.exe (5.x)
+    // which does not support &&.
+    const shell = usePwsh ? 'pwsh.exe' : 'powershell.exe';
     return {
-      shell: 'powershell.exe',
+      shell,
       // Prevent PowerShell from printing the Encoding object to stdout.
       args: ['-NoProfile', '-Command', `$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]
     };
@@ -91,7 +121,10 @@ export class ShellRunManager {
     inactivityTimeoutMs = DEFAULT_INACTIVITY_TIMEOUT_MS,
     interruptGraceMs = DEFAULT_INTERRUPT_GRACE_MS,
     completedRetentionMs = DEFAULT_COMPLETED_RETENTION_MS,
-    platform = process.platform
+    platform = process.platform,
+    // Pass true/false to override detection (useful in tests). null triggers
+    // auto-detection via detectPwsh() at construction time.
+    pwshAvailable = null
   } = {}) {
     this.io = io;
     this.pty = ptyModule;
@@ -103,6 +136,7 @@ export class ShellRunManager {
     this.interruptGraceMs = interruptGraceMs;
     this.completedRetentionMs = completedRetentionMs;
     this.platform = platform;
+    this.pwshAvailable = pwshAvailable !== null ? pwshAvailable : detectPwsh(platform);
     this.runs = new Map();
   }
 
@@ -215,7 +249,7 @@ export class ShellRunManager {
       run.reject = reject;
 
       try {
-        const { shell, args } = buildShellInvocation(run.command, this.platform);
+        const { shell, args } = buildShellInvocation(run.command, this.platform, this.pwshAvailable);
         run.pty = this.pty.spawn(shell, args, {
           name: 'xterm-256color',
           cols: 120,
@@ -278,7 +312,14 @@ export class ShellRunManager {
   resizeRun(runId, cols, rows) {
     const run = this.runs.get(runId);
     if (!run || run.status !== 'running' || !run.pty || cols <= 0 || rows <= 0) return false;
-    run.pty.resize(cols, rows);
+    try {
+      run.pty.resize(cols, rows);
+    } catch {
+      // node-pty on Windows defers the resize internally; the PTY may exit between
+      // the status check above and the deferred WindowsPtyAgent.resize() call,
+      // causing it to throw "Cannot resize a pty that has already exited".
+      return false;
+    }
     return true;
   }
 
