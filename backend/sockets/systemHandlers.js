@@ -1,6 +1,7 @@
 import fs from 'fs';
 import acpClient from '../services/acpClient.js';
 import { getLogFilePath } from '../services/logger.js';
+import * as db from '../database.js';
 
 export default function registerSystemHandlers(io, socket) {
   socket.on('get_stats', async ({ sessionId }, callback) => {
@@ -8,6 +9,18 @@ export default function registerSystemHandlers(io, socket) {
     const meta = acpClient.sessionMetadata.get(sessionId) || {
       model: 'Unknown', toolCalls: 0, successTools: 0, startTime: Date.now(), usedTokens: 0, totalTokens: 0
     };
+    if (!acpClient.sessionMetadata.get(sessionId)) {
+      try {
+        const dbSession = await db.getSessionByAcpId(providerId, sessionId);
+        if (dbSession?.stats) {
+          meta.model = dbSession.currentModelId || dbSession.model || meta.model;
+          meta.usedTokens = Number(dbSession.stats.usedTokens || 0);
+          meta.totalTokens = Number(dbSession.stats.totalTokens || 0);
+        }
+      } catch {
+        // best-effort DB fallback only
+      }
+    }
     if (meta.totalTokens === 0) {
       meta.totalTokens = 1000000;
     }

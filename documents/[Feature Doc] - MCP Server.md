@@ -37,7 +37,7 @@ Meanwhile, the **backend** handles all the real work:
 - **No tool state in the proxy:** If the proxy crashes, tools and sockets aren't affected
 - **Live streaming works:** Tools can emit real-time updates via Socket.IO (the proxy just forwards results)
 - **Sub-agents work:** Tools can spawn new ACP sessions independently
-- **No timeout issues:** HTTP timeouts are disabled, tools can run indefinitely
+- **Backend HTTP timeouts disabled:** backend routes keep long tool calls open; provider MCP clients may still retry or time out upstream, so side-effectful tools need replay protection
 
 ---
 
@@ -54,9 +54,8 @@ tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessi
   // Delegate to shellRunManager for interactive terminal execution.
 };
 
-tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {
-```
-  // Real logic: spawn sub-agent sessions, await responses, cleanup
+tools.ux_invoke_subagents = async ({ requests, model, providerId, acpSessionId, mcpProxyId, mcpRequestId, requestMeta }) => {
+  // Build an idempotency key, then spawn sub-agent sessions through SubAgentInvocationManager.
 };
 ```
 
@@ -438,12 +437,12 @@ export function createToolHandlers(io) {
     // Interactive implementation via shellRunManager
   };
 
-  tools.ux_invoke_subagents = async ({ requests, model, providerId }) => {  // LINE 87
-    // Real implementation
+  tools.ux_invoke_subagents = async ({ requests, model, providerId, acpSessionId, mcpProxyId, mcpRequestId, requestMeta }) => {
+    // Build replay key; delegate to SubAgentInvocationManager
   };
 
-  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId }) => {  // LINE 92
-    // Real implementation
+  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId, acpSessionId, mcpProxyId, mcpRequestId, requestMeta }) => {
+    // Builds counsel requests and reuses the sub-agent replay guard
   };
 
   return tools;
@@ -662,23 +661,29 @@ Both `sessionManager.js:getMcpServers(providerId)` and `mcpServer.js:getMcpServe
 
 Handlers must return `{ content: [{ type: 'text', text: '...' }, ...] }`. Returning raw strings or other shapes will confuse the ACP.
 
-### 6. **Provider Scope Is Inherited by Sub-Agents**
+### 6. **Side-Effectful Tool Calls Need Idempotency**
+
+The stdio proxy retries failed backend fetches, and provider MCP clients may also retry a long-running tool if their own timeout fires or the response is lost. Tools that only read data can tolerate this. Tools that create durable side effects, especially `ux_invoke_subagents`, must deduplicate by provider/session/tool/MCP request identity and return an active or cached result instead of repeating the side effect.
+
+`ux_invoke_subagents` builds a key from `mcpRequestId`, `requestMeta.toolCallId`, or a scoped hash of its input. Duplicate active calls join the original promise. Duplicate completed calls return the cached result for a short TTL.
+
+### 7. **Provider Scope Is Inherited by Sub-Agents**
 
 Sub-agent sessions inherit the parent provider's `ACP_SESSION_PROVIDER_ID` via environment variable. This ensures tools called from within sub-agents maintain the correct provider scope and access the right configuration, models, and branding. No fallback logic needed.
 
-### 7. **Tool Definitions Are Cached by Proxy**
+### 8. **Tool Definitions Are Cached by Proxy**
 
 The proxy fetches tool definitions once at startup (line 41). If you update schemas while a session is running, the agent won't see the new definitions until a new session is created. No need to restart anything — just create a new session.
 
-### 8. **Errors Must Be Caught and Wrapped**
+### 9. **Errors Must Be Caught and Wrapped**
 
 If a handler throws, mcpApi.js catches it (line 102) and returns `{ content: [{ type: 'text', text: 'Error: ...' }] }`. The proxy passes this back as a successful response. The ACP sees it as tool output, not an error. This is acceptable — the tool ran and returned an error message.
 
-### 9. **Shell Terminal Events Happen Outside Tool Result**
+### 10. **Shell Terminal Events Happen Outside Tool Result**
 
 `ux_invoke_shell` emits `shell_run_started`, `shell_run_output`, and `shell_run_exit` through Socket.IO while the HTTP/MCP tool call remains pending. The final MCP result is returned only after process exit or user termination. Multiple shell calls can be pending at once because each run is correlated by `shellRunId`.
 
-### 10. **MCP Tool Annotations Are Hints, Not Scheduling Controls**
+### 11. **MCP Tool Annotations Are Hints, Not Scheduling Controls**
 
 `GET /api/mcp/tools` includes conservative `annotations` for `ux_invoke_shell`:
 
@@ -689,11 +694,11 @@ If a handler throws, mcpApi.js catches it (line 102) and returns `{ content: [{ 
 
 MCP does not define a standard `parallelizable` flag. The shell tool description states that independent shell calls may be invoked concurrently, and the tool descriptor includes `_meta["acpui/concurrentInvocationsSupported"] = true` for AcpUI-aware clients. The stdio proxy preserves `title`, `annotations`, `execution`, `outputSchema`, and `_meta` when registering tools.
 
-### 11. **Tool Output Streaming Happens Outside Tool Call**
+### 12. **Tool Output Streaming Happens Outside Tool Call**
 
 Shell output is not streamed through the HTTP response body. It is sent through Socket.IO terminal events, and the HTTP response carries only the final MCP content array.
 
-### 12. **The Proxy Is Stateless**
+### 13. **The Proxy Is Stateless**
 
 Every tool call includes `providerId` and `proxyId`. The proxy doesn't store state. If you need to track state across tool calls, use backend state keyed by proxy/session/run id.
 

@@ -260,6 +260,26 @@ describe('mcpServer', () => {
       expect(result.content[0].text).toContain('Error: Shell execution context unavailable');
       expect(mockShellRunManager.startPreparedRun).not.toHaveBeenCalled();
     });
+
+    it('falls back to default MCP server name when provider lookup fails while caching metadata', async () => {
+      mockGetProvider.mockImplementation(() => {
+        throw new Error('missing provider');
+      });
+      const handlers = createToolHandlers(mockIo);
+
+      await handlers.ux_invoke_shell({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        requestMeta: { toolCallId: 'tool-1' },
+        description: 'List files',
+        command: 'ls'
+      });
+
+      expect(mockIo.to).toHaveBeenCalledWith('session:acp-1');
+      expect(mockIo.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+        mcpServer: 'AcpUI'
+      }));
+    });
   });
 
   describe('ux_invoke_subagents', () => {
@@ -293,6 +313,105 @@ describe('mcpServer', () => {
       });
 
       expect(result.content[0].text).toContain('Sub response');
+    });
+
+    it('deduplicates repeated MCP request ids for the same parent session', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'dedupe-sub-acp';
+
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        if (method === 'session/prompt') {
+          const meta = mockAcpClient.sessionMetadata.get(subId);
+          if (meta) meta.lastResponseBuffer = 'Deduped response';
+          return {};
+        }
+        return {};
+      });
+
+      vi.useFakeTimers();
+      const args = {
+        requests: [{ name: 'Agent 1', prompt: 'Do thing', agent: 'dev' }],
+        providerId: 'provider-a',
+        acpSessionId: 'parent-acp-dedupe',
+        mcpRequestId: 42
+      };
+      const first = handlers.ux_invoke_subagents(args);
+      const second = handlers.ux_invoke_subagents(args);
+      await vi.runAllTimersAsync();
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      vi.useRealTimers();
+
+      expect(firstResult.content[0].text).toContain('Deduped response');
+      expect(secondResult.content[0].text).toContain('Deduped response');
+      expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
+    });
+
+    it('deduplicates by tool call metadata when MCP request id is absent', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'dedupe-meta-sub-acp';
+
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        if (method === 'session/prompt') {
+          const meta = mockAcpClient.sessionMetadata.get(subId);
+          if (meta) meta.lastResponseBuffer = 'Metadata deduped response';
+          return {};
+        }
+        return {};
+      });
+
+      vi.useFakeTimers();
+      const args = {
+        requests: [{ name: 'Agent 1', prompt: 'Do thing', agent: 'dev' }],
+        providerId: 'provider-a',
+        acpSessionId: 'parent-acp-dedupe',
+        requestMeta: { tool_call_id: 'tool-call-123' }
+      };
+      const first = handlers.ux_invoke_subagents(args);
+      const second = handlers.ux_invoke_subagents(args);
+      await vi.runAllTimersAsync();
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      vi.useRealTimers();
+
+      expect(firstResult.content[0].text).toContain('Metadata deduped response');
+      expect(secondResult.content[0].text).toContain('Metadata deduped response');
+      expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
+    });
+
+    it('deduplicates by scoped input fingerprint when request ids are absent', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const subId = 'dedupe-fingerprint-sub-acp';
+
+      mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+        if (method === 'session/new') return { sessionId: subId };
+        if (method === 'session/prompt') {
+          const meta = mockAcpClient.sessionMetadata.get(subId);
+          if (meta) meta.lastResponseBuffer = 'Fingerprint deduped response';
+          return {};
+        }
+        return {};
+      });
+
+      vi.useFakeTimers();
+      const args = {
+        requests: [{ name: 'Agent 1', prompt: 'Do thing', agent: 'dev', cwd: 'D:/Git/AcpUI' }],
+        model: 's',
+        providerId: 'provider-a',
+        acpSessionId: 'parent-acp-dedupe'
+      };
+      const first = handlers.ux_invoke_subagents(args);
+      const second = handlers.ux_invoke_subagents({
+        ...args,
+        requests: [{ cwd: 'D:/Git/AcpUI', agent: 'dev', prompt: 'Do thing', name: 'Agent 1' }]
+      });
+      await vi.runAllTimersAsync();
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      vi.useRealTimers();
+
+      expect(firstResult.content[0].text).toContain('Fingerprint deduped response');
+      expect(secondResult.content[0].text).toContain('Fingerprint deduped response');
+      expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
     });
 
     it('emits sub_agents_starting immediately with invocationId before stagger', async () => {
@@ -572,6 +691,26 @@ describe('mcpServer', () => {
       expect(getSessionByAcpId).toHaveBeenCalledWith('provider-a', 'parent-acp-456');
       expect(mockIo.emit).toHaveBeenCalledWith('sub_agents_starting', expect.objectContaining({
         parentUiId: 'parent-ui-123'
+      }));
+    });
+
+    it('prefers MCP session context over stale parent tracking', async () => {
+      const { getSessionByAcpId } = await import('../database.js');
+      vi.mocked(getSessionByAcpId).mockResolvedValueOnce({ id: 'parent-ui-explicit' });
+      mockAcpClient.lastSubAgentParentAcpId = 'stale-parent-acp';
+
+      const handlers = createToolHandlers(mockIo);
+      await handlers.ux_invoke_subagents({
+        requests: [{ prompt: 'hi' }],
+        providerId: 'provider-a',
+        acpSessionId: 'explicit-parent-acp',
+        mcpRequestId: 99
+      });
+
+      expect(getSessionByAcpId).toHaveBeenCalledWith('provider-a', 'explicit-parent-acp');
+      expect(getSessionByAcpId).not.toHaveBeenCalledWith('provider-a', 'stale-parent-acp');
+      expect(mockIo.emit).toHaveBeenCalledWith('sub_agents_starting', expect.objectContaining({
+        parentUiId: 'parent-ui-explicit'
       }));
     });
 

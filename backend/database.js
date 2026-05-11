@@ -35,6 +35,8 @@ export function initDb() {
           messages_json TEXT,
           last_active INTEGER,
           is_pinned INTEGER DEFAULT 0,
+          used_tokens REAL,
+          total_tokens REAL,
           config_options_json TEXT,
           current_model_id TEXT,
           model_options_json TEXT,
@@ -55,6 +57,8 @@ export function initDb() {
       db.run(`ALTER TABLE sessions ADD COLUMN fork_point INTEGER`, (err) => { if (err && !err.message.includes('duplicate')) writeLog(`[DB] Migration skip: ${err.message}`); });
       db.run(`ALTER TABLE sessions ADD COLUMN is_sub_agent INTEGER DEFAULT 0`, (err) => { if (err && !err.message.includes('duplicate')) writeLog(`[DB] Migration skip: ${err.message}`); });
       db.run(`ALTER TABLE sessions ADD COLUMN parent_acp_session_id TEXT`, (err) => { if (err && !err.message.includes('duplicate')) writeLog(`[DB] Migration skip: ${err.message}`); });
+      db.run(`ALTER TABLE sessions ADD COLUMN used_tokens REAL`, (err) => { if (err && !err.message.includes('duplicate')) writeLog(`[DB] Migration skip: ${err.message}`); });
+      db.run(`ALTER TABLE sessions ADD COLUMN total_tokens REAL`, (err) => { if (err && !err.message.includes('duplicate')) writeLog(`[DB] Migration skip: ${err.message}`); });
       db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_provider_acp ON sessions(provider, acp_id)`, (err) => { if (err) writeLog(`[DB] Index error: ${err.message}`); });
       db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_acp ON sessions(acp_id)`, (err) => { if (err) writeLog(`[DB] Index error: ${err.message}`); });
 
@@ -116,18 +120,20 @@ export function setDbForTesting(mock) {
 
 // Save or update a session
 export function saveSession(session) {
-  const { id, acpSessionId, name, model, messages, isPinned, cwd, folderId, forkedFrom, forkPoint, isSubAgent, parentAcpSessionId, configOptions, currentModelId, modelOptions, provider } = session;
+  const { id, acpSessionId, name, model, messages, isPinned, cwd, folderId, forkedFrom, forkPoint, isSubAgent, parentAcpSessionId, configOptions, currentModelId, modelOptions, provider, stats } = session;
   const messagesJson = JSON.stringify(messages || []);
   const configOptionsJson = JSON.stringify(configOptions || []);
   const normalizedModelOptions = normalizeModelOptions(modelOptions);
   const modelOptionsJson = Array.isArray(modelOptions) ? JSON.stringify(normalizedModelOptions) : null;
+  const usedTokens = Number.isFinite(Number(stats?.usedTokens)) ? Number(stats.usedTokens) : null;
+  const totalTokens = Number.isFinite(Number(stats?.totalTokens)) ? Number(stats.totalTokens) : null;
   const lastActive = Date.now();
   const pinnedVal = isPinned ? 1 : 0;
 
   return new Promise((resolve, reject) => {
     db.run(`
-      INSERT INTO sessions (ui_id, acp_id, name, model, messages_json, last_active, is_pinned, cwd, folder_id, forked_from, fork_point, is_sub_agent, parent_acp_session_id, config_options_json, current_model_id, model_options_json, provider)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO sessions (ui_id, acp_id, name, model, messages_json, last_active, is_pinned, cwd, folder_id, forked_from, fork_point, is_sub_agent, parent_acp_session_id, used_tokens, total_tokens, config_options_json, current_model_id, model_options_json, provider)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(ui_id) DO UPDATE SET
         acp_id = excluded.acp_id,
         name = excluded.name,
@@ -137,6 +143,8 @@ export function saveSession(session) {
         is_pinned = excluded.is_pinned,
         cwd = excluded.cwd,
         folder_id = excluded.folder_id,
+        used_tokens = COALESCE(excluded.used_tokens, used_tokens),
+        total_tokens = COALESCE(excluded.total_tokens, total_tokens),
         config_options_json = CASE
           WHEN excluded.config_options_json IS NULL OR excluded.config_options_json = '[]'
             THEN config_options_json
@@ -149,7 +157,7 @@ export function saveSession(session) {
           ELSE excluded.model_options_json
         END,
         provider = COALESCE(excluded.provider, provider)
-    `, [id, acpSessionId, name, model, messagesJson, lastActive, pinnedVal, cwd || null, folderId || null, forkedFrom || null, forkPoint ?? null, isSubAgent ? 1 : 0, parentAcpSessionId || null, configOptionsJson, currentModelId || null, modelOptionsJson, provider || null], (err) => {
+    `, [id, acpSessionId, name, model, messagesJson, lastActive, pinnedVal, cwd || null, folderId || null, forkedFrom || null, forkPoint ?? null, isSubAgent ? 1 : 0, parentAcpSessionId || null, usedTokens, totalTokens, configOptionsJson, currentModelId || null, modelOptionsJson, provider || null], (err) => {
       if (err) reject(err);
       else resolve();
     });
@@ -168,7 +176,7 @@ function parseJsonArray(value) {
 // Get all session metadata (no heavy messages)
 export function getAllSessions(provider = null, options = {}) {
   let query = `
-    SELECT ui_id, acp_id, name, model, last_active, is_pinned, cwd, folder_id, forked_from, fork_point, is_sub_agent, parent_acp_session_id, config_options_json, provider,
+    SELECT ui_id, acp_id, name, model, last_active, is_pinned, cwd, folder_id, forked_from, fork_point, is_sub_agent, parent_acp_session_id, used_tokens, total_tokens, config_options_json, provider,
            CASE WHEN notes IS NOT NULL AND notes != '' THEN 1 ELSE 0 END as has_notes
     FROM sessions
   `;
@@ -199,6 +207,17 @@ export function getAllSessions(provider = null, options = {}) {
         parentAcpSessionId: row.parent_acp_session_id || null,
         hasNotes: row.has_notes === 1,
         provider: row.provider || null,
+        stats: {
+          sessionId: row.acp_id || '',
+          sessionPath: 'Relative',
+          model: row.model || 'Unknown',
+          toolCalls: 0,
+          successTools: 0,
+          durationMs: 0,
+          usedTokens: Number(row.used_tokens || 0),
+          totalTokens: Number(row.total_tokens || 0),
+          sessionSizeMb: 0
+        },
         configOptions: parseJsonArray(row.config_options_json),
         currentModelId: row.current_model_id || null,
         modelOptions: normalizeModelOptions(parseJsonArray(row.model_options_json)),
@@ -212,7 +231,7 @@ export function getAllSessions(provider = null, options = {}) {
 export function getPinnedSessions(providerId) {
   return new Promise((resolve, reject) => {
     db.all(`
-      SELECT ui_id, acp_id, name, model, last_active, is_pinned, cwd, folder_id, provider, config_options_json, current_model_id, model_options_json
+      SELECT ui_id, acp_id, name, model, last_active, is_pinned, cwd, folder_id, provider, used_tokens, total_tokens, config_options_json, current_model_id, model_options_json
       FROM sessions
       WHERE is_pinned = 1 AND (provider = ? OR provider IS NULL)
     `, [providerId], (err, rows) => {
@@ -227,6 +246,17 @@ export function getPinnedSessions(providerId) {
         cwd: row.cwd || null,
         folderId: row.folder_id || null,
         provider: row.provider || null,
+        stats: {
+          sessionId: row.acp_id || '',
+          sessionPath: 'Relative',
+          model: row.model || 'Unknown',
+          toolCalls: 0,
+          successTools: 0,
+          durationMs: 0,
+          usedTokens: Number(row.used_tokens || 0),
+          totalTokens: Number(row.total_tokens || 0),
+          sessionSizeMb: 0
+        },
         configOptions: parseJsonArray(row.config_options_json),
         currentModelId: row.current_model_id || null,
         modelOptions: normalizeModelOptions(parseJsonArray(row.model_options_json)),
@@ -256,6 +286,17 @@ export function getSession(uiId) {
         isSubAgent: row.is_sub_agent === 1,
         parentAcpSessionId: row.parent_acp_session_id || null,
         provider: row.provider || null,
+        stats: {
+          sessionId: row.acp_id || '',
+          sessionPath: 'Relative',
+          model: row.model || 'Unknown',
+          toolCalls: 0,
+          successTools: 0,
+          durationMs: 0,
+          usedTokens: Number(row.used_tokens || 0),
+          totalTokens: Number(row.total_tokens || 0),
+          sessionSizeMb: 0
+        },
         configOptions: parseJsonArray(row.config_options_json),
         currentModelId: row.current_model_id || null,
         modelOptions: normalizeModelOptions(parseJsonArray(row.model_options_json)),
@@ -288,6 +329,17 @@ export function getSessionByAcpId(providerOrAcpId, maybeAcpId = null) {
         cwd: row.cwd || null,
         folderId: row.folder_id || null,
         provider: row.provider || null,
+        stats: {
+          sessionId: row.acp_id || '',
+          sessionPath: 'Relative',
+          model: row.model || 'Unknown',
+          toolCalls: 0,
+          successTools: 0,
+          durationMs: 0,
+          usedTokens: Number(row.used_tokens || 0),
+          totalTokens: Number(row.total_tokens || 0),
+          sessionSizeMb: 0
+        },
         configOptions: parseJsonArray(row.config_options_json),
         currentModelId: row.current_model_id || null,
         modelOptions: normalizeModelOptions(parseJsonArray(row.model_options_json)),

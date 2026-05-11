@@ -16,6 +16,7 @@ import { getProvider, getProviderModuleSync } from '../services/providerLoader.j
 import { writeLog } from '../services/logger.js';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { createHash } from 'crypto';
 import { subAgentInvocationManager } from './subAgentInvocationManager.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
 import { createMcpProxyBinding } from './mcpProxyRegistry.js';
@@ -31,6 +32,36 @@ export function getMaxShellResultLines(env = process.env) {
 
 function toolCallIdFromMeta(requestMeta) {
   return requestMeta?.toolCallId || requestMeta?.tool_call_id || requestMeta?.callId || null;
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(item => stableStringify(item)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hashInvocationInput(input) {
+  return createHash('sha256').update(stableStringify(input)).digest('hex').slice(0, 16);
+}
+
+function buildSubAgentInvocationKey({ providerId, acpSessionId, mcpProxyId, mcpRequestId, requestMeta, toolName, input }) {
+  if (!providerId) return null;
+  const sessionScope = acpSessionId || mcpProxyId;
+  if (!sessionScope) return null;
+
+  const scope = `${providerId}::${sessionScope}::${toolName}`;
+  if (mcpRequestId !== undefined && mcpRequestId !== null && mcpRequestId !== '') {
+    return `${scope}::mcp-request::${String(mcpRequestId)}`;
+  }
+
+  const toolCallId = toolCallIdFromMeta(requestMeta);
+  if (toolCallId) return `${scope}::tool-call::${String(toolCallId)}`;
+
+  return `${scope}::fingerprint::${hashInvocationInput(input)}`;
 }
 
 function mcpServerName(providerId) {
@@ -143,7 +174,17 @@ export function createToolHandlers(io) {
     return { content: [{ type: 'text', text: 'Error: Shell execution context unavailable' }] };
   };
 
-  tools.ux_invoke_subagents = async ({ requests, model, providerId, acpSessionId, requestMeta, skipToolState = false }) => {
+  tools.ux_invoke_subagents = async ({
+    requests,
+    model,
+    providerId,
+    acpSessionId,
+    mcpProxyId,
+    mcpRequestId,
+    requestMeta,
+    skipToolState = false,
+    idempotencyToolName = 'ux_invoke_subagents'
+  }) => {
     if (!skipToolState) {
       cacheMcpToolInvocation({
         io,
@@ -155,8 +196,23 @@ export function createToolHandlers(io) {
         title: 'Invoke Subagents'
       });
     }
+    const idempotencyKey = buildSubAgentInvocationKey({
+      providerId,
+      acpSessionId,
+      mcpProxyId,
+      mcpRequestId,
+      requestMeta,
+      toolName: idempotencyToolName,
+      input: { requests, model }
+    });
     subAgentInvocationManager.setIo(io);
-    return subAgentInvocationManager.runInvocation({ requests, model, providerId });
+    return subAgentInvocationManager.runInvocation({
+      requests,
+      model,
+      providerId,
+      parentAcpSessionId: acpSessionId,
+      idempotencyKey
+    });
   };
 
   /**
@@ -171,7 +227,18 @@ export function createToolHandlers(io) {
    * Delegates to ux_invoke_subagents so counsel agents get the same session lifecycle,
    * UI visibility, and cleanup as any other sub-agent.
    */
-  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId, acpSessionId, requestMeta }) => {
+  tools.ux_invoke_counsel = async ({
+    question,
+    architect,
+    performance,
+    security,
+    ux,
+    providerId,
+    acpSessionId,
+    mcpProxyId,
+    mcpRequestId,
+    requestMeta
+  }) => {
     const config = loadCounselConfig();
     // Core agents (e.g. Advocate, Critic, Pragmatist) are always spawned
     const agents = [...(config.core || [])];
@@ -202,7 +269,16 @@ export function createToolHandlers(io) {
       input: { question, architect, performance, security, ux },
       title: 'Invoke Counsel'
     });
-    return tools.ux_invoke_subagents({ requests, providerId, acpSessionId, requestMeta, skipToolState: true });
+    return tools.ux_invoke_subagents({
+      requests,
+      providerId,
+      acpSessionId,
+      mcpProxyId,
+      mcpRequestId,
+      requestMeta,
+      skipToolState: true,
+      idempotencyToolName: 'ux_invoke_counsel'
+    });
   };
 
   return tools;

@@ -214,6 +214,8 @@ When `acpSupportsMcpTimeouts` is `true`, `getMcpServerMeta()` returns:
 
 This is spread as `_meta` on the MCP server config entry in both `session/new` and `session/load` requests. Fields are omitted individually if their value is not a positive integer. Set `acpSupportsMcpTimeouts: false` (the default) until upstream support is confirmed.
 
+Because Codex can retry long-running MCP calls when the upstream timeout path is hit or a result is lost, AcpUI's `ux_invoke_subagents` and `ux_invoke_counsel` handlers are replay-protected. Duplicate calls with the same provider/session/tool/MCP request identity join the active invocation or return the recent cached result instead of spawning another sub-agent batch.
+
 ## Gotchas
 
 1. **Do not advertise `fs` in initialize.** AcpUI does not implement Codex fs proxy requests.
@@ -227,6 +229,7 @@ This is spread as `_meta` on the MCP server config entry in both `session/new` a
 9. **Codex buries the user-facing error message in `error.data.message`.** The JSON-RPC top-level `error.message` is always the generic sentinel `"Internal error"` (-32603). The `intercept()` function promotes `error.data.message` to `error.message` so the real cause (e.g. `usage_limit_exceeded`) surfaces in logs and in the UI error box.
 10. **Avoid double-counting assistant text during rehydration.** When `event_msg/agent_message` exists, treat `response_item/message(role=assistant)` as fallback-only for text to prevent duplicate assistant outputs.
 11. **`acpSupportsMcpTimeouts` is `false` by default.** The `_meta` timeout injection only activates when explicitly set to `true`. Until `codex-acp` officially supports MCP `_meta` timeout overrides, leave this disabled to avoid sending unexpected fields to the daemon.
+12. **Sub-agent MCP retries must stay idempotent.** Codex may retry a long-running MCP tool call. Do not remove the sub-agent idempotency key path in `backend/mcp/mcpServer.js` or the active/completed replay cache in `backend/mcp/subAgentInvocationManager.js`.
 
 ## Unit Tests
 

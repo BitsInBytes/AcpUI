@@ -253,7 +253,7 @@ export default function registerSessionHandlers(io, socket) {
       acpClient.sessionMetadata.set(newAcpId, {
         model: resolvedModel.modelId, currentModelId: resolvedModel.modelId,
         modelOptions: knownModelOptions, toolCalls: 0, successTools: 0, startTime: Date.now(),
-        usedTokens: 0, totalTokens: 0, promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '',
+        usedTokens: Number(session.stats?.usedTokens || 0), totalTokens: Number(session.stats?.totalTokens || 0), promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '',
         agentName: null, spawnContext: null, provider: runtime.providerId, configOptions: session.configOptions
       });
 
@@ -302,6 +302,14 @@ export default function registerSessionHandlers(io, socket) {
           writeLog(`[SESSION] Skipping load for hot session: ${existingAcpId}`);
           result = { sessionId: existingAcpId };
           const meta = acpClient.sessionMetadata.get(existingAcpId);
+          if (dbSession?.stats) {
+            if ((Number(meta.usedTokens || 0) === 0) && Number(dbSession.stats.usedTokens || 0) > 0) {
+              meta.usedTokens = Number(dbSession.stats.usedTokens || 0);
+            }
+            if ((Number(meta.totalTokens || 0) === 0) && Number(dbSession.stats.totalTokens || 0) > 0) {
+              meta.totalTokens = Number(dbSession.stats.totalTokens || 0);
+            }
+          }
           selectedModelState = {
             model: meta.model,
             currentModelId: meta.currentModelId,
@@ -315,8 +323,8 @@ export default function registerSessionHandlers(io, socket) {
             const resolvedModel = resolveModelSelection(dbSession.currentModelId || dbSession.model || model, models, knownModelOptions);
             acpClient.sessionMetadata.set(existingAcpId, {
               model: resolvedModel.modelId, currentModelId: resolvedModel.modelId,
-              modelOptions: knownModelOptions, toolCalls: 0, successTools: 0, startTime: Date.now(),
-              usedTokens: 0, totalTokens: 0, promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '',
+modelOptions: knownModelOptions, toolCalls: 0, successTools: 0, startTime: Date.now(),
+              usedTokens: Number(dbSession.stats?.usedTokens || 0), totalTokens: Number(dbSession.stats?.totalTokens || 0), promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '',
               agentName: requestAgent || null, spawnContext: null,
               configOptions: dbSession.configOptions, provider: resolvedProviderId
             });

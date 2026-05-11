@@ -201,8 +201,8 @@ export async function loadSessionIntoMemory(acpClient, dbSession) {
       toolCalls: 0,
       successTools: 0,
       startTime: Date.now(),
-      usedTokens: 0,
-      totalTokens: 0,
+      usedTokens: Number(dbSession.stats?.usedTokens || 0),
+      totalTokens: Number(dbSession.stats?.totalTokens || 0),
       promptCount: 0,
       lastResponseBuffer: '',
       lastThoughtBuffer: '',
@@ -308,7 +308,8 @@ export async function autoSaveTurn(sessionId, acpClient = null) {
     
     if (session && session.messages && session.messages.length > 0) {
       const lastMsg = session.messages[session.messages.length - 1];
-      
+      let statsChanged = false;
+
       // Update configOptions from memory if available
       if (meta?.configOptions) {
         session.configOptions = meta.configOptions;
@@ -319,7 +320,25 @@ export async function autoSaveTurn(sessionId, acpClient = null) {
       if (meta?.modelOptions) {
         session.modelOptions = meta.modelOptions;
       }
-      
+      if (meta) {
+        const prevUsed = Number(session.stats?.usedTokens || 0);
+        const prevTotal = Number(session.stats?.totalTokens || 0);
+        const nextUsed = Number(meta.usedTokens || 0);
+        const nextTotal = Number(meta.totalTokens || 0);
+        statsChanged = prevUsed !== nextUsed || prevTotal !== nextTotal;
+        session.stats = {
+          sessionId,
+          sessionPath: session.stats?.sessionPath || 'Relative',
+          model: meta.currentModelId || meta.model || session.model || session.stats?.model || 'Unknown',
+          toolCalls: Number(meta.toolCalls || session.stats?.toolCalls || 0),
+          successTools: Number(meta.successTools || session.stats?.successTools || 0),
+          durationMs: Number((Date.now() - Number(meta.startTime || Date.now())) || 0),
+          usedTokens: nextUsed,
+          totalTokens: nextTotal,
+          sessionSizeMb: Number(((nextUsed * 4) / (1024 * 1024)).toFixed(2))
+        };
+      }
+
       // Only save if it's still in a streaming state in the DB
       if (lastMsg.role === 'assistant' && lastMsg.isStreaming) {
         writeLog(`[DB] Auto-completing turn for disconnected UI: ${sessionId}`);
@@ -330,6 +349,8 @@ export async function autoSaveTurn(sessionId, acpClient = null) {
         if (lastMsg.content || (lastMsg.timeline && lastMsg.timeline.length > 0)) {
           await db.saveSession(session);
         }
+      } else if (statsChanged) {
+        await db.saveSession(session);
       }
     }
   } catch (e) {

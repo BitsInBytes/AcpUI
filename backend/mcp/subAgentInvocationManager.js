@@ -7,9 +7,13 @@ import { getProvider, getProviderModule } from '../services/providerLoader.js';
 import { modelOptionsFromProviderConfig, resolveModelSelection } from '../services/modelOptions.js';
 import { getMcpServers } from './mcpServer.js';
 
+const DEFAULT_COMPLETED_INVOCATION_TTL_MS = 10 * 60 * 1000;
+
 export class SubAgentInvocationManager {
   constructor(deps = {}) {
     this.invocations = new Map();
+    this.idempotentInvocations = new Map();
+    this.completedInvocations = new Map();
     this.io = deps.io || null;
     this.db = deps.db || db;
     this.acpClientFactory = deps.acpClientFactory || ((pid) => providerRuntimeManager.getClient(pid));
@@ -22,6 +26,7 @@ export class SubAgentInvocationManager {
     this.getMcpServersFn = deps.getMcpServersFn || getMcpServers;
     this.resolveModelSelectionFn = deps.resolveModelSelectionFn || resolveModelSelection;
     this.modelOptionsFromProviderConfigFn = deps.modelOptionsFromProviderConfigFn || modelOptionsFromProviderConfig;
+    this.completedInvocationTtlMs = deps.completedInvocationTtlMs ?? DEFAULT_COMPLETED_INVOCATION_TTL_MS;
   }
 
   setIo(io) {
@@ -38,6 +43,14 @@ export class SubAgentInvocationManager {
       }
     }
     return result;
+  }
+
+  pruneCompletedInvocations(now = this.now()) {
+    for (const [key, record] of this.completedInvocations.entries()) {
+      if (now - record.completedAt > this.completedInvocationTtlMs) {
+        this.completedInvocations.delete(key);
+      }
+    }
   }
 
   cancelAllForParent(parentAcpSessionId, providerId) {
@@ -67,14 +80,55 @@ export class SubAgentInvocationManager {
     }
   }
 
-  async runInvocation({ requests, model, providerId }) {
+  async runInvocation({ requests, model, providerId, parentAcpSessionId: explicitParentAcpSessionId = null, idempotencyKey = null }) {
     if (!this.io) return { content: [{ type: 'text', text: 'Error: Sub-agent system not available' }] };
-    this.log(`[SUB-AGENT] Spawning ${requests.length} sub-agent(s)`);
+    const safeRequests = Array.isArray(requests) ? requests : [];
 
     const provider = this.getProviderFn(providerId);
     const resolvedProviderId = provider.id;
     const acpClient = this.acpClientFactory(resolvedProviderId);
     if (!acpClient) return { content: [{ type: 'text', text: 'Error: Sub-agent system not available' }] };
+
+    const parentAcpSessionId = explicitParentAcpSessionId || acpClient.lastSubAgentParentAcpId || null;
+
+    if (idempotencyKey) {
+      this.pruneCompletedInvocations();
+      const active = this.idempotentInvocations.get(idempotencyKey);
+      if (active?.promise) {
+        this.log(`[SUB-AGENT] Duplicate invocation ${idempotencyKey}; returning active result`);
+        return active.promise;
+      }
+      const completed = this.completedInvocations.get(idempotencyKey);
+      if (completed?.result) {
+        this.log(`[SUB-AGENT] Duplicate invocation ${idempotencyKey}; returning cached result`);
+        return completed.result;
+      }
+    }
+
+    const promise = this.executeInvocation({
+      requests: safeRequests,
+      model,
+      provider,
+      resolvedProviderId,
+      acpClient,
+      parentAcpSessionId
+    });
+
+    if (!idempotencyKey) return promise;
+
+    this.idempotentInvocations.set(idempotencyKey, { promise, startedAt: this.now() });
+    return promise.then(result => {
+      this.idempotentInvocations.delete(idempotencyKey);
+      this.completedInvocations.set(idempotencyKey, { result, completedAt: this.now() });
+      return result;
+    }).catch(err => {
+      this.idempotentInvocations.delete(idempotencyKey);
+      throw err;
+    });
+  }
+
+  async executeInvocation({ requests, model, provider, resolvedProviderId, acpClient, parentAcpSessionId }) {
+    this.log(`[SUB-AGENT] Spawning ${requests.length} sub-agent(s)`);
 
     const models = provider.config.models || {};
     const quickModelOptions = this.modelOptionsFromProviderConfigFn(models);
@@ -82,9 +136,8 @@ export class SubAgentInvocationManager {
     const resolvedModelKey = modelId;
 
     const invocationId = `inv-${this.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    
+
     let parentUiId = null;
-    const parentAcpSessionId = acpClient.lastSubAgentParentAcpId || null;
     if (parentAcpSessionId) {
       const parentSession = await this.db.getSessionByAcpId(resolvedProviderId, parentAcpSessionId);
       if (parentSession) parentUiId = parentSession.id;

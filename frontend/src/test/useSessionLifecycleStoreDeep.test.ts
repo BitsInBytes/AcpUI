@@ -29,14 +29,23 @@ describe('useSessionLifecycleStore (Deep Logic)', () => {
     expect(mockSocket.emit).toHaveBeenCalledWith('save_snapshot', expect.objectContaining({ name: 'New Name' }));
   });
 
-  it('handleSessionSelect emits get_session_history', () => {
+  it('handleSessionSelect rehydrates loaded sessions when cached context is missing', () => {
+    mockSocket.emit.mockImplementation((event: string, ...args: any[]) => {
+      const cb = args[args.length - 1];
+      if (event === 'get_session_history') {
+        cb({ session: { id: 's2', acpSessionId: 'a2', provider: 'p1', messages: [{ id: 'm1' }], model: 'balanced' } });
+      }
+      if (event === 'create_session') {
+        cb({ sessionId: 'a2' });
+      }
+    });
+
     act(() => {
       useSessionLifecycleStore.getState().handleSessionSelect(mockSocket, 's2');
     });
-    // Since s2 has messages, it just switches ID. 
-    // Wait, implementation says: if (session.acpSessionId && !session.isWarmingUp && session.messages.length > 0) return;
-    // So it should NOT emit.
-    expect(mockSocket.emit).not.toHaveBeenCalled();
+
+    expect(mockSocket.emit).toHaveBeenCalledWith('get_session_history', expect.objectContaining({ uiId: 's2' }), expect.any(Function));
+    expect(mockSocket.emit).toHaveBeenCalledWith('create_session', expect.objectContaining({ existingAcpId: 'a2' }), expect.any(Function));
     expect(useSessionLifecycleStore.getState().activeSessionId).toBe('s2');
   });
 

@@ -69,6 +69,100 @@ describe('SubAgentInvocationManager', () => {
     expect(deps.cleanupFn).toHaveBeenCalledWith('sub-acp-1', 'provider-a');
   });
 
+  it('joins an active invocation when the idempotency key repeats', async () => {
+    const first = manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp',
+      idempotencyKey: 'repeat-key-active'
+    });
+
+    const second = manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp',
+      idempotencyKey: 'repeat-key-active'
+    });
+
+    await vi.runAllTimersAsync();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(firstResult.content[0].text).toContain('test response');
+    expect(secondResult.content[0].text).toContain('test response');
+    expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
+  });
+
+  it('returns a cached result when a completed invocation key repeats', async () => {
+    const args = {
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp',
+      idempotencyKey: 'repeat-key-completed'
+    };
+
+    const first = manager.runInvocation(args);
+    await vi.runAllTimersAsync();
+    const firstResult = await first;
+    const secondResult = await manager.runInvocation(args);
+
+    expect(firstResult.content[0].text).toContain('test response');
+    expect(secondResult).toEqual(firstResult);
+    expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
+  });
+
+  it('prunes expired completed invocation results before replay lookup', async () => {
+    let now = 1000;
+    deps.now = vi.fn(() => now);
+    deps.completedInvocationTtlMs = 100;
+    manager = new SubAgentInvocationManager(deps);
+    manager.completedInvocations.set('expired-key', {
+      result: { content: [{ type: 'text', text: 'old result' }] },
+      completedAt: 800
+    });
+
+    const resultPromise = manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp',
+      idempotencyKey: 'expired-key'
+    });
+
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.content[0].text).toContain('test response');
+    expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
+  });
+
+  it('cleans active idempotency state when invocation setup rejects', async () => {
+    mockDb.getSessionByAcpId.mockRejectedValueOnce(new Error('lookup failed'));
+
+    await expect(manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp',
+      idempotencyKey: 'reject-key'
+    })).rejects.toThrow('lookup failed');
+
+    expect(manager.idempotentInvocations.has('reject-key')).toBe(false);
+  });
+
+  it('uses explicit parent ACP session before stale client parent tracking', async () => {
+    mockAcpClient.lastSubAgentParentAcpId = 'stale-parent-acp';
+
+    const resultPromise = manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'explicit-parent-acp'
+    });
+
+    await vi.runAllTimersAsync();
+    await resultPromise;
+
+    expect(mockDb.getSessionByAcpId).toHaveBeenCalledWith('provider-a', 'explicit-parent-acp');
+    expect(mockDb.getSessionByAcpId).not.toHaveBeenCalledWith('provider-a', 'stale-parent-acp');
+  });
+
   it('cancelAllForParent calls abortFn and sends session/cancel to sub-agents', async () => {
     mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
       if (method === 'session/new') return { sessionId: 'sub-acp-1' };

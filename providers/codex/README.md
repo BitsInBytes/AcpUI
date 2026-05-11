@@ -97,6 +97,8 @@ Codex's LLM benefits from explicit instructions on which tools to use and when. 
 
 > **Known issue (upstream):** `codex-acp` currently has a bug where some MCP tool calls can time out around the 2-minute mark. Track status here: https://github.com/zed-industries/codex-acp/issues/277
 
+`ux_invoke_subagents` and `ux_invoke_counsel` are guarded in AcpUI against duplicate Codex MCP retries: repeated calls with the same provider/session/tool/MCP request identity return the active or recently completed result instead of spawning another batch. Keep sub-agent work bounded anyway, because upstream timeout behavior can still affect when Codex receives the final tool result.
+
 **Example AGENTS.md:**
 
 ```markdown

@@ -32,6 +32,14 @@ function applyModelState(
   };
 }
 
+function maybeHydrateContextUsage(session: ChatSession) {
+  const acpSessionId = session.acpSessionId;
+  const used = Number(session.stats?.usedTokens);
+  const total = Number(session.stats?.totalTokens);
+  if (!acpSessionId || !Number.isFinite(used) || !Number.isFinite(total) || total <= 0) return;
+  useSystemStore.getState().setContextUsage(acpSessionId, (used / total) * 100);
+}
+
 interface SessionLifecycleState {
   sessions: ChatSession[];
   activeSessionId: string | null;
@@ -102,6 +110,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
             )),
             sessionNotes: notesMap
           });
+          res.sessions.forEach((s: ChatSession) => maybeHydrateContextUsage(s));
 
           const urlParams = new URLSearchParams(window.location.search);
           const urlSessionId = urlParams.get('s');
@@ -122,6 +131,11 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
     return new Promise((resolve) => {
       socket.emit('get_stats', { sessionId: acpSessionId }, (res: StatsResponse) => {
         if (res.stats) {
+          const used = Number(res.stats.usedTokens);
+          const total = Number(res.stats.totalTokens);
+          if (Number.isFinite(used) && Number.isFinite(total) && total > 0) {
+            useSystemStore.getState().setContextUsage(acpSessionId, (used / total) * 100);
+          }
           set(state => ({
             sessions: state.sessions.map(s => s.acpSessionId === acpSessionId ? { ...s, stats: res.stats } : s)
           }));
@@ -201,13 +215,20 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
     const { sessions } = get();
     const session = sessions.find(s => s.id === uiId);
     if (!session) return;
+    const contextUsageBySession = useSystemStore.getState().contextUsageBySession;
+    const hasCachedContext = session.acpSessionId
+      ? Object.prototype.hasOwnProperty.call(contextUsageBySession, session.acpSessionId)
+      : false;
 
     set(state => ({
       activeSessionId: uiId,
       sessions: state.sessions.map(s => s.id === uiId ? { ...s, hasUnreadResponse: false } : s)
     }));
 
-    if (session.acpSessionId && !session.isWarmingUp && session.messages.length > 0) return;
+    if (session.acpSessionId && !session.isWarmingUp && session.messages.length > 0) {
+      if (!hasCachedContext) get().hydrateSession(socket, uiId);
+      return;
+    }
     get().hydrateSession(socket, uiId);
   },
 
@@ -235,6 +256,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
               modelOptions: mergeModelOptions(s.modelOptions, fullHistory.modelOptions)
             } : s)
           }));
+          maybeHydrateContextUsage(fullHistory);
 
           const resumeAgent = useSystemStore.getState().workspaceCwds.find(w => w.path === fullHistory.cwd)?.agent || useSystemStore.getState().workspaceCwds[0]?.agent;
           socket.emit('create_session', { providerId: fullHistory.provider, model: fullHistory.currentModelId || fullHistory.model, existingAcpId: fullHistory.acpSessionId, cwd: fullHistory.cwd, agent: resumeAgent }, (acpRes: CreateSessionResponse) => {

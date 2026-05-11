@@ -19,6 +19,7 @@ The backend performs these key responsibilities:
 - **Tool System V2**: Centralized tool orchestration using `toolRegistry`, `toolCallState`, and `toolInvocationResolver`. It dispatches lifecycle events (`onStart`, `onUpdate`, `onEnd`) to specific handlers (shell, subagents, counsel). This layer merges authoritative MCP handler metadata with provider-specific extraction, ensuring consistent titles (e.g., `Invoke Shell: <description>`) and robust state management.
 - **Stream & State Management**: Buffers output chunks, manages streaming saves, handles permission workflows, and enforces session isolation via AsyncLocalStorage
 - **Database Persistence**: Stores sessions, folders, canvas artifacts, notes, and dynamic model state in SQLite with provider scoping and cascade delete protection
+  - Session rows also persist `used_tokens`/`total_tokens` so context usage can be restored on pre-existing chats before fresh provider metadata arrives.
 
 ### Why This Matters
 
@@ -501,6 +502,8 @@ The tool is executed in the backend Node.js process. The **Tool System V2** (loc
 4.  **`toolIdPattern`**: Allows providers to define how MCP tool IDs are formatted (e.g., `mcp__{mcpName}__{toolName}`), allowing the system to automatically extract the canonical tool name.
 
 `ux_invoke_shell` uses the interactive `shellRunManager`, which now includes the `description` in snapshots, allowing the UI to render `Invoke Shell: <description>` even before the shell process has fully started.
+
+`ux_invoke_subagents` and `ux_invoke_counsel` are side-effectful MCP tools because they create ACP sessions. Their handlers build a scoped idempotency key from provider/session/tool identity plus `mcpRequestId`, `requestMeta.toolCallId`, or a hash of the requests/model input. `SubAgentInvocationManager` uses that key to join duplicate active calls and return recently completed results, preventing provider MCP retries from spawning another batch.
 
 ---
 

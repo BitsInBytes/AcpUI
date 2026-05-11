@@ -557,6 +557,8 @@ CREATE TABLE sessions (
   acp_id TEXT,                        -- Link to ACP session (used for JSONL lookup)
   name TEXT,
   messages_json TEXT,                 -- Serialized message array (UI source of truth)
+  used_tokens REAL,                   -- Persisted used context tokens for UI restore
+  total_tokens REAL,                  -- Persisted total context window for UI restore
   config_options_json TEXT,           -- Serialized config options array
   current_model_id TEXT,              -- Which model was selected
   model_options_json TEXT,            -- Available model options
@@ -566,6 +568,8 @@ CREATE TABLE sessions (
 ```
 
 Messages are stored as **JSON.stringify(messages)** — no individual message table. This keeps the schema simple and makes rehydration straightforward: parse JSONL → update messages_json → done.
+
+Context usage metadata (`used_tokens` / `total_tokens`) is persisted on the session row and rehydrated into frontend `contextUsageBySession` as a fallback when the provider does not emit immediate metadata during session resume.
 
 ---
 

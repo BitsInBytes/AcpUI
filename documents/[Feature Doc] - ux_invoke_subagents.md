@@ -89,7 +89,22 @@ cacheMcpToolInvocation({
 });
 ```
 
-It then delegates to the `subAgentInvocationManager`:
+It then builds a replay guard key from the MCP call context before delegating to the `subAgentInvocationManager`. The key prefers `mcpRequestId`, falls back to provider tool-call metadata when present, and finally falls back to a scoped hash of `{ requests, model }`. This makes the tool idempotent for retries from the same provider/session/tool call:
+
+**File:** `backend/mcp/mcpServer.js`
+```javascript
+const idempotencyKey = buildSubAgentInvocationKey({
+  providerId,
+  acpSessionId,
+  mcpProxyId,
+  mcpRequestId,
+  requestMeta,
+  toolName: idempotencyToolName,
+  input: { requests, model }
+});
+```
+
+It then delegates to the `subAgentInvocationManager` with the explicit parent ACP session:
 
 **File:** `backend/mcp/subAgentInvocationManager.js` (Lines 69-317)
 
@@ -97,6 +112,8 @@ It then delegates to the `subAgentInvocationManager`:
 ```javascript
 const invocationId = `inv-${this.now()}-${Math.random().toString(36).slice(2, 7)}`;
 ```
+
+Before any sessions are spawned, `runInvocation()` checks the idempotency key. If the same key is already active, it returns the active promise. If that key completed recently, it returns the cached result. Only the first call emits `sub_agents_starting` and creates sessions.
 
 **Line 88:** Emit `sub_agents_starting` to the frontend:
 ```javascript
@@ -953,7 +970,17 @@ const modelId = resolveModelSelection(model || models.subAgent, ...)
 
 If `models.subAgent` is undefined, it falls back to `models.default`. Ensure your provider's `user.json` has at least one model defined.
 
-### 7. **The 1-Second Stagger Prevents Overwhelming ACP**
+### 7. **MCP Retries Must Not Spawn A Second Batch**
+
+`ux_invoke_subagents` is non-idempotent at the side-effect level: it creates new ACP sessions. Codex and other MCP clients may retry a tool call if the result is lost, delayed, or timed out upstream. The backend therefore deduplicates calls by a scoped idempotency key:
+
+- Prefer `providerId + parent ACP session + tool name + mcpRequestId`
+- Fall back to `requestMeta.toolCallId` when available
+- Fall back to a scoped hash of the requests/model payload
+
+Duplicate active calls join the original promise. Duplicate completed calls return the cached result for a short TTL. If this guard is removed, a single visual tool step can spawn repeated batches while the parent tool remains in progress.
+
+### 8. **The 1-Second Stagger Prevents Overwhelming ACP**
 
 Sub-agent sessions are created with a 1-second stagger (line 162):
 ```javascript
@@ -962,7 +989,7 @@ setTimeout(async () => { /* create session */ }, i * 1000);
 
 This prevents the ACP from being flooded with parallel session creations. If you're adding 5 agents, expect ~5 seconds for all to spawn.
 
-### 8. **Sub-Agents Can't Be Pinned, Renamed, or Archived from Sidebar**
+### 9. **Sub-Agents Can't Be Pinned, Renamed, or Archived from Sidebar**
 
 Action handlers in Sidebar are no-ops for `isSubAgent: true`:
 ```typescript
@@ -973,11 +1000,11 @@ onSettings={() => {}}
 
 Only delete is functional. This is intentional — sub-agents are transient and controlled by the parent orchestration.
 
-### 9. **Sub-Agent Sessions Share Parent's Provider**
+### 10. **Sub-Agent Sessions Share Parent's Provider**
 
 All sub-agents inherit the parent's provider. There's no per-sub-agent provider selection — all sub-agents run under the same provider as the parent session.
 
-### 10. **The Summary Text Becomes a Regular Message**
+### 11. **The Summary Text Becomes a Regular Message**
 
 When sub-agents complete, the concatenated summary is returned as the tool's result, which becomes a regular message in the parent's chat. This summary is searchable and archivable like any other message.
 

@@ -120,6 +120,9 @@ export function useChatManager(
 
     socket.on('stats_push', (data: { sessionId: string; usedTokens?: number; totalTokens?: number }) => {
       if (!data || !data.sessionId) return;
+      if (Number.isFinite(data.usedTokens) && Number.isFinite(data.totalTokens) && Number(data.totalTokens) > 0) {
+        useSystemStore.getState().setContextUsage(data.sessionId, (Number(data.usedTokens) / Number(data.totalTokens)) * 100);
+      }
       setSessions(useSessionLifecycleStore.getState().sessions.map(s => {
         if (s.acpSessionId !== data.sessionId) return s;
         return {
