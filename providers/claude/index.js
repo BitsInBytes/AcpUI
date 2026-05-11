@@ -1068,6 +1068,14 @@ export function getMcpServerMeta() {
   return undefined;
 }
 
+export function onPromptStarted(_sessionId) {
+  // Claude quota tracking is proxy/header driven, not prompt-lifecycle driven.
+}
+
+export function onPromptCompleted(_sessionId) {
+  // Claude quota tracking is proxy/header driven, not prompt-lifecycle driven.
+}
+
 export function buildSessionParams(agent) {
   const options = { disallowedTools: ['Bash', 'PowerShell', 'Agent'] };
   if (agent) options.agent = agent;

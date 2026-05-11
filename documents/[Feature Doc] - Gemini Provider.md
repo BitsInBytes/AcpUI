@@ -12,7 +12,7 @@ Gemini is implemented via the `@google/gemini-cli` npm package running in ACP (A
 
 Gemini implements all required provider contract functions:
 
-- **intercept()** — Caches tool arguments on `tool_call`, normalizes `available_commands_update` into slash-prefixed `commands/available` provider extensions, extracts Context Usage Percentage on `end_turn`, triggers OAuth quota fetching, and actively **swallows** the native Gemini `usage_update` event to prevent wild UI percentage swings.
+- **intercept()** — Caches tool arguments on `tool_call`, normalizes `available_commands_update` into slash-prefixed `commands/available` provider extensions, extracts Context Usage Percentage on `end_turn`, and actively **swallows** the native Gemini `usage_update` event to prevent wild UI percentage swings. Does NOT track prompt lifecycle (see `onPromptStarted`/`onPromptCompleted`).
 - **normalizeUpdate()** — Strips `<system-reminder>` XML tags from message chunks and trims leading/trailing whitespace.
 - **extractToolOutput()** — Multi-stage lookup for tool output. Fixes `read_file` by reading from disk directly. Reconstructs dropped structured outputs (like `list_directory`) using cached arguments.
 - **extractFilePath()** — Fallback chain to find paths in `locations` arrays, `content` arrays, and parsed JSON `arguments`.
@@ -27,7 +27,8 @@ Gemini implements all required provider contract functions:
 - **Session file operations** — `getSessionPaths()`, `cloneSession()`, `archiveSessionFiles()`, `restoreSessionFiles()`, `deleteSessionFiles()`. Handles Gemini's project-hashed subdirectory layout.
 - **parseSessionHistory()** — Reconstructs the Unified Timeline from Gemini's JSONL format, correctly applying `$rewindTo` truncations and extracting nested `tool_use` blocks.
 - **Context Debug Logging** — Maintains `context_debug.log` (Line 11) to track token flow, prompt starts, and quota refreshes.
-- **Smart Polling** — Controls background quota polling using `_activePromptCount` (Line 29) and `_inFlightSessions` (Line 30) to only poll when work is actually being done.
+- **Smart Polling** — Controls background quota polling using `_activePromptCount` (Line 24) and `_inFlightSessions` (Line 25) to only poll when work is actually being done. Lifecycle is tracked via explicit `onPromptStarted()` / `onPromptCompleted()` hooks called by `promptHandlers.js`, NOT via `intercept()` — see Gotcha #12.
+- **onPromptStarted() / onPromptCompleted()** — Exported lifecycle hooks called by `promptHandlers.js` before and after the `session/prompt` RPC (lines 114 and 158). These are the authoritative signals for quota polling — more reliable than watching `intercept()` which also fires for `session/load` history drain traffic.
 
 ### Gemini-Unique Characteristics
 
@@ -261,10 +262,11 @@ If enabled via `fetchQuotaStatus: true` in `user.json`, the provider communicate
 
 The quota-fetching system uses **reactive 401-based token refresh** and emits status immediately on startup:
 
-1. **Startup**: `_startQuotaFetching()` (Line 1215) is called from `prepareAcpEnvironment()`. It:
+1. **Startup**: `_startQuotaFetching()` (Line 1396) is called from `prepareAcpEnvironment()`. It:
    - Discovers the user's `cloudaicompanionProject` ID via `loadCodeAssist`.
    - Immediately emits initial status using `emitInitial: true`.
    - Sets up a 30-second polling timer that only runs when `_activePromptCount > 0`.
+   - `_activePromptCount` is managed exclusively by `onPromptStarted()` / `onPromptCompleted()` — not by `intercept()`.
 
 2. **Client ID Derivation**: The OAuth client ID is **derived at runtime** from the `azp` field of the JWT `id_token` in `oauth_creds.json` via `_extractClientId()` (Line 1076). The **client secret** is hardcoded (Line 1074).
 
@@ -318,7 +320,7 @@ Unlike other providers, Gemini does not physically truncate the JSONL file when 
 | Lines | Function | Purpose |
 |-------|----------|---------|
 | 11–22 | logContext() | JSONL logging to `context_debug.log`. |
-| 78–181 | intercept() | Emit context %, normalize available commands, trigger quota fetch, cache tool args, track active prompts. |
+| 78–181 | intercept() | Emit context %, normalize available commands, cache tool args, swallow `usage_update`. Does NOT track prompt lifecycle. |
 | 163–185 | normalizeUpdate() | Strips `<system-reminder>` XML tags. |
 | 205–302 | extractToolOutput() | Extracts from `result` / `content`, fixes `read_file` disk reads, reconstructions. |
 | 314–343 | extractFilePath() | Extracts file paths from locations, content arrays, or parsed JSON args. |
@@ -337,11 +339,13 @@ Unlike other providers, Gemini does not physically truncate the JSONL file when 
 | 1088–1096 | _readTokenFromDisk() | Reads access token from `oauth_creds.json`. |
 | 1102-1116 | _requestQuota() | Makes HTTP POST to retrieveUserQuota endpoint. |
 | 1118–1166 | _refreshAndSaveToken() | Refreshes expired token using derived client_id + hardcoded secret; saves to disk. |
-| 1168–1173 | stopQuotaFetching() | Clears polling timer (for cleanup/shutdown). |
-| 1215–1254 | _startQuotaFetching() | Bootstrap: discover project ID, emit initial status, start 30s polling timer. |
-| 1256–1293 | _fetchAndEmitQuota() | Reactive 401 fetch: read token, try request, refresh on 401, build/cache/emit status. |
-| 1295–1365 | _buildStatus() | Build provider_status extension with formatted quota buckets. |
-| 1367-1372 | _emitStatus() | Emits the latest cached status to the UI. |
+| 1320–1324 | stopQuotaFetching() | Clears polling timer and resets counters (for cleanup/shutdown). |
+| 1334–1340 | onPromptStarted() | Lifecycle hook: registers a session as active, starts quota polling. Called by `promptHandlers.js` before `session/prompt`. |
+| 1347–1353 | onPromptCompleted() | Lifecycle hook: removes a session from the active set, stops polling when count reaches zero. Called in a `finally` block in `promptHandlers.js`. |
+| 1396–1441 | _startQuotaFetching() | Bootstrap: discover project ID, emit initial status, start 30s polling timer. |
+| 1442–1481 | _fetchAndEmitQuota() | Reactive 401 fetch: read token, try request, refresh on 401, build/cache/emit status. |
+| 1483–1579 | _buildStatus() | Build provider_status extension with formatted quota buckets. |
+| 1581–1586 | _emitStatus() | Emits the latest cached status to the UI. |
 
 ---
 
@@ -369,5 +373,9 @@ Unlike other providers, Gemini does not physically truncate the JSONL file when 
    Token refresh is no longer proactive (checking `expiry_date` before each request). Instead, the provider tries the request first. If it gets a 401, it re-reads the token from disk (another process may have refreshed it), retries, and only if that fails does it refresh and save new credentials. This is more efficient and aligns with Codex's approach.
 11. **Context Debug Log**
     A `context_debug.log` file is created in the provider directory. If you experience unexpected progress bar behavior, check this log for `INTERCEPT_CALLED`, `PROMPT_START`, and `SESSION_COMPLETED` events.
-12. **Smart Polling Timer**
+12. **Smart Polling Timer — Hook-Based Lifecycle Tracking (not intercept-based)**
     Polling only occurs when `_activePromptCount > 0`. If no sessions are active, the polling timer is stopped to save battery and network bandwidth.
+
+    **The lifecycle is NOT tracked via `intercept()`.** An earlier implementation detected prompt starts by watching for `agent_message_chunk`, `user_message_chunk`, and `tool_call` events inside `intercept()`. This caused a critical bug: when Gemini CLI resumes a session via `session/load`, it replays the entire history as a stream of ACP notifications (`user_message_chunk`, `tool_call` with `status: "completed"`, `agent_message_chunk`). These are byte-for-byte identical to live traffic inside `intercept()`. Since `session/load` has no `stopReason` in its result (only `session/prompt` results have `stopReason`), the decrement logic never fired, leaving `_activePromptCount` permanently elevated and the polling timer running indefinitely — even with no chat active.
+
+    **The fix**: `onPromptStarted(sessionId)` and `onPromptCompleted(sessionId)` are explicit exported functions called directly by `promptHandlers.js`. `promptHandlers.js` only handles real user-initiated prompts — never `session/load`. `onPromptCompleted` is called from a `finally` block, guaranteeing it fires on success, cancellation (`stopReason: "cancelled"` resolves normally), and errors alike.

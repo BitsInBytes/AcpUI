@@ -108,43 +108,66 @@ export default function registerPromptHandlers(io, socket) {
         meta.lastThoughtBuffer = '';
       }
 
-      const response = await acpClient.transport.sendRequest('session/prompt', {
-        sessionId: sessionId,
-        prompt: acpPromptParts
-      });
+      // Notify provider that a real prompt is starting. This is the authoritative
+      // signal for lifecycle tracking (e.g. quota polling) — more reliable than
+      // watching intercept() which also fires for session/load history drain traffic.
+      acpClient.providerModule.onPromptStarted(sessionId);
 
-      if (response && response.usage) {
-         if (meta) {
-            meta.usedTokens = response.usage.totalTokens || meta.usedTokens;
-         }
-         io.to('session:' + sessionId).emit('stats_push', { providerId: resolvedProviderId, sessionId, usedTokens: meta?.usedTokens, totalTokens: meta?.totalTokens });
-      }
+      try {
+        const response = await acpClient.transport.sendRequest('session/prompt', {
+          sessionId: sessionId,
+          prompt: acpPromptParts
+        });
 
-      // If statsCaptures still has this session, a tool_result is pending — don't finalize yet.
-      // Otherwise the turn is complete: notify UI and persist to JSONL/DB.
-      if (!acpClient.stream.statsCaptures.has(sessionId)) {
-        io.to('session:' + sessionId).emit('token_done', { providerId: resolvedProviderId, sessionId });
-        autoSaveTurn(sessionId, acpClient);
-        writeLog(`[HOOKS] Turn complete for ${sessionId}, agentName=${meta?.agentName}`);
+        if (response && response.usage) {
+           if (meta) {
+              meta.usedTokens = response.usage.totalTokens || meta.usedTokens;
+           }
+           io.to('session:' + sessionId).emit('stats_push', { providerId: resolvedProviderId, sessionId, usedTokens: meta?.usedTokens, totalTokens: meta?.totalTokens });
+        }
+
+        // If statsCaptures still has this session, a tool_result is pending — don't finalize yet.
+        // Otherwise the turn is complete: notify UI and persist to JSONL/DB.
+        if (!acpClient.stream.statsCaptures.has(sessionId)) {
+          io.to('session:' + sessionId).emit('token_done', { providerId: resolvedProviderId, sessionId });
+          autoSaveTurn(sessionId, acpClient);
+          writeLog(`[HOOKS] Turn complete for ${sessionId}, agentName=${meta?.agentName}`);
+        }
+      } catch (_err) {
+        const errorMessage = _err.message || 'An unknown error occurred.';
+        writeLog(`Prompt Error: ${JSON.stringify(_err)}`);
+
+        if (acpClient.stream.statsCaptures.has(sessionId)) {
+          acpClient.stream.statsCaptures.delete(sessionId);
+        } else {
+          io.to('session:' + sessionId).emit('token', {
+            providerId: resolvedProviderId,
+            sessionId,
+            text: `\n\n:::ERROR:::\n${errorMessage}\n:::END_ERROR:::\n\n**Recovery:** The request failed. You can try asking again, or check the server logs for more technical details.`
+          });
+          io.to('session:' + sessionId).emit('token_done', { providerId: resolvedProviderId, sessionId, error: true });
+
+          // ENSURE PERSISTENCE ON FAILURE:
+          // This prevents the 'Thinking...' bubble on refresh.
+          autoSaveTurn(sessionId, acpClient);
+        }
+      } finally {
+        // Always notify the provider that this prompt is done — whether it resolved,
+        // was cancelled (session/cancel causes sendRequest to resolve with stopReason:
+        // "cancelled"), or threw an error. This keeps _activePromptCount accurate.
+        acpClient.providerModule.onPromptCompleted(sessionId);
       }
     } catch (_err) {
-      const errorMessage = _err.message || 'An unknown error occurred.';
-      writeLog(`Prompt Error: ${JSON.stringify(_err)}`);
-      
-      if (acpClient.stream.statsCaptures.has(sessionId)) {
-        acpClient.stream.statsCaptures.delete(sessionId);
-      } else {
-        io.to('session:' + sessionId).emit('token', { 
-          providerId: resolvedProviderId,
-          sessionId, 
-          text: `\n\n:::ERROR:::\n${errorMessage}\n:::END_ERROR:::\n\n**Recovery:** The request failed. You can try asking again, or check the server logs for more technical details.` 
-        });
-        io.to('session:' + sessionId).emit('token_done', { providerId: resolvedProviderId, sessionId, error: true });
-        
-        // ENSURE PERSISTENCE ON FAILURE: 
-        // This prevents the 'Thinking...' bubble on refresh.
-        autoSaveTurn(sessionId, acpClient);
-      }
+      // Outer catch: session not found, model switch errors, or attachment processing
+      // failures that occur before the prompt is sent. onPromptStarted was never
+      // called in this path, so no cleanup is needed.
+      writeLog(`Pre-prompt Error: ${JSON.stringify(_err)}`);
+      io.to('session:' + sessionId).emit('token', {
+        providerId: resolvedProviderId,
+        sessionId,
+        text: `\n\n:::ERROR:::\n${_err.message || 'An unknown error occurred.'}\n:::END_ERROR:::\n\n**Recovery:** The request failed. You can try asking again, or check the server logs for more technical details.`
+      });
+      io.to('session:' + sessionId).emit('token_done', { providerId: resolvedProviderId, sessionId, error: true });
     }
 
   });

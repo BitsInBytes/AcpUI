@@ -50,6 +50,10 @@ const { mockFs, mockDb, mockAcpClient, mockProviderModule } = vi.hoisted(() => (
             pendingPermissions: new Map()
         },
         handleUpdate: vi.fn().mockResolvedValue(),
+        providerModule: {
+            onPromptStarted: vi.fn(),
+            onPromptCompleted: vi.fn()
+        },
     },
     mockProviderModule: {
         intercept: (p) => p,

@@ -15,7 +15,7 @@ The Codex provider connects AcpUI to the `codex-acp` executable. The main implem
 - **Fetches background quota status** on startup, turn completion, and 30s poll.
 - **Manages automatic OAuth token refresh** by deriving `client_id` from JWT access tokens in `auth.json`.
 - **Extracts canonical tool identity** via `extractToolInvocation()` using `toolIdPattern` (`{mcpName}/{toolName}`).
-- **Tracks active prompts** to only poll quota while the daemon is actively processing messages.
+- **Tracks active prompts via provider hooks** (`onPromptStarted` / `onPromptCompleted`) to only poll quota while a real prompt is in flight.
 - **Replays persisted context usage** through `emitCachedContext(sessionId)` when the backend loads or hot-resumes a session.
 
 **Why This Matters**
@@ -91,7 +91,7 @@ The Codex provider connects AcpUI to the `codex-acp` executable. The main implem
     - **Initial Load:** Fetches quota immediately on boot and emits `_codex/provider/status`.
     - **Reactive Refresh:** `fetchCodexQuota()` (Lines 430-456) implements a retry loop. On 401, it reads `auth.json`, refreshes the token, saves it, and retries.
     - **Client ID Derivation:** `extractClientIdFromAccessToken()` (Lines 506-516) decodes the JWT `access_token` from `auth.json` to find the `client_id` automatically.
-    - **Poll Control:** `intercept()` (Lines 116-248) tracks `_activePromptCount`. Polling only occurs when at least one prompt is in-flight and stops when all turns end.
+    - **Poll Control:** `onPromptStarted()` / `onPromptCompleted()` track `_activePromptCount` and `_inFlightSessions`. Polling only occurs while prompts are in flight.
 
 ## Architecture Diagram
 
@@ -177,7 +177,8 @@ Frontend receives:
 | File | Key Functions | Purpose |
 | --- | --- | --- |
 | `providers/codex/index.js` | `performHandshake`, `prepareAcpEnvironment` | Startup, auth, and quota init |
-| `providers/codex/index.js` | `intercept`, `normalizeConfigOptions` | Config/Command updates; active prompt tracking; error message promotion |
+| `providers/codex/index.js` | `intercept`, `normalizeConfigOptions` | Config/Command updates and error message promotion |
+| `providers/codex/index.js` | `onPromptStarted`, `onPromptCompleted` | Prompt lifecycle hooks used for quota polling control and turn-complete quota refresh |
 | `providers/codex/index.js` | `fetchCodexQuota` | Handled OAuth-backed quota retrieval with 401 retry |
 | `providers/codex/index.js` | `refreshCodexOAuthToken` | Refreshes and persists tokens to `auth.json` |
 | `providers/codex/index.js` | `buildCodexProviderStatus` | Maps raw ChatGPT usage JSON to UI status shape |
@@ -214,7 +215,7 @@ When `acpSupportsMcpTimeouts` is `true`, `getMcpServerMeta()` returns:
 
 This is spread as `_meta` on the MCP server config entry in both `session/new` and `session/load` requests. Fields are omitted individually if their value is not a positive integer. Set `acpSupportsMcpTimeouts: false` (the default) until upstream support is confirmed.
 
-Because Codex can retry long-running MCP calls when the upstream timeout path is hit or a result is lost, AcpUI's `ux_invoke_subagents` and `ux_invoke_counsel` handlers are replay-protected. Duplicate calls with the same provider/session/tool/MCP request identity join the active invocation or return the recent cached result instead of spawning another sub-agent batch.
+Because Codex can retry or cancel long-running MCP calls when the upstream timeout path is hit or a result is lost, AcpUI's `ux_invoke_subagents` and `ux_invoke_counsel` handlers are replay-protected and abort-aware. Duplicate calls with the same provider/session/tool/MCP request identity join the active invocation or return the recent cached result instead of spawning another sub-agent batch. When the MCP request is actually cancelled, the stdio proxy and backend route propagate abort signals so `SubAgentInvocationManager` cascades cancellation through nested sub-agents instead of leaving them running.
 
 ## Gotchas
 
@@ -229,7 +230,7 @@ Because Codex can retry long-running MCP calls when the upstream timeout path is
 9. **Codex buries the user-facing error message in `error.data.message`.** The JSON-RPC top-level `error.message` is always the generic sentinel `"Internal error"` (-32603). The `intercept()` function promotes `error.data.message` to `error.message` so the real cause (e.g. `usage_limit_exceeded`) surfaces in logs and in the UI error box.
 10. **Avoid double-counting assistant text during rehydration.** When `event_msg/agent_message` exists, treat `response_item/message(role=assistant)` as fallback-only for text to prevent duplicate assistant outputs.
 11. **`acpSupportsMcpTimeouts` is `false` by default.** The `_meta` timeout injection only activates when explicitly set to `true`. Until `codex-acp` officially supports MCP `_meta` timeout overrides, leave this disabled to avoid sending unexpected fields to the daemon.
-12. **Sub-agent MCP retries must stay idempotent.** Codex may retry a long-running MCP tool call. Do not remove the sub-agent idempotency key path in `backend/mcp/mcpServer.js` or the active/completed replay cache in `backend/mcp/subAgentInvocationManager.js`.
+12. **Sub-agent MCP retries must stay idempotent and abort-aware.** Codex may retry or cancel a long-running MCP tool call. Do not remove the sub-agent idempotency key path in `backend/mcp/mcpServer.js`, the active/completed replay cache in `backend/mcp/subAgentInvocationManager.js`, or the abort signal propagation through `backend/mcp/stdio-proxy.js` and `backend/routes/mcpApi.js`.
 
 ## Unit Tests
 

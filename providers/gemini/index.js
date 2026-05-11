@@ -103,16 +103,6 @@ export function intercept(payload) {
 
         // On first detection of a session, emit persisted context % if available
         _emitCachedContext(sessionId);
-
-        // Track active prompts: increment on first message chunk of a new turn
-        if (!_inFlightSessions.has(sessionId) &&
-            (update?.sessionUpdate === 'agent_message_chunk' ||
-             update?.sessionUpdate === 'user_message_chunk' ||
-             update?.sessionUpdate === 'tool_call')) {
-          _inFlightSessions.add(sessionId);
-          _activePromptCount++;
-          _ensureQuotaPolling();
-        }
       }
 
       // Log usage_update events to understand the token flow
@@ -130,18 +120,6 @@ export function intercept(payload) {
     // 2. Handle Final Response Results (Turn Completion)
     if (payload?.result?.stopReason) {
       const sessionId = payload.result.sessionId || _lastSessionId;
-
-
-      // Remove from in-flight sessions and decrement counter
-      if (sessionId && _inFlightSessions.has(sessionId)) {
-        _inFlightSessions.delete(sessionId);
-        if (_activePromptCount > 0) {
-          _activePromptCount--;
-        }
-        if (_activePromptCount === 0) {
-          _stopQuotaPolling();
-        }
-      }
 
       if (payload.result?._meta?.quota && sessionId) {
         const quota = payload.result._meta.quota;
@@ -1343,6 +1321,35 @@ export function stopQuotaFetching() {
   _stopQuotaPolling();
   _activePromptCount = 0;
   _inFlightSessions.clear();
+}
+
+/**
+ * Called by the backend immediately before session/prompt is sent.
+ * Registers the session as active and starts quota polling if needed.
+ * Using an explicit hook instead of intercept()-based detection avoids false
+ * positives from session/load history drain messages (user_message_chunk,
+ * tool_call with status:completed, agent_message_chunk) that look identical
+ * to live traffic inside intercept() but never produce a stopReason result.
+ */
+export function onPromptStarted(sessionId) {
+  if (sessionId && !_inFlightSessions.has(sessionId)) {
+    _inFlightSessions.add(sessionId);
+    _activePromptCount++;
+    _ensureQuotaPolling();
+  }
+}
+
+/**
+ * Called by the backend in a finally block after session/prompt resolves or
+ * rejects (including cancellation). Decrements the active counter and stops
+ * quota polling when no prompts remain in flight.
+ */
+export function onPromptCompleted(sessionId) {
+  if (sessionId && _inFlightSessions.has(sessionId)) {
+    _inFlightSessions.delete(sessionId);
+    if (_activePromptCount > 0) _activePromptCount--;
+    if (_activePromptCount === 0) _stopQuotaPolling();
+  }
 }
 
 function _stopQuotaPolling() {

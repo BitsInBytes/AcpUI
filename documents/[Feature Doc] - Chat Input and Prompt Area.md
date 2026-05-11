@@ -306,7 +306,7 @@ socket.emit('prompt', {
 ```
 
 ### 11. Backend promptHandlers Compresses Images
-**File:** `backend/sockets/promptHandlers.js` (Lines 58-93)
+**File:** `backend/sockets/promptHandlers.js` (Lines 57-92)
 
 ```javascript
 const acpPromptParts = [];
@@ -363,7 +363,7 @@ For files with disk paths (Line 84):
 - Sends as resource_link (Lines 87-89)
 
 ### 12. ACP Receives and Processes Multi-Part Prompt
-**File:** `backend/sockets/promptHandlers.js` (Lines 112-115)
+**File:** `backend/sockets/promptHandlers.js` (Lines 117-120)
 
 ```javascript
 const response = await acpClient.transport.sendRequest('session/prompt', {
@@ -751,8 +751,8 @@ User clicks footer dropdown (currently shows "Using Sonnet (62%)")
 
 | File | Handler/Function | Lines | Purpose |
 |------|------------------|-------|---------|
-| `backend/sockets/promptHandlers.js` | `prompt` socket handler | 12-150 | Main prompt handler; image compression; ACP routing |
-| `backend/sockets/promptHandlers.js` | Image compression logic | 60-79 | Resize with sharp; JPEG encode; log ratio |
+| `backend/sockets/promptHandlers.js` | `prompt` socket handler | 11-173 | Main prompt handler; image compression; ACP routing |
+| `backend/sockets/promptHandlers.js` | Image compression logic | 59-92 | Resize with sharp; JPEG encode; log ratio |
 | `backend/routes/upload.js` | `POST /upload/:uiId` | 6 | Express route; delegates to multer + handleUpload |
 | `backend/services/attachmentVault.js` | `storage` (multer) | 14-26 | Disk storage configuration; sanitizes filenames |
 | `backend/services/attachmentVault.js` | `handleUpload` | 30-40 | Returns file metadata; logs upload |
@@ -867,7 +867,7 @@ User clicks footer dropdown (currently shows "Using Sonnet (62%)")
 
 1. **Textarea not focusing** — Check `isDisabled` condition (Line 81). Engine ready? Session warming up?
 2. **Attachments not uploading** — Check browser console for fetch error. Verify `POST /upload/{sessionId}` endpoint. Check disk permissions on attachments directory.
-3. **Images look blurry** — Quality 85 is default (Line 69, promptHandlers.js). Increase if needed; accept larger file size.
+3. **Images look blurry** — Quality 85 is default (Line 68, promptHandlers.js). Increase if needed; accept larger file size.
 4. **Slash dropdown not appearing** — Check that filtered commands exist (Line 112). Hidden commands excluded (Line 109)?
 5. **Model dropdown doesn't close** — Check pointerdown listener (Lines 117-128). Click outside? Click on model-dropdown-item?
 6. **Context % not showing** — Verify provider emits context updates. Check `contextUsageBySession[acpSessionId]` in SystemStore.

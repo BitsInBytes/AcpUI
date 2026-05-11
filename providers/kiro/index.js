@@ -485,6 +485,14 @@ export function getMcpServerMeta() {
   return undefined;
 }
 
+export function onPromptStarted(_sessionId) {
+  // Kiro has no prompt-scoped provider polling lifecycle to manage.
+}
+
+export function onPromptCompleted(_sessionId) {
+  // Kiro has no prompt-scoped provider polling lifecycle to manage.
+}
+
 export async function setConfigOption(acpClient, sessionId, optionId, value) {
   if (optionId === 'model') {
     return acpClient.transport.sendRequest('session/set_model', {

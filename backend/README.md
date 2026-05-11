@@ -11,6 +11,7 @@ It is intentionally provider-agnostic: provider identity, branding, models, and 
 - Persists sessions/folders/artifacts/notes in SQLite.
 - Routes ACP updates into the normalized timeline/events the UI expects.
 - Hosts MCP tool execution endpoints and related orchestration helpers.
+- Propagates MCP cancellation/disconnect signals so long-running tools can stop their descendant work.
 
 ## Quick Start
 

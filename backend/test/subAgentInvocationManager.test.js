@@ -194,6 +194,74 @@ describe('SubAgentInvocationManager', () => {
     expect(result.content[0].text).toContain('Aborted');
   });
 
+  it('cancelAllForParent cascades through nested sub-agent invocations', () => {
+    mockAcpClient.transport.sendNotification = vi.fn();
+    const directAbort = vi.fn();
+    const nestedAbort = vi.fn();
+    const deepAbort = vi.fn();
+
+    manager.trackSubAgentParent('provider-a', 'child-acp', 'parent-acp');
+    manager.trackSubAgentParent('provider-a', 'grandchild-acp', 'child-acp');
+    manager.trackSubAgentParent('provider-a', 'great-grandchild-acp', 'grandchild-acp');
+
+    manager.invocations.set('inv-direct', {
+      invocationId: 'inv-direct',
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp',
+      agents: new Map([['child-acp', { acpId: 'child-acp', status: 'running' }]]),
+      abortFn: directAbort
+    });
+    manager.invocations.set('inv-nested', {
+      invocationId: 'inv-nested',
+      providerId: 'provider-a',
+      parentAcpSessionId: 'child-acp',
+      agents: new Map([['grandchild-acp', { acpId: 'grandchild-acp', status: 'running' }]]),
+      abortFn: nestedAbort
+    });
+    manager.invocations.set('inv-deep', {
+      invocationId: 'inv-deep',
+      providerId: 'provider-a',
+      parentAcpSessionId: 'grandchild-acp',
+      agents: new Map([['great-grandchild-acp', { acpId: 'great-grandchild-acp', status: 'running' }]]),
+      abortFn: deepAbort
+    });
+
+    manager.cancelAllForParent('parent-acp', 'provider-a');
+
+    expect(directAbort).toHaveBeenCalled();
+    expect(nestedAbort).toHaveBeenCalled();
+    expect(deepAbort).toHaveBeenCalled();
+    expect(mockAcpClient.transport.sendNotification).toHaveBeenCalledWith('session/cancel', { sessionId: 'child-acp' });
+    expect(mockAcpClient.transport.sendNotification).toHaveBeenCalledWith('session/cancel', { sessionId: 'grandchild-acp' });
+    expect(mockAcpClient.transport.sendNotification).toHaveBeenCalledWith('session/cancel', { sessionId: 'great-grandchild-acp' });
+  });
+
+  it('aborts and cancels sub-agents when the tool call abort signal fires', async () => {
+    mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
+      if (method === 'session/new') return { sessionId: 'sub-acp-1' };
+      if (method === 'session/prompt') return new Promise(() => {}); // hang
+      return {};
+    });
+    mockAcpClient.transport.sendNotification = vi.fn();
+    const controller = new AbortController();
+
+    const runPromise = manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp',
+      abortSignal: controller.signal
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    controller.abort();
+
+    expect(mockAcpClient.transport.sendNotification).toHaveBeenCalledWith('session/cancel', { sessionId: 'sub-acp-1' });
+
+    await vi.runAllTimersAsync();
+    const result = await runPromise;
+    expect(result.content[0].text).toContain('Aborted');
+  });
+
   it('cancelAllForParent handles errors when sending notification', async () => {
     mockAcpClient.transport.sendRequest.mockImplementation(async (method) => {
       if (method === 'session/new') return { sessionId: 'sub-acp-1' };
@@ -214,6 +282,70 @@ describe('SubAgentInvocationManager', () => {
 
     manager.cancelAllForParent('parent-acp', 'provider-a');
     expect(deps.log).toHaveBeenCalledWith(expect.stringContaining('Error sending cancel to sub-agent sub-acp-1: Send failed'));
+  });
+
+  it('trackSubAgentParent ignores calls with any null/undefined argument', () => {
+    manager.trackSubAgentParent(null, 'child-acp', 'parent-acp');
+    manager.trackSubAgentParent('provider-a', null, 'parent-acp');
+    manager.trackSubAgentParent('provider-a', 'child-acp', null);
+    manager.trackSubAgentParent(undefined, 'child-acp', 'parent-acp');
+    expect(manager.subAgentParentLinks.size).toBe(0);
+  });
+
+  it('cancelInvocationRecord is idempotent — double-cancel does not re-trigger abortFn', () => {
+    const abortFn = vi.fn();
+    const inv = {
+      invocationId: 'inv-idempotent',
+      providerId: 'provider-a',
+      status: 'running',
+      agents: new Map(),
+      abortFn,
+      completedAt: null
+    };
+
+    manager.cancelInvocationRecord(inv);
+    expect(abortFn).toHaveBeenCalledTimes(1);
+    expect(inv.status).toBe('cancelled');
+
+    manager.cancelInvocationRecord(inv);
+    expect(abortFn).toHaveBeenCalledTimes(1); // not called again
+    expect(inv.status).toBe('cancelled');
+  });
+
+  it('collectDescendantAcpSessionIds returns an empty set when parentAcpSessionId is null', () => {
+    manager.trackSubAgentParent('provider-a', 'child-acp', 'some-parent');
+    const result = manager.collectDescendantAcpSessionIds(null, 'provider-a');
+    expect(result.size).toBe(0);
+  });
+
+  it('collectDescendantAcpSessionIds excludes sessions from a different provider', () => {
+    manager.trackSubAgentParent('provider-a', 'child-a', 'parent-acp');
+    manager.trackSubAgentParent('provider-b', 'child-b', 'parent-acp');
+
+    const result = manager.collectDescendantAcpSessionIds('parent-acp', 'provider-a');
+    expect(result.has('parent-acp')).toBe(true);
+    expect(result.has('child-a')).toBe(true);
+    expect(result.has('child-b')).toBe(false);
+  });
+
+  it('immediately aborts when abortSignal is already aborted before spawning starts', async () => {
+    mockAcpClient.transport.sendNotification = vi.fn();
+    const controller = new AbortController();
+    controller.abort(); // already aborted before runInvocation is called
+
+    const runPromise = manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp',
+      abortSignal: controller.signal
+    });
+
+    await vi.runAllTimersAsync();
+    const result = await runPromise;
+
+    expect(result.content[0].text).toContain('Aborted');
+    // No ACP session should have been created — the abort fires before any spawn
+    expect(mockAcpClient.transport.sendRequest).not.toHaveBeenCalledWith('session/new', expect.anything());
   });
 
   it('getSnapshotsForParent returns active agents', async () => {

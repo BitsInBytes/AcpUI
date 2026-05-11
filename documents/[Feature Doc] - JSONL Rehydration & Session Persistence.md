@@ -192,11 +192,11 @@ await reapplySavedConfigOptions(acpClient, sessionId, dbSession.configOptions, p
 ### Flow C: Active Streaming (Periodic Save + Turn End)
 
 **Step 1: User Submits Prompt**
-- File: `backend/sockets/promptHandlers.js` (Lines 12–128)
+- File: `backend/sockets/promptHandlers.js` (Lines 11–173)
 - Frontend: `socket.emit('prompt', { providerId, uiId, sessionId, prompt, ... })`
 
 **Step 2: Backend Sends to ACP**
-- File: `backend/sockets/promptHandlers.js` (Line 112)
+- File: `backend/sockets/promptHandlers.js` (Line 117)
 - `acpClient.transport.sendRequest('session/prompt', { sessionId, prompt: [...] })`
 - ACP streams back updates
 
@@ -248,13 +248,13 @@ if (session && session.messages && session.messages.length > 0) {
 ```
 
 **Step 6: Turn End Notification**
-- File: `backend/sockets/promptHandlers.js` (Line 127)
+- File: `backend/sockets/promptHandlers.js` (Line 132)
 - ACP sends final response (no more updates coming)
 - Backend emits: `io.to('session:' + sessionId).emit('token_done', { ... })`
 - Frontend marks session as no longer typing
 
 **Step 7: Final autoSaveTurn Call**
-- File: `backend/sockets/promptHandlers.js` (Line 128)
+- File: `backend/sockets/promptHandlers.js` (Line 133)
 - Explicit call to `autoSaveTurn(sessionId, acpClient)` at turn end
 - Ensures final state (with `isStreaming = false`) is persisted
 
@@ -590,7 +590,7 @@ Context usage metadata (`used_tokens` / `total_tokens`) is persisted on the sess
 | `backend/services/sessionManager.js` | 128–175 | `setSessionModel()` | Switch model via RPC + update metadata |
 | `backend/services/acpUpdateHandler.js` | 84–91 | Periodic save trigger | Check time, call autoSaveTurn |
 | `backend/services/acpUpdateHandler.js` | 74–82 | Drain logic | Drop messages if draining active |
-| `backend/sockets/promptHandlers.js` | 112–148 | Prompt + turn-end | Send RPC, handle response, save |
+| `backend/sockets/promptHandlers.js` | 117–158 | Prompt + turn-end | Send RPC, handle response, save |
 | `backend/database.js` | 29–58 | Schema + migrations | SQLite table definition |
 | `backend/database.js` | 155–188 | `saveSession()` | Serialize and persist session |
 | `backend/database.js` | 224–258 | `getSession()` / `getAllSessions()` | Query and deserialize |

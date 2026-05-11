@@ -37,7 +37,7 @@ Meanwhile, the **backend** handles all the real work:
 - **No tool state in the proxy:** If the proxy crashes, tools and sockets aren't affected
 - **Live streaming works:** Tools can emit real-time updates via Socket.IO (the proxy just forwards results)
 - **Sub-agents work:** Tools can spawn new ACP sessions independently
-- **Backend HTTP timeouts disabled:** backend routes keep long tool calls open; provider MCP clients may still retry or time out upstream, so side-effectful tools need replay protection
+- **Backend HTTP timeouts disabled plus abort-aware:** backend routes keep long tool calls open, but MCP cancellation/disconnects are propagated through abort signals so side-effectful tools can stop background work
 
 ---
 
@@ -49,14 +49,26 @@ The system has **three components**:
 
 Where the actual tool logic lives. These are plain async functions that receive `{ description, command, args, providerId, ... }` and resolve with `{ content: [{ type: 'text', text: '...' }] }` or throw errors.
 ```javascript
-// FILE: backend/mcp/mcpServer.js (Lines 70-85)
-tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
-  // Delegate to shellRunManager for interactive terminal execution.
-};
+// FILE: backend/mcp/mcpServer.js (Lines 140-289)
+export function createToolHandlers(io) {
+  const tools = {};
 
-tools.ux_invoke_subagents = async ({ requests, model, providerId, acpSessionId, mcpProxyId, mcpRequestId, requestMeta }) => {
-  // Build an idempotency key, then spawn sub-agent sessions through SubAgentInvocationManager.
-};
+  tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+    // Delegate to shellRunManager for interactive terminal execution.
+    // Caches tool invocation metadata and returns PTY output.
+  };
+
+  tools.ux_invoke_subagents = async ({ requests, model, providerId, acpSessionId, mcpProxyId, mcpRequestId, requestMeta, abortSignal }) => {
+    // Build an idempotency key, then spawn sub-agent sessions through SubAgentInvocationManager.
+    // abortSignal is passed through so upstream MCP cancellation cascades to sub-agents.
+  };
+
+  tools.ux_invoke_counsel = async ({ question, architect, performance, security, ux, providerId, acpSessionId, mcpProxyId, mcpRequestId, requestMeta, abortSignal }) => {
+    // Spawn counsel agents with different perspectives. Delegates to ux_invoke_subagents.
+  };
+
+  return tools;  // LINE 289
+}
 ```
 
 ### 2. **Stdio Proxy** (`backend/mcp/stdio-proxy.js`)
@@ -64,36 +76,61 @@ tools.ux_invoke_subagents = async ({ requests, model, providerId, acpSessionId, 
 A child process spawned per ACP session. The proxy is stateless and generic.
 
 ```javascript
-// FILE: backend/mcp/stdio-proxy.js
-async function runProxy() {
-  // Fetch tool definitions from backend
-  const { tools, serverName } = await backendFetch(`/api/mcp/tools?providerId=...&proxyId=...`);
+// FILE: backend/mcp/stdio-proxy.js (Lines 46-119)
+
+// Fetch with retry loop (3 attempts, exponential backoff)
+// Abort errors bypass retry immediately
+async function backendFetch(path, options = {}) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(`${getBackendUrl()}${path}`, {
+        ...options,
+        headers: { 'Content-Type': 'application/json', ...options.headers },
+      });
+      return await res.json();
+    } catch (err) {
+      if (options.signal?.aborted || err.name === 'AbortError') throw err;  // LINE 55: Don't retry aborts
+      if (attempt < 2) await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+      else throw err;
+    }
+  }
+}
+
+async function runProxy() {  // LINE 62
+  const providerId = process.env.ACP_SESSION_PROVIDER_ID || '';
+  const proxyId = process.env.ACP_UI_MCP_PROXY_ID || '';
+  const query = ...;
+  const { tools, serverName } = await backendFetch(`/api/mcp/tools${query}`);
   
   // Register with MCP SDK and advertise server-level instructions
   const instructions = buildServerInstructions(tools, serverName);
   const server = new Server({ name: serverName, ... }, { instructions, ... });
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [...] }));
-  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
-    // Forward to backend HTTP endpoint
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    // Forward to backend HTTP endpoint, passing MCP signal
     return await backendFetch('/api/mcp/tool-call', {
       method: 'POST',
       body: JSON.stringify({
-        tool: req.params.name,
-        args: req.params.arguments,
-        providerId: ...,
-        proxyId: ...,
-        mcpRequestId: extra?.requestId,
-      })
+        tool: request.params.name,
+        args: request.params.arguments,
+        providerId: process.env.ACP_SESSION_PROVIDER_ID || null,
+        proxyId: process.env.ACP_UI_MCP_PROXY_ID || null,
+        mcpRequestId: extra?.requestId ?? null,
+        requestMeta: request.params?._meta || extra?._meta || null
+      }),
+      signal: extra?.signal  // LINE 106: Propagate MCP cancellation
     });
   });
   
   // Connect to ACP via stdio
   const transport = new StdioServerTransport();
-  await server.connect(transport);
-}
+  await server.connect(transport);  // LINE 111
+}  // LINE 112
 ```
 
-**Key details:** The proxy fetches tool definitions on startup and derives MCP `instructions` from the same tool list. If schemas are out of date, discovery and instructions will both be stale until a new session starts.
+**Key details:** 
+- `backendFetch()` (lines 46-60): Retries 3x with exponential backoff (500ms, 1s, 1.5s). **Important:** Abort errors and pre-aborted signals are NOT retried (line 55) — they throw immediately so MCP cancellation propagates cleanly.
+- `runProxy()` (lines 62-119): Fetches tool definitions on startup, derives MCP `instructions`, registers with SDK, and forwards tool calls. The proxy forwards the MCP SDK `extra.signal` into `fetch()` so client-side cancellation or timeouts close the backend request.
 
 ### 3. **Backend HTTP API** (`backend/routes/mcpApi.js`)
 
@@ -101,7 +138,7 @@ Two routes that bridge proxy ↔ backend:
 
 **GET /api/mcp/tools?providerId=...&proxyId=...** — Returns tool definitions with JSON schemas and MCP tool metadata.
 ```javascript
-// FILE: backend/routes/mcpApi.js (Lines 30-73)
+// FILE: backend/routes/mcpApi.js (Lines 54-118)
 router.get('/tools', (req, res) => {
   const context = resolveToolContext(req.query.providerId || null, req.query.proxyId || null);
   const toolList = [
@@ -116,34 +153,77 @@ router.get('/tools', (req, res) => {
     },
     // ... more tools
   ];
-  res.json({ tools: toolList, serverName: 'AcpUI' });
-});
+  res.json({ tools: toolList, serverName });  // LINE 117
+});  // LINE 118
 ```
 
 **POST /api/mcp/tool-call** — Executes a tool and returns the result.
+
 ```javascript
-// FILE: backend/routes/mcpApi.js (Lines 81-113)
-router.post('/tool-call', async (req, res) => {
+// FILE: backend/routes/mcpApi.js (Lines 16-34, 124-158)
+
+// Helper: Create an AbortSignal tied to request/response lifecycle
+function createToolCallAbortSignal(req, res, toolName) {  // LINE 16
+  const controller = new globalThis.AbortController();
+  const abort = (reason) => {
+    if (controller.signal.aborted) return;
+    writeLog(`[MCP API] Tool ${toolName} aborted: ${reason}`);
+    controller.abort(new Error(reason));
+  };
+
+  req.on?.('aborted', () => abort('request aborted'));  // LINE 24
+  res.on?.('close', () => {
+    if (!res.writableEnded) abort('response closed');
+  });
+
+  return controller.signal;  // LINE 29
+}
+
+// Helper: Check if response can still be written
+function canWriteResponse(res, abortSignal) {  // LINE 32
+  return !abortSignal.aborted && !res.destroyed && !res.writableEnded;  // LINE 33
+}
+
+router.post('/tool-call', async (req, res) => {  // LINE 124
   // CRITICAL: Disable timeouts so tools can run indefinitely
-  req.setTimeout(0);      // LINE 85
-  res.setTimeout(0);      // LINE 86
+  req.setTimeout(0);      // LINE 125
+  res.setTimeout(0);      // LINE 126
   if (req.socket) req.socket.setTimeout(0);
 
-  const { tool: toolName, args, providerId } = req.body;
+  const { tool: toolName, args, providerId, proxyId, mcpRequestId, requestMeta } = req.body;
   const handler = tools[toolName];
   if (!handler) {
     res.status(404).json({ error: `Unknown tool: ${toolName}` });
     return;
   }
 
+  let abortSignal = null;
   try {
-    const result = await handler({ ...(args || {}), providerId });  // LINE 99
-    res.json(result);  // Content array, not plain text
+    abortSignal = createToolCallAbortSignal(req, res, toolName);  // LINE 140
+    const context = resolveToolContext(providerId || null, proxyId || null);  // LINE 141
+    const handlerArgs = { ...(args || {}) };
+    if (context.providerId) handlerArgs.providerId = context.providerId;
+    if (context.acpSessionId) handlerArgs.acpSessionId = context.acpSessionId;
+    if (context.mcpProxyId) handlerArgs.mcpProxyId = context.mcpProxyId;
+    if (mcpRequestId !== undefined && mcpRequestId !== null) handlerArgs.mcpRequestId = mcpRequestId;
+    if (requestMeta) handlerArgs.requestMeta = requestMeta;
+    handlerArgs.abortSignal = abortSignal;  // LINE 148
+    const result = await handler(handlerArgs);  // LINE 149
+    if (canWriteResponse(res, abortSignal)) res.json(result);  // LINE 151: Guard write
   } catch (err) {
-    res.json({ content: [{ type: 'text', text: `Error: ${err.message}` }] });
+    writeLog(`[MCP API] Tool ${toolName} error: ${err.message}`);
+    if (!abortSignal?.aborted && !res.destroyed && !res.writableEnded) {
+      res.json({ content: [{ type: 'text', text: `Error: ${err.message}` }] });  // LINE 155
+    }
   }
-});
+});  // LINE 158
 ```
+
+**Key details:**
+- `createToolCallAbortSignal()` (lines 16-30): Creates an `AbortController` that aborts on request `aborted` event (line 24; client closed connection) or response `close` event (line 25-26; response sent/closed). Logs which event triggered abort.
+- `canWriteResponse()` (lines 32-33): Guards response writes to ensure we don't write to an already-closed or aborted response.
+- Tool timeouts disabled (lines 125-127): Intentional — tools like sub-agents can take minutes. Disconnects still abort via canWriteResponse guard at line 151.
+- Abort signal passed to handler (line 148): Every handler receives the signal so it can cancel background work if client disconnects.
 
 ---
 
@@ -208,7 +288,7 @@ With environment variables from the config.
 
 ### 5. **Proxy Fetches Tool Definitions**
 
-**File:** `backend/mcp/stdio-proxy.js` (Lines 40-41)
+**File:** `backend/mcp/stdio-proxy.js` (Lines 62-69)
 
 ```javascript
 const queryParts = [];
@@ -218,7 +298,7 @@ const query = queryParts.length > 0 ? `?${queryParts.join('&')}` : '';
 const { tools, serverName } = await backendFetch(`/api/mcp/tools${query}`);
 ```
 
-The proxy makes an HTTPS request to the backend's GET /api/mcp/tools endpoint. Includes a retry loop (lines 25-38) with exponential backoff (500ms * attempt) for reliability.
+The proxy makes an HTTPS request to the backend's GET /api/mcp/tools endpoint. Includes a retry loop (lines 46-60) with exponential backoff (500ms * attempt) for reliability.
 
 ### 6. **Proxy Registers with MCP SDK**
 
@@ -252,6 +332,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       mcpRequestId: extra?.requestId ?? null,
       requestMeta: request.params?._meta || extra?._meta || null
     }),
+    signal: extra?.signal,
   });
 });
 
@@ -303,29 +384,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       proxyId: process.env.ACP_UI_MCP_PROXY_ID,        // Session binding
       mcpRequestId: extra?.requestId ?? null
     }),
+    signal: extra?.signal,                             // MCP cancellation
   });
 });
 ```
 
-The proxy calls `backendFetch()` (with retry logic) to POST /api/mcp/tool-call.
+The proxy calls `backendFetch()` (with retry logic) to POST /api/mcp/tool-call. If the MCP request is cancelled, `extra.signal` aborts the fetch and closes the backend route.
 
-### 10. **Backend Executes Tool Handler**
+### 10. **Backend Executes Tool Handler with Abort Signal**
 
-**File:** `backend/routes/mcpApi.js` (Lines 103-132)
+**File:** `backend/routes/mcpApi.js` (Lines 140-151)
 
 ```javascript
-const context = resolveToolContext(providerId || null, proxyId || null);  // LINE 118: Resolve from proxy registry
-const handlerArgs = { ...(args || {}) };
-if (context.providerId)   handlerArgs.providerId   = context.providerId;
-if (context.acpSessionId) handlerArgs.acpSessionId = context.acpSessionId;
-if (context.mcpProxyId)   handlerArgs.mcpProxyId   = context.mcpProxyId;
-if (mcpRequestId !== undefined && mcpRequestId !== null) handlerArgs.mcpRequestId = mcpRequestId;
-if (requestMeta)          handlerArgs.requestMeta  = requestMeta;
-const result = await handler(handlerArgs);  // Execute; may block for long-running tools
-res.json(result);
+let abortSignal = null;
+try {
+  abortSignal = createToolCallAbortSignal(req, res, toolName);  // LINE 140
+  const context = resolveToolContext(providerId || null, proxyId || null);  // LINE 141: Resolve from proxy registry
+  const handlerArgs = { ...(args || {}) };
+  if (context.providerId)   handlerArgs.providerId   = context.providerId;
+  if (context.acpSessionId) handlerArgs.acpSessionId = context.acpSessionId;
+  if (context.mcpProxyId)   handlerArgs.mcpProxyId   = context.mcpProxyId;
+  if (mcpRequestId !== undefined && mcpRequestId !== null) handlerArgs.mcpRequestId = mcpRequestId;
+  if (requestMeta)          handlerArgs.requestMeta  = requestMeta;
+  handlerArgs.abortSignal = abortSignal;  // LINE 148: Pass to handler
+  const result = await handler(handlerArgs);  // Execute; may block for long-running tools
+  if (canWriteResponse(res, abortSignal)) res.json(result);  // LINE 151: Guard write
+} catch (err) {
+  writeLog(`[MCP API] Tool ${toolName} error: ${err.message}`);
+  if (!abortSignal?.aborted && !res.destroyed && !res.writableEnded) {
+    res.json({ content: [{ type: 'text', text: `Error: ${err.message}` }] });
+  }
+}
 ```
 
+**Abort Signal Flow:**
+- **Line 140:** `createToolCallAbortSignal()` creates an AbortController that aborts on request `aborted` or response `close` events.
+- **Line 148:** Handler receives `abortSignal` in its arguments.
+- **Line 151:** Response write is guarded — only writes if signal is not aborted and response is still open.
+
 The handler for `ux_invoke_shell` delegates to `shellRunManager.startPreparedRun(...)` and blocks until the PTY exits or is user-terminated. It emits `shell_run_started`, `shell_run_output`, and `shell_run_exit` during execution.
+
+For `ux_invoke_subagents` and `ux_invoke_counsel`, the handler passes the abort signal to `SubAgentInvocationManager.runInvocation()` (line 216 of mcpServer.js), which cascades cancellation through every active descendant sub-agent via `cancelAllForParent()` if the signal aborts.
 
 ### 11. **Tool Result Returned to Proxy**
 
@@ -403,7 +502,7 @@ Tool schemas and handlers are defined in **two separate files** with **no code l
 
 ### Where Schemas Are Defined
 
-**File:** `backend/routes/mcpApi.js` (Lines 30-73)
+**File:** `backend/routes/mcpApi.js` (Lines 57-121)
 
 ```javascript
 const toolList = [
@@ -427,7 +526,7 @@ res.json({ tools: toolList, serverName });
 
 ### Where Handlers Are Defined
 
-**File:** `backend/mcp/mcpServer.js` (Lines 67-117)
+**File:** `backend/mcp/mcpServer.js` (Lines 140-217)
 
 ```javascript
 export function createToolHandlers(io) {
@@ -522,7 +621,7 @@ export function getMcpServers(providerId, { acpSessionId = null } = {}) {
 
 ### Version 2: For Sub-Agent Sessions (mcpServer.js)
 
-**File:** `backend/mcp/mcpServer.js` (Lines 38-58)
+**File:** `backend/mcp/mcpServer.js` (Lines 114-134)
 
 ```javascript
 export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
@@ -548,7 +647,7 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
 }
 ```
 
-**Used by:** Inside `mcpServer.js` for sub-agent spawning (line 146: `mcpServers: getMcpServers(resolvedProviderId)`). After `session/new` returns, `bindMcpProxy` is called to associate the proxy id with the newly created ACP session id.
+**Used by:** Inside `subAgentInvocationManager.js` for sub-agent spawning (line 251: `const mcpServers = this.getMcpServersFn(resolvedProviderId)`). After `session/new` returns (line 252), `bindMcpProxy` is called (line 255) to associate the proxy id with the newly created ACP session id.
 
 **Key:** Same contract as Version 1 — both include `ACP_SESSION_PROVIDER_ID` and `ACP_UI_MCP_PROXY_ID`. The distinction is purely about which call site uses which version.
 
@@ -622,18 +721,26 @@ After making changes:
 
 | File | Functions | Lines | Purpose |
 |------|-----------|-------|---------|
-| `backend/mcp/mcpServer.js` | `createToolHandlers(io)` | 63-276 | Defines all tool handlers (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) |
-| | `getMcpServers()` | 38-55 | Returns MCP server config for sub-agent spawning (includes proxy id env) |
-| | `ux_invoke_shell` | 66-88 | Delegate to `shellRunManager` for interactive shell execution |
-| | `ux_invoke_subagents` | 89-248 | Spawn sub-agents, await responses, cleanup |
-| | `ux_invoke_counsel` | 250-276 | Spawn counsel agents (delegates to ux_invoke_subagents) |
-| `backend/mcp/stdio-proxy.js` | `runProxy()`, `buildServerInstructions()` | 52-108 | Fetch schemas, derive MCP instructions, register with MCP SDK, forward tool calls with proxy/session context |
-| | `backendFetch()` | 20-39 | HTTP request with 3-attempt retry loop |
-| `backend/routes/mcpApi.js` | `GET /tools` | 34-97 | Return tool schemas and server name |
-| | `POST /tool-call` | 103-132 | Execute tool handler, disable timeouts, return result |
+| `backend/mcp/mcpServer.js` | `createToolHandlers(io)` | 140-289 | Defines all tool handlers (ux_invoke_shell, ux_invoke_subagents, ux_invoke_counsel) |
+| | `getMcpServers(providerId)` | 114-134 | Returns MCP server config for sub-agent spawning (includes proxy id env) |
+| | `ux_invoke_shell` | 143-175 | Delegate to `shellRunManager` for interactive shell execution |
+| | `ux_invoke_subagents` | 177-218 | Spawn sub-agents, pass abort signal, await responses, cleanup |
+| | `ux_invoke_counsel` | 232-286 | Spawn counsel agents (delegates to ux_invoke_subagents) |
+| `backend/mcp/stdio-proxy.js` | `backendFetch(path, options)` | 46-60 | HTTP fetch with 3-attempt retry; abort errors bypass retry |
+| | `runProxy()` | 62-119 | Fetch schemas, derive MCP instructions, register with MCP SDK, forward tool calls with proxy/session context and abort signal |
+| `backend/routes/mcpApi.js` | `createToolCallAbortSignal(req, res, toolName)` | 16-30 | Create AbortSignal from request aborted/response close events |
+| | `canWriteResponse(res, abortSignal)` | 32-33 | Guard response writes; check abort status and writability |
+| | `GET /tools` | 54-118 | Return tool schemas and server name |
+| | `POST /tool-call` | 124-158 | Execute tool handler, disable timeouts, propagate disconnect aborts, return result |
 | `backend/mcp/mcpProxyRegistry.js` | proxy binding helpers | 1-78 | Correlate stdio proxy ids to provider/session context |
-| `backend/services/shellRunManager.js` | `ShellRunManager` | 113-460 | Interactive PTY lifecycle, startup control sanitation, and final-result formatting |
+| `backend/services/shellRunManager.js` | `detectPwsh(platform, spawnSyncFn)` | 28-44 | Detect if PowerShell 7+ (pwsh) is available on Windows |
+| | `ShellRunManager` constructor | 114-141 | Initialize PTY manager with `pwshAvailable` option (null = auto-detect) |
+| | `resizeRun(runId, cols, rows)` | 312-324 | Resize PTY; wrapped in try/catch to handle Windows PTY race |
 | `backend/services/sessionManager.js` | `getMcpServers(providerId, { acpSessionId })` | 28-44 | Returns MCP server config for user sessions (includes proxy id env) |
+| `backend/mcp/subAgentInvocationManager.js` | `subAgentParentKey()` | 57-59 | Build parent-child tracking key |
+| | `trackSubAgentParent()` | 61-68 | Record parent-child relationship for cascade cancellation |
+| | `collectDescendantAcpSessionIds()` | 70-95 | Recursive descent graph traversal to find all descendants |
+| | `cancelAllForParent(parentAcpSessionId, providerId)` | 124-131 | Cancel all invocations for a parent and its descendants |
 
 ---
 
@@ -645,17 +752,25 @@ Adding a tool to `mcpServer.js` without adding its schema to `mcpApi.js` means t
 
 **Test:** When you add a tool, verify that both places are updated before testing.
 
-### 2. **HTTP Timeouts Are Disabled**
+### 2. **HTTP Timeouts Are Disabled, But Disconnects Create AbortSignals**
 
-Lines 85-87 of `mcpApi.js` disable all HTTP timeouts. **This is intentional** — tools like sub-agents can take minutes. If you add timeout logic, be aware it's disabled at the socket level.
+Lines 125-127 of `mcpApi.js` disable all HTTP timeouts. **This is intentional** — tools like sub-agents can take minutes.
+
+This does not mean tool calls are uncancellable. Two abort mechanisms exist:
+1. **Request/Response Abort (Local):** `createToolCallAbortSignal()` (lines 17-31) converts request `aborted` events and response `close` events into an `AbortSignal`. The route guards response writes with `canWriteResponse()` (lines 33-35).
+2. **MCP Cancellation (Upstream):** The stdio proxy passes the MCP SDK `extra.signal` into the backend `fetch()` (line 106 of stdio-proxy.js), so an upstream MCP cancellation closes the backend request instead of leaving backend work running. The `backendFetch()` retry loop (line 55) also checks for pre-aborted signals and throws immediately without retry.
+
+Both paths ensure handlers receive an abort signal and can cancel background work (shell commands, sub-agent spawning) when the client disconnects.
 
 ### 3. **Two Different getMcpServers Functions**
 
 Both `sessionManager.js:getMcpServers(providerId)` and `mcpServer.js:getMcpServers(providerId)` include `ACP_SESSION_PROVIDER_ID` in env. They exist in two places because one is used for user session creation (sessionManager) and the other for sub-agent session creation within tool handlers (mcpServer). Both must stay aligned.
 
-### 4. **The Proxy Retries Three Times**
+### 4. **The Proxy Retries Three Times, But NOT Abort Errors**
 
-`backendFetch()` in stdio-proxy.js (lines 25-38) retries with exponential backoff (500ms, 1s, 1.5s). If the backend is down, the proxy may hang for a few seconds before failing. This is intentional — allows backend startup race conditions to recover.
+`backendFetch()` in stdio-proxy.js (lines 46-60) retries with exponential backoff (500ms, 1s, 1.5s). If the backend is down, the proxy may hang for a few seconds before failing. This is intentional — allows backend startup race conditions to recover.
+
+**Critical:** Abort errors are NOT retried. Line 55 checks `if (options.signal?.aborted || err.name === 'AbortError') throw err;` immediately. This ensures MCP cancellation (when client disconnects or upstream cancels) propagates cleanly without unnecessary retry delays.
 
 ### 5. **Tool Result Must Be Content Array**
 
@@ -667,17 +782,19 @@ The stdio proxy retries failed backend fetches, and provider MCP clients may als
 
 `ux_invoke_subagents` builds a key from `mcpRequestId`, `requestMeta.toolCallId`, or a scoped hash of its input. Duplicate active calls join the original promise. Duplicate completed calls return the cached result for a short TTL.
 
+Idempotency prevents duplicate batches, but abort propagation is a separate requirement. A cancelled `ux_invoke_subagents` or `ux_invoke_counsel` call must cascade cancellation through every active descendant sub-agent.
+
 ### 7. **Provider Scope Is Inherited by Sub-Agents**
 
 Sub-agent sessions inherit the parent provider's `ACP_SESSION_PROVIDER_ID` via environment variable. This ensures tools called from within sub-agents maintain the correct provider scope and access the right configuration, models, and branding. No fallback logic needed.
 
-### 8. **Tool Definitions Are Cached by Proxy**
+### 8. **Tool Definitions Are Cached by Proxy; Session Restart Required for Updates**
 
-The proxy fetches tool definitions once at startup (line 41). If you update schemas while a session is running, the agent won't see the new definitions until a new session is created. No need to restart anything — just create a new session.
+The proxy fetches tool definitions once at startup (line 69 in stdio-proxy.js). If you update schemas while a session is running, the agent won't see the new definitions until a new session is created. No need to restart the backend — just create a new session.
 
 ### 9. **Errors Must Be Caught and Wrapped**
 
-If a handler throws, mcpApi.js catches it (line 102) and returns `{ content: [{ type: 'text', text: 'Error: ...' }] }`. The proxy passes this back as a successful response. The ACP sees it as tool output, not an error. This is acceptable — the tool ran and returned an error message.
+If a handler throws, mcpApi.js catches it (lines 155-159) and returns `{ content: [{ type: 'text', text: 'Error: ...' }] }` unless the request was already aborted. The proxy passes this back as a successful response. The ACP sees it as tool output, not an error. This is acceptable — the tool ran and returned an error message.
 
 ### 10. **Shell Terminal Events Happen Outside Tool Result**
 

@@ -636,7 +636,9 @@ const DEFAULT_MODULE = {
 };
 ```
 
-The default module remains a runtime safety net, but it is not a substitute for updating providers when the contract changes. New contract functions require explicit provider implementations so behavior is visible and testable in each provider.
+    The default module remains a runtime safety net, but it is not a substitute for updating providers when the contract changes. New contract functions require explicit provider implementations so behavior is visible and testable in each provider.
+
+    **Prompt lifecycle contract:** `onPromptStarted(sessionId)` and `onPromptCompleted(sessionId)` are provider-owned hooks called by `backend/sockets/promptHandlers.js` around every real `session/prompt` request. Providers that drive quota polling or other prompt-scoped side effects must implement these hooks directly instead of inferring lifecycle from `intercept()` traffic (which also includes `session/load` history replay notifications).
 
 ### Contract 3: toolIdPattern Resolution & Tool Categorization
 

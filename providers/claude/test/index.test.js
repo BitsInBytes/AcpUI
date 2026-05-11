@@ -79,7 +79,7 @@ describe('Claude Provider', () => {
     });
   });
 
-  describe('prepareAcpEnvironment', () => {
+      describe('prepareAcpEnvironment', () => {
     it('returns the provided environment unchanged when proxy capture is disabled', async () => {
       const env = {
         CLAUDE_QUOTA_PROXY: 'false',
@@ -122,10 +122,19 @@ describe('Claude Provider', () => {
       expect(result.ANTHROPIC_BASE_URL).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
       expect(result.KEEP).toBe('1');
       expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('Injecting ANTHROPIC_BASE_URL='));
-    });
-  });
+        });
+      });
 
-  describe('intercept', () => {
+      describe('prompt lifecycle hooks', () => {
+        it('exports onPromptStarted and onPromptCompleted as no-op hooks', () => {
+          expect(typeof claude.onPromptStarted).toBe('function');
+          expect(typeof claude.onPromptCompleted).toBe('function');
+          expect(() => claude.onPromptStarted('sess-1')).not.toThrow();
+          expect(() => claude.onPromptCompleted('sess-1')).not.toThrow();
+        });
+      });
+
+      describe('intercept', () => {
     it('normalizes available_commands_update', () => {
       const payload = {
         method: 'session/update',

@@ -14,6 +14,26 @@ function resolveToolContext(providerId, proxyId) {
   };
 }
 
+function createToolCallAbortSignal(req, res, toolName) {
+  const controller = new globalThis.AbortController();
+  const abort = (reason) => {
+    if (controller.signal.aborted) return;
+    writeLog(`[MCP API] Tool ${toolName} aborted: ${reason}`);
+    controller.abort(new Error(reason));
+  };
+
+  req.on?.('aborted', () => abort('request aborted'));
+  res.on?.('close', () => {
+    if (!res.writableEnded) abort('response closed');
+  });
+
+  return controller.signal;
+}
+
+function canWriteResponse(res, abortSignal) {
+  return !abortSignal.aborted && !res.destroyed && !res.writableEnded;
+}
+
 /**
  * Internal API for the stdio MCP proxy.
  * The proxy forwards tool calls here; we execute them using the real tool handlers.
@@ -115,7 +135,9 @@ export default function createMcpApiRoutes(io) {
       return;
     }
 
+    let abortSignal = null;
     try {
+      abortSignal = createToolCallAbortSignal(req, res, toolName);
       const context = resolveToolContext(providerId || null, proxyId || null);
       const handlerArgs = { ...(args || {}) };
       if (context.providerId) handlerArgs.providerId = context.providerId;
@@ -123,12 +145,15 @@ export default function createMcpApiRoutes(io) {
       if (context.mcpProxyId) handlerArgs.mcpProxyId = context.mcpProxyId;
       if (mcpRequestId !== undefined && mcpRequestId !== null) handlerArgs.mcpRequestId = mcpRequestId;
       if (requestMeta) handlerArgs.requestMeta = requestMeta;
+      handlerArgs.abortSignal = abortSignal;
       const result = await handler(handlerArgs);
       writeLog(`[MCP API] Tool ${toolName} completed`);
-      res.json(result);
+      if (canWriteResponse(res, abortSignal)) res.json(result);
     } catch (err) {
       writeLog(`[MCP API] Tool ${toolName} error: ${err.message}`);
-      res.json({ content: [{ type: 'text', text: `Error: ${err.message}` }] });
+      if (!abortSignal?.aborted && !res.destroyed && !res.writableEnded) {
+        res.json({ content: [{ type: 'text', text: `Error: ${err.message}` }] });
+      }
     }
   });
 

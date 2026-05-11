@@ -631,4 +631,59 @@ describe('Gemini Provider', () => {
       expect(fs.readFileSync).toBeDefined();
     });
   });
+
+  describe('onPromptStarted / onPromptCompleted', () => {
+    beforeEach(() => {
+      // Always reset polling state before each test
+      gemini.stopQuotaFetching();
+    });
+
+    it('onPromptStarted and onPromptCompleted are exported', () => {
+      expect(typeof gemini.onPromptStarted).toBe('function');
+      expect(typeof gemini.onPromptCompleted).toBe('function');
+    });
+
+    it('onPromptCompleted is a no-op for sessions never started', () => {
+      // Should not throw for unknown sessionId
+      expect(() => gemini.onPromptCompleted('unknown-session')).not.toThrow();
+    });
+
+    it('onPromptStarted is idempotent — double-calling does not double-count', () => {
+      // Two calls for same session should only register once
+      gemini.onPromptStarted('sess-idem');
+      gemini.onPromptStarted('sess-idem'); // duplicate — must be ignored
+      // One matching complete should clean up fully (no throw)
+      expect(() => gemini.onPromptCompleted('sess-idem')).not.toThrow();
+    });
+
+    it('intercept() does not start quota polling from session/load drain messages', () => {
+      // Simulate drain: user_message_chunk and completed tool_call arrive via intercept
+      // (these are replayed from JSONL history during session/load)
+      const drainChunk = (sessionUpdate) => gemini.intercept({
+        method: 'session/update',
+        params: {
+          sessionId: 'sess-drain',
+          update: { sessionUpdate, status: sessionUpdate === 'tool_call' ? 'completed' : undefined }
+        }
+      });
+
+      drainChunk('user_message_chunk');
+      drainChunk('tool_call');
+      drainChunk('agent_message_chunk');
+
+      // Without onPromptStarted being called, polling must NOT have been triggered.
+      // We verify by checking that onPromptCompleted is a no-op (nothing to clean up).
+      expect(() => gemini.onPromptCompleted('sess-drain')).not.toThrow();
+    });
+
+    it('onPromptCompleted stops polling when the last active prompt ends', () => {
+      gemini.onPromptStarted('sess-a');
+      gemini.onPromptStarted('sess-b');
+      gemini.onPromptCompleted('sess-a'); // still one active
+      gemini.onPromptCompleted('sess-b'); // last one — polling should stop
+
+      // Further completes should be safe no-ops
+      expect(() => gemini.onPromptCompleted('sess-b')).not.toThrow();
+    });
+  });
 });

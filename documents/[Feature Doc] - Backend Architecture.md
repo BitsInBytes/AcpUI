@@ -234,45 +234,71 @@ The session metadata stored in `AcpClient.sessionMetadata[sessionId]` tracks act
 ---
 
 ### 7. Prompt Execution & Output Streaming
-**File:** `backend/sockets/promptHandlers.js` (Lines 12-151)
+**File:** `backend/sockets/promptHandlers.js` (Lines 11-225)
 
 When the frontend sends a prompt, the backend assembles it and sends `session/prompt`:
 
 ```javascript
-// FILE: backend/sockets/promptHandlers.js (Lines 12-151)
-socket.on('prompt', async (payload) => {
-  const client = runtimeManager.getClient(payload.providerId);
-  const sessionId = payload.sessionId;
+// FILE: backend/sockets/promptHandlers.js (Lines 11-225)
+socket.on('prompt', async ({ providerId, uiId, sessionId, prompt, model, attachments = [] }) => {
+  let runtime;
+  try {
+    runtime = providerRuntimeManager.getRuntime(providerId);  // Outer try: pre-prompt setup
+  } catch (err) {
+    // Pre-prompt errors (invalid provider, missing setup)
+    // onPromptStarted was never called, so no cleanup needed
+    io.to('session:' + sessionId).emit('token', { ... error ... });
+    return;  // LINE 19
+  }
   
-  // Process attachments (compress images, embed files)
-  const blocks = [];
-  for (const attachment of payload.attachments) {
-    if (attachment.type === 'image') {
-      const compressed = await sharp(attachment.buffer).resize(1568, 1568).toBuffer();
-      blocks.push({ type: 'image', media_type: 'image/jpeg', data: base64(compressed) });
-    } else if (attachment.type === 'file') {
-      blocks.push({ type: 'text', text: attachment.content });
+  const acpClient = runtime.client;
+  const meta = acpClient.sessionMetadata.get(sessionId);
+  
+  // Assemble prompt parts, process attachments (image compression, file reading)...
+
+  // LIFECYCLE HOOK: Notify provider that a real prompt is starting
+  // This is the authoritative signal for lifecycle tracking (e.g., quota polling)
+  acpClient.providerModule.onPromptStarted(sessionId);  // LINE 114
+
+  try {  // LINE 116: Inner try — actual prompt execution
+    // Send to ACP daemon
+    const response = await acpClient.transport.request('session/prompt', {
+      sessionId: sessionId,
+      prompt: acpPromptParts
+    });
+
+    if (response && response.usage) {
+      meta.usedTokens = response.usage.totalTokens || meta.usedTokens;
+      io.to('session:' + sessionId).emit('stats_push', { ... });
     }
+
+    // Auto-finalize if no pending tool results
+    if (!acpClient.stream.statsCaptures.has(sessionId)) {
+      io.to('session:' + sessionId).emit('token_done', { ... });
+      autoSaveTurn(sessionId, acpClient);
+    }
+  } catch (_err) {  // LINE 136: Inner catch — handle prompt execution errors
+    // Prompt send/execution failed
+    writeLog(`Prompt Error: ${JSON.stringify(_err)}`);
+    io.to('session:' + sessionId).emit('token', { 
+      providerId, sessionId, text: \`\\n\\n:::ERROR:::\\n${_err.message}\\n:::END_ERROR:::\\n\\n\` 
+    });
+    io.to('session:' + sessionId).emit('token_done', { ... error: true ... });
+    autoSaveTurn(sessionId, acpClient);  // Prevent persistent 'Thinking...' state
+  } finally {  // LINE 154: Finally — cleanup after prompt attempt
+    // Always notify the provider that this prompt is done — whether it resolved,
+    // was cancelled (stopReason: "cancelled"), or threw an error.
+    // This keeps _activePromptCount and quota tracking accurate.
+    acpClient.providerModule.onPromptCompleted(sessionId);  // LINE 158
   }
-  
-  // Assemble prompt
-  blocks.push({ type: 'text', text: payload.prompt });
-  
-  // Add spawn context on first prompt (if provider requested it)
-  if (metadata.spawnContext && !metadata.hasSpawnContext) {
-    blocks.unshift({ type: 'text', text: metadata.spawnContext });
-  }
-  
-  // Send to ACP daemon
-  await client.transport.request('session/prompt', {
-    sessionId,
-    prompt: blocks
-  });
-  
-  // ACP daemon will send session/update notifications in response
-  // Handled by handleAcpMessage → acpUpdateHandler
-});
+});  // LINE 173
 ```
+
+**Two-Level Error Handling (New in this version):**
+- **Outer try/catch (Lines 12-20):** Catches pre-prompt errors (invalid provider, missing config, attachment processing). `onPromptStarted` is never called here.
+- **Inner try/catch/finally (Lines 116-158):** Wraps the actual `session/prompt` RPC call. `onPromptStarted` is called before inner try (line 114), inner catch handles execution errors (line 136), and finally ensures `onPromptCompleted` is always called (line 158) whether the prompt succeeded, was cancelled, or threw an error.
+
+This structure ensures lifecycle hooks (`onPromptStarted` / `onPromptCompleted`) are always paired and that errors don't prevent proper cleanup.
 
 The request is sent asynchronously; the ACP daemon will respond with `session/update` notifications as the agent generates output.
 
@@ -468,22 +494,30 @@ When a provider implements `emitCachedContext(sessionId)`, the backend calls it 
 ---
 
 ### 12. Tool Execution via Tool System V2
-**File:** `backend/mcp/mcpServer.js` (Lines 61-300) & `backend/services/tools/index.js`
+**File:** `backend/mcp/mcpServer.js` (Lines 140-289) & `backend/services/tools/index.js`
 
 When the ACP daemon calls a tool, the stdio proxy forwards the call to the backend. The backend now uses a centralized tool system to manage execution:
 
 ```javascript
-// FILE: backend/mcp/mcpServer.js (Lines 70-85)
-tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+// FILE: backend/mcp/mcpServer.js (Lines 143-175)
+tools.ux_invoke_shell = async ({ 
+  description, command, cwd, providerId, acpSessionId, mcpRequestId, 
+  requestMeta, abortSignal  // ← New: abort signal for cancellation
+}) => {
   if (providerId && acpSessionId) {
+    const toolCallId = toolCallIdFromMeta(requestMeta);
     const title = description ? `Invoke Shell: ${description}` : 'Invoke Shell';
 
-    // Authoritative state upsert
-    cacheMcpToolInvocation({ io, providerId, acpSessionId, toolCallId, toolName: 'ux_invoke_shell', input: { description, command, cwd }, title });
+    // Authoritative state upsert — description cached here for UI display
+    cacheMcpToolInvocation({ 
+      io, providerId, acpSessionId, toolCallId, toolName: 'ux_invoke_shell', 
+      input: { description, command, cwd }, title 
+    });
 
     return shellRunManager.startPreparedRun({
       providerId,
       acpSessionId,
+      toolCallId,
       mcpRequestId,
       description,
       command,
@@ -504,6 +538,14 @@ The tool is executed in the backend Node.js process. The **Tool System V2** (loc
 `ux_invoke_shell` uses the interactive `shellRunManager`, which now includes the `description` in snapshots, allowing the UI to render `Invoke Shell: <description>` even before the shell process has fully started.
 
 `ux_invoke_subagents` and `ux_invoke_counsel` are side-effectful MCP tools because they create ACP sessions. Their handlers build a scoped idempotency key from provider/session/tool identity plus `mcpRequestId`, `requestMeta.toolCallId`, or a hash of the requests/model input. `SubAgentInvocationManager` uses that key to join duplicate active calls and return recently completed results, preventing provider MCP retries from spawning another batch.
+
+**Abort-Aware Tool Execution (Cancellation Flow):**
+The MCP execution path is fully abort-aware:
+1. **Upstream MCP Cancellation:** `stdio-proxy.js` passes the MCP SDK `extra.signal` into `backendFetch()` (line 106). If MCP client cancels, the fetch aborts.
+2. **Local Disconnect:** `createToolCallAbortSignal()` (mcpApi.js lines 17-31) converts request `aborted` and response `close` events into an `AbortSignal`.
+3. **Abort Bypass in Retry Loop:** `backendFetch()` at line 55 checks for pre-aborted signals and throws immediately (no retry).
+4. **Handler Receives Signal:** Every tool handler receives `abortSignal` in its args (line 148 of mcpApi.js) and can cancel background work.
+5. **SubAgent Cascade:** `SubAgentInvocationManager.cancelAllForParent()` (lines 124-131) uses recursive descent to cancel every active descendant sub-agent when a parent is cancelled.
 
 ---
 
@@ -989,7 +1031,7 @@ Assistant Message (turn_end)
 |------|-------------|-------|---------|
 | `sockets/index.js` | `connection`, `watch_session`, `unwatch_session` | 50-126 | Provider hydration, session rooms |
 | `sockets/sessionHandlers.js` | `load_sessions`, `create_session`, `fork_session`, `merge_fork`, `set_session_model` | 94-481 | Session CRUD & model/config management |
-| `sockets/promptHandlers.js` | `prompt`, `cancel_prompt`, `respond_permission`, `set_mode` | 12-224 | Prompt execution, streaming, cancellation |
+| `sockets/promptHandlers.js` | `prompt`, `cancel_prompt`, `respond_permission`, `set_mode` | 11-225 | Prompt execution, lifecycle hooks (`onPromptStarted` at 114, `onPromptCompleted` at 158), cascading cancellation, improved error recovery |
 | `sockets/archiveHandlers.js` | `archive_session`, `restore_archive`, `delete_archive` | 9-149 | Archive/restore sessions |
 | `sockets/canvasHandlers.js` | `canvas_save`, `canvas_load`, `canvas_apply_to_file`, `canvas_read_file` | 7-78 | Artifact CRUD |
 | `sockets/folderHandlers.js` | `create_folder`, `rename_folder`, `delete_folder`, `move_session_to_folder` | 16-67 | Folder management |
@@ -1002,20 +1044,26 @@ Assistant Message (turn_end)
 
 | File | Key Exports | Lines | Purpose |
 |------|-------------|-------|---------|
-| `mcp/mcpServer.js` | `createToolHandlers()` | 67-329 | Tool implementations |
-| | `.ux_invoke_shell` | 70-85 | Shell command execution via `shellRunManager` |
-| | `.ux_invoke_subagents` | 87-90 | Parallel agent spawning via `subAgentInvocationManager` |
-| | `.ux_invoke_counsel` | 92-114 | Expert evaluation |
-| `mcp/stdio-proxy.js` | `runProxy()` | 52-108 | Stdio MCP proxy setup and proxy/session context forwarding |
-| | `backendFetch()` | 20-39 | HTTP fetch to backend with retries |
-| `routes/mcpApi.js` | `GET /api/mcp/tools` | 30-73 | Tool schema endpoint |
-| | `POST /api/mcp/tool-call` | 81-113 | Tool execution endpoint with timeout disabled |
+| `mcp/mcpServer.js` | `createToolHandlers(io)` | 140-289 | Tool implementations; returns map of handlers |
+| | `.ux_invoke_shell` | 143-175 | Shell command execution via `shellRunManager` with description caching |
+| | `.ux_invoke_subagents` | 177-218 | Parallel agent spawning via `subAgentInvocationManager`, includes abort-signal forwarding and idempotency |
+| | `.ux_invoke_counsel` | 232-286 | Expert evaluation; delegates to ux_invoke_subagents |
+| `mcp/stdio-proxy.js` | `backendFetch(path, options)` | 46-60 | HTTP fetch with 3-attempt retry; abort errors bypass retry immediately (line 55) |
+| | `runProxy()` | 62-119 | Stdio MCP proxy setup; fetches schemas, registers with MCP SDK, forwards tool calls with MCP abort-signal |
+| `routes/mcpApi.js` | `createToolCallAbortSignal(req, res, toolName)` | 17-31 | Create AbortSignal from request/response lifecycle events |
+| | `canWriteResponse(res, abortSignal)` | 33-35 | Guard response writes to abort-signaled or closed responses |
+| | `GET /api/mcp/tools` | 54-118 | Tool schema endpoint |
+| | `POST /api/mcp/tool-call` | 124-158 | Tool execution endpoint; timeouts disabled, disconnect aborts propagated to handlers |
 | `mcp/mcpProxyRegistry.js` | proxy binding helpers | 1-78 | Correlates stdio MCP proxy instances to provider/session context |
-| `services/shellRunManager.js` | `ShellRunManager` | 113-460 | Interactive PTY lifecycle, startup control sanitation, transcripts, termination formatting, completed-run cleanup |
-| `mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager` | 10-317 | Orchestrates sub-agent sessions, state machine, and abort flow |
-| `mcp/subAgentRegistry.js` | `registerSubAgent()` | 8-10 | Track sub-agent lifecycle |
-| | `getSubAgentsForParent()` | 26-34 | Find children of parent session |
-| | `removeSubAgentsForParent()` | 44-54 | Cleanup orphaned sub-agents |
+| `services/shellRunManager.js` | `detectPwsh(platform, spawnSyncFn)` | 28-44 | Detect PowerShell 7+ availability on Windows |
+| | `ShellRunManager` class | 114-141 | Constructor with `pwshAvailable` option (null = auto-detect via `detectPwsh()`) |
+| | `resizeRun(runId, cols, rows)` | 312-324 | Resize PTY; wrapped in try/catch for Windows race condition |
+| | (overall) | 113-462 | Interactive PTY lifecycle, startup control sanitation, transcripts, termination formatting, completed-run cleanup |
+| `mcp/subAgentInvocationManager.js` | `subAgentParentKey(providerId, acpSessionId)` | 57-59 | Build parent-child tracking key |
+| | `trackSubAgentParent(providerId, childAcpSessionId, parentAcpSessionId)` | 61-68 | Record parent-child relationship |
+| | `collectDescendantAcpSessionIds(parentAcpSessionId, providerId)` | 70-95 | Recursive descent graph traversal for cascade cancellation |
+| | `cancelAllForParent(parentAcpSessionId, providerId)` | 124-131 | Cancel all invocations for parent and descendants |
+| | `SubAgentInvocationManager` class | 12-382 | Orchestrates sub-agent sessions, state machine, recursive parent-child cancellation, abort-signal flow, idempotency |
 
 ---
 

@@ -22,6 +22,7 @@ Claude implements all required provider contract functions:
 - **categorizeToolCall()** — Maps Claude's tool names to UI categories
 - **parseExtension()** — Routes Claude's `_anthropic/` protocol extensions
 - **prepareAcpEnvironment()** — **Unique to Claude**: Starts the quota proxy and injects `ANTHROPIC_BASE_URL`
+- **onPromptStarted() / onPromptCompleted()** — Explicit no-op lifecycle hooks required by the provider contract (Claude quota capture is proxy/header driven, not timer/prompt driven)
 - **emitCachedContext()** — Replays persisted context usage when the backend loads or hot-resumes a session
 - **performHandshake()** — Single `initialize` call (no auth pairing)
 - **setConfigOption()** — Routes to three different ACP methods based on optionId
@@ -1398,6 +1399,7 @@ export function parseExtension(method, params) {
 | 324–353 | parseExtension() | Route _anthropic/ extensions |
 | – | emitCachedContext() | Replay cached `_anthropic/metadata` context usage after session load or hot-resume |
 | 355–384 | prepareAcpEnvironment() | Quota proxy startup + ANTHROPIC_BASE_URL injection |
+| 1071–1076 | onPromptStarted() / onPromptCompleted() | Required prompt lifecycle hook exports (intentional no-op for Claude) |
 | 386–388 | getQuotaState() | Return latest quota data |
 | 390–456 | buildClaudeProviderStatus() | Format quota for UI |
 | 523–561 | setConfigOption() | Route mode/model/effort to ACP methods |

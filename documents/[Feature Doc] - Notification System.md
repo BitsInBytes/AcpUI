@@ -96,20 +96,20 @@ const activeSession = sessions.find(s => s.id === activeSessionId);
 ---
 
 ### 1. Backend Turn Completion
-**File:** `backend/sockets/promptHandlers.js` (Function: `registerPromptHandlers`, Lines 19, 33, 127, 143)
+**File:** `backend/sockets/promptHandlers.js` (Function: `registerPromptHandlers`, Lines 18, 32, 132, 148)
 
 The backend emits `token_done` when an agent finishes its response. This event includes the `sessionId`, which the frontend uses to determine if a notification is needed.
 
 ```javascript
-// FILE: backend/sockets/promptHandlers.js (Lines 19, 33, 127, 143)
+// FILE: backend/sockets/promptHandlers.js (Lines 18, 32, 132, 148)
 io.to('session:' + sessionId).emit('token_done', { providerId, sessionId, ... });
 ```
 
 **Emission points:**
-- Line 127: Successful completion
-- Line 33: Session expired error
-- Line 143: Prompt processing error
-- Line 19: Invalid provider error
+- Line 132: Successful completion
+- Line 32: Session expired error
+- Line 148: Prompt processing error
+- Line 18: Invalid provider error
 
 **Event shape:**
 ```typescript

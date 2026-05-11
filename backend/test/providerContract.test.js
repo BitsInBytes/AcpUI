@@ -29,7 +29,9 @@ const requiredExports = [
   'getAttachmentsDir',
   'getAgentsDir',
   'getHooksForAgent',
-  'getMcpServerMeta'
+  'getMcpServerMeta',
+  'onPromptStarted',
+  'onPromptCompleted'
 ];
 
 describe('provider contract exports', () => {

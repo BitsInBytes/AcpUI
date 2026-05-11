@@ -30,10 +30,10 @@ The auto chat title generation feature creates human-readable titles for new cha
 ### Path A: New Chat Title Generation (`generateTitle()`)
 
 **Step 1: User Submits Initial Message**
-- File: `backend/sockets/promptHandlers.js` (Lines 49–52)
+- File: `backend/sockets/promptHandlers.js` (Lines 48–51)
 - When a user sends a message, the prompt handler increments `meta.promptCount` and stores the text in `meta.userPrompt` if this is the first prompt
 ```javascript
-// Lines 49-52 in promptHandlers.js
+// Lines 48-51 in promptHandlers.js
 meta.promptCount = (meta.promptCount || 0) + 1;
 if (meta.promptCount === 1 && typeof prompt === 'string') {
   meta.userPrompt = prompt;  // Captured for title generation later
@@ -45,11 +45,11 @@ if (meta.promptCount === 1 && typeof prompt === 'string') {
 - The ACP daemon processes the user's message and begins streaming the response back via `agent_message_chunk` updates
 
 **Step 3: First Response Chunk Triggers Title Generation**
-- File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Lines 126-136)
+- File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Lines 48–57)
 - On the very first token of the response, the system checks conditions: `promptCount === 1`, `!titleStarted`, and `!isSubAgent`
-- If all conditions pass, it calls `acpClient.generateTitle()` asynchronously
+- If all conditions pass, it calls `generateTitle()` asynchronously
 ```javascript
-// Lines 126-136 in acpUpdateHandler.js
+// Lines 48-57 in acpUpdateHandler.js (approximate, within message chunk handling)
 if (metadata.promptCount === 1 && metadata.lastResponseBuffer.length > 0 && !metadata.titleStarted && !metadata.isSubAgent) {
   metadata.titleStarted = true;
   generateTitle(acpClient, sessionId, metadata).catch(() => {});
@@ -473,7 +473,7 @@ Providers do **not** need to implement any special logic for title generation. T
 | `backend/services/acpTitleGenerator.js` | 7–10 | `getConfiguredModelId()` | Resolve model ID from provider config |
 | `backend/services/acpUpdateHandler.js` | 121–131 | — | Trigger detection and title gen call |
 | `backend/services/acpClient.js` | 383–385 | `generateTitle()` method | Wrapper that delegates to acpTitleGenerator |
-| `backend/sockets/promptHandlers.js` | 49–52 | — | Capture userPrompt on first prompt |
+| `backend/sockets/promptHandlers.js` | 48–51 | — | Capture userPrompt on first prompt |
 | `backend/sockets/sessionHandlers.js` | 251 | — | Call site for fork title generation |
 | `backend/database.js` | — | `updateSessionName()` | Persist title to DB |
 | `backend/database.js` | — | `getSessionByAcpId()` | Lookup UI session by ACP ID |

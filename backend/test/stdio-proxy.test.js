@@ -83,7 +83,8 @@ describe('stdio-proxy', () => {
 
     if (callHandler) {
       global.fetch.mockResolvedValue({ json: () => Promise.resolve({ ok: true }) });
-      const res = await callHandler({ params: { name: 't1', arguments: {}, _meta: { request: 'meta' } } }, { requestId: 42 });
+      const controller = new AbortController();
+      const res = await callHandler({ params: { name: 't1', arguments: {}, _meta: { request: 'meta' } } }, { requestId: 42, signal: controller.signal });
       expect(res.ok).toBe(true);
 
       // Test with missing arguments
@@ -100,11 +101,25 @@ describe('stdio-proxy', () => {
       expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tool-call'), expect.objectContaining({
         body: expect.stringContaining('"mcpRequestId":42')
       }));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tool-call'), expect.objectContaining({
+        signal: controller.signal
+      }));
     }
   });
 
   it('throws error after max retries in backendFetch', async () => {
     global.fetch.mockRejectedValue(new Error('fatal'));
     await expect(runProxy()).rejects.toThrow('fatal');
+  });
+
+  it('does not retry when fetch throws an AbortError', async () => {
+    const abortError = new Error('fetch was aborted');
+    abortError.name = 'AbortError';
+    // Second mock is intentionally absent — it must never be reached
+    global.fetch.mockRejectedValueOnce(abortError);
+
+    await expect(runProxy()).rejects.toThrow('fetch was aborted');
+    // Retry logic must be bypassed: only one fetch attempt should have been made
+    expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 });

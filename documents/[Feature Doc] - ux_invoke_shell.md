@@ -36,38 +36,56 @@
 ## How It Works — End-to-End Flow
 
 ### 1. Agent Calls ux_invoke_shell (MCP Tool)
-**File:** `backend/mcp/mcpServer.js` (Function: `tools.ux_invoke_shell`, Line: 116)
+**File:** `backend/mcp/mcpServer.js` (Function: `tools.ux_invoke_shell`, Lines: 143-175)
 
 The ACP daemon calls the MCP tool with arguments:
 
 ```javascript
-// FILE: backend/mcp/mcpServer.js (Line 116)
+// FILE: backend/mcp/mcpServer.js (Lines 143-175)
 tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+  const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
+  const maxLines = getMaxShellResultLines();
+
+  if (providerId && acpSessionId) {
+    const toolCallId = toolCallIdFromMeta(requestMeta);
+    const title = description ? `Invoke Shell: ${description}` : 'Invoke Shell';
+    cacheMcpToolInvocation({
+      io,
+      providerId,
+      acpSessionId,
+      toolCallId,
+      toolName: 'ux_invoke_shell',
+      input: { description, command, cwd: workingDir },
+      title
+    });
+    shellRunManager.setIo?.(io);
+    writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
+    return shellRunManager.startPreparedRun({
+      providerId,
+      acpSessionId,
+      toolCallId,
+      mcpRequestId,
+      description,
+      command,
+      cwd: workingDir,
+      maxLines
+    });
+  }
   // ...
-  return shellRunManager.startPreparedRun({
-    providerId,
-    acpSessionId,
-    toolCallId,
-    mcpRequestId,
-    description,
-    command,
-    cwd: workingDir,
-    maxLines
-  });
 };
 ```
 
-The handler receiving the request delegates to `shellRunManager.startPreparedRun()`.
+The handler delegates to `shellRunManager.startPreparedRun()`, which blocks until the shell process exits.
 
 ---
 
 ### 2. ACP Tool Call Update Arrives at Backend
-**File:** `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Lines 116-140)
+**File:** `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Lines 148-195 — tool_call handling)
 
 When the ACP daemon emits a `session/update` with `type: 'tool_call'`, the backend routes it via the **Tool System V2** registry:
 
 ```javascript
-// FILE: backend/services/acpUpdateHandler.js (Lines 116-140)
+// FILE: backend/services/acpUpdateHandler.js (Lines 148-195)
 case 'tool_call':
   // ... provider extraction ...
   const invocation = resolveToolInvocation({ ... });
@@ -79,14 +97,18 @@ case 'tool_call':
 ---
 
 ### 3. Shell Run Preparation (Tool Handler)
-**File:** `backend/services/tools/handlers/shellToolHandler.js` (Function: `onStart`, Lines 25-59)
+**File:** `backend/services/tools/handlers/shellToolHandler.js` (Export: `shellToolHandler`, Lines 25-69; Method: `onStart`, Lines 26-60)
 
-The `shellToolHandler.onStart` function prepares the shell run and merges metadata:
+The `shellToolHandler.onStart` method prepares the shell run and merges metadata:
 
 ```javascript
-// FILE: backend/services/tools/handlers/shellToolHandler.js (Lines 25-59)
+// FILE: backend/services/tools/handlers/shellToolHandler.js (Lines 26-60)
 onStart(ctx, invocation, event) {
-  // ...
+  const description = normalizeText(invocation.input?.description);
+  const command = invocation.input?.command || '';
+  const cwd = invocation.input?.cwd || null;
+
+  shellRunManager.setIo?.(ctx.acpClient.io);
   const prepared = shellRunManager.prepareRun({
     providerId: ctx.providerId,
     sessionId: ctx.sessionId,
@@ -95,66 +117,53 @@ onStart(ctx, invocation, event) {
     command,
     cwd
   });
-  // ... upsert tool state and return event ...
-}
-```
-function prepareShellRunForToolStart(acpClient, providerId, sessionId, update, eventToEmit) {
-  if (!providerId || !isUxShellToolEvent(update, eventToEmit)) {
-    return eventToEmit;
-  }
 
-  try {
-    shellRunManager.setIo?.(acpClient.io);
-    const candidates = shellCandidateObjects(update, eventToEmit);
-    const command = firstShellValue(candidates, SHELL_COMMAND_KEYS);
-    const description = normalizeShellDescription(firstShellValue(candidates, SHELL_DESC_KEYS));
-    const prepared = shellRunManager.prepareRun({
-      providerId,
-      sessionId,
-      toolCallId: update.toolCallId,
-      description,
-      command,
-      cwd: firstShellValue(candidates, SHELL_CWD_KEYS) || null
-    });
+  const title = shellTitle(description) || event.title;
+  toolCallState.upsert({
+    providerId: ctx.providerId,
+    sessionId: ctx.sessionId,
+    toolCallId: invocation.toolCallId,
+    input: { description, command: prepared.command, cwd: prepared.cwd },
+    display: { title, titleSource: title === event.title ? 'provider' : 'tool_handler' },
+    toolSpecific: { shellRunId: prepared.runId }
+  });
 
-    return {
-      ...eventToEmit,
-      shellRunId: prepared.runId,
-      shellInteractive: true,
-      shellState: prepared.status,
-      command: prepared.command,
-      cwd: prepared.cwd,
-      title: shellDescriptionTitle(description) || eventToEmit.title
-    };
-  } catch (err) {
-    writeLog(`[SHELL V2] Failed to prepare shell run for ${sessionId}: ${err.message}`);
-    return eventToEmit;
-  }
+  return {
+    ...event,
+    shellRunId: prepared.runId,
+    shellInteractive: true,
+    shellState: prepared.status,
+    command: prepared.command,
+    cwd: prepared.cwd,
+    title
+  };
 }
 ```
 
-**Key step:** This creates a "pending" shell run **before** the MCP tool is even called. The run is keyed by `toolCallId` so when MCP handler calls `startPreparedRun()` later, it can find and activate the same run.
+**Key step:** The `onStart` method:
+1. Extracts command, cwd, and description from `invocation.input`
+2. Calls `shellRunManager.prepareRun()` to create a "pending" shell run
+3. Stores the `shellRunId` in `toolCallState` for later retrieval
+4. Returns an updated event with `shellRunId`, `shellInteractive`, `shellState`, and other shell metadata
 
-**Detection logic** (Lines 75-102):
-- Checks if `isUxShellToolEvent()` matches tool call naming patterns
-- Patterns: `ux_invoke_shell`, `/ux_invoke_shell`, `_ux_invoke_shell`, `__ux_invoke_shell`, `:ux_invoke_shell`
-- Extracts command, cwd, and description from deeply nested objects (rawInput, invocation, arguments, etc.)
+This happens **before** the MCP tool is called. When the MCP handler `tools.ux_invoke_shell` invokes `shellRunManager.startPreparedRun()` later, it can find and activate the same run using the `toolCallId`.
 
-**Emitted to UI** with updated event containing:
+**Event enrichment** with shell metadata:
 - `shellRunId: "shell-run-<uuid>"` — unique run identifier
-- `shellInteractive: true`
+- `shellInteractive: true` — indicates an interactive shell tool
 - `shellState: "pending"` — status before execution
-- `command`, `cwd` — extracted from tool call
+- `command`, `cwd` — extracted from tool input
+- `title` — formatted as `"Invoke Shell: <description>"` if description present
 
 ---
 
 ### 4. System Event with Shell Run ID Emitted to Frontend
-**File:** `backend/services/acpUpdateHandler.js` (Line 305)
+**File:** `backend/services/acpUpdateHandler.js` (Line 190 — within tool_call handling at lines 148-191)
 
-The updated event is emitted to all sockets watching the session:
+After the tool handler completes, the enriched event is emitted to all sockets watching the session:
 
 ```javascript
-// FILE: backend/services/acpUpdateHandler.js (Line 305)
+// FILE: backend/services/acpUpdateHandler.js (Line 190)
 acpClient.io.to('session:' + sessionId).emit('system_event', eventToEmit);
 ```
 
@@ -178,12 +187,14 @@ Frontend receives:
 ---
 
 ### 5. MCP Handler Starts the Prepared Run
-**File:** `backend/mcp/mcpServer.js` (Lines 74-83) + `backend/services/shellRunManager.js` (Lines 147-277)
+**File:** `backend/mcp/mcpServer.js` (Lines 161-170) + `backend/services/shellRunManager.js` (Lines 183-277)
 
 When the ACP daemon calls `ux_invoke_shell`, the tool handler invokes:
 
 ```javascript
-// FILE: backend/mcp/mcpServer.js (Lines 74-83)
+// FILE: backend/mcp/mcpServer.js (Lines 161-170)
+shellRunManager.setIo?.(io);
+writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
 return shellRunManager.startPreparedRun({
   providerId,
   acpSessionId,
@@ -200,12 +211,17 @@ return shellRunManager.startPreparedRun({
 
 ```javascript
 // FILE: backend/services/shellRunManager.js (Lines 195-205)
+const resolvedSessionId = sessionId || acpSessionId;
 let run = this.findPreparedRun({ providerId, sessionId: resolvedSessionId, toolCallId, command, cwd });
 if (!run) {
   const prepared = this.prepareRun({ providerId, sessionId: resolvedSessionId, toolCallId, description, command, cwd, maxLines });
   run = this.runs.get(prepared.runId);
 }
 run.description = normalizeDescription(description) || run.description;
+run.command = run.command || command;
+run.cwd = normalizeCwd(cwd || run.cwd);
+run.maxLines = maxLines || run.maxLines;
+run.mcpRequestId = mcpRequestId ?? run.mcpRequestId;
 ```
 
 Then calls `startRun(run)` which spawns the PTY:
@@ -258,12 +274,86 @@ startRun(run) {
 }
 ```
 
-**Platform-specific invocation** (Lines 90-102):
-- **Windows (pwsh available)**: `pwsh.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"` — PowerShell 7+, supports `&&` pipeline-chain operator
-- **Windows (pwsh not available)**: `powershell.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"` — Windows PowerShell 5.x fallback
+**Platform-specific invocation** (Lines 90-103):
+
+The `buildShellInvocation()` function at lines 90-103 determines which shell to use based on the platform and `usePwsh` parameter:
+
+```javascript
+// FILE: backend/services/shellRunManager.js (Lines 90-103)
+function buildShellInvocation(command, platform = process.platform, usePwsh = false) {
+  if (platform === 'win32') {
+    // Use pwsh (PowerShell 7+) when available — it supports the && pipeline-chain
+    // operator that AI models commonly generate. Fall back to powershell.exe (5.x)
+    // which does not support &&.
+    const shell = usePwsh ? 'pwsh.exe' : 'powershell.exe';
+    return {
+      shell,
+      // Prevent PowerShell from printing the Encoding object to stdout.
+      args: ['-NoProfile', '-Command', `$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]
+    };
+  }
+  return { shell: 'bash', args: ['-c', command] };
+}
+```
+
+**Shell selection logic:**
+- **Windows (usePwsh = true)**: `pwsh.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"` — PowerShell 7+, supports `&&` pipeline-chain operator
+- **Windows (usePwsh = false)**: `powershell.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"` — Windows PowerShell 5.x fallback
 - **Unix**: `bash -c <command>`
 
-`detectPwsh()` runs `spawnSync('pwsh', ['--version'])` once at `ShellRunManager` construction time to determine which shell to use. It returns false immediately if `pwsh` is not installed (ENOENT), or within ~100ms if it is. The result is stored as `this.pwshAvailable` and passed to `buildShellInvocation()` on every `startRun` call. Pass `pwshAvailable: true/false` to the constructor to override auto-detection (used in tests).
+**PowerShell detection** (Lines 28-44):
+
+The `detectPwsh()` function at lines 28-44 synchronously detects PowerShell 7+ availability:
+
+```javascript
+// FILE: backend/services/shellRunManager.js (Lines 28-44)
+export function detectPwsh(platform = process.platform, spawnSyncFn = null) {
+  if (platform !== 'win32') return false;
+  try {
+    const runner = typeof spawnSyncFn === 'function'
+      ? spawnSyncFn
+      : (typeof childProcess.spawnSync === 'function' ? childProcess.spawnSync : null);
+    if (!runner) return false;
+    const result = runner('pwsh', ['--version'], {
+      timeout: 3000,
+      stdio: 'ignore',
+      windowsHide: true
+    });
+    return result.status === 0;
+  } catch {
+    return false;
+  }
+}
+```
+
+This function runs `spawnSync('pwsh', ['--version'])` once. It returns false immediately if `pwsh` is not installed (ENOENT), or within ~100ms if it is.
+
+**ShellRunManager constructor** (Lines 113-141) accepts a `pwshAvailable` option:
+
+```javascript
+// FILE: backend/services/shellRunManager.js (Lines 113-141)
+constructor({
+  io = null,
+  ptyModule = pty,
+  log = writeLog,
+  now = () => Date.now(),
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
+  inactivityTimeoutMs = DEFAULT_INACTIVITY_TIMEOUT_MS,
+  interruptGraceMs = DEFAULT_INTERRUPT_GRACE_MS,
+  completedRetentionMs = DEFAULT_COMPLETED_RETENTION_MS,
+  platform = process.platform,
+  // Pass true/false to override detection (useful in tests). null triggers
+  // auto-detection via detectPwsh() at construction time.
+  pwshAvailable = null
+} = {}) {
+  // ...
+  this.pwshAvailable = pwshAvailable !== null ? pwshAvailable : detectPwsh(platform);
+  // ...
+}
+```
+
+When `pwshAvailable` is `null` (default), it auto-detects via `detectPwsh(platform)` at construction time (line 139). When explicitly `true` or `false`, it uses that value directly (useful for tests). The result is stored as `this.pwshAvailable` and passed to `buildShellInvocation()` on every `startRun()` call.
 
 The function **blocks** until the PTY exits, awaiting `run.resolve()` which is called in `finalizeRun()`.
 
@@ -646,7 +736,7 @@ markExited: ({ providerId, sessionId, runId, exitCode = null, reason = null }) =
 ---
 
 ### 12. MCP Tool Call Completes and Agent Continues
-**File:** `backend/mcp/mcpServer.js` (Lines 74-83)
+**File:** `backend/mcp/mcpServer.js` (Lines 143-175, specifically return at lines 161-170)
 
 The `shellRunManager.startPreparedRun()` promise resolves with:
 
@@ -1062,7 +1152,7 @@ npm ERR! code ENOENT
 | | `socket.on('shell_run_input')` | 38-52 | Route user input to writeInput() |
 | | `socket.on('shell_run_resize')` | 54-68 | Route resize to resizeRun() |
 | | `socket.on('shell_run_kill')` | 70-82 | Route kill to killRun() |
-| `backend/mcp/mcpServer.js` | `tools.ux_invoke_shell` | 66-83 | MCP tool handler, delegate to ShellRunManager |
+| `backend/mcp/mcpServer.js` | `tools.ux_invoke_shell` | 143-175 | MCP tool handler, delegate to ShellRunManager |
 
 ### Frontend Stores
 
@@ -1085,11 +1175,11 @@ npm ERR! code ENOENT
 
 | File | Function | Purpose | Lines |
 |------|---|---|---|
-| `backend/services/shellRunManager.js` | `detectPwsh()` | Sync check for PowerShell 7+ (pwsh) availability | 28-44 |
+| `backend/services/shellRunManager.js` | `detectPwsh()` | Sync check for PowerShell 7+ (pwsh) availability; spawnSync('pwsh', ['--version']) | 28-44 |
 | | `getMaxShellResultLines()` | Read MAX_SHELL_RESULT_LINES env var | 46-49 |
 | | `trimShellOutputLines()` | Keep only last N lines of output | 55-64 |
-| | `sanitizeShellOutputChunk()` | Remove PowerShell startup terminal noise before streaming | 66-79 |
-| | `buildShellInvocation()` | Platform-specific shell command; picks pwsh.exe vs powershell.exe | 90-102 |
+| | `sanitizeShellOutputChunk()` | Remove PowerShell startup terminal noise before streaming | 66-80 |
+| | `buildShellInvocation()` | Platform-specific shell command; takes usePwsh param to select pwsh.exe vs powershell.exe | 90-103 |
 | | `normalizeCwd()` | Resolve working directory | 105-107 |
 | `frontend/src/store/useShellRunStore.ts` | `trimShellTranscript()` | Keep only last N lines of transcript | 30-43 |
 | | `pruneShellRuns()` | Keep at most 50 runs, prioritize active | 45-55 |
@@ -1201,11 +1291,37 @@ npm ERR! code ENOENT
 
 **Why:** Read-only rendering uses `ansi-to-html` (library) to convert ANSI codes to HTML. This is a different renderer than xterm.js, so colors may not match exactly.
 
-**How to avoid:** The difference is minimal (same color palette). If output is missing, check that the transcript was populated during streaming (shell_run_output events) before exit.
+**How to avoid:** The difference is minimal (same color palette). If output is missing, check that the transcript was populated during streaming (shell_run_output events) before exit and that the final render correctly applied color codes.
 
 ---
 
-### 12. Windows PowerShell Startup Controls Must Not Reach the Transcript
+### 12. Windows PTY Resize Race Condition
+**What breaks:** `resizeRun()` throws "Cannot resize a pty that has already exited" on Windows, even though the status check just passed.
+
+**Why:** On Windows, node-pty's `WindowsPtyAgent.resize()` is deferred internally. The PTY may exit between the status check and the deferred resize call, causing the error. The `resizeRun()` function at lines 312-324 wraps the resize call in a try/catch (lines 315-322) to handle this race condition.
+
+**Code** (Lines 312-324):
+```javascript
+resizeRun(runId, cols, rows) {
+  const run = this.runs.get(runId);
+  if (!run || run.status !== 'running' || !run.pty || cols <= 0 || rows <= 0) return false;
+  try {
+    run.pty.resize(cols, rows);
+  } catch {
+    // node-pty on Windows defers the resize internally; the PTY may exit between
+    // the status check above and the deferred WindowsPtyAgent.resize() call,
+    // causing it to throw "Cannot resize a pty that has already exited".
+    return false;
+  }
+  return true;
+}
+```
+
+**How to avoid:** This is already handled in the implementation. Callers should check the return value: `false` means the resize was attempted but failed (likely due to PTY exit), which is safe to ignore.
+
+---
+
+### 13. Windows PowerShell Startup Controls Must Not Reach the Transcript
 **What breaks:** A simple command can display `$ command`, then many blank rows, then the actual output.
 
 **Why:** Windows PowerShell under ConPTY emits startup terminal controls such as private mode toggles, cursor hide/show, full-screen clear, cursor-home, and title OSC sequences. Those bytes are correct for a fresh PTY viewport, but AcpUI has already injected its own `$ command` prompt into the transcript. If the startup prologue is stored or replayed as normal output, xterm/read-only rendering can separate the prompt from the output or erase/reposition around it.
@@ -1243,7 +1359,7 @@ Located in `frontend/src/test/`:
 
 ### For Implementing Shell Features
 
-1. **Understand the lifecycle** — Read Section "How It Works — End-to-End Flow" (Steps 1-12)
+1. **Understand the lifecycle** — Read Section "How It Works — End-to-End Flow" (Steps 1-12, which includes all major phases)
 2. **Check the contract** — Read "The Critical Contract" section to understand run states and concurrency
 3. **Identify the layer** — Is your feature:
    - **Backend PTY management?** → `ShellRunManager` (Lines 113-460 in shellRunManager.js)

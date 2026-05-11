@@ -74,7 +74,7 @@ describe('Kiro Provider', () => {
     });
   });
 
-  describe('prepareAcpEnvironment', () => {
+      describe('prepareAcpEnvironment', () => {
     it('returns the provided environment unchanged', async () => {
       const env = { KEEP: '1' };
       await expect(kiro.prepareAcpEnvironment(env)).resolves.toBe(env);
@@ -97,10 +97,19 @@ describe('Kiro Provider', () => {
         sessionId: 'kiro-session-1',
         contextUsagePercentage: 37.25
       });
-    });
-  });
+        });
+      });
 
-  describe('intercept', () => {
+      describe('prompt lifecycle hooks', () => {
+        it('exports onPromptStarted and onPromptCompleted as no-op hooks', () => {
+          expect(typeof kiro.onPromptStarted).toBe('function');
+          expect(typeof kiro.onPromptCompleted).toBe('function');
+          expect(() => kiro.onPromptStarted('sess-1')).not.toThrow();
+          expect(() => kiro.onPromptCompleted('sess-1')).not.toThrow();
+        });
+      });
+
+      describe('intercept', () => {
     it('normalizes agent switch model into currentModelId', () => {
       const payload = {
         method: '_kiro.dev/agent/switched',

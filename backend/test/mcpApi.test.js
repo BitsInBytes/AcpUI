@@ -1,4 +1,5 @@
 import { beforeEach, describe, it, expect, vi } from 'vitest';
+import EventEmitter from 'events';
 
 const mockHandlers = {};
 const { mockResolveMcpProxy } = vi.hoisted(() => ({
@@ -34,11 +35,22 @@ describe('MCP API Routes', () => {
   }
 
   function mockReq(body = {}) {
-    return { body, setTimeout: vi.fn(), socket: { setTimeout: vi.fn() } };
+    const req = new EventEmitter();
+    req.body = body;
+    req.setTimeout = vi.fn();
+    req.socket = { setTimeout: vi.fn() };
+    return req;
   }
 
   function mockRes() {
-    const res = { status: vi.fn().mockReturnThis(), json: vi.fn(), setTimeout: vi.fn() };
+    const res = new EventEmitter();
+    res.status = vi.fn().mockReturnThis();
+    res.json = vi.fn(() => {
+      res.writableEnded = true;
+    });
+    res.setTimeout = vi.fn();
+    res.writableEnded = false;
+    res.destroyed = false;
     return res;
   }
 
@@ -115,7 +127,10 @@ describe('MCP API Routes', () => {
     const res = mockRes();
     await route.route.stack[0].handle(mockReq({ tool: 'good_tool', args: { x: 1 } }), res, vi.fn());
 
-    expect(mockHandlers.good_tool).toHaveBeenCalledWith({ x: 1 });
+    expect(mockHandlers.good_tool).toHaveBeenCalledWith({
+      x: 1,
+      abortSignal: expect.objectContaining({ aborted: false })
+    });
     expect(res.json).toHaveBeenCalledWith(expected);
   });
 
@@ -147,8 +162,72 @@ describe('MCP API Routes', () => {
       acpSessionId: 'acp-1',
       mcpProxyId: 'proxy-1',
       mcpRequestId: 42,
-      requestMeta: { source: 'test' }
+      requestMeta: { source: 'test' },
+      abortSignal: expect.objectContaining({ aborted: false })
     });
     expect(res.json).toHaveBeenCalledWith(expected);
+  });
+
+  it('POST /tool-call aborts the handler signal when the request fires the "aborted" event', async () => {
+    mockHandlers.slow_tool = vi.fn(({ abortSignal }) => new Promise(resolve => {
+      abortSignal.addEventListener('abort', () => {
+        resolve({ content: [{ type: 'text', text: 'aborted' }] });
+      });
+    }));
+
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'post', '/tool-call');
+    const req = mockReq({ tool: 'slow_tool', args: { x: 1 } });
+    const res = mockRes();
+    const routePromise = route.route.stack[0].handle(req, res, vi.fn());
+
+    await Promise.resolve();
+
+    const abortSignal = mockHandlers.slow_tool.mock.calls[0][0].abortSignal;
+    expect(abortSignal.aborted).toBe(false);
+
+    req.emit('aborted');
+    await routePromise;
+
+    expect(abortSignal.aborted).toBe(true);
+    expect(res.json).not.toHaveBeenCalled();
+  });
+
+  it('POST /tool-call suppresses the error response when res.destroyed is true before the handler throws', async () => {
+    mockHandlers.failing_tool = vi.fn().mockRejectedValue(new Error('kaboom'));
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'post', '/tool-call');
+    const req = mockReq({ tool: 'failing_tool', args: {} });
+    const res = mockRes();
+    res.destroyed = true; // simulate destroyed response before handler resolves
+
+    await route.route.stack[0].handle(req, res, vi.fn());
+
+    expect(res.json).not.toHaveBeenCalled();
+  });
+
+  it('POST /tool-call aborts the handler signal when the response closes before completion', async () => {
+    mockHandlers.slow_tool = vi.fn(({ abortSignal }) => new Promise(resolve => {
+      abortSignal.addEventListener('abort', () => {
+        resolve({ content: [{ type: 'text', text: 'aborted' }] });
+      });
+    }));
+
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'post', '/tool-call');
+    const req = mockReq({ tool: 'slow_tool', args: { x: 1 } });
+    const res = mockRes();
+    const routePromise = route.route.stack[0].handle(req, res, vi.fn());
+
+    await Promise.resolve();
+
+    const abortSignal = mockHandlers.slow_tool.mock.calls[0][0].abortSignal;
+    expect(abortSignal.aborted).toBe(false);
+
+    res.emit('close');
+    await routePromise;
+
+    expect(abortSignal.aborted).toBe(true);
+    expect(res.json).not.toHaveBeenCalled();
   });
 });

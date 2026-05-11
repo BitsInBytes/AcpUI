@@ -27,6 +27,7 @@ export class SubAgentInvocationManager {
     this.resolveModelSelectionFn = deps.resolveModelSelectionFn || resolveModelSelection;
     this.modelOptionsFromProviderConfigFn = deps.modelOptionsFromProviderConfigFn || modelOptionsFromProviderConfig;
     this.completedInvocationTtlMs = deps.completedInvocationTtlMs ?? DEFAULT_COMPLETED_INVOCATION_TTL_MS;
+    this.subAgentParentLinks = new Map();
   }
 
   setIo(io) {
@@ -53,34 +54,83 @@ export class SubAgentInvocationManager {
     }
   }
 
-  cancelAllForParent(parentAcpSessionId, providerId) {
-    for (const inv of this.invocations.values()) {
-      if (inv.parentAcpSessionId === parentAcpSessionId && inv.providerId === providerId) {
-        if (inv.abortFn) inv.abortFn();
+  subAgentParentKey(providerId, acpSessionId) {
+    return `${providerId}\u0000${acpSessionId}`;
+  }
+
+  trackSubAgentParent(providerId, childAcpSessionId, parentAcpSessionId) {
+    if (!providerId || !childAcpSessionId || !parentAcpSessionId) return;
+    this.subAgentParentLinks.set(this.subAgentParentKey(providerId, childAcpSessionId), {
+      providerId,
+      acpSessionId: childAcpSessionId,
+      parentAcpSessionId
+    });
+  }
+
+  collectDescendantAcpSessionIds(parentAcpSessionId, providerId) {
+    const descendants = new Set(parentAcpSessionId ? [parentAcpSessionId] : []);
+    let changed = true;
+
+    while (changed) {
+      changed = false;
+      for (const link of this.subAgentParentLinks.values()) {
+        if (link.providerId !== providerId) continue;
+        if (!descendants.has(link.parentAcpSessionId) || descendants.has(link.acpSessionId)) continue;
+        descendants.add(link.acpSessionId);
+        changed = true;
+      }
+
+      for (const inv of this.invocations.values()) {
+        if (inv.providerId !== providerId || !descendants.has(inv.parentAcpSessionId)) continue;
         for (const agent of inv.agents.values()) {
-           agent.status = 'cancelled';
-           try {
-             const acpClient = this.acpClientFactory(providerId);
-             if (acpClient && agent.acpId) {
-               acpClient.transport.sendNotification('session/cancel', { sessionId: agent.acpId });
-               if (acpClient.transport.pendingRequests) {
-                 for (const [id, pending] of acpClient.transport.pendingRequests) {
-                   if (pending.params?.sessionId === agent.acpId) {
-                     pending.reject(new Error('Session cancelled'));
-                     acpClient.transport.pendingRequests.delete(id);
-                   }
-                 }
-               }
-             }
-           } catch (e) {
-             this.log(`Error sending cancel to sub-agent ${agent.acpId}: ${e.message}`);
-           }
+          if (agent.acpId && !descendants.has(agent.acpId)) {
+            descendants.add(agent.acpId);
+            changed = true;
+          }
         }
+      }
+    }
+
+    return descendants;
+  }
+
+  cancelInvocationRecord(inv) {
+    if (inv.status === 'cancelled') return;
+    if (inv.abortFn) inv.abortFn();
+    inv.status = 'cancelled';
+    inv.completedAt = this.now();
+
+    for (const agent of inv.agents.values()) {
+      agent.status = 'cancelled';
+      try {
+        const acpClient = this.acpClientFactory(inv.providerId);
+        if (acpClient && agent.acpId) {
+          acpClient.transport.sendNotification('session/cancel', { sessionId: agent.acpId });
+          if (acpClient.transport.pendingRequests) {
+            for (const [id, pending] of acpClient.transport.pendingRequests) {
+              if (pending.params?.sessionId === agent.acpId) {
+                pending.reject(new Error('Session cancelled'));
+                acpClient.transport.pendingRequests.delete(id);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        this.log(`Error sending cancel to sub-agent ${agent.acpId}: ${e.message}`);
       }
     }
   }
 
-  async runInvocation({ requests, model, providerId, parentAcpSessionId: explicitParentAcpSessionId = null, idempotencyKey = null }) {
+  cancelAllForParent(parentAcpSessionId, providerId) {
+    const descendantAcpSessionIds = this.collectDescendantAcpSessionIds(parentAcpSessionId, providerId);
+    for (const inv of this.invocations.values()) {
+      if (inv.providerId === providerId && descendantAcpSessionIds.has(inv.parentAcpSessionId)) {
+        this.cancelInvocationRecord(inv);
+      }
+    }
+  }
+
+  async runInvocation({ requests, model, providerId, parentAcpSessionId: explicitParentAcpSessionId = null, idempotencyKey = null, abortSignal = null }) {
     if (!this.io) return { content: [{ type: 'text', text: 'Error: Sub-agent system not available' }] };
     const safeRequests = Array.isArray(requests) ? requests : [];
 
@@ -111,7 +161,8 @@ export class SubAgentInvocationManager {
       provider,
       resolvedProviderId,
       acpClient,
-      parentAcpSessionId
+      parentAcpSessionId,
+      abortSignal
     });
 
     if (!idempotencyKey) return promise;
@@ -127,7 +178,7 @@ export class SubAgentInvocationManager {
     });
   }
 
-  async executeInvocation({ requests, model, provider, resolvedProviderId, acpClient, parentAcpSessionId }) {
+  async executeInvocation({ requests, model, provider, resolvedProviderId, acpClient, parentAcpSessionId, abortSignal }) {
     this.log(`[SUB-AGENT] Spawning ${requests.length} sub-agent(s)`);
 
     const models = provider.config.models || {};
@@ -164,6 +215,20 @@ export class SubAgentInvocationManager {
     };
     this.invocations.set(invocationId, invocationRecord);
 
+    const abortFromSignal = () => {
+      this.log(`[SUB-AGENT] Tool call aborted; cancelling invocation ${invocationId}`);
+      if (parentAcpSessionId) {
+        this.cancelAllForParent(parentAcpSessionId, resolvedProviderId);
+      } else {
+        this.cancelInvocationRecord(invocationRecord);
+      }
+    };
+    if (abortSignal?.aborted) {
+      abortFromSignal();
+    } else if (abortSignal?.addEventListener) {
+      abortSignal.addEventListener('abort', abortFromSignal, { once: true });
+    }
+
     const sendWithTimeout = (method, params, timeoutMs = 600000) => {
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error(`${method} timed out after ${timeoutMs / 1000}s`)), timeoutMs);
@@ -186,6 +251,7 @@ export class SubAgentInvocationManager {
             const mcpServers = this.getMcpServersFn(resolvedProviderId);
             const result = await sendWithTimeout('session/new', { cwd, mcpServers, ...sessionParams }, 30000);
             const subAcpId = result.sessionId;
+            this.trackSubAgentParent(resolvedProviderId, subAcpId, parentAcpSessionId);
             this.bindMcpProxyFn(getMcpProxyIdFromServers(mcpServers), { providerId: resolvedProviderId, acpSessionId: subAcpId });
             this.log(`[SUB-AGENT ${i}] Created session ${subAcpId} (agent: ${agentName})`);
 

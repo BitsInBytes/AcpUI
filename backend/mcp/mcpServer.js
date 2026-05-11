@@ -182,6 +182,7 @@ export function createToolHandlers(io) {
     mcpProxyId,
     mcpRequestId,
     requestMeta,
+    abortSignal,
     skipToolState = false,
     idempotencyToolName = 'ux_invoke_subagents'
   }) => {
@@ -211,7 +212,8 @@ export function createToolHandlers(io) {
       model,
       providerId,
       parentAcpSessionId: acpSessionId,
-      idempotencyKey
+      idempotencyKey,
+      abortSignal
     });
   };
 
@@ -237,7 +239,8 @@ export function createToolHandlers(io) {
     acpSessionId,
     mcpProxyId,
     mcpRequestId,
-    requestMeta
+    requestMeta,
+    abortSignal
   }) => {
     const config = loadCounselConfig();
     // Core agents (e.g. Advocate, Critic, Pragmatist) are always spawned
@@ -276,6 +279,7 @@ export function createToolHandlers(io) {
       mcpProxyId,
       mcpRequestId,
       requestMeta,
+      abortSignal,
       skipToolState: true,
       idempotencyToolName: 'ux_invoke_counsel'
     });

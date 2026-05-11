@@ -26,6 +26,7 @@ Kiro implements all required provider contract functions:
 - **setInitialAgent()** — Actively switches agents via `/agent {name}` prompt post-creation
 - **buildSessionParams()** — Returns `undefined`
 - **getHooksForAgent()** — Reads agent-specific hook configs from `~/.kiro/agents/{agentName}.json`
+- **onPromptStarted() / onPromptCompleted()** — Explicit no-op lifecycle hooks required by the provider contract
 - **setConfigOption()** — Only handles 'model'; returns null for other options
 - **Session file operations** — Flat directory layout
 - **parseSessionHistory()** — Reconstructs Unified Timeline from Kiro's JSONL format
@@ -925,6 +926,7 @@ export function buildSessionParams(_agent) {
 | 332–339 | performHandshake() | Send initialize request |
 | 345–365 | setInitialAgent() | Switch agent via /agent prompt |
 | 367–369 | buildSessionParams() | Return undefined |
+| 488–495 | onPromptStarted() / onPromptCompleted() | Required prompt lifecycle hook exports (intentional no-op for Kiro) |
 | 371–382 | setConfigOption() | Set model only |
 | 389–431 | normalizeTool() | Strip MCP prefix, resolve generic IDs, format title |
 | 436–450 | categorizeToolCall() | Tool categorization |

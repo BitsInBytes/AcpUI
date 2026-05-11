@@ -161,18 +161,20 @@ describe('App Component', () => {
     it('handles resize handle mouse events', () => {
        act(() => { useCanvasStore.setState({ isCanvasOpen: true }); });
        const { container } = render(<App />);
-       
+
        const handle = container.querySelector('.canvas-resize-handle')!;
        expect(handle).toBeInTheDocument();
 
-       fireEvent.mouseDown(handle, { clientX: 500 });
-       
-       const moveEvent = new MouseEvent('mousemove', { clientX: 600, bubbles: true });
-       document.dispatchEvent(moveEvent);
+       act(() => {
+         fireEvent.mouseDown(handle, { clientX: 500 });
 
-       const upEvent = new MouseEvent('mouseup', { bubbles: true });
-       document.dispatchEvent(upEvent);
-       
+         const moveEvent = new MouseEvent('mousemove', { clientX: 600, bubbles: true });
+         document.dispatchEvent(moveEvent);
+
+         const upEvent = new MouseEvent('mouseup', { bubbles: true });
+         document.dispatchEvent(upEvent);
+       });
+
        // Success is just not throwing and exercising the event listeners
     });
   });

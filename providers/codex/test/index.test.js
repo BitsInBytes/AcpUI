@@ -319,6 +319,18 @@ describe('Codex Provider', () => {
     });
   });
 
+  describe('prompt lifecycle hooks', () => {
+    it('exports onPromptStarted and onPromptCompleted', () => {
+      expect(typeof codex.onPromptStarted).toBe('function');
+      expect(typeof codex.onPromptCompleted).toBe('function');
+    });
+
+    it('onPromptCompleted is a no-op for unknown sessions', () => {
+      mockConfig.fetchQuotaStatus = true;
+      expect(() => codex.onPromptCompleted('missing-session')).not.toThrow();
+    });
+  });
+
   describe('intercept', () => {
     it('normalizes available commands into slash commands', () => {
       const result = codex.intercept({
@@ -456,7 +468,7 @@ describe('Codex Provider', () => {
       expect(result).toBe(payload);
     });
 
-    it('does not start the poll timer on agent_message_chunk', () => {
+    it('does not start the poll timer from intercepted streaming chunks', () => {
       mockConfig.fetchQuotaStatus = true;
       mockConfig.quotaStatusIntervalMs = 100;
       const setIntervalSpy = vi.spyOn(global, 'setInterval');
@@ -470,38 +482,30 @@ describe('Codex Provider', () => {
       setIntervalSpy.mockRestore();
     });
 
-    it('starts the poll timer on user_message and stops it on stopReason', () => {
+    it('starts polling on onPromptStarted and stops on onPromptCompleted', () => {
       mockConfig.fetchQuotaStatus = true;
       mockConfig.quotaStatusIntervalMs = 100;
-      global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
       const setIntervalSpy = vi.spyOn(global, 'setInterval');
       const clearIntervalSpy = vi.spyOn(global, 'clearInterval');
 
-      // user_message: polling should start
-      codex.intercept({
-        method: 'session/update',
-        params: { sessionId: 's1', update: { sessionUpdate: 'user_message' } }
-      });
+      codex.onPromptStarted('s1');
       expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 100);
 
-      // many chunks: must not start a second timer
-      const chunksBefore = setIntervalSpy.mock.calls.length;
-      for (let i = 0; i < 5; i++) {
-        codex.intercept({
-          method: 'session/update',
-          params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { text: 'x' } } }
-        });
-      }
-      expect(setIntervalSpy.mock.calls.length).toBe(chunksBefore);
+      const callsBeforeDuplicate = setIntervalSpy.mock.calls.length;
+      codex.onPromptStarted('s1');
+      expect(setIntervalSpy.mock.calls.length).toBe(callsBeforeDuplicate);
 
-      // stopReason result: polling should stop
-      codex.intercept({ id: 1, result: { stopReason: 'end_turn' } });
+      codex.onPromptStarted('s2');
+      codex.onPromptCompleted('s1');
+      expect(clearIntervalSpy).not.toHaveBeenCalled();
+
+      codex.onPromptCompleted('s2');
       expect(clearIntervalSpy).toHaveBeenCalled();
 
       setIntervalSpy.mockRestore();
       clearIntervalSpy.mockRestore();
     });
-  });
+       });
 
   describe('normalizeModelState', () => {
     it('preserves effort-suffixed model IDs as canonical options', () => {

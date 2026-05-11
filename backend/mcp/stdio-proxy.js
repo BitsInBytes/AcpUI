@@ -52,6 +52,7 @@ async function backendFetch(path, options = {}) {
       });
       return await res.json();
     } catch (err) {
+      if (options.signal?.aborted || err.name === 'AbortError') throw err;
       if (attempt < 2) await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
       else throw err;
     }
@@ -102,6 +103,7 @@ export async function runProxy() {
         mcpRequestId: extra?.requestId ?? null,
         requestMeta: request.params?._meta || extra?._meta || null
       }),
+      signal: extra?.signal,
     });
   });
 

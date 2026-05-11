@@ -19,6 +19,7 @@ let _quotaFetchInFlight = false;
 let _quotaRefreshInFlight = false;
 let _latestQuotaStatus = null;
 let _activePromptCount = 0; // Only poll quota while prompts are in-flight
+let _inFlightSessions = new Set(); // Track sessions with active prompts
 let _sessionContextCache = new Map(); // sessionId -> contextUsagePercentage
 let _contextStateFile = null; // Path to persist context state
 let _sessionsWithInitialEmit = new Set(); // Track which sessions we've already emitted initial context for
@@ -243,33 +244,6 @@ export function intercept(payload) {
       }
     }
 
-    // Track active prompts to only poll while chats are in progress.
-    // Increment once per submitted prompt (user_message), not on every response
-    // chunk — agent_message_chunk fires many times per turn and would ratchet
-    // _activePromptCount above 1, so stopReason could never bring it back to 0.
-    const isUpdate = payload?.method === 'session/update';
-    const update = payload?.params?.update;
-    const isUserMessage = isUpdate && sessionId &&
-      update?.sessionUpdate === 'user_message';
-    if (isUserMessage) {
-      _activePromptCount++;
-      _ensureQuotaPolling();
-    }
-
-    const stopReason = payload?.result?.stopReason || payload?.result?.stop_reason;
-    if (stopReason) {
-      if (_activePromptCount > 0) {
-        _activePromptCount--;
-        if (_activePromptCount === 0) {
-          _stopQuotaPolling();
-        }
-      }
-      if (config.fetchQuotaStatus) {
-        fetchAndEmitQuota(sessionId, config.paths?.home).catch(err =>
-          _writeLog?.(`[CODEX QUOTA] Turn-complete refresh failed: ${err?.message || String(err)}`)
-        );
-      }
-    }
   } catch {}
 
   if (
@@ -747,6 +721,35 @@ export function getQuotaState() {
 export function stopQuotaFetching() {
   _stopQuotaPolling();
   _activePromptCount = 0;
+  _inFlightSessions.clear();
+}
+
+export function onPromptStarted(sessionId) {
+  const { config } = getProvider();
+  if (!config.fetchQuotaStatus) return;
+
+  if (sessionId) _lastSessionId = sessionId;
+  if (sessionId && !_inFlightSessions.has(sessionId)) {
+    _inFlightSessions.add(sessionId);
+    _activePromptCount++;
+    _ensureQuotaPolling();
+  }
+}
+
+export function onPromptCompleted(sessionId) {
+  const { config } = getProvider();
+  if (!config.fetchQuotaStatus) return;
+
+  if (sessionId) _lastSessionId = sessionId;
+  if (sessionId && _inFlightSessions.has(sessionId)) {
+    _inFlightSessions.delete(sessionId);
+    if (_activePromptCount > 0) _activePromptCount--;
+    if (_activePromptCount === 0) _stopQuotaPolling();
+
+    fetchAndEmitQuota(sessionId, config.paths?.home).catch(err =>
+      _writeLog?.(`[CODEX QUOTA] Turn-complete refresh failed: ${err?.message || String(err)}`)
+    );
+  }
 }
 
 function _stopQuotaPolling() {

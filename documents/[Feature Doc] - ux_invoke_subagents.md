@@ -104,18 +104,30 @@ const idempotencyKey = buildSubAgentInvocationKey({
 });
 ```
 
-It then delegates to the `subAgentInvocationManager` with the explicit parent ACP session:
+It then delegates to the `subAgentInvocationManager` with the explicit parent ACP session and an optional MCP abort signal. That abort signal is used when the upstream MCP request is cancelled or the proxy/backend connection closes before the tool completes:
 
-**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 69-317)
+**File:** `backend/mcp/mcpServer.js` (Lines 210-217)
+```javascript
+return subAgentInvocationManager.runInvocation({
+  requests,
+  model,
+  providerId,
+  parentAcpSessionId: acpSessionId,
+  idempotencyKey,
+  abortSignal
+});
+```
 
-**Line 79:** Generate a unique invocation ID:
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 133-379)
+
+**Line 189:** Generate a unique invocation ID:
 ```javascript
 const invocationId = `inv-${this.now()}-${Math.random().toString(36).slice(2, 7)}`;
 ```
 
 Before any sessions are spawned, `runInvocation()` checks the idempotency key. If the same key is already active, it returns the active promise. If that key completed recently, it returns the cached result. Only the first call emits `sub_agents_starting` and creates sessions.
 
-**Line 88:** Emit `sub_agents_starting` to the frontend:
+**Line 197:** Emit `sub_agents_starting` to the frontend:
 ```javascript
 this.io.emit('sub_agents_starting', { invocationId, parentUiId, providerId: resolvedProviderId, count: requests.length });
 ```
@@ -128,11 +140,10 @@ The frontend receives this and **clears stale sidebar sessions** for the parent 
 
 The backend translates parent ACP session ID to parent UI ID:
 
-**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 81-86)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 191-195)
 
 ```javascript
 let parentUiId = null;
-const parentAcpSessionId = acpClient.lastSubAgentParentAcpId || null;
 if (parentAcpSessionId) {
   const parentSession = await this.db.getSessionByAcpId(resolvedProviderId, parentAcpSessionId);
   if (parentSession) parentUiId = parentSession.id;  // Resolve ACP ID → UI ID
@@ -147,40 +158,38 @@ This is needed because all socket events use **UI IDs**, but the tool handler on
 
 For each request, with a 1-second stagger:
 
-**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 102-184)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 240-330)
 
-**Lines 111-114:** Create sub-agent session via ACP:
+**Lines 249-254:** Create sub-agent session via ACP and record its parent link for cancellation cascades:
 ```javascript
-const result = await sendWithTimeout('session/new', { 
-  cwd, 
-  mcpServers: this.getMcpServersFn(resolvedProviderId), 
-  ...sessionParams  // From provider's buildSessionParams(agent)
-}, 30000);
+const providerModule = await this.getProviderModuleFn(resolvedProviderId);
+const sessionParams = providerModule.buildSessionParams(agentName);
+const mcpServers = this.getMcpServersFn(resolvedProviderId);
+const result = await sendWithTimeout('session/new', { cwd, mcpServers, ...sessionParams }, 30000);
 const subAcpId = result.sessionId;
+this.trackSubAgentParent(resolvedProviderId, subAcpId, parentAcpSessionId);
 ```
 
-**Lines 134-142:** Save to database with `isSubAgent` flag:
+**Lines 276-284:** Save to database with `isSubAgent` flag:
 ```javascript
 await this.db.saveSession({
   id: uiId, acpSessionId: subAcpId,
-  name: req.name || `Agent ${i + 1}`,
-  model: resolvedModelKey || null,
-  messages: [],
-  isPinned: false,
-  isSubAgent: true,        // Mark as sub-agent
-  forkedFrom: parentUiId,  // Link to parent
-  ...
+  name: req.name || `Agent ${i + 1}: ${req.prompt.slice(0, 50)}`,
+  model: resolvedModelKey || null, messages: [], isPinned: false,
+  isSubAgent: true, forkedFrom: parentUiId,  // Mark as sub-agent and link to parent
+  currentModelId: modelId || null,
+  modelOptions: quickModelOptions,
+  provider: resolvedProviderId,
 });
 ```
 
-**Lines 159-170:** Filtered socket join and emit `sub_agent_started` to frontend:
+**Lines 298-315:** Filtered socket join and emit `sub_agent_started` to frontend:
 ```javascript
 if (!parentAcpSessionId) {
   this.log('[SUB-AGENT] Warning: parent ACP session unknown, joining all sockets');
   const sockets = await this.io.fetchSockets();
   for (const s of sockets) s.join(`session:${subAcpId}`);
 } else {
-  // Only join sockets already watching the parent session
   const parentRoom = `session:${parentAcpSessionId}`;
   const sockets = await this.io.fetchSockets();
   for (const s of sockets) {
@@ -189,14 +198,9 @@ if (!parentAcpSessionId) {
 }
 this.io.emit('sub_agent_started', {
   providerId: resolvedProviderId,
-  acpSessionId: subAcpId,
-  uiId,
-  parentUiId,
-  index: i,
+  acpSessionId: subAcpId, uiId, parentUiId, index: i,
   name: req.name || `Agent ${i + 1}`,
-  prompt: req.prompt,
-  agent: agentName,
-  model: resolvedModelKey,
+  prompt: req.prompt, agent: agentName, model: resolvedModelKey,
   invocationId,  // Ties agent to this spawn batch
 });
 ```
@@ -389,7 +393,7 @@ Permissions from sub-agents show in the SubAgentPanel (lines 66-77 of `SubAgentP
 
 ### 10. **Backend: Capture Response & Cleanup**
 
-**File:** `backend/mcp/subAgentInvocationManager.js`
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 350-356)
 
 ```javascript
 const meta = acpClient.sessionMetadata.get(s.subAcpId);
@@ -424,7 +428,7 @@ socket.on('sub_agent_completed', (data) => {
 
 ### 12. **Return Summary**
 
-**File:** `backend/mcp/subAgentInvocationManager.js`
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 367-378)
 
 ```javascript
 const summary = results.map((r, i) => {
@@ -432,6 +436,11 @@ const summary = results.map((r, i) => {
   if (r.error) return `${header}\nError: ${r.error}`;
   return `${header}\n${r.response}`;
 }).join('\n\n---\n\n');
+
+this.log(`[SUB-AGENT] All ${requests.length} agents completed, returning summary (${summary.length} chars)`);
+invocationRecord.status = 'completed';
+invocationRecord.completedAt = this.now();
+this.invocations.delete(invocationId);
 
 return { content: [{ type: 'text', text: summary }] };
 ```
@@ -656,26 +665,25 @@ if (pendingSubAgents.has(data.sessionId)) {
 
 **File:** `backend/database.js`
 
-```sql
-CREATE TABLE sessions (
-  ui_id TEXT PRIMARY KEY,
-  is_sub_agent INTEGER DEFAULT 0,
-  parent_acp_session_id TEXT,
-  forked_from TEXT,
-  ...
-)
+Sessions are stored with `isSubAgent` and `forkedFrom` flags:
+
+When saved (Lines 276-284):
+```javascript
+await this.db.saveSession({
+  id: uiId, acpSessionId: subAcpId,
+  name: req.name || `Agent ${i + 1}: ${req.prompt.slice(0, 50)}`,
+  model: resolvedModelKey || null, messages: [], isPinned: false,
+  isSubAgent: true, forkedFrom: parentUiId,  // Sub-agent flags
+  currentModelId: modelId || null,
+  modelOptions: quickModelOptions,
+  provider: resolvedProviderId,
+});
 ```
 
-When saved (Lines 152):
-```javascript
-..., isSubAgent ? 1 : 0, ..., parentAcpSessionId || null, ...
-```
-
-When loaded (Lines 198-199):
-```javascript
-isSubAgent: row.is_sub_agent === 1,
-parentAcpSessionId: row.parent_acp_session_id || null,
-```
+The database schema tracks:
+- `is_sub_agent`: Flag marking this session as a sub-agent
+- `forked_from`: Parent UI ID for hierarchy navigation
+- `parent_acp_session_id`: ACP session ID for parent (used in cancellation graph)
 
 ### Cleanup: Cascade Delete
 
@@ -713,13 +721,176 @@ for (const child of descendants) {
 
 When a sub-agent completes, its ACP session files are deleted:
 
-**File:** `backend/mcp/mcpServer.js` (Line 240)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 351-355)
 
 ```javascript
-cleanupAcpSession(s.subAcpId, providerId);  // Deletes .jsonl, .json, tasks/
+if (agentRec) agentRec.status = 'completed';
+this.io.emit('sub_agent_completed', { providerId: resolvedProviderId, acpSessionId: s.subAcpId, index: s.index });
+this.log(`[SUB-AGENT ${s.index}] Completed: ${s.subAcpId}`);
+if (this.cleanupFn) this.cleanupFn(s.subAcpId, resolvedProviderId);
+acpClient.sessionMetadata.delete(s.subAcpId);
 ```
 
 But the sidebar **ChatSession record** remains in the database (marked `isSubAgent: true`), allowing the user to view the conversation history.
+
+### Runtime Cancellation Cascade
+
+Cancelling a parent prompt or aborting the MCP tool request must cancel every active descendant sub-agent, not just direct children. The system uses a **graph-based BFS traversal** to recursively cancel all nested agents.
+
+#### Data Structure: `subAgentParentLinks` Map
+
+**File:** `backend/mcp/subAgentInvocationManager.js` (Line 30 in constructor)
+
+The manager tracks a durable **parent-child relationship graph** in a Map:
+
+```javascript
+this.subAgentParentLinks = new Map();
+```
+
+Each entry maps `${providerId}\u0000${acpSessionId}` → `{ providerId, acpSessionId, parentAcpSessionId }`. This allows cancellation to work across session boundaries and survive temporary invocation cleanup.
+
+#### Three Methods: The Cancellation Pipeline
+
+**Method 1: `subAgentParentKey(providerId, acpSessionId)` (Lines 57-59)**
+
+Generates a stable, scoped key for the parent-links map to avoid collisions:
+
+```javascript
+subAgentParentKey(providerId, acpSessionId) {
+  return `${providerId}\u0000${acpSessionId}`;
+}
+```
+
+**Method 2: `trackSubAgentParent(providerId, childAcpSessionId, parentAcpSessionId)` (Lines 61-68)**
+
+Records a child-parent link after `session/new` completes. Guards against null arguments:
+
+```javascript
+trackSubAgentParent(providerId, childAcpSessionId, parentAcpSessionId) {
+  if (!providerId || !childAcpSessionId || !parentAcpSessionId) return;
+  this.subAgentParentLinks.set(this.subAgentParentKey(providerId, childAcpSessionId), {
+    providerId,
+    acpSessionId: childAcpSessionId,
+    parentAcpSessionId
+  });
+}
+```
+
+Called at Line 254 after each session creation.
+
+**Method 3: `collectDescendantAcpSessionIds(parentAcpSessionId, providerId)` (Lines 70-95)**
+
+Performs an **iterative BFS** to find all descendants of a parent session (including the parent itself):
+
+```javascript
+collectDescendantAcpSessionIds(parentAcpSessionId, providerId) {
+  const descendants = new Set(parentAcpSessionId ? [parentAcpSessionId] : []);
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    // Walk durable parent links (persists across invocation cleanup)
+    for (const link of this.subAgentParentLinks.values()) {
+      if (link.providerId !== providerId) continue;
+      if (!descendants.has(link.parentAcpSessionId) || descendants.has(link.acpSessionId)) continue;
+      descendants.add(link.acpSessionId);
+      changed = true;
+    }
+
+    // Walk active invocation agent records (transient tracking)
+    for (const inv of this.invocations.values()) {
+      if (inv.providerId !== providerId || !descendants.has(inv.parentAcpSessionId)) continue;
+      for (const agent of inv.agents.values()) {
+        if (agent.acpId && !descendants.has(agent.acpId)) {
+          descendants.add(agent.acpId);
+          changed = true;
+        }
+      }
+    }
+  }
+
+  return descendants;
+}
+```
+
+The algorithm starts with the root parent, iteratively finds all direct children (via `subAgentParentLinks`), then finds grandchildren, and so on until no new descendants are discovered. This handles:
+- **Direct sub-agents:** Found immediately in first iteration
+- **Nested sub-agents:** Agents spawned by other agents (found in subsequent iterations)
+- **Deep hierarchies:** Arbitrary nesting depth supported
+
+**Method 4: `cancelInvocationRecord(inv)` (Lines 97-122)**
+
+Extracted method to cancel a single invocation record. Idempotent (returns early if already cancelled):
+
+```javascript
+cancelInvocationRecord(inv) {
+  if (inv.status === 'cancelled') return;  // Idempotent guard
+  if (inv.abortFn) inv.abortFn();
+  inv.status = 'cancelled';
+  inv.completedAt = this.now();
+
+  for (const agent of inv.agents.values()) {
+    agent.status = 'cancelled';
+    try {
+      const acpClient = this.acpClientFactory(inv.providerId);
+      if (acpClient && agent.acpId) {
+        // Send session/cancel notification to stop ACP processing
+        acpClient.transport.sendNotification('session/cancel', { sessionId: agent.acpId });
+        // Reject any pending requests for this session
+        if (acpClient.transport.pendingRequests) {
+          for (const [id, pending] of acpClient.transport.pendingRequests) {
+            if (pending.params?.sessionId === agent.acpId) {
+              pending.reject(new Error('Session cancelled'));
+              acpClient.transport.pendingRequests.delete(id);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      this.log(`Error sending cancel to sub-agent ${agent.acpId}: ${e.message}`);
+    }
+  }
+}
+```
+
+**Method 5: `cancelAllForParent(parentAcpSessionId, providerId)` (Lines 124-131)**
+
+The orchestration method: computes the full descendant set and cancels all invocations in that set:
+
+```javascript
+cancelAllForParent(parentAcpSessionId, providerId) {
+  const descendantAcpSessionIds = this.collectDescendantAcpSessionIds(parentAcpSessionId, providerId);
+  for (const inv of this.invocations.values()) {
+    if (inv.providerId === providerId && descendantAcpSessionIds.has(inv.parentAcpSessionId)) {
+      this.cancelInvocationRecord(inv);
+    }
+  }
+}
+```
+
+#### Abort Signal Integration
+
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 218-230)
+
+The abort signal is wired up in `executeInvocation()`:
+
+```javascript
+const abortFromSignal = () => {
+  this.log(`[SUB-AGENT] Tool call aborted; cancelling invocation ${invocationId}`);
+  if (parentAcpSessionId) {
+    this.cancelAllForParent(parentAcpSessionId, resolvedProviderId);  // Full cascade
+  } else {
+    this.cancelInvocationRecord(invocationRecord);  // Direct cancellation
+  }
+};
+if (abortSignal?.aborted) {
+  abortFromSignal();  // Synchronous if already aborted
+} else if (abortSignal?.addEventListener) {
+  abortSignal.addEventListener('abort', abortFromSignal, { once: true });  // Register listener
+}
+```
+
+When the upstream MCP request is cancelled or the proxy/backend connection closes, the abort signal fires. If a `parentAcpSessionId` is set (meaning this is a sub-agent invocation), the full cascade is triggered. Otherwise, only this invocation is cancelled.
 
 ---
 
@@ -827,15 +998,13 @@ A provider must support two hooks for sub-agent spawning:
 
 Called before `session/new` for each sub-agent. Return extra parameters to pass to the daemon.
 
-**File:** `backend/mcp/mcpServer.js` (Lines 174-176)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 249-252)
 
 ```javascript
+const providerModule = await this.getProviderModuleFn(resolvedProviderId);
 const sessionParams = providerModule.buildSessionParams(agentName);
-const result = await sendWithTimeout('session/new', { 
-  cwd, 
-  mcpServers: getMcpServers(resolvedProviderId), 
-  ...sessionParams  // Spread provider's extra params
-}, 30000);
+const mcpServers = this.getMcpServersFn(resolvedProviderId);
+const result = await sendWithTimeout('session/new', { cwd, mcpServers, ...sessionParams }, 30000);
 ```
 
 A provider uses this to set the agent at spawn time if the daemon requires it:
@@ -851,7 +1020,7 @@ export function buildSessionParams(agent) {
 
 Called after `session/new` completes. Use this to switch agents at runtime via a command.
 
-**File:** `backend/mcp/mcpServer.js` (Lines 214-216)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 317-319)
 
 ```javascript
 if (agentName !== provider.config.defaultSystemAgentName) {
@@ -875,10 +1044,12 @@ export async function setInitialAgent(client, sessionId, agent) {
 
 A provider's `user.json` can specify which model to use for sub-agents:
 
-**File:** `backend/mcp/mcpServer.js` (Lines 129)
+**File:** `backend/mcp/subAgentInvocationManager.js` (Lines 184-186)
 
 ```javascript
-const modelId = resolveModelSelection(model || models.subAgent, models, quickModelOptions).modelId;
+const models = provider.config.models || {};
+const quickModelOptions = this.modelOptionsFromProviderConfigFn(models);
+const modelId = this.resolveModelSelectionFn(model || models.subAgent, models, quickModelOptions).modelId;
 ```
 
 Example:
@@ -902,15 +1073,22 @@ This allows sub-agents to run on a faster/cheaper model while the parent uses a 
 
 | File | Functions | Lines | Purpose |
 |------|-----------|-------|---------|
-| `backend/mcp/mcpServer.js` | `ux_invoke_subagents` | 116-260 | Main handler: delegates to manager |
-| | `getMcpServers()` | 40-53 | MCP server config injection |
-| `backend/mcp/subAgentInvocationManager.js` | `runInvocation` | 69-317 | Main orchestration logic: spawn, prompt, cleanup, abort, snapshot generation |
-| `backend/mcp/subAgentRegistry.js` | `registerSubAgent` | 8-10 | Track running agents |
-| | `completeSubAgent` | 12-15 | Mark complete |
-| | `removeSubAgentsForParent` | 44-54 | Cascade cleanup |
-| `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession` | - | Reconnect hydration |
+| `backend/mcp/mcpServer.js` | `ux_invoke_subagents` | 177-218 | Main handler: caches tool state, builds idempotency key, passes abort signal to manager |
+| | `ux_invoke_counsel` | 232-286 | Counsel tool: builds role-based requests, delegates to ux_invoke_subagents |
+| | `getMcpServers()` | 114-134 | MCP server config injection |
+| `backend/mcp/subAgentInvocationManager.js` | `subAgentParentKey` | 57-59 | Generates scoped key for parent-links map |
+| | `trackSubAgentParent` | 61-68 | Records child→parent link for cascade tracking |
+| | `collectDescendantAcpSessionIds` | 70-95 | BFS traversal to find all descendants (direct + nested + deep) |
+| | `cancelInvocationRecord` | 97-122 | Extracted cancel logic; idempotent; sends session/cancel + rejects pending |
+| | `cancelAllForParent` | 124-131 | Computes descendant set via BFS, then cancels all invocations in that set |
+| | `runInvocation` | 133-179 | Entry point: idempotency check, delegates to executeInvocation |
+| | `executeInvocation` | 181-379 | Main orchestration: spawn (1s stagger), prompt, cleanup, abort signal setup |
+| `backend/mcp/stdio-proxy.js` | `backendFetch` | 46-60 | Forwards MCP abort signals to backend `/tool-call` fetches |
+| | `CallTool` handler | 94-108 | Passes `extra.signal` (MCP abort) to backend POST body |
+| `backend/routes/mcpApi.js` | `createToolCallAbortSignal` | 17-31 | Converts request/response close into AbortSignal |
+| | `POST /tool-call` | 124-158 | Creates abort signal, injects context + signal into handler args |
+| `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession` | - | Reconnect hydration: emits `sub_agent_snapshot` for active agents |
 | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | 12-17 | Delete ephemeral files |
-| `backend/services/acpUpdateHandler.js` | `handleUpdate` (tool_call) | 153-188 | Set `lastSubAgentParentAcpId` |
 | `backend/database.js` | `saveSession` | 119-157 | Store with `isSubAgent`, `forkedFrom` |
 | | `getAllSessions` | 171-200 | Load with sub-agent flags |
 | `backend/sockets/sessionHandlers.js` | `delete_session` | 168-202 | Cascade delete children |
@@ -980,16 +1158,35 @@ If `models.subAgent` is undefined, it falls back to `models.default`. Ensure you
 
 Duplicate active calls join the original promise. Duplicate completed calls return the cached result for a short TTL. If this guard is removed, a single visual tool step can spawn repeated batches while the parent tool remains in progress.
 
-### 8. **The 1-Second Stagger Prevents Overwhelming ACP**
+### 8. **Cancellation Must Cascade Through Nested Sub-Agents (BFS Graph Traversal)**
 
-Sub-agent sessions are created with a 1-second stagger (line 162):
+Cancelling a parent prompt is not enough to cancel only the direct `ux_invoke_subagents` invocation. A sub-agent can invoke its own sub-agents, creating arbitrary nesting depth. Cancellation uses a **graph-based BFS algorithm** to walk the full parent-link graph and abort every nested descendant.
+
+**How it works:**
+1. `subAgentParentLinks` Map (line 30, constructor) stores durable `childAcpId → parentAcpId` relationships
+2. `trackSubAgentParent()` (lines 61-68) records each child-parent link after `session/new`
+3. `collectDescendantAcpSessionIds()` (lines 70-95) performs iterative BFS: starts with the root parent, finds all direct children, then all grandchildren, and so on
+4. `cancelAllForParent()` (lines 124-131) computes the full descendant set then cancels every invocation whose parent is in that set
+5. `cancelInvocationRecord()` (lines 97-122) is idempotent and sends `session/cancel` notifications to the ACP
+
+**Abort signal integration (lines 218-230):**
+- When upstream MCP timeout/cancellation closes the tool request, the abort signal fires
+- If this invocation has a `parentAcpSessionId`, `cancelAllForParent()` is called → full cascade
+- Otherwise, only this invocation is cancelled
+- The same cascade is also called by `cancel_prompt` after the parent `session/cancel` notification
+
+Do not bypass this path by resolving the tool call without cancelling descendants. The graph-based approach ensures that sub-agents spawned by sub-agents are also cancelled, preventing orphaned sessions.
+
+### 9. **The 1-Second Stagger Prevents Overwhelming ACP**
+
+Sub-agent sessions are created with a 1-second stagger (line 328):
 ```javascript
 setTimeout(async () => { /* create session */ }, i * 1000);
 ```
 
 This prevents the ACP from being flooded with parallel session creations. If you're adding 5 agents, expect ~5 seconds for all to spawn.
 
-### 9. **Sub-Agents Can't Be Pinned, Renamed, or Archived from Sidebar**
+### 10. **Sub-Agents Can't Be Pinned, Renamed, or Archived from Sidebar**
 
 Action handlers in Sidebar are no-ops for `isSubAgent: true`:
 ```typescript
@@ -1000,11 +1197,11 @@ onSettings={() => {}}
 
 Only delete is functional. This is intentional — sub-agents are transient and controlled by the parent orchestration.
 
-### 10. **Sub-Agent Sessions Share Parent's Provider**
+### 11. **Sub-Agent Sessions Share Parent's Provider**
 
 All sub-agents inherit the parent's provider. There's no per-sub-agent provider selection — all sub-agents run under the same provider as the parent session.
 
-### 11. **The Summary Text Becomes a Regular Message**
+### 12. **The Summary Text Becomes a Regular Message**
 
 When sub-agents complete, the concatenated summary is returned as the tool's result, which becomes a regular message in the parent's chat. This summary is searchable and archivable like any other message.
 
@@ -1029,8 +1226,9 @@ The frontend receives `sub_agent_snapshot` and:
 
 ### Backend Tests
 
-- **`backend/test/mcpApi.test.js`** — Tool schema validation
-- **`backend/test/subAgentInvocationManager.test.js`** — Complete orchestration unit tests (spawning, cancelling, snapshotting, prompt timeouts)
+- **`backend/test/mcpApi.test.js`** — Tool schema validation and backend abort-signal propagation on client/proxy disconnect
+- **`backend/test/stdio-proxy.test.js`** — Stdio proxy tool forwarding, including MCP `extra.signal` propagation into backend fetch calls
+- **`backend/test/subAgentInvocationManager.test.js`** — Complete orchestration unit tests (spawning, cascading cancellation, abort signals, snapshotting, prompt timeouts)
 - **`backend/test/subAgentHandlers.test.js`** — Reconnect hydration snapshot emissions
 - **`backend/test/subAgentRegistry.test.js`** — Sub-agent lifecycle tracking (register, complete, cascade cleanup)
 - **`backend/test/sessionHandlers.test.js`** — Session deletion including cascade delete of sub-agents
@@ -1108,23 +1306,79 @@ The **critical contract** is `invocationId` — it must be stamped on the parent
 
 ## Tool System V2 Integration
 
-The sub-agent system is now fully integrated with the **Tool System V2**, which provides a canonical layer for tool identity and state management.
+The sub-agent system is fully integrated with the **Tool System V2**, which provides a canonical layer for tool identity and state management.
 
-### Canonical Identity
-Sub-agent tools are no longer identified by scanning title strings in the update handler. Instead:
-- **`ux_invoke_subagents`** and **`ux_invoke_counsel`** are registered canonical names.
-- Providers implement `extractToolInvocation()` to map their raw MCP tool naming (e.g., `mcp__AcpUI__ux_invoke_subagents`) to these canonical names.
-- The `toolRegistry` dispatches to `subAgentToolHandler` or `counselToolHandler` based on this canonical identity.
+### MCP Handler Integration
 
-### State Management (`toolCallState`)
+**File:** `backend/mcp/mcpServer.js` (Lines 177-218, 232-286)
+
+Both `ux_invoke_subagents` and `ux_invoke_counsel` handlers:
+1. Call `cacheMcpToolInvocation()` to record tool metadata (requests, model, title) in `toolCallState`
+2. Build an `idempotencyKey` to deduplicate retries from the same MCP request
+3. Pass `abortSignal` to `subAgentInvocationManager.runInvocation()` for cascade cancellation
+
+**Tool State Caching (Lines 189-198):**
+
+```javascript
+cacheMcpToolInvocation({
+  io,
+  providerId,
+  acpSessionId,
+  toolCallId: toolCallIdFromMeta(requestMeta),
+  toolName: 'ux_invoke_subagents',
+  input: { requests, model },
+  title: 'Invoke Subagents'
+});
+```
+
 The `toolCallState` service acts as a "sticky" cache for tool metadata:
-- **Authoritative Input**: When an MCP tool starts, the handler in `mcpServer.js` upserts the exact `requests` and `model` arguments into the state.
-- **Title Preservation**: The tool handlers set authoritative titles (e.g., "Invoke Subagents"). These titles are preserved even if the provider later emits a generic title (like "Running Tool").
-- **Persistence**: Metadata survives across intermediate stream updates, ensuring the UI always has access to the tool's canonical identity and input.
+- **Authoritative Input**: Exact `requests` and `model` arguments are upserted at handler entry
+- **Title Preservation**: "Invoke Subagents" and "Invoke Counsel" titles are preserved even if the provider later emits generic titles
+- **Persistence**: Metadata survives across intermediate stream updates
 
-### Lifecycle Handlers
-The `subAgentToolHandler` and `counselToolHandler` implement the `onStart` lifecycle method to perform sub-agent-specific initialization:
-- **Parent Tracking**: They set `acpClient.lastSubAgentParentAcpId = sessionId`, which is required by `subAgentInvocationManager` to resolve the `parentUiId`.
-- **Event Enrichment**: They ensure the `system_event` emitted to the UI contains the `canonicalName` and a clean `title`.
+### Abort Signal Propagation
 
-This architectural shift decouples sub-agent logic from provider-specific string formats and moves it into a structured, lifecycle-aware registry.
+**File:** `backend/routes/mcpApi.js` (Lines 17-31, 138-148)
+
+The `createToolCallAbortSignal()` function converts request/response closure into an AbortSignal:
+
+```javascript
+function createToolCallAbortSignal(req, res, toolName) {
+  const controller = new globalThis.AbortController();
+  const abort = (reason) => {
+    if (controller.signal.aborted) return;
+    writeLog(`[MCP API] Tool ${toolName} aborted: ${reason}`);
+    controller.abort(new Error(reason));
+  };
+
+  req.on?.('aborted', () => abort('request aborted'));
+  res.on?.('close', () => {
+    if (!res.writableEnded) abort('response closed');
+  });
+
+  return controller.signal;
+}
+```
+
+This signal is injected into handler args and flows through to `subAgentInvocationManager.executeInvocation()` for the cascade cancellation logic.
+
+**File:** `backend/mcp/stdio-proxy.js` (Lines 46-60, 94-108)
+
+The stdio proxy passes the MCP `extra.signal` through to the backend:
+
+```javascript
+return await backendFetch('/api/mcp/tool-call', {
+  method: 'POST',
+  body: JSON.stringify({
+    tool: name,
+    args: args || {},
+    providerId: providerId || null,
+    proxyId: proxyId || null,
+    mcpRequestId: extra?.requestId ?? null,
+    requestMeta: request.params?._meta || extra?._meta || null
+  }),
+  signal: extra?.signal,  // MCP abort signal → fetch signal
+});
+```
+
+The full chain: **MCP abort → fetch signal → AbortController → executeInvocation → cascade cancellation**

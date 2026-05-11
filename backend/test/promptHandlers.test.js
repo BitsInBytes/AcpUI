@@ -21,6 +21,10 @@ const { mockAcpClient } = vi.hoisted(() => ({
       respond: vi.fn(),
       pendingPermissions: new Map()
     },
+    providerModule: {
+      onPromptStarted: vi.fn(),
+      onPromptCompleted: vi.fn()
+    },
     setMode: vi.fn(),
     sessionMetadata: new Map()
   }
@@ -397,5 +401,70 @@ describe('Prompt Handlers', () => {
         expect.objectContaining({ type: 'image', mimeType: 'image/png', data: originalData })
       ])
     }));
+  });
+
+  describe('provider prompt lifecycle hooks', () => {
+    it('calls onPromptStarted before sendRequest and onPromptCompleted after success', async () => {
+      const sessionId = 'sess-hooks';
+      mockAcpClient.sessionMetadata.set(sessionId, { model: 'test-balanced', promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '' });
+      mockAcpClient.transport.sendRequest.mockResolvedValue({ success: true });
+
+      const handler = mockSocket.listeners('prompt')[0];
+      await handler({ uiId: 'ui-hooks', sessionId, prompt: 'hello', model: 'test-balanced' });
+
+      expect(mockAcpClient.providerModule.onPromptStarted).toHaveBeenCalledWith(sessionId);
+      expect(mockAcpClient.providerModule.onPromptCompleted).toHaveBeenCalledWith(sessionId);
+      // Started must be called before the sendRequest, completed after
+      const startOrder = mockAcpClient.providerModule.onPromptStarted.mock.invocationCallOrder[0];
+      const sendOrder = mockAcpClient.transport.sendRequest.mock.invocationCallOrder[0];
+      const endOrder = mockAcpClient.providerModule.onPromptCompleted.mock.invocationCallOrder[0];
+      expect(startOrder).toBeLessThan(sendOrder);
+      expect(sendOrder).toBeLessThan(endOrder);
+    });
+
+    it('calls onPromptCompleted even when sendRequest rejects (error path)', async () => {
+      const sessionId = 'sess-hooks-err';
+      mockAcpClient.sessionMetadata.set(sessionId, { model: 'test-balanced', promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '' });
+      mockAcpClient.transport.sendRequest.mockRejectedValue(new Error('Network error'));
+
+      const handler = mockSocket.listeners('prompt')[0];
+      await handler({ uiId: 'ui-hooks-err', sessionId, prompt: 'fail', model: 'test-balanced' });
+
+      expect(mockAcpClient.providerModule.onPromptStarted).toHaveBeenCalledWith(sessionId);
+      expect(mockAcpClient.providerModule.onPromptCompleted).toHaveBeenCalledWith(sessionId);
+    });
+
+    it('does not call onPromptStarted when session metadata is missing', async () => {
+      // No metadata set — stale session; handler returns early before the prompt
+      const handler = mockSocket.listeners('prompt')[0];
+      await handler({ uiId: 'ui-stale', sessionId: 'stale-hooks', prompt: 'hello', model: 'test-balanced' });
+
+      expect(mockAcpClient.providerModule.onPromptStarted).not.toHaveBeenCalled();
+      expect(mockAcpClient.providerModule.onPromptCompleted).not.toHaveBeenCalled();
+    });
+
+    it('outer catch emits error token/token_done and does not call onPromptCompleted when onPromptStarted throws', async () => {
+      // onPromptStarted throws — this is a pre-prompt failure inside the outer try block.
+      // The inner try/finally is never entered, so onPromptCompleted must NOT be called.
+      const sessionId = 'sess-outer-catch';
+      mockAcpClient.sessionMetadata.set(sessionId, { model: 'test-balanced', promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '' });
+      mockAcpClient.providerModule.onPromptStarted.mockImplementationOnce(() => {
+        throw new Error('setup failed unexpectedly');
+      });
+
+      const handler = mockSocket.listeners('prompt')[0];
+      await handler({ uiId: 'ui-outer', sessionId, prompt: 'hello', model: 'test-balanced' });
+
+      expect(mockIo.emit).toHaveBeenCalledWith('token', expect.objectContaining({
+        text: expect.stringContaining('setup failed unexpectedly')
+      }));
+      expect(mockIo.emit).toHaveBeenCalledWith('token_done', expect.objectContaining({
+        sessionId,
+        error: true,
+        providerId: 'provider-a'
+      }));
+      // The finally block inside the inner try was never reached
+      expect(mockAcpClient.providerModule.onPromptCompleted).not.toHaveBeenCalled();
+    });
   });
 });

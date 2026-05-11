@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getMcpServers, createToolHandlers, getMaxShellResultLines } from '../mcp/mcpServer.js';
 import { clearMcpProxyRegistry, getMcpProxyIdFromServers, resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
+import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
 import { toolCallState } from '../services/tools/index.js';
 import EventEmitter from 'events';
@@ -293,6 +294,31 @@ describe('mcpServer', () => {
       vi.useRealTimers();
       return result;
     }
+
+    it('passes abortSignal through to the sub-agent invocation manager', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const controller = new AbortController();
+      const spy = vi.spyOn(subAgentInvocationManager, 'runInvocation')
+        .mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+
+      try {
+        await handlers.ux_invoke_subagents({
+          requests: [{ prompt: 'Do thing' }],
+          providerId: 'provider-a',
+          acpSessionId: 'parent-acp',
+          abortSignal: controller.signal
+        });
+
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({
+          requests: [{ prompt: 'Do thing' }],
+          providerId: 'provider-a',
+          parentAcpSessionId: 'parent-acp',
+          abortSignal: controller.signal
+        }));
+      } finally {
+        spy.mockRestore();
+      }
+    });
 
     it('spawns sub-agents and aggregates summaries', async () => {
       const handlers = createToolHandlers(mockIo);
