@@ -37,6 +37,8 @@ Global settings act as the "Security Guard." They define hard boundaries that ap
 
 Permissions are managed within a `permissions` object using `allow` and `deny` arrays. Use the allow suggestion below if you want all UI features to work without being asked. Note that the Claude providers code denys the system Bash, Powershell and Agent tools because the AcpUI replaces these tools.
 
+AcpUI exposes the core UX MCP tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) when they are enabled in `configuration/mcp.json`. Optional IO tools (`ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`) and `ux_google_web_search` are advertised only when enabled before creating the session.
+
 ```json
 {
   "permissions": {

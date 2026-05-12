@@ -166,7 +166,15 @@ export async function handleUpdate(acpClient, sessionId, update) {
     const category = providerModule.categorizeToolCall(eventToEmit);
     if (category) eventToEmit = { ...eventToEmit, ...category };
 
-    const invocation = resolveToolInvocation({ providerId, sessionId, update, event: eventToEmit, providerModule, phase: 'start' });
+    const invocation = resolveToolInvocation({
+      providerId,
+      sessionId,
+      update,
+      event: eventToEmit,
+      providerModule,
+      phase: 'start',
+      acpUiMcpServerName: config.mcpName
+    });
     eventToEmit = applyInvocationToEvent(eventToEmit, invocation);
     eventToEmit = toolRegistry.dispatch('start', { acpClient, providerId, sessionId }, invocation, eventToEmit);
     toolCallState.upsert({
@@ -242,7 +250,15 @@ export async function handleUpdate(acpClient, sessionId, update) {
     if (category) endEvent = { ...endEvent, ...category };
 
     const phase = update.status ? 'end' : 'update';
-    const invocation = resolveToolInvocation({ providerId, sessionId, update, event: endEvent, providerModule, phase });
+    const invocation = resolveToolInvocation({
+      providerId,
+      sessionId,
+      update,
+      event: endEvent,
+      providerModule,
+      phase,
+      acpUiMcpServerName: config.mcpName
+    });
     endEvent = applyInvocationToEvent(endEvent, invocation);
     endEvent = toolRegistry.dispatch(phase, { acpClient, providerId, sessionId }, invocation, endEvent);
     toolCallState.upsert({

@@ -1,6 +1,8 @@
-# Feature Doc — ux_invoke_shell System
+# Feature Doc - ux_invoke_shell System
 
-**ux_invoke_shell is AcpUI's interactive shell execution tool. It provides a terminal-backed PTY lifecycle that allows agents to run shell commands while users interact in real-time (typing input, resizing terminal, canceling). The tool blocks until the process exits, supporting concurrent independent shell runs with per-run transcripts, exit codes, and timeout/termination handling.**
+`ux_invoke_shell` is AcpUI's terminal-backed MCP shell tool. It lets an agent run a shell command through the AcpUI backend while the user watches live PTY output, types into the process, resizes the terminal, or stops the run from the chat timeline.
+
+This feature matters because shell execution crosses the MCP proxy, Tool System V2, Socket.IO, node-pty, Zustand stores, and xterm.js. The fragile part is correlation: MCP execution metadata, ACP `tool_call` updates, shell run IDs, and frontend timeline steps must all describe the same command.
 
 ---
 
@@ -8,193 +10,130 @@
 
 ### What It Does
 
-- **Spawns PTY-backed shell processes** on Windows (PowerShell) and Unix (bash), capturing all output and terminal events
-- **Maintains concurrent independent runs** — multiple ux_invoke_shell calls simultaneously get separate PTY instances, file descriptors, and socket event streams with no cross-contamination
-- **Emits real-time terminal output** via Socket.IO (`shell_run_output` events) allowing the frontend to stream output character-by-character into an interactive xterm.js terminal
-- **Handles user interaction** — captures keyboard input (including Ctrl+C), terminal resize, and stop button clicks; routes them back to the shell process via PTY write
-- **Manages lifecycle events** — emits `shell_run_prepared`, `shell_run_started`, `shell_run_output`, and `shell_run_exit` socket events representing the full run lifecycle, including the optional user-facing run description
-- **Enforces resource limits** — caps transcript lines (default 1000), enforces 30-minute inactivity timeout, handles user termination with appropriate exit messages
-- **Blocks MCP tool call** until the process exits, ensuring agents wait for results before continuing
+- Advertises `ux_invoke_shell` as an AcpUI core MCP tool through `GET /api/mcp/tools` when `configuration/mcp.json` enables `tools.invokeShell`.
+- Runs shell commands in isolated PTYs through `ShellRunManager`, using PowerShell on Windows and bash on Unix-like platforms.
+- Correlates ACP tool updates with backend MCP execution records through `toolInvocationResolver`, `toolCallState`, `mcpExecutionRegistry`, and `shellToolHandler`.
+- Emits session-scoped Socket.IO events: `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, and `shell_run_exit`.
+- Routes frontend stdin, resize, and stop actions through `shell_run_input`, `shell_run_resize`, and `shell_run_kill` socket events.
+- Renders a live xterm.js terminal while the run is active and a read-only ANSI-preserving transcript after exit.
+- Returns an MCP result only after the shell process exits or is finalized.
 
 ### Why This Matters
 
-- **Realistic terminal experience** — Commands that prompt for input (git, vim, etc.) can be driven by the user in real-time, not just fire-and-forget
-- **Concurrent execution** — Multiple shell commands run in parallel without output mixing or PTY collision
-- **Clear user interaction** — Users see live output as it happens, can interrupt, resize, and control shell behavior directly
-- **Proper exit semantics** — Distinguishes between normal completion, user termination, timeouts, and errors with appropriate final text
-- **Provider-agnostic** — The tool is detected by name and integrated at the acpUpdateHandler phase, allowing any provider to normalize its tool calls
+- Shell commands can be interactive: user input and Ctrl+C flow back into the PTY.
+- Concurrent shell calls require separate `runId` values so output never mixes between commands.
+- Tool titles and command metadata must remain sticky across provider updates and MCP handler updates.
+- The frontend timeline must render shell output through `ShellToolTerminal`, not through generic tool output blocks.
+- Socket room validation prevents a client from controlling a shell run for a session it is not watching.
 
 ### Architectural Role
 
-**Backend-heavy feature** with specific frontend rendering:
-- **Backend**: Manages PTY lifecycle in `ShellRunManager`, routes socket events, handles tool preparation in `acpUpdateHandler`
-- **Frontend**: Renders interactive terminal via `ShellToolTerminal` component, manages run snapshots in `useShellRunStore`
-- **Integration point**: Detected during `tool_call` event processing, then flows through MCP system to backend tool handler
+`ux_invoke_shell` is a backend-owned MCP tool with a specialized frontend renderer. The backend owns MCP advertisement, request handling, tool-state correlation, PTY lifecycle, and socket controls. The frontend owns live terminal rendering, run snapshot storage, timeline step patching, and user control events.
 
 ---
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### 1. Agent Calls ux_invoke_shell (MCP Tool)
-**File:** `backend/mcp/mcpServer.js` (Function: `tools.ux_invoke_shell`, Lines: 143-175)
+### 1. Session creation injects the MCP proxy
 
-The ACP daemon calls the MCP tool with arguments:
+File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)  
+File: `backend/mcp/mcpProxyRegistry.js` (Function: `createMcpProxyBinding`)
+
+When the backend creates or loads an ACP session, `getMcpServers(providerId, { acpSessionId })` returns the stdio MCP server entry for the provider's configured MCP server name. The entry runs `backend/mcp/stdio-proxy.js` with environment values that bind the proxy to a provider/session context.
 
 ```javascript
-// FILE: backend/mcp/mcpServer.js (Lines 143-175)
-tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
-  const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
-  const maxLines = getMaxShellResultLines();
+// FILE: backend/mcp/mcpServer.js (Function: getMcpServers)
+return [{
+  name,
+  command: 'node',
+  args: [proxyPath],
+  env: [
+    { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
+    { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
+    { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
+    { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' }
+  ],
+  ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
+}];
+```
 
-  if (providerId && acpSessionId) {
-    const toolCallId = toolCallIdFromMeta(requestMeta);
-    const title = description ? `Invoke Shell: ${description}` : 'Invoke Shell';
-    cacheMcpToolInvocation({
-      io,
-      providerId,
-      acpSessionId,
-      toolCallId,
-      toolName: 'ux_invoke_shell',
-      input: { description, command, cwd: workingDir },
-      title
-    });
-    shellRunManager.setIo?.(io);
-    writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
-    return shellRunManager.startPreparedRun({
-      providerId,
-      acpSessionId,
-      toolCallId,
-      mcpRequestId,
-      description,
-      command,
-      cwd: workingDir,
-      maxLines
-    });
+If the provider has no `config.mcpName`, `getMcpServers` returns an empty list and the ACP daemon does not receive AcpUI MCP tools for that session.
+
+### 2. The stdio proxy advertises the shell tool
+
+File: `backend/mcp/stdio-proxy.js` (Function: `runProxy`, MCP handler: `ListToolsRequestSchema`)  
+File: `backend/routes/mcpApi.js` (Route: `GET /api/mcp/tools`)  
+File: `backend/mcp/coreMcpToolDefinitions.js` (Function: `getInvokeShellMcpToolDefinition`)
+
+The proxy fetches `/api/mcp/tools` from the backend and registers the returned tool list with the MCP SDK. `GET /api/mcp/tools` includes `getInvokeShellMcpToolDefinition()` only when `isInvokeShellMcpEnabled()` is true.
+
+```javascript
+// FILE: backend/mcp/coreMcpToolDefinitions.js (Function: getInvokeShellMcpToolDefinition)
+{
+  name: ACP_UX_TOOL_NAMES.invokeShell,
+  title: 'Interactive shell',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      description: { type: 'string' },
+      command: { type: 'string' },
+      cwd: { type: 'string' }
+    },
+    required: ['description', 'command']
+  },
+  _meta: {
+    'acpui/concurrentInvocationsSupported': true
   }
-  // ...
-};
+}
 ```
 
-The handler delegates to `shellRunManager.startPreparedRun()`, which blocks until the shell process exits.
+The definition tells the agent that `description` and `command` are required and that concurrent invocations are supported.
 
----
+### 3. The proxy forwards MCP calls to the backend API
 
-### 2. ACP Tool Call Update Arrives at Backend
-**File:** `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Lines 148-195 — tool_call handling)
+File: `backend/mcp/stdio-proxy.js` (MCP handler: `CallToolRequestSchema`)  
+File: `backend/routes/mcpApi.js` (Route: `POST /api/mcp/tool-call`, Functions: `resolveToolContext`, `createToolCallAbortSignal`)
 
-When the ACP daemon emits a `session/update` with `type: 'tool_call'`, the backend routes it via the **Tool System V2** registry:
+When the ACP daemon calls `ux_invoke_shell`, the proxy posts the tool name, public arguments, provider ID, proxy ID, MCP request ID, and request metadata to `/api/mcp/tool-call`.
 
-```javascript
-// FILE: backend/services/acpUpdateHandler.js (Lines 148-195)
-case 'tool_call':
-  // ... provider extraction ...
-  const invocation = resolveToolInvocation({ ... });
-  eventToEmit = applyInvocationToEvent(eventToEmit, invocation);
-  eventToEmit = toolRegistry.dispatch('start', ctx, invocation, eventToEmit);
-  // ...
-```
+`POST /api/mcp/tool-call` resolves provider/session context from `resolveMcpProxy(proxyId)`, disables HTTP request timeouts for long-running commands, creates an `AbortSignal` for client disconnects, and calls the handler returned by `createToolHandlers(io)`.
 
----
+### 4. The MCP handler records public execution metadata
 
-### 3. Shell Run Preparation (Tool Handler)
-**File:** `backend/services/tools/handlers/shellToolHandler.js` (Export: `shellToolHandler`, Lines 25-69; Method: `onStart`, Lines 26-60)
+File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`, Helper: `wrapToolHandlers`)  
+File: `backend/services/tools/mcpExecutionRegistry.js` (Functions: `publicMcpToolInput`, `mcpExecutionRegistry.begin`, `describeAcpUxToolExecution`)
 
-The `shellToolHandler.onStart` method prepares the shell run and merges metadata:
+Every AcpUI MCP handler is wrapped. Before `runShellInvocation` runs, `wrapToolHandlers` stores public input and display metadata in `mcpExecutionRegistry` and projects it into `toolCallState` when a tool call ID is available.
 
 ```javascript
-// FILE: backend/services/tools/handlers/shellToolHandler.js (Lines 26-60)
-onStart(ctx, invocation, event) {
-  const description = normalizeText(invocation.input?.description);
-  const command = invocation.input?.command || '';
-  const cwd = invocation.input?.cwd || null;
-
-  shellRunManager.setIo?.(ctx.acpClient.io);
-  const prepared = shellRunManager.prepareRun({
-    providerId: ctx.providerId,
-    sessionId: ctx.sessionId,
-    toolCallId: invocation.toolCallId,
-    description,
-    command,
-    cwd
-  });
-
-  const title = shellTitle(description) || event.title;
-  toolCallState.upsert({
-    providerId: ctx.providerId,
-    sessionId: ctx.sessionId,
-    toolCallId: invocation.toolCallId,
-    input: { description, command: prepared.command, cwd: prepared.cwd },
-    display: { title, titleSource: title === event.title ? 'provider' : 'tool_handler' },
-    toolSpecific: { shellRunId: prepared.runId }
-  });
-
+// FILE: backend/services/tools/mcpExecutionRegistry.js (Function: publicMcpToolInput)
+if (toolName === ACP_UX_TOOL_NAMES.invokeShell) {
   return {
-    ...event,
-    shellRunId: prepared.runId,
-    shellInteractive: true,
-    shellState: prepared.status,
-    command: prepared.command,
-    cwd: prepared.cwd,
-    title
+    description: input.description,
+    command: input.command,
+    cwd: input.cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd()
   };
 }
 ```
 
-**Key step:** The `onStart` method:
-1. Extracts command, cwd, and description from `invocation.input`
-2. Calls `shellRunManager.prepareRun()` to create a "pending" shell run
-3. Stores the `shellRunId` in `toolCallState` for later retrieval
-4. Returns an updated event with `shellRunId`, `shellInteractive`, `shellState`, and other shell metadata
+The shell descriptor title is `Invoke Shell: <description>` when a description exists, or `Invoke Shell` when it does not.
 
-This happens **before** the MCP tool is called. When the MCP handler `tools.ux_invoke_shell` invokes `shellRunManager.startPreparedRun()` later, it can find and activate the same run using the `toolCallId`.
+### 5. The shell MCP handler delegates to ShellRunManager
 
-**Event enrichment** with shell metadata:
-- `shellRunId: "shell-run-<uuid>"` — unique run identifier
-- `shellInteractive: true` — indicates an interactive shell tool
-- `shellState: "pending"` — status before execution
-- `command`, `cwd` — extracted from tool input
-- `title` — formatted as `"Invoke Shell: <description>"` if description present
+File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`, Helper: `runShellInvocation`)  
+File: `backend/services/tools/mcpExecutionRegistry.js` (Function: `toolCallIdFromMcpContext`)
 
----
-
-### 4. System Event with Shell Run ID Emitted to Frontend
-**File:** `backend/services/acpUpdateHandler.js` (Line 190 — within tool_call handling at lines 148-191)
-
-After the tool handler completes, the enriched event is emitted to all sockets watching the session:
+`runShellInvocation` resolves `cwd`, `MAX_SHELL_RESULT_LINES`, and the tool call ID. With provider and session context present, it calls `shellRunManager.startPreparedRun()` and awaits the result.
 
 ```javascript
-// FILE: backend/services/acpUpdateHandler.js (Line 190)
-acpClient.io.to('session:' + sessionId).emit('system_event', eventToEmit);
-```
-
-Frontend receives:
-```javascript
-{
-  providerId: 'my-provider',
-  sessionId: 'abc-123',
-  type: 'tool_start',
-  id: '<tool-call-id>',
-  toolName: 'ux_invoke_shell',
-  shellRunId: 'shell-run-<uuid>',           // NEW
-  shellInteractive: true,                    // NEW
-  shellState: 'pending',                     // NEW
-  title: 'Invoke Shell: Run tests',           // when description is present
-  command: 'npm test',
-  cwd: '/home/user/project'
-}
-```
-
----
-
-### 5. MCP Handler Starts the Prepared Run
-**File:** `backend/mcp/mcpServer.js` (Lines 161-170) + `backend/services/shellRunManager.js` (Lines 183-277)
-
-When the ACP daemon calls `ux_invoke_shell`, the tool handler invokes:
-
-```javascript
-// FILE: backend/mcp/mcpServer.js (Lines 161-170)
-shellRunManager.setIo?.(io);
-writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
+// FILE: backend/mcp/mcpServer.js (Helper: runShellInvocation)
+const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
+const maxLines = getMaxShellResultLines();
+const toolCallId = toolCallIdFromMcpContext({
+  requestMeta,
+  mcpRequestId,
+  toolName: ACP_UX_TOOL_NAMES.invokeShell
+});
 return shellRunManager.startPreparedRun({
   providerId,
   acpSessionId,
@@ -207,1227 +146,548 @@ return shellRunManager.startPreparedRun({
 });
 ```
 
-`startPreparedRun()` finds the prepared run by `toolCallId` (or command/cwd fallback):
+If provider or session context is missing, the handler returns MCP text content with `Error: Shell execution context unavailable` and does not start a PTY.
+
+### 6. The ACP tool update enters Tool System V2
+
+File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Branches: `tool_call`, `tool_call_update`)  
+File: `backend/services/tools/toolInvocationResolver.js` (Functions: `resolveToolInvocation`, `applyInvocationToEvent`)  
+File: `backend/services/tools/toolRegistry.js` (Function: `dispatch`)
+
+The ACP daemon also emits `session/update` messages for tool starts and tool updates. `handleUpdate` normalizes the provider payload, asks the provider to extract structured tool identity, resolves the invocation through Tool System V2, applies the resolved identity/title to the timeline event, and dispatches the lifecycle phase to `toolRegistry`.
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 195-205)
-const resolvedSessionId = sessionId || acpSessionId;
-let run = this.findPreparedRun({ providerId, sessionId: resolvedSessionId, toolCallId, command, cwd });
-if (!run) {
-  const prepared = this.prepareRun({ providerId, sessionId: resolvedSessionId, toolCallId, description, command, cwd, maxLines });
-  run = this.runs.get(prepared.runId);
-}
-run.description = normalizeDescription(description) || run.description;
-run.command = run.command || command;
-run.cwd = normalizeCwd(cwd || run.cwd);
-run.maxLines = maxLines || run.maxLines;
-run.mcpRequestId = mcpRequestId ?? run.mcpRequestId;
+// FILE: backend/services/acpUpdateHandler.js (Function: handleUpdate, Branch: tool_call)
+const invocation = resolveToolInvocation({
+  providerId,
+  sessionId,
+  update,
+  event: eventToEmit,
+  providerModule,
+  phase: 'start',
+  acpUiMcpServerName: config.mcpName
+});
+eventToEmit = applyInvocationToEvent(eventToEmit, invocation);
+eventToEmit = toolRegistry.dispatch('start', { acpClient, providerId, sessionId }, invocation, eventToEmit);
 ```
 
-Then calls `startRun(run)` which spawns the PTY:
+`resolveToolInvocation` merges provider extraction, existing `toolCallState`, and recent `mcpExecutionRegistry` records. A shell invocation is marked with identity kind `acpui_mcp`, canonical name `ux_invoke_shell`, MCP server name, and public input.
+
+### 7. shellToolHandler prepares the visible run
+
+File: `backend/services/tools/handlers/shellToolHandler.js` (Export: `shellToolHandler`, Methods: `onStart`, `onUpdate`, `onEnd`)  
+File: `backend/services/tools/toolCallState.js` (Function: `upsert`)
+
+`shellToolHandler.onStart` creates a pending shell run before the PTY starts. The returned `runId` is stored in `toolCallState.toolSpecific.shellRunId` and attached to the `system_event` emitted to the frontend.
 
 ```javascript
-// FILE: backend/services/shellRunManager.js (Lines 234-277)
-startRun(run) {
-  if (run.status !== 'pending') {
-    throw new Error(`Shell run ${run.runId} cannot start from status ${run.status}`);
-  }
-
-  run.status = 'starting';
-  run.startedAt = this.now();
-  this.emit(run, 'shell_run_started', {
-    ...this.snapshot(run),
-    cols: 120,
-    rows: 30
-  });
-
-  return new Promise((resolve, reject) => {
-    run.resolve = resolve;
-    run.reject = reject;
-
-    try {
-      const { shell, args } = buildShellInvocation(run.command, this.platform, this.pwshAvailable);
-      run.pty = this.pty.spawn(shell, args, {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
-        cwd: run.cwd,
-        env: { ...process.env, TERM: 'xterm-256color', FORCE_COLOR: '1', PYTHONIOENCODING: 'utf-8' }
-      });
-
-      run.status = 'running';
-      this.appendOutput(run, `$ ${run.command}\n`, { includeInRaw: false });
-      this.resetInactivityTimer(run);
-
-      run.pty.onData((data) => {
-        this.appendOutput(run, data);
-        this.resetInactivityTimer(run);
-      });
-
-      run.pty.onExit(({ exitCode }) => {
-        this.finalizeRun(run, exitCode);
-      });
-    } catch (err) {
-      this.finalizeRun(run, null, 'error', err);
-    }
-  });
-}
-```
-
-**Platform-specific invocation** (Lines 90-103):
-
-The `buildShellInvocation()` function at lines 90-103 determines which shell to use based on the platform and `usePwsh` parameter:
-
-```javascript
-// FILE: backend/services/shellRunManager.js (Lines 90-103)
-function buildShellInvocation(command, platform = process.platform, usePwsh = false) {
-  if (platform === 'win32') {
-    // Use pwsh (PowerShell 7+) when available — it supports the && pipeline-chain
-    // operator that AI models commonly generate. Fall back to powershell.exe (5.x)
-    // which does not support &&.
-    const shell = usePwsh ? 'pwsh.exe' : 'powershell.exe';
-    return {
-      shell,
-      // Prevent PowerShell from printing the Encoding object to stdout.
-      args: ['-NoProfile', '-Command', `$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]
-    };
-  }
-  return { shell: 'bash', args: ['-c', command] };
-}
-```
-
-**Shell selection logic:**
-- **Windows (usePwsh = true)**: `pwsh.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"` — PowerShell 7+, supports `&&` pipeline-chain operator
-- **Windows (usePwsh = false)**: `powershell.exe -NoProfile -Command "$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; <command>"` — Windows PowerShell 5.x fallback
-- **Unix**: `bash -c <command>`
-
-**PowerShell detection** (Lines 28-44):
-
-The `detectPwsh()` function at lines 28-44 synchronously detects PowerShell 7+ availability:
-
-```javascript
-// FILE: backend/services/shellRunManager.js (Lines 28-44)
-export function detectPwsh(platform = process.platform, spawnSyncFn = null) {
-  if (platform !== 'win32') return false;
-  try {
-    const runner = typeof spawnSyncFn === 'function'
-      ? spawnSyncFn
-      : (typeof childProcess.spawnSync === 'function' ? childProcess.spawnSync : null);
-    if (!runner) return false;
-    const result = runner('pwsh', ['--version'], {
-      timeout: 3000,
-      stdio: 'ignore',
-      windowsHide: true
-    });
-    return result.status === 0;
-  } catch {
-    return false;
-  }
-}
-```
-
-This function runs `spawnSync('pwsh', ['--version'])` once. It returns false immediately if `pwsh` is not installed (ENOENT), or within ~100ms if it is.
-
-**ShellRunManager constructor** (Lines 113-141) accepts a `pwshAvailable` option:
-
-```javascript
-// FILE: backend/services/shellRunManager.js (Lines 113-141)
-constructor({
-  io = null,
-  ptyModule = pty,
-  log = writeLog,
-  now = () => Date.now(),
-  setTimeoutFn = setTimeout,
-  clearTimeoutFn = clearTimeout,
-  inactivityTimeoutMs = DEFAULT_INACTIVITY_TIMEOUT_MS,
-  interruptGraceMs = DEFAULT_INTERRUPT_GRACE_MS,
-  completedRetentionMs = DEFAULT_COMPLETED_RETENTION_MS,
-  platform = process.platform,
-  // Pass true/false to override detection (useful in tests). null triggers
-  // auto-detection via detectPwsh() at construction time.
-  pwshAvailable = null
-} = {}) {
-  // ...
-  this.pwshAvailable = pwshAvailable !== null ? pwshAvailable : detectPwsh(platform);
-  // ...
-}
-```
-
-When `pwshAvailable` is `null` (default), it auto-detects via `detectPwsh(platform)` at construction time (line 139). When explicitly `true` or `false`, it uses that value directly (useful for tests). The result is stored as `this.pwshAvailable` and passed to `buildShellInvocation()` on every `startRun()` call.
-
-The function **blocks** until the PTY exits, awaiting `run.resolve()` which is called in `finalizeRun()`.
-
----
-
-### 6. PTY Output Streams to Frontend via Socket.IO
-**File:** `backend/services/shellRunManager.js` (Lines 279-300)
-
-As the PTY writes data, `appendOutput()` is called:
-
-```javascript
-// FILE: backend/services/shellRunManager.js (Lines 279-300)
-appendOutput(run, chunk, { includeInRaw = true } = {}) {
-  if (!chunk) return;
-  let outputChunk = chunk;
-  if (includeInRaw) {
-    outputChunk = sanitizeShellOutputChunk(outputChunk, {
-      stripStartupControls: Boolean(run.stripStartupControls)
-    });
-    if (run.stripStartupControls && hasVisibleShellOutput(outputChunk)) {
-      run.stripStartupControls = false;
-    }
-  }
-  if (!outputChunk) return;
-  if (includeInRaw) run.rawOutput += outputChunk;
-  run.transcript = trimShellOutputLines(`${run.transcript}${outputChunk}`, run.maxLines);
-  this.emit(run, 'shell_run_output', {
-    providerId: run.providerId,
-    sessionId: run.sessionId,
-    runId: run.runId,
-    chunk: outputChunk,
-    maxLines: run.maxLines
-  });
-}
-```
-
-On Windows, `sanitizeShellOutputChunk()` removes the initial PowerShell/ConPTY screen-control prologue before it reaches `rawOutput`, `transcript`, or the frontend. This keeps AcpUI's injected `$ command` prompt adjacent to the command output instead of letting PowerShell startup `clear screen` and `cursor home` sequences create blank rows or overwrite the prompt.
-
-Each chunk emits `shell_run_output` to `session:<sessionId>` room:
-
-```javascript
-{
-  providerId: 'my-provider',
-  sessionId: 'abc-123',
-  runId: 'shell-run-<uuid>',
-  chunk: 'test output line 1\n',
-  maxLines: 1000
-}
-```
-
-This is emitted for **every data chunk** from the PTY, in real-time.
-
----
-
-### 7. Frontend Receives Output and Updates Store
-**File:** `frontend/src/hooks/useChatManager.ts` (Lines 175-180) + `frontend/src/store/useShellRunStore.ts` (Lines 88-107)
-
-In `useChatManager`, a listener captures shell events:
-
-```typescript
-// FILE: frontend/src/hooks/useChatManager.ts
-socket.on('shell_run_output', (event) => {
-  useShellRunStore.getState().appendOutput(event);
+// FILE: backend/services/tools/handlers/shellToolHandler.js (Method: onStart)
+const prepared = shellRunManager.prepareRun({
+  providerId: ctx.providerId,
+  sessionId: ctx.sessionId,
+  toolCallId: invocation.toolCallId,
+  description,
+  command,
+  cwd
 });
 
-socket.on('shell_run_started', (event) => {
-  useShellRunStore.getState().markStarted(event);
+return {
+  ...event,
+  shellRunId: prepared.runId,
+  shellInteractive: true,
+  shellState: prepared.status,
+  command: prepared.command,
+  cwd: prepared.cwd,
+  title
+};
+```
+
+`onUpdate` and `onEnd` keep `Invoke Shell: <description>` titles in place when description input appears in a later structured update.
+
+### 8. ShellRunManager starts or creates the PTY run
+
+File: `backend/services/shellRunManager.js` (Class: `ShellRunManager`, Methods: `prepareRun`, `startPreparedRun`, `findPreparedRun`, `startRun`)  
+File: `backend/services/shellRunManager.js` (Functions: `detectPwsh`, `buildShellInvocation`, `normalizeCwd`)
+
+`startPreparedRun` finds the pending run by `toolCallId` and falls back to command/cwd matching when a tool call ID is unavailable. If no pending run exists, it prepares a run inside the manager before starting it.
+
+`startRun` emits `shell_run_started`, spawns the PTY, injects a `$ <command>` transcript prompt, hooks `onData` and `onExit`, and resets the inactivity timer on output.
+
+```javascript
+// FILE: backend/services/shellRunManager.js (Method: startRun)
+const { shell, args } = buildShellInvocation(run.command, this.platform, this.pwshAvailable);
+run.pty = this.pty.spawn(shell, args, {
+  name: 'xterm-256color',
+  cols: 120,
+  rows: 30,
+  cwd: run.cwd,
+  env: { ...process.env, TERM: 'xterm-256color', FORCE_COLOR: '1', PYTHONIOENCODING: 'utf-8' }
 });
 
-socket.on('shell_run_exit', (event) => {
-  useShellRunStore.getState().markExited(event);
-});
+run.status = 'running';
+this.appendOutput(run, `$ ${run.command}\n`, { includeInRaw: false });
 ```
 
-The store's `appendOutput()` accumulates chunks into a transcript:
+On Windows, `detectPwsh()` selects `pwsh.exe` when PowerShell 7+ is available and otherwise uses `powershell.exe`. On Unix-like platforms the command runs as `bash -c <command>`.
 
-```typescript
-// FILE: frontend/src/store/useShellRunStore.ts (Lines 88-107)
-appendOutput: ({ providerId, sessionId, runId, chunk, maxLines }) => set(state => {
-  const existing = state.runs[runId];
-  const effectiveMaxLines = maxLines || existing?.maxLines;
-  const nextRuns: Record<string, ShellRunSnapshot> = {
-    ...state.runs,
-    [runId]: {
-      ...existing,
-      providerId: existing?.providerId || providerId,
-      sessionId: existing?.sessionId || sessionId,
-      runId,
-      status: existing?.status === 'exited' ? 'exited' : 'running',
-      maxLines: effectiveMaxLines,
-      transcript: trimShellTranscript(`${existing?.transcript || ''}${chunk || ''}`, effectiveMaxLines),
-      updatedAt: Date.now()
-    }
-  };
-  return { runs: pruneShellRuns(nextRuns) };
-})
-```
+### 9. PTY output streams through shell_run_output
 
-**Trimming** (Lines 30-43) keeps only the last `maxLines` lines to prevent unbounded memory growth.
+File: `backend/services/shellRunManager.js` (Methods: `appendOutput`, `finalizeRun`, `formatFinalText`)  
+File: `backend/services/shellRunManager.js` (Functions: `sanitizeShellOutputChunk`, `trimShellOutputLines`)
 
----
+Each PTY data chunk is sanitized, appended to `rawOutput`, appended to a trimmed transcript, and emitted to the session room as `shell_run_output`.
 
-### 8. Frontend Renders Interactive Terminal or Read-Only Transcript
-**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 18-379)
-
-The `ToolStep` component detects `shellRunId` on a tool event and renders `ShellToolTerminal`:
-
-```typescript
-// FILE: frontend/src/components/ToolStep.tsx (implied)
-if (step.event.shellRunId) {
-  return <ShellToolTerminal event={step.event} />;
-}
-```
-
-`ShellToolTerminal` has two render modes:
-
-**A. Interactive (Pending/Running)** (Lines 189-338):
-- Creates xterm.js terminal with FitAddon (fit to container)
-- Automatically takes focus when the terminal is active and running, provided the user is viewing the associated chat session
-- Queues transcript deltas through callback-paced `term.write(data, callback)` calls
-- Splits large writes into 64 KiB chunks so xterm's internal write buffer cannot be flooded by one React update
-- Uses suffix/prefix overlap detection so rolling transcript trimming appends only new output instead of repeatedly resetting and replaying the whole transcript
-- Listens for user input via `term.onData()` and emits `shell_run_input`
-- Handles resize events and emits `shell_run_resize`
-- Handles paste via Ctrl+V by reading clipboard and emitting `shell_run_input`
-
-```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 190-210)
-const drainWriteQueue = useCallback(() => {
-  const term = xtermRef.current;
-  if (!term || writeInFlightRef.current) return;
-
-  const next = writeQueueRef.current.shift();
-  if (!next) return;
-
-  const generation = writeGenerationRef.current;
-  writeInFlightRef.current = true;
-  try {
-    term.write(next, () => {
-      if (writeGenerationRef.current !== generation) return;
-      writeInFlightRef.current = false;
-      drainWriteQueueRef.current();
-    });
-  } catch {
-    if (writeGenerationRef.current !== generation) return;
-    writeInFlightRef.current = false;
-    drainWriteQueueRef.current();
-  }
-}, []);
-```
-
-Transcript updates use this queue:
-
-```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 325-338)
-useEffect(() => {
-  const term = xtermRef.current;
-  if (!term) return;
-  const transcript = run?.transcript || '';
-  const written = writtenRef.current;
-  const plan = getTranscriptWritePlan(written, transcript);
-  if (plan.reset) {
-    resetQueuedWrites();
-    term.reset();
-  }
-  enqueueTerminalWrite(plan.data);
-  writtenRef.current = transcript;
-}, [enqueueTerminalWrite, resetQueuedWrites, run?.transcript]);
-```
-
-User input still goes directly back to the backend:
-
-```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 293-302)
-const dataDisposable = term.onData((data) => {
-  const currentRun = runRef.current;
-  if (!isRunningRef.current || isPasting || !currentRun?.runId) return;
-  socket?.emit('shell_run_input', {
-    providerId: currentRun.providerId,
-    sessionId: currentRun.sessionId,
-    runId: currentRun.runId,
-    data
-  });
-});
-```
-
-**B. Read-Only (Exited)** (Lines 116-127, 350-353):
-- Converts stored transcript to HTML with ANSI color codes
-- Strips noise terminal escape sequences
-- Appends exit summary if needed (user terminated, timeout, exit code)
-- Renders as `<pre>` with HTML content
-
-```typescript
-// FILE: frontend/src/components/ShellToolTerminal.tsx (Lines 369-374)
-} : (
-  <pre ref={readOnlyRef} className="shell-tool-terminal-readonly" dangerouslySetInnerHTML={{ __html: readOnlyHtml }} />
-)
-```
-
----
-
-### 9. Frontend Emits User Input Back to Backend
-**File:** `frontend/src/components/ShellToolTerminal.tsx` (Lines 274-283) + `backend/sockets/shellRunHandlers.js` (Lines 35-52)
-
-User types in xterm → emits `shell_run_input`:
-
-```typescript
-// Frontend emit
-socket?.emit('shell_run_input', {
+```javascript
+// FILE: backend/services/shellRunManager.js (Method: appendOutput)
+this.emit(run, 'shell_run_output', {
   providerId: run.providerId,
   sessionId: run.sessionId,
   runId: run.runId,
-  data: 'ls\n'  // or '\x03' for Ctrl+C
+  chunk: outputChunk,
+  maxLines: run.maxLines
 });
 ```
 
-Backend socket handler processes it:
+Windows startup control sequences are stripped before storage and frontend emission. `transcript` and `rawOutput` are trimmed by `maxLines`; the injected `$ <command>` prompt is included in `transcript` but not in `rawOutput`.
 
-```javascript
-// FILE: backend/sockets/shellRunHandlers.js (Lines 35-52)
-socket.on('shell_run_input', (payload = {}, callback) => {
-  const validation = validateRunAccess(manager, socket, payload);
-  if (!validation.ok) {
-    ack(callback, { success: false, error: validation.error });
-    return;
-  }
+### 10. Frontend socket listeners store snapshots and patch timeline steps
 
-  if (typeof payload.data !== 'string') {
-    ack(callback, { success: false, error: 'data must be a string' });
-    return;
-  }
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Helpers: `patchShellRunToolStep`, `shellRunSnapshotPatch`)  
+File: `frontend/src/store/useShellRunStore.ts` (Store: `useShellRunStore`, Actions: `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`)
 
-  const accepted = manager.writeInput(payload.runId, payload.data);
-  ack(callback, accepted ? { success: true } : { success: false, error: 'input rejected' });
-});
-```
-
-Handler calls `shellRunManager.writeInput()`:
-
-```javascript
-// FILE: backend/services/shellRunManager.js (Lines 302-310)
-writeInput(runId, data) {
-  const run = this.runs.get(runId);
-  if (!run || run.status !== 'running' || !run.pty) return false;
-  if (data === '\x03' || String(data).includes('\x03')) {
-    run.interruptRequestedAt = this.now();
-  }
-  run.pty.write(data);
-  return true;
-}
-```
-
-The data is written directly to the PTY, where the shell process reads it as stdin.
-
----
-
-### 10. PTY Exit and Finalization
-**File:** `backend/services/shellRunManager.js` (Lines 348-386)
-
-When the PTY exits (either naturally or via kill), `finalizeRun()` is called:
-
-```javascript
-// FILE: backend/services/shellRunManager.js (Lines 348-386)
-finalizeRun(run, exitCode, forcedReason = null, err = null) {
-  if (run.status === 'exited') return;
-  if (run.inactivityTimer) {
-    this.clearTimeout(run.inactivityTimer);
-    run.inactivityTimer = null;
-  }
-
-  const now = this.now();
-  let reason = forcedReason || run.terminationReason;
-  if (!reason && run.interruptRequestedAt && now - run.interruptRequestedAt <= this.interruptGraceMs) {
-    reason = 'user_terminated';
-  }
-  if (!reason) reason = exitCode === 0 ? 'completed' : 'failed';
-
-  run.status = 'exited';
-  run.exitCode = exitCode;
-  run.reason = reason;
-  run.exitedAt = now;
-  run.pty = null;
-
-  const finalText = this.formatFinalText(run, reason, exitCode, err);
-  this.emit(run, 'shell_run_exit', {
-    providerId: run.providerId,
-    sessionId: run.sessionId,
-    runId: run.runId,
-    exitCode,
-    reason,
-    finalText
-  });
-
-  if (err) {
-    this.log(`[SHELL RUN] ${run.runId} error: ${err.message}`);
-  } else {
-    this.log(`[SHELL RUN] ${run.runId} exited (${reason}; code ${exitCode})`);
-  }
-
-  this.scheduleCompletedCleanup(run);
-  run.resolve?.({ content: [{ type: 'text', text: finalText }] });
-}
-```
-
-**Reason detection** (Lines 356-360):
-- If user sent Ctrl+C within 1.5s of exit → `user_terminated`
-- Otherwise, exit code 0 → `completed`, non-zero → `failed`
-- Can be forced to `timeout`, `error`, etc.
-
-**Final text formatting** (Lines 399-413):
-```javascript
-formatFinalText(run, reason, exitCode, err = null) {
-  if (err) return `Error: ${err.message}`;
-  if (reason === 'user_terminated') {
-    const plain = stripAnsi(run.transcript).trim() || '(no output)';
-    return `${plain}\n\nCommand terminated by user`;
-  }
-  if (reason === 'timeout') {
-    const plain = stripAnsi(run.transcript).trim() || '(no output)';
-    return `${plain}\n\nCommand timed out after 30 minutes without output`;
-  }
-
-  const plainOutput = stripAnsi(run.rawOutput).trim() || '(no output)';
-  if (reason === 'failed') return `${plainOutput}\n\nExit Code: ${exitCode}`;
-  return plainOutput;
-}
-```
-
-**Emits `shell_run_exit`** and **resolves the MCP promise** with the formatted text:
-
-```javascript
-run.resolve?.({ content: [{ type: 'text', text: finalText }] });
-```
-
----
-
-### 11. Frontend Receives Exit Event and Switches to Read-Only Mode
-**File:** `frontend/src/hooks/useChatManager.ts` (implied) + `frontend/src/store/useShellRunStore.ts` (Lines 108-123)
-
-Frontend receives `shell_run_exit`:
+`useChatManager` listens for all shell run events. It updates `useShellRunStore` by `runId` and patches the matching timeline tool event by `shellRunId`.
 
 ```typescript
-socket.on('shell_run_exit', (event) => {
-  useShellRunStore.getState().markExited({
-    providerId: event.providerId,
-    sessionId: event.sessionId,
-    runId: event.runId,
-    exitCode: event.exitCode,
-    reason: event.reason,
-    finalText: event.finalText
+// FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager)
+socket.on('shell_run_output', (data) => {
+  useShellRunStore.getState().appendOutput(data);
+  patchShellRunToolStep(data.runId, { shellState: 'running' });
+});
+
+socket.on('shell_run_exit', (data) => {
+  useShellRunStore.getState().markExited(data);
+  patchShellRunToolStep(data.runId, {
+    shellState: 'exited',
+    ...(data.finalText !== undefined ? { output: data.finalText } : {})
   });
 });
 ```
 
-Store marks run as exited:
+This keeps the timeline event and the shell run store aligned even when the shell description or command arrives through a snapshot after the initial tool start.
 
-```typescript
-// FILE: frontend/src/store/useShellRunStore.ts (Lines 108-123)
-markExited: ({ providerId, sessionId, runId, exitCode = null, reason = null }) => set(state => {
-  const existing = state.runs[runId];
-  const nextRuns: Record<string, ShellRunSnapshot> = {
-    ...state.runs,
-    [runId]: {
-      ...existing,
-      providerId: existing?.providerId || providerId,
-      sessionId: existing?.sessionId || sessionId,
-      runId,
-      status: 'exited',
-      exitCode,
-      reason,
-      updatedAt: Date.now()
-    }
-  };
-  return { runs: pruneShellRuns(nextRuns) };
-})
-```
+### 11. ToolStep renders ShellToolTerminal
 
-`ShellToolTerminal` detects `status === 'exited'` and switches to read-only `<pre>` rendering.
+File: `frontend/src/components/ToolStep.tsx` (Component: `ToolStep`, Helper: `getFilePathFromEvent`)  
+File: `frontend/src/components/ShellToolTerminal.tsx` (Component: `ShellToolTerminal`)  
+File: `frontend/src/components/ChatMessage.css` (CSS classes: `.shell-tool-terminal`, `.shell-tool-terminal-surface`, `.shell-tool-terminal-readonly`)
 
----
+`ToolStep` renders `ShellToolTerminal` whenever the tool event has `shellRunId`. It suppresses generic output rendering for that step so final output does not duplicate the terminal transcript.
 
-### 12. MCP Tool Call Completes and Agent Continues
-**File:** `backend/mcp/mcpServer.js` (Lines 143-175, specifically return at lines 161-170)
+`ShellToolTerminal` uses a stored run when available, or falls back to shell metadata attached to the event. Active runs mount xterm.js; exited runs render a read-only `<pre>` with ANSI-to-HTML conversion.
 
-The `shellRunManager.startPreparedRun()` promise resolves with:
+### 12. User controls flow back through socket handlers
+
+File: `frontend/src/components/ShellToolTerminal.tsx` (Handlers: `term.onData`, custom Ctrl+V paste handler, `emitResize`, `stopRun`)  
+File: `backend/sockets/shellRunHandlers.js` (Function: `registerShellRunHandlers`, Helper: `validateRunAccess`)  
+File: `backend/services/shellRunManager.js` (Methods: `writeInput`, `resizeRun`, `killRun`)
+
+Frontend controls emit session/run-scoped socket events. The backend validates that the socket is watching the run's session before writing input, resizing, or killing the PTY.
 
 ```javascript
-{ content: [{ type: 'text', text: '...' }] }
+// FILE: backend/sockets/shellRunHandlers.js (Socket event: shell_run_input)
+const validation = validateRunAccess(manager, socket, payload);
+if (!validation.ok) {
+  ack(callback, { success: false, error: validation.error });
+  return;
+}
+const accepted = manager.writeInput(payload.runId, payload.data);
 ```
 
-The ACP daemon receives this as the MCP tool result and continues executing, potentially calling more tools or generating more output based on the shell command result.
+`writeInput` accepts only running PTYs and records Ctrl+C when the data contains `\x03`. `resizeRun` guards invalid dimensions and catches node-pty resize races. `killRun` marks the run as user terminated and kills or finalizes the run.
+
+### 13. Exit finalizes the socket event and MCP result
+
+File: `backend/services/shellRunManager.js` (Methods: `finalizeRun`, `scheduleCompletedCleanup`, `formatFinalText`)  
+File: `backend/services/tools/mcpExecutionRegistry.js` (Methods: `complete`, `fail`)
+
+When the PTY exits, `finalizeRun` determines `reason`, emits `shell_run_exit`, schedules completed-run cleanup, and resolves the original MCP call with `{ content: [{ type: 'text', text: finalText }] }`.
+
+Reasons are:
+
+- `completed`: zero exit code.
+- `failed`: non-zero exit code.
+- `user_terminated`: `shell_run_kill`, pending-run kill, or Ctrl+C followed by prompt exit within the interrupt grace window.
+- `timeout`: no output for the inactivity timeout window.
+- `error`: PTY spawn or setup failure.
+
+The wrapper around the MCP handler then marks the execution record completed or failed in `mcpExecutionRegistry`.
 
 ---
 
 ## Architecture Diagram
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                    BROWSER FRONTEND                                │
-│                                                                    │
-│  ┌──────────────────────────────────────────────────────────────┐ │
-│  │  ToolStep Component                                          │ │
-│  │  ├─ Detects event.shellRunId                                │ │
-│  │  └─ Renders ShellToolTerminal                               │ │
-│  └──────────────────────────────────────────────────────────────┘ │
-│                          ▲                                         │
-│                          │                                         │
-│  ┌──────────────────────────────────────────────────────────────┐ │
-│  │  ShellToolTerminal                                           │ │
-│  │  ├─ Interactive mode (pending/running): xterm.js terminal   │ │
-│  │  │  ├─ Queues transcript deltas with xterm flow control       │ │
-│  │  │  ├─ Emits shell_run_input (user typing)                  │ │
-│  │  │  ├─ Emits shell_run_resize (terminal resize)             │ │
-│  │  │  └─ Emits shell_run_kill (stop button)                   │ │
-│  │  │                                                           │ │
-│  │  └─ Read-only mode (exited): HTML <pre> with ANSI colors   │ │
-│  └──────────────────────────────────────────────────────────────┘ │
-│                          ▲                                         │
-│                          │ shell_run_output,                       │
-│                          │ shell_run_started,                      │
-│                          │ shell_run_exit                          │
-│  ┌──────────────────────────────────────────────────────────────┐ │
-│  │  useShellRunStore (Zustand)                                 │ │
-│  │  ├─ runs: Record<runId, ShellRunSnapshot>                  │ │
-│  │  ├─ appendOutput: accumulate transcript                     │ │
-│  │  ├─ markStarted: set status to running                      │ │
-│  │  └─ markExited: set status to exited                        │ │
-│  └──────────────────────────────────────────────────────────────┘ │
-│                          ▲                                         │
-│                          │                                         │
-│  ┌──────────────────────────────────────────────────────────────┐ │
-│  │  useChatManager (Socket Listeners)                          │ │
-│  │  ├─ on('shell_run_output', ...) → appendOutput             │ │
-│  │  ├─ on('shell_run_started', ...) → markStarted             │ │
-│  │  ├─ on('shell_run_exit', ...) → markExited                 │ │
-│  │  └─ on('shell_run_snapshot', ...) → hydrate on reconnect   │ │
-│  └──────────────────────────────────────────────────────────────┘ │
-└────────────────────────┬───────────────────────────────────────────┘
-                         │ Socket.IO
-                         │
-┌────────────────────────▼───────────────────────────────────────────┐
-│                         BACKEND                                    │
-│                                                                    │
-│  ┌──────────────────────────────────────────────────────────────┐ │
-│  │  MCP Tool Handler (ux_invoke_shell)                         │ │
-│  │  ├─ Receives: description, command, cwd, providerId        │ │
-│  │  │  acpSessionId                                           │ │
-│  │  └─ Delegates → shellRunManager.startPreparedRun()          │ │
-│  │     (BLOCKS until shell exits, returns text result)         │ │
-│  └──────────────────────────────────────────────────────────────┘ │
-│                          ▲                                         │
-│                          │ promise resolves                        │
-│                          │ when shell exits                        │
-│  ┌──────────────────────────────────────────────────────────────┐ │
-│  │  ShellRunManager                                            │ │
-│  │  ├─ runs: Map<runId, Run>                                  │ │
-│  │  ├─ prepareRun({...}): create pending run                  │ │
-│  │  │  └─ Emits shell_run_prepared                            │ │
-│  │  │                                                          │ │
-│  │  ├─ startPreparedRun({...}): find/create + start           │ │
-│  │  │  ├─ Spawns PTY (PowerShell on Win, bash on Unix)       │ │
-│  │  │  ├─ Status: pending → starting → running → exiting     │ │
-│  │  │  ├─ Listens to pty.onData → appendOutput()             │ │
-│  │  │  │   └─ Emits shell_run_output (each chunk)            │ │
-│  │  │  ├─ Listens to pty.onExit → finalizeRun()              │ │
-│  │  │  │   └─ Emits shell_run_exit                           │ │
-│  │  │  └─ Returns promise (blocked until shell exits)         │ │
-│  │  │                                                          │ │
-│  │  ├─ writeInput(runId, data): write to pty.stdin            │ │
-│  │  ├─ resizeRun(runId, cols, rows): pty.resize()            │ │
-│  │  └─ killRun(runId): pty.kill()                             │ │
-│  └──────────────────────────────────────────────────────────────┘ │
-│                          ▲ ▲                                       │
-│                          │ │                                       │
-│         ┌────────────────┘ └─────────────────┐                    │
-│         │                                    │                    │
-│  ┌──────▼──────────────────┐      ┌─────────▼──────────────────┐ │
-│  │  acpUpdateHandler       │      │  shellRunHandlers          │ │
-│  │  ├─ Detects tool_call   │      │  ├─ shell_run_input       │ │
-│  │  │  where toolName ===  │      │  │  → writeInput()       │ │
-│  │  │  'ux_invoke_shell'   │      │  ├─ shell_run_resize      │ │
-│  │  │                      │      │  │  → resizeRun()        │ │
-│  │  ├─ prepareRun()        │      │  └─ shell_run_kill       │ │
-│  │  │  ├─ Extracts cmd/cwd │      │     → killRun()          │ │
-│  │  │  ├─ Creates pending  │      │                          │ │
-│  │  │  │  run              │      │  (validates socket has    │ │
-│  │  │  └─ Emits            │      │   access to session)      │ │
-│  │  │     system_event     │      │                          │ │
-│  │  │     with shellRunId  │      │  emitShellRunSnapshots:  │ │
-│  │  └─ (during tool_call)  │      │  (for reconnecting clients)
-│  └─────────────────────────┘      └────────────────────────────┘ │
-└────────────────────────────────────────────────────────────────────┘
-             │                          │
-             └──────────────┬───────────┘
-                  JSON-RPC 2.0
-                   (stdio)
-                      ▼
-         ┌──────────────────────────┐
-         │   ACP DAEMON            │
-         │   (calls ux_invoke_shell)│
-         └──────────────────────────┘
-```
+```mermaid
+flowchart TD
+  A[ACP Daemon] -->|MCP list/call over stdio| P[stdio-proxy.js]
+  P -->|GET /api/mcp/tools| R1[mcpApi GET /tools]
+  R1 --> D[getInvokeShellMcpToolDefinition]
+  P -->|POST /api/mcp/tool-call| R2[mcpApi POST /tool-call]
+  R2 --> H[createToolHandlers wrapper]
+  H --> E[mcpExecutionRegistry]
+  H --> M[runShellInvocation]
+  M --> SRM[ShellRunManager.startPreparedRun]
 
-**Data flow:**
-- ACP daemon calls MCP tool `ux_invoke_shell(description, command, cwd, ...)`
-- MCP handler delegates to `ShellRunManager.startPreparedRun()` which blocks
-- Shell runs as PTY, emits `shell_run_output` events in real-time to frontend
-- Frontend receives chunks and appends to transcript in `useShellRunStore`
-- `ShellToolTerminal` renders live via xterm.js
-- User interaction (input, resize, kill) routes back via `shell_run_input`, `shell_run_resize`, `shell_run_kill`
-- When shell exits, `finalizeRun()` emits `shell_run_exit` and resolves MCP promise
-- Frontend switches to read-only transcript rendering
-- MCP tool call completes, ACP daemon continues
+  A -->|session/update tool_call| U[acpUpdateHandler.handleUpdate]
+  U --> TIR[resolveToolInvocation]
+  TIR --> TCS[toolCallState]
+  TIR --> E
+  U --> TR[toolRegistry.dispatch]
+  TR --> STH[shellToolHandler.onStart]
+  STH --> SRM
+  U -->|system_event with shellRunId| CM[useChatManager]
+
+  SRM -->|shell_run_prepared/started/output/exit| CM
+  CM --> STORE[useShellRunStore]
+  CM --> TL[Timeline tool event patch]
+  TL --> TS[ToolStep]
+  TS --> STT[ShellToolTerminal]
+  STT -->|shell_run_input/resize/kill| SH[shellRunHandlers]
+  SH --> SRM
+  SRM -->|PTY spawn/write/resize/kill| PTY[node-pty process]
+```
 
 ---
 
-## The Critical Contract: Run Lifecycle & Concurrency Model
+## Critical Contract
 
-### Run State Machine
+### Contract: Structured Tool Identity + Run ID Correlation
 
-Every shell run transitions through states in strict order:
+The shell feature depends on these stable identifiers staying attached through the whole lifecycle:
 
-```
-pending → starting → running → exiting → exited
-```
+- `providerId`: provider runtime identity.
+- `sessionId` / `acpSessionId`: ACP session room and transport identity.
+- `toolCallId`: primary correlation key between provider tool updates, MCP execution records, and `toolCallState`.
+- `runId` / `shellRunId`: shell-run correlation key for Socket.IO stream chunks and frontend terminal rendering.
+- `canonicalName`: must be `ux_invoke_shell` for shell-specific handling.
+- `identity.kind`: `acpui_mcp` marks AcpUI-owned tools for frontend styling and file-path suppression.
 
-**Invariants:**
-- A run cannot skip states (e.g., pending → exited is invalid)
-- A run in `exited` status is immutable
-- Only `running` status accepts input (writeInput, resizeRun) or kill (killRun)
-- Each state has explicit timeout/finalization semantics
+The state machine is:
 
-### Run Identity & Storage
-
-Runs are stored in `ShellRunManager.runs: Map<runId, Run>`:
-- **Key**: `runId = "shell-run-<uuid>"` — globally unique, immutable
-- **Lookup patterns**:
-  - By `runId` (direct): `manager.snapshot(runId)`
-  - By `providerId + sessionId + toolCallId` (prepared): `findPreparedRun()`
-  - By `providerId + sessionId` (session): `getSnapshotsForSession()`
-
-### Prepared Run Matching
-
-Before MCP tool execution, `prepareRun()` creates a pending run identified by:
-- `providerId` (required)
-- `sessionId` (required)
-- `toolCallId` (optional, from tool_call event)
-- `description` (optional, shown in the tool header as `Invoke Shell: <description>`)
-- `command` (extracted, may be empty)
-- `cwd` (extracted, may be null)
-
-When MCP handler calls `startPreparedRun()`, it finds the prepared run by:
-1. If `toolCallId` is provided, match by `toolCallId`
-2. Otherwise, match by `command + cwd`
-3. Otherwise, take the first pending run for the session
-
-**Critical**: If `startPreparedRun()` can't find a prepared run, it creates a new one. This allows for out-of-order arrival of acpUpdateHandler vs MCP handler.
-
-### Concurrent Execution Semantics
-
-Multiple shell runs can execute in parallel **as long as they have different `runId`s**:
-- Each run has its own PTY file descriptor
-- Each run has its own transcript in memory
-- Each run emits to the same room (`session:<sessionId>`) but with distinct `runId` in payload
-- Frontend demultiplexes by `runId` → `useShellRunStore` → distinct xterm instances
-
-**Example:** Two simultaneous `npm test` commands:
-```
-tool_call_1: ux_invoke_shell(command='npm test') → creates run A
-tool_call_2: ux_invoke_shell(command='npm test') → creates run B
-
-PTY A runs, emits shell_run_output { runId: 'shell-run-A', ... }
-PTY B runs, emits shell_run_output { runId: 'shell-run-B', ... }
-
-Frontend receives both, routes by runId:
-  run A → useShellRunStore.runs['shell-run-A']
-  run B → useShellRunStore.runs['shell-run-B']
-
-Two separate xterm instances render both in parallel (in two ToolSteps)
+```text
+pending -> starting -> running -> exiting -> exited
 ```
 
-### Termination Reasons & Exit Semantics
+`ShellRunManager` owns this state. The frontend mirrors it through `shellState` on timeline events and `ShellRunSnapshot.status` in `useShellRunStore`.
 
-When a run finalizes, `reason` is one of:
+A provider should expose structured shell identity through `extractToolInvocation()` when its ACP updates contain tool data. The resolver can merge MCP handler metadata, but the most reliable path is a provider invocation with canonical identity and public input:
 
-| Reason | Condition | Final Text |
-|--------|-----------|-----------|
-| `completed` | Natural exit with code 0 | Plain output (ANSI stripped) |
-| `failed` | Natural exit with non-zero code | Plain output + `\n\nExit Code: N` |
-| `user_terminated` | Ctrl+C within 1.5s of exit OR `killRun()` called | Transcript + `\n\nCommand terminated by user` |
-| `timeout` | 30 minutes inactivity | Transcript + `\n\nCommand timed out after 30 minutes without output` |
-| `error` | Exception during spawn/execution | `Error: <message>` |
-
-**Critical**: The reason string is included in the MCP result. Agents may inspect it to decide next steps (e.g., "if reason === 'timeout', retry with increased timeout").
-
-### Output Limits & Transcripts
-
-Each run maintains two outputs:
-
-| Field | Purpose | Limit | Mutation |
-|-------|---------|-------|----------|
-| `rawOutput` | Plain-text output (ANSI stripped), for final result | Unbounded | Lines trimmed for final text rendering |
-| `transcript` | Full live output with ANSI codes, for frontend display | `maxLines` (default 1000) | Trimmed on each append |
-
-**Trimming**: When appending a chunk, `transcript` is trimmed to the **last N lines**:
 ```javascript
-run.transcript = trimShellOutputLines(`${run.transcript}${chunk}`, run.maxLines);
+// FILE: provider index.js (Hook: extractToolInvocation)
+return {
+  canonicalName: 'ux_invoke_shell',
+  mcpServer: '<provider MCP server name>',
+  mcpToolName: 'ux_invoke_shell',
+  input: { description, command, cwd },
+  title: description ? `Invoke Shell: ${description}` : 'Invoke Shell',
+  category: { toolCategory: 'shell', isShellCommand: true, isFileOperation: false }
+};
 ```
 
-This keeps the live terminal responsive (don't store 100MB in memory), while final results trim for readability.
+What breaks if the contract is violated:
+
+- Missing `toolCallId` can force command/cwd fallback matching and can pair the wrong pending run when commands are identical.
+- Missing `shellRunId` leaves the frontend on generic tool rendering and prevents terminal controls.
+- Missing provider/session context makes the MCP handler return an execution-context error.
+- Missing room membership makes `shell_run_input`, `shell_run_resize`, and `shell_run_kill` fail validation.
+- Missing canonical identity prevents `shellToolHandler` from preparing the run.
 
 ---
 
 ## Configuration / Provider Support
 
-### Provider Detection of ux_invoke_shell Tool Calls
+### MCP tool availability
 
-Providers must normalize tool call events so `acpUpdateHandler.isUxShellToolEvent()` can reliably detect them.
+File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `isInvokeShellMcpEnabled`)  
+File: `configuration/mcp.json.example` (Config key: `tools.invokeShell`)
 
-**Detection pattern** (acpUpdateHandler.js Lines 75-102):
-
-The backend checks if `isUxInvokeShellToolName(value)` where `value` is:
-- `event.toolName`
-- `update.toolName`
-- `update.name`
-- `update.toolCall?.toolName`
-- `update.toolCall?.tool`
-- `update.toolCall?.name`
-- Value extracted from nested `invocation` field
-
-**Normalized form**:
-```typescript
-isUxInvokeShellToolName(value) {
-  const normalized = String(value || '').trim().toLowerCase();
-  return normalized === 'ux_invoke_shell' ||
-    normalized.endsWith('/ux_invoke_shell') ||
-    normalized.endsWith('_ux_invoke_shell') ||
-    normalized.endsWith('__ux_invoke_shell') ||
-    normalized.endsWith(':ux_invoke_shell');
-}
-```
-
-**Examples a provider may normalize from:**
-- `mcp__AcpUI__ux_invoke_shell` → normalized to `ux_invoke_shell` ✓
-- `@AcpUI/ux_invoke_shell` → normalized to `ux_invoke_shell` ✓
-- `Tool: AcpUI:ux_invoke_shell` → extracted and normalized ✓
-
-### Command & CWD Extraction
-
-`acpUpdateHandler` searches for command and cwd in nested structures:
-
-**Command keys** (SHELL_COMMAND_KEYS):
-- `command`, `cmd`, `parsed_cmd`, `parsedCmd`, `commandLine`, `command_line`, `script`, `line`
-
-**CWD keys** (SHELL_CWD_KEYS):
-- `cwd`, `workdir`, `workingDirectory`, `working_dir`, `folder`
-
-**Search order** (shellCandidateObjects):
-1. The tool call event itself
-2. `event.invocation` field (if JSON)
-3. `event.arguments` / `event.args` / `event.params` / `event.input` fields
-4. Nested `invocation.arguments` / `invocation.args` etc.
-
-A provider should ensure the command and cwd are in one of these locations. If they're deeply nested, the backend will search recursively.
-
-### Example: Custom Provider Integration
-
-If a provider sends:
+`MCP_CONFIG` points to the JSON file that controls MCP tool advertisement. The default path is `configuration/mcp.json`. The shell tool is advertised and registered only when `tools.invokeShell` normalizes to enabled.
 
 ```json
 {
-  "toolName": "@MyProvider/shell",
-  "arguments": {
-    "exec": {
-      "command": "npm test",
-      "cwd": "/home/user/project"
-    }
+  "tools": {
+    "invokeShell": { "enabled": true }
   }
 }
 ```
 
-The provider's `normalizeUpdate()` should transform it to:
+When the MCP config cannot be loaded, `disabledConfig()` disables all MCP tools, including `ux_invoke_shell`.
 
-```json
-{
-  "toolName": "ux_invoke_shell",
-  "arguments": {
-    "command": "npm test",
-    "cwd": "/home/user/project"
-  }
-}
-```
+### Provider MCP setup
 
-OR the backend's fallback search will find `command` in `arguments.exec.command` automatically.
+File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)  
+Provider config key: `mcpName`  
+Provider hook: `getMcpServerMeta()`
+
+A provider must define `config.mcpName` for `getMcpServers` to inject the stdio proxy into ACP session configuration. `getMcpServerMeta()` may attach provider-specific `_meta` to the MCP server entry; the shell tool does not interpret that metadata directly.
+
+### Shell runtime environment
+
+File: `backend/mcp/mcpServer.js` (Function: `getMaxShellResultLines`)  
+File: `backend/services/shellRunManager.js` (Functions: `getMaxShellResultLines`, `normalizeCwd`, `detectPwsh`)
+
+- `MAX_SHELL_RESULT_LINES`: positive integer transcript/result cap; default is `1000`.
+- `DEFAULT_WORKSPACE_CWD`: fallback working directory when `cwd` is not supplied.
+- `BACKEND_PORT`: passed to the stdio proxy so it can reach the backend API.
+- `ACP_SESSION_PROVIDER_ID`: provider context passed into the stdio proxy.
+- `ACP_UI_MCP_PROXY_ID`: proxy binding key used by `resolveMcpProxy`.
+- `NODE_TLS_REJECT_UNAUTHORIZED=0`: lets the local stdio proxy call the self-signed HTTPS backend.
+- `SHELL_V2_ENABLED`: exported and tested by `isShellV2Enabled`; it is not a runtime gate in the shell execution path.
 
 ---
 
-## Data Flow Example: Token to Terminal Output
+## Data Flow / Rendering Pipeline
 
-### 1. PTY Emits Data
-```
-PTY output: "npm ERR! code ENOENT\n"
-```
+### MCP call and backend execution
 
-### 2. Backend Appends & Emits
-```javascript
-// ShellRunManager.appendOutput()
-run.transcript += "npm ERR! code ENOENT\n";  // stored
-run.rawOutput += "npm ERR! code ENOENT\n";   // also stored
-
-// Emit to frontend
-io.emit('shell_run_output', {
-  providerId: 'my-provider',
-  sessionId: 'abc-123',
-  runId: 'shell-run-xyz',
-  chunk: "npm ERR! code ENOENT\n",
-  maxLines: 1000
-});
+```text
+MCP CallTool request
+  -> stdio-proxy CallToolRequestSchema
+  -> POST /api/mcp/tool-call
+  -> createToolHandlers wrapper
+  -> mcpExecutionRegistry.begin
+  -> runShellInvocation
+  -> ShellRunManager.startPreparedRun
+  -> node-pty spawn
+  -> shell_run_output chunks
+  -> shell_run_exit
+  -> MCP result content
 ```
 
-### 3. Frontend Receives & Buffers
-```typescript
-// useChatManager socket listener
-socket.on('shell_run_output', (event) => {
-  useShellRunStore.getState().appendOutput(event);
-});
+### ACP update and timeline event
 
-// useShellRunStore.appendOutput()
-const existing = state.runs['shell-run-xyz'];
-const nextRuns = {
-  ...state.runs,
-  ['shell-run-xyz']: {
-    ...existing,
-    status: 'running',
-    transcript: trimShellTranscript(
-      existing.transcript + "npm ERR! code ENOENT\n",
-      1000
-    ),
-    updatedAt: Date.now()
-  }
-};
+```text
+ACP session/update tool_call
+  -> providerModule.normalizeUpdate
+  -> providerModule.normalizeTool
+  -> providerModule.extractToolInvocation
+  -> resolveToolInvocation
+  -> applyInvocationToEvent
+  -> toolRegistry.dispatch('start')
+  -> shellToolHandler.onStart
+  -> system_event tool_start with shellRunId
 ```
 
-### 4. Component Reads Store & Renders
-```typescript
-// ShellToolTerminal component
-const run = useShellRunStore(state => state.runs['shell-run-xyz']);
+### Frontend rendering
 
-// Computes a transcript delta and queues it for callback-paced xterm writes.
-const plan = getTranscriptWritePlan(writtenRef.current, run?.transcript || '');
-if (plan.reset) {
-  resetQueuedWrites();
-  term.reset();
+```text
+system_event / shell_run_* socket events
+  -> useChatManager shell listeners
+  -> useShellRunStore.runs[runId]
+  -> timeline step patched by shellRunId
+  -> ToolStep sees shellRunId
+  -> ShellToolTerminal live xterm or read-only transcript
+```
+
+### Key payload shapes
+
+Tool start event sent to the frontend:
+
+```json
+{
+  "providerId": "provider-a",
+  "sessionId": "acp-session-id",
+  "type": "tool_start",
+  "id": "tool-call-id",
+  "toolName": "ux_invoke_shell",
+  "canonicalName": "ux_invoke_shell",
+  "mcpServer": "AcpUI",
+  "mcpToolName": "ux_invoke_shell",
+  "isAcpUxTool": true,
+  "shellRunId": "shell-run-uuid",
+  "shellInteractive": true,
+  "shellState": "pending",
+  "title": "Invoke Shell: Run tests",
+  "command": "npm test",
+  "cwd": "D:/repo"
 }
-enqueueTerminalWrite(plan.data);
-
-// xterm renders live as user types
 ```
 
-### 5. User Sees Live Output
-Terminal shows:
+Shell snapshot stored in `useShellRunStore`:
+
+```json
+{
+  "providerId": "provider-a",
+  "sessionId": "acp-session-id",
+  "runId": "shell-run-uuid",
+  "toolCallId": "tool-call-id",
+  "mcpRequestId": "mcp-request-id",
+  "status": "running",
+  "description": "Run tests",
+  "command": "npm test",
+  "cwd": "D:/repo",
+  "transcript": "$ npm test\nPASS\n",
+  "exitCode": null,
+  "reason": null,
+  "maxLines": 1000
+}
 ```
-$ npm test
-npm ERR! code ENOENT
+
+Shell output chunk:
+
+```json
+{
+  "providerId": "provider-a",
+  "sessionId": "acp-session-id",
+  "runId": "shell-run-uuid",
+  "chunk": "PASS\n",
+  "maxLines": 1000
+}
 ```
 
 ---
 
 ## Component Reference
 
-### Backend Services
+### Backend
 
-| File | Function/Class | Lines | Purpose |
-|------|---|---|---|
-| `backend/services/shellRunManager.js` | `ShellRunManager` (class) | 113-141 | Owns PTY lifecycle, manages concurrent runs |
-| | `prepareRun()` | 147-181 | Create pending run before MCP execution |
-| | `startPreparedRun()` | 183-208 | Find prepared run or create new, merge MCP description, then start |
-| | `findPreparedRun()` | 210-232 | Locate run by toolCallId or command+cwd |
-| | `startRun()` | 234-277 | Spawn PTY, setup listeners, return promise |
-| | `appendOutput()` | 279-300 | Sanitize startup control noise, buffer chunk, emit shell_run_output |
-| | `writeInput()` | 302-310 | Write data to pty.stdin, detect Ctrl+C |
-| | `resizeRun()` | 312-324 | Resize PTY to cols/rows (returns false on Windows deferred-resize race) |
-| | `killRun()` | 326-337 | Kill PTY, mark as exiting |
-| | `resetInactivityTimer()` | 339-346 | Set 30-min inactivity timeout |
-| | `finalizeRun()` | 348-386 | Mark exited, format result, resolve promise |
-| | `formatFinalText()` | 399-413 | Generate final text based on reason |
-| | `snapshot()` | 415-433 | Return immutable snapshot of run, including description |
-| | `getSnapshotsForSession()` | 435-439 | Get all snapshots for a session |
-| | `emit()` | 441-450 | Emit socket event to session room |
-| `backend/services/acpUpdateHandler.js` | `isUxInvokeShellToolName()` | 75-81 | Check if string matches ux_invoke_shell patterns |
-| | `isUxShellToolEvent()` | 93-102 | Check if tool_call is ux_invoke_shell |
-| | `prepareShellRunForToolStart()` | 104-142 | Prepare run on tool_call, extract cmd/cwd/description |
-| | (handleUpdate) | 300-302 | Call prepareShellRunForToolStart before emit |
-| `backend/sockets/shellRunHandlers.js` | `registerShellRunHandlers()` | 36-84 | Register socket event handlers |
-| | `emitShellRunSnapshotsForSession()` | 26-33 | Emit snapshots to client on reconnect |
-| | `socket.on('shell_run_input')` | 38-52 | Route user input to writeInput() |
-| | `socket.on('shell_run_resize')` | 54-68 | Route resize to resizeRun() |
-| | `socket.on('shell_run_kill')` | 70-82 | Route kill to killRun() |
-| `backend/mcp/mcpServer.js` | `tools.ux_invoke_shell` | 143-175 | MCP tool handler, delegate to ShellRunManager |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| MCP definition | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `_meta.acpui/concurrentInvocationsSupported` | Defines tool schema, annotations, required input, and concurrency metadata. |
+| MCP config | `backend/services/mcpConfig.js` | `getMcpConfig`, `isInvokeShellMcpEnabled`, config key `tools.invokeShell` | Controls whether the shell tool is advertised and registered. |
+| MCP server config | `backend/mcp/mcpServer.js` | `getMcpServers`, provider config key `mcpName`, provider hook `getMcpServerMeta` | Injects the stdio proxy into ACP session configuration. |
+| MCP handler | `backend/mcp/mcpServer.js` | `createToolHandlers`, `wrapToolHandlers`, `runShellInvocation`, `getMaxShellResultLines` | Registers the shell handler, records execution metadata, and delegates to `ShellRunManager`. |
+| MCP proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `ListToolsRequestSchema`, `CallToolRequestSchema`, `backendFetch` | Bridges MCP stdio calls to backend HTTPS routes. |
+| MCP proxy binding | `backend/mcp/mcpProxyRegistry.js` | `createMcpProxyBinding`, `resolveMcpProxy`, `bindMcpProxy`, `getMcpProxyIdFromServers` | Preserves provider/session context for proxy-originated tool calls. |
+| MCP API | `backend/routes/mcpApi.js` | `GET /api/mcp/tools`, `POST /api/mcp/tool-call`, `resolveToolContext`, `createToolCallAbortSignal`, `canWriteResponse` | Serves schemas, executes tool calls, forwards context, and suppresses writes after disconnects. |
+| ACP routing | `backend/services/acpUpdateHandler.js` | `handleUpdate`, branches `tool_call` and `tool_call_update` | Converts provider updates into timeline events and dispatches Tool System V2. |
+| Tool registration | `backend/services/tools/index.js` | `toolRegistry.register(ACP_UX_TOOL_NAMES.invokeShell, shellToolHandler)` | Registers shell-specific lifecycle handling. |
+| Tool resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider extraction, cached state, and MCP execution details. |
+| Tool state | `backend/services/tools/toolCallState.js` | `ToolCallState`, `upsert`, `shouldUseTitle`, `clearSession` | Stores sticky identity, input, title, file path, and shell-specific metadata. |
+| MCP execution state | `backend/services/tools/mcpExecutionRegistry.js` | `mcpExecutionRegistry.begin`, `complete`, `fail`, `invocationFromMcpExecution`, `toolCallIdFromMcpContext` | Records authoritative MCP handler input and titles. |
+| Shell tool handler | `backend/services/tools/handlers/shellToolHandler.js` | `shellToolHandler.onStart`, `onUpdate`, `onEnd`, `shellTitle` | Prepares shell runs and enriches timeline events with shell metadata. |
+| Shell manager | `backend/services/shellRunManager.js` | `ShellRunManager`, `prepareRun`, `startPreparedRun`, `findPreparedRun`, `startRun`, `appendOutput`, `writeInput`, `resizeRun`, `killRun`, `finalizeRun`, `snapshot`, `getSnapshotsForSession` | Owns PTY lifecycle, output streaming, transcripts, termination, and snapshots. |
+| Shell utilities | `backend/services/shellRunManager.js` | `detectPwsh`, `getMaxShellResultLines`, `isShellV2Enabled`, `trimShellOutputLines`, `sanitizeShellOutputChunk` | Handles shell selection, config helpers, output trimming, and startup-noise cleanup. |
+| Socket controls | `backend/sockets/shellRunHandlers.js` | `registerShellRunHandlers`, `emitShellRunSnapshotsForSession`, `validateRunAccess`, events `shell_run_input`, `shell_run_resize`, `shell_run_kill` | Routes user controls to the PTY and replays active snapshots on session watch. |
 
-### Frontend Stores
+### Frontend
 
-| File | Store Hook | State Fields | Key Methods | Lines |
-|------|---|---|---|---|
-| `frontend/src/store/useShellRunStore.ts` | `useShellRunStore()` | `runs: Record<runId, ShellRunSnapshot>` | `upsertSnapshot()`, `markStarted()`, `appendOutput()`, `markExited()`, `reset()` | 55-127 |
-
-### Frontend Components & Hooks
-
-| File | Export | Purpose | Key Lines |
-|------|---|---|---|
-| `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal` | Interactive xterm or read-only transcript | 143-379 |
-| | | Mounts xterm on pending/running | 245-316 |
-| | | Queues xterm writes with callback pacing | 190-210 |
-| | | Computes transcript deltas and trim overlap | 68-82, 325-338 |
-| | | Switches to read-only on exited | 369-374 |
-| `frontend/src/hooks/useChatManager.ts` | `useChatManager()` (implied) | Socket listeners for shell events | (implied) |
-
-### Utility Functions
-
-| File | Function | Purpose | Lines |
-|------|---|---|---|
-| `backend/services/shellRunManager.js` | `detectPwsh()` | Sync check for PowerShell 7+ (pwsh) availability; spawnSync('pwsh', ['--version']) | 28-44 |
-| | `getMaxShellResultLines()` | Read MAX_SHELL_RESULT_LINES env var | 46-49 |
-| | `trimShellOutputLines()` | Keep only last N lines of output | 55-64 |
-| | `sanitizeShellOutputChunk()` | Remove PowerShell startup terminal noise before streaming | 66-80 |
-| | `buildShellInvocation()` | Platform-specific shell command; takes usePwsh param to select pwsh.exe vs powershell.exe | 90-103 |
-| | `normalizeCwd()` | Resolve working directory | 105-107 |
-| `frontend/src/store/useShellRunStore.ts` | `trimShellTranscript()` | Keep only last N lines of transcript | 30-43 |
-| | `pruneShellRuns()` | Keep at most 50 runs, prioritize active | 45-55 |
-| `frontend/src/components/ShellToolTerminal.tsx` | `stripAnsi()` | Remove ANSI escape codes | 18-24 |
-| | `stripTerminalNoise()` | Remove select escape sequences for rendering | 26-32 |
-| | `getSuffixPrefixOverlap()` | Find trim overlap between previous and next transcript | 45-66 |
-| | `getTranscriptWritePlan()` | Decide append-vs-reset and return only data to queue | 68-82 |
-| | `transcriptHasCommandOutput()` | Check if transcript has output beyond command line | 84-92 |
-| | `appendExitSummary()` | Add termination message to transcript | 94-106 |
-| | `trimStartupBlankRows()` | Collapse blank rows left by stripped screen controls | 108-114 |
-| | `getReadOnlyTerminalHtml()` | Convert transcript to HTML with colors | 116-127 |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `patchShellRunToolStep`, `shellRunSnapshotPatch`, listeners `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit` | Stores shell snapshots and patches timeline events by `shellRunId`. |
+| Shell store | `frontend/src/store/useShellRunStore.ts` | `useShellRunStore`, `ShellRunSnapshot`, `trimShellTranscript`, `pruneShellRuns`, actions `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited` | Holds frontend run state keyed by `runId`. |
+| Tool renderer | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `ShellToolTerminal` | Uses shell terminal rendering for tool events with `shellRunId`. |
+| Terminal renderer | `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal`, `getTranscriptWritePlan`, `getSuffixPrefixOverlap`, `getReadOnlyTerminalHtml`, `emitResize`, `stopRun` | Renders xterm.js for active runs and ANSI HTML for exited runs. |
+| Types | `frontend/src/types.ts` | `SystemEvent`, `StreamEventData`, fields `shellRunId`, `shellInteractive`, `shellState`, `canonicalName`, `isAcpUxTool` | Defines the frontend event shape used by the shell timeline. |
+| Styling | `frontend/src/components/ChatMessage.css` | `.shell-tool-terminal`, `.shell-tool-terminal-toolbar`, `.shell-tool-terminal-surface`, `.shell-tool-terminal-readonly`, `.shell-tool-terminal-stop` | Styles the embedded terminal and read-only transcript. |
 
 ---
 
-## Gotchas & Important Notes
+## Gotchas
 
-### 1. Tool Preparation Happens in acpUpdateHandler, Not MCP Handler
-**What breaks:** Shell run never starts; MCP handler calls `startPreparedRun()` but no prepared run exists.
+### 1. Tool identity is structured
 
-**Why:** The acpUpdateHandler processes `tool_call` updates from the ACP daemon **before** the MCP proxy has a chance to forward the actual tool call. `prepareShellRunForToolStart()` must run early to create the pending run.
+Shell detection depends on `resolveToolInvocation` seeing `canonicalName: 'ux_invoke_shell'` from provider extraction, cached state, or MCP execution records. Filename text, titles, and raw output are not enough to trigger `shellToolHandler`.
 
-**How to avoid:** Ensure acpUpdateHandler calls `prepareShellRunForToolStart()` **before** emitting `system_event`. The MCP handler will later find the prepared run by `toolCallId`.
+### 2. `toolCallId` is the primary correlation key
 
----
+`findPreparedRun` can match by command and cwd, but identical commands in the same session can collide. Providers and MCP metadata should preserve `toolCallId` whenever available.
 
-### 2. findPreparedRun Fallback Matching Is Fragile
-**What breaks:** Two identical commands (`npm test`) in same session match the wrong run.
+### 3. MCP execution can emit a title update before the full shell event
 
-**Why:** If `toolCallId` is absent, matching falls back to command + cwd. If both commands are identical, the first pending run will match both calls, causing the second call to wait for the first to exit.
+`mcpExecutionRegistry.begin` projects `Invoke Shell: <description>` into `toolCallState` and can emit a `tool_update`. The terminal becomes available when the `tool_start` event receives `shellRunId` from `shellToolHandler.onStart` or when a prepared run is created by `startPreparedRun`.
 
-**How to avoid:** Always pass `toolCallId` (from `update.toolCallId`) to both `prepareRun()` and `startPreparedRun()`. This disambiguates runs even if they have identical commands.
+### 4. The route abort signal does not stop the PTY
 
----
+`routes/mcpApi.js` passes `abortSignal` into tool handlers, but `runShellInvocation` does not consume it. User-facing stop behavior is implemented through `shell_run_kill` and Ctrl+C through `shell_run_input`.
 
-### 3. Shell Description Can Arrive at Two Different Times
-**What breaks:** The tool header stays as `Invoke Shell` even though the MCP call included a description.
+### 5. Socket controls require room membership
 
-**Why:** Some ACP providers include tool arguments in the initial `tool_call` update, while others only expose the final arguments when the MCP proxy forwards the actual tool call. `prepareShellRunForToolStart()` should use the early description when available, and `startPreparedRun()` must merge the MCP handler's `description` into the existing run snapshot.
+`validateRunAccess` checks the socket's `session:<sessionId>` room before writing input, resizing, or killing. A client must be watching the session to control its shell run.
 
-**How to avoid:** Keep `description` in the MCP schema, pass it through `mcpServer.js`, store it on `ShellRunManager` runs, and let `useChatManager` patch matching `shellRunId` tool steps from shell snapshots.
+### 6. Transcript trimming affects final results
 
----
+`appendOutput` trims `transcript` and `rawOutput` to `maxLines`. Long commands can stream more output than the retained final MCP result. Increase `MAX_SHELL_RESULT_LINES` before starting the backend when long retained results matter.
 
-### 4. Transcript Trimming Is One-Way
-**What breaks:** User sees command output, but final MCP result is truncated.
+### 7. Windows startup controls are removed in the backend and read-only renderer
 
-**Why:** `transcript` is trimmed to `maxLines` on every append, keeping only the tail. If a command runs 100K lines and `maxLines=1000`, the frontend sees all 100K but only stores the last 1000. When `finalizeRun()` formats `rawOutput` (which is also trimmed), the result is limited.
+`sanitizeShellOutputChunk` strips startup screen controls before chunks enter `rawOutput`, `transcript`, or `shell_run_output`. `ShellToolTerminal` also cleans already-buffered terminal noise for read-only rendering.
 
-**How to avoid:** For long-running commands, increase `MAX_SHELL_RESULT_LINES` env var before startup. The value is immutable per run once set.
+### 8. xterm writes must be callback-paced
 
----
+`ShellToolTerminal` uses `term.write(data, callback)` with a queue and 64 KiB chunks. Direct unpaced writes can overflow xterm's parser buffer during heavy output.
 
-### 5. User Termination Window is 1.5 Seconds
-**What breaks:** User presses Ctrl+C but the shell exits naturally before the 1.5s grace window; final text shows `completed` instead of `user_terminated`.
+### 9. Exited snapshots are not replayed on watch
 
-**Why:** `finalizeRun()` marks `user_terminated` if Ctrl+C was sent **and** the shell exited within 1.5s. If the shell ignores Ctrl+C and exits 2+ seconds later, the grace window has expired and the exit reason is determined by exit code.
+`emitShellRunSnapshotsForSession` filters out `status: 'exited'`. Reconnect replay is for active runs; completed runs render through persisted timeline output and frontend store state when present.
 
-**How to avoid:** If detecting user intent is critical, check if `interruptRequestedAt` is set (in snapshot) rather than relying on the final `reason` alone.
+### 10. Stop and Ctrl+C finalize differently
 
----
-
-### 6. Ctrl+C Input Must Be '\x03' (Not '\n')
-**What breaks:** Sending Ctrl+C via `shell_run_input` with value `'C'` or `'^C'` doesn't interrupt the shell.
-
-**Why:** Ctrl+C is a control character (ASCII 3, hex 0x03), not a text character. Sending `'C'` writes the letter C to stdin, which some commands may interpret as a command but is not a terminal signal.
-
-**How to avoid:** Frontend `ShellToolTerminal` emits `'\x03'` when user presses Ctrl+C in xterm. For raw input, send the literal byte 0x03.
-
----
-
-### 7. Inactivity Timeout Resets on Every Output Chunk
-**What breaks:** Long-running command that outputs a tiny bit every 30+ minutes hangs forever.
-
-**Why:** `resetInactivityTimer()` is called on every `pty.onData()`. If a command outputs a single byte every 29 minutes, the timer never expires.
-
-**How to avoid:** This is by design — inactivity means "no output for 30 minutes", not "running for 30 minutes". A command that steadily outputs is not idle.
-
----
-
-### 8. Prepared Runs Expire After 5 Minutes
-**What breaks:** acpUpdateHandler prepares a run, but MCP handler takes >5 minutes to call `startPreparedRun()`, and the run is cleaned up.
-
-**Why:** `scheduleCompletedCleanup()` schedules removal of exited runs after 5 minutes (DEFAULT_COMPLETED_RETENTION_MS). This doesn't apply to pending runs in the current implementation, but prepared runs that never start may be orphaned.
-
-**How to avoid:** Ensure MCP context is set up promptly after tool_call event. In normal operation, the time between acpUpdateHandler tool_call and MCP handler invocation is <100ms.
-
----
-
-### 9. Socket Room Validation in shellRunHandlers
-**What breaks:** User in different session tries to control another session's shell run; socket sends `shell_run_input` but is rejected.
-
-**Why:** `validateRunAccess()` checks `isWatchingSession(socket, snapshot.sessionId)`. If the socket is not in the `session:<sessionId>` room, the request is rejected.
-
-**How to avoid:** This is a security feature. Ensure the socket joins the session room before attempting shell controls. The frontend handles this automatically via `watch_session` on the main session.
-
----
-
-### 10. xterm.js Writes Must Be Callback-Paced
-**What breaks:** During fast command output, the browser can throw `write data discarded, use flow control to avoid losing data` and crash the UI.
-
-**Why:** xterm.js `Terminal.write()` is buffered and asynchronous. If the frontend calls `write()` repeatedly before xterm has parsed prior data, xterm's internal write buffer can exceed its discard watermark. Rolling transcript trimming also used to force reset + full replay, multiplying the write volume during heavy output.
-
-**How to avoid:** All live shell output must go through `ShellToolTerminal`'s write queue. The queue splits large data into 64 KiB chunks and starts the next `term.write(data, callback)` only after the previous callback fires. Transcript trimming must use `getTranscriptWritePlan()` overlap detection so normal rolling output writes only the new delta, not a full replay.
-
----
-
-### 11. Read-Only Transcript Uses ANSI Converter, Not xterm.js
-**What breaks:** Exited run shows garbled colors or missing output in read-only mode.
-
-**Why:** Read-only rendering uses `ansi-to-html` (library) to convert ANSI codes to HTML. This is a different renderer than xterm.js, so colors may not match exactly.
-
-**How to avoid:** The difference is minimal (same color palette). If output is missing, check that the transcript was populated during streaming (shell_run_output events) before exit and that the final render correctly applied color codes.
-
----
-
-### 12. Windows PTY Resize Race Condition
-**What breaks:** `resizeRun()` throws "Cannot resize a pty that has already exited" on Windows, even though the status check just passed.
-
-**Why:** On Windows, node-pty's `WindowsPtyAgent.resize()` is deferred internally. The PTY may exit between the status check and the deferred resize call, causing the error. The `resizeRun()` function at lines 312-324 wraps the resize call in a try/catch (lines 315-322) to handle this race condition.
-
-**Code** (Lines 312-324):
-```javascript
-resizeRun(runId, cols, rows) {
-  const run = this.runs.get(runId);
-  if (!run || run.status !== 'running' || !run.pty || cols <= 0 || rows <= 0) return false;
-  try {
-    run.pty.resize(cols, rows);
-  } catch {
-    // node-pty on Windows defers the resize internally; the PTY may exit between
-    // the status check above and the deferred WindowsPtyAgent.resize() call,
-    // causing it to throw "Cannot resize a pty that has already exited".
-    return false;
-  }
-  return true;
-}
-```
-
-**How to avoid:** This is already handled in the implementation. Callers should check the return value: `false` means the resize was attempted but failed (likely due to PTY exit), which is safe to ignore.
-
----
-
-### 13. Windows PowerShell Startup Controls Must Not Reach the Transcript
-**What breaks:** A simple command can display `$ command`, then many blank rows, then the actual output.
-
-**Why:** Windows PowerShell under ConPTY emits startup terminal controls such as private mode toggles, cursor hide/show, full-screen clear, cursor-home, and title OSC sequences. Those bytes are correct for a fresh PTY viewport, but AcpUI has already injected its own `$ command` prompt into the transcript. If the startup prologue is stored or replayed as normal output, xterm/read-only rendering can separate the prompt from the output or erase/reposition around it.
-
-**How to avoid:** Keep `sanitizeShellOutputChunk()` in the backend `appendOutput()` path for raw PTY chunks. It removes the initial Windows startup screen controls before the chunk is appended to `rawOutput`, persisted in `transcript`, or emitted as `shell_run_output`. The frontend read-only renderer also collapses blank rows left by already-buffered screen-control noise.
+`shell_run_kill` sets `terminationReason: 'user_terminated'`. Ctrl+C records `interruptRequestedAt`; `finalizeRun` treats it as user termination only when the PTY exits inside the interrupt grace window.
 
 ---
 
 ## Unit Tests
 
-### Backend Tests
+### Backend tests
 
-Located in `backend/test/`:
+| File | Verified anchors and important tests |
+|---|---|
+| `backend/test/shellRunManager.test.js` | `reads max line config`; `prepares a run and emits a session-scoped prepared event`; `starts a prepared run and resolves normal command output on exit`; `streams sanitized PowerShell startup output after the injected prompt`; `formats non-zero exits with exit code`; `writes input and resizes only while running`; `returns false and does not throw if pty throws during deferred resize (race condition)`; `returns rendered transcript plus user termination message on hard kill`; `classifies Ctrl+C followed by exit as user termination`; `kills inactive runs on timeout and returns timeout text`; `returns snapshots for reattach`; `spawns pwsh.exe instead of powershell.exe when pwsh is available` |
+| `backend/test/shellRunHandlers.test.js` | `registers io on the shell run manager`; `accepts input for a watched matching shell run`; `rejects input when the socket is not watching the run session`; `rejects input for provider or session mismatches`; `resizes valid dimensions and rejects invalid dimensions`; `kills a watched matching shell run`; `emits active snapshots for a watched session` |
+| `backend/test/acpUpdateHandler.test.js` | `prepares shell run metadata for ux_invoke_shell tool starts`; `preserves a shell description title after provider normalization on updates`; `updates shell title when provider exposes description after tool start`; `does not prepare shell metadata for non-shell tools that mention ux_invoke_shell`; `restores tool title from cache if missing in update` |
+| `backend/test/mcpServer.test.js` | `registers core handlers when MCP config enables them`; `omits invoke shell handler when MCP config disables it`; `defaults MAX_SHELL_RESULT_LINES to 1000 when env is not a positive integer`; `delegates to shellRunManager with session context`; `keeps the MCP tool call pending until shell completion`; `aborts when lacking session context`; `falls back to default MCP server name when provider lookup fails while caching metadata` |
+| `backend/test/mcpApi.test.js` | `GET /tools returns tool list with JSON Schema`; `GET /tools includes default-on core tools when flags are blank`; `GET /tools hides disabled core tools`; `GET /tools describes ux_invoke_shell as an interactive terminal-backed shell replacement`; `POST /tool-call passes resolved proxy context to handlers`; `POST /tool-call aborts the handler signal when the request fires the "aborted" event`; `POST /tool-call aborts the handler signal when the response closes before completion` |
+| `backend/test/toolInvocationResolver.test.js` | `uses provider extraction as canonical tool identity`; `reuses cached identity and title for incomplete updates`; `marks registered AcpUI UX tool names without relying on a ux prefix`; `prefers centrally recorded MCP execution details over provider generic titles`; `can claim a recent MCP execution when the provider tool id arrives later` |
+| `backend/test/toolCallState.test.js` | `merges identity, input, file path, and tool-specific metadata by tool call id`; `preserves authoritative titles over later provider titles` |
+| `backend/test/toolRegistry.test.js` | `dispatches lifecycle events by canonical tool name`; `passes unknown tools through unchanged` |
 
-| File | Key Tests | Coverage |
-|------|-----------|----------|
-| `shellRunManager.test.js` | Prepare, start, append, resize, kill, finalize, trimming, reason detection | 95%+ |
-| `acpUpdateHandler.test.js` | isUxShellToolEvent, prepareShellRunForToolStart, extraction, normalization | 90%+ |
-| `shellRunHandlers.test.js` | socket handlers, validation, input/resize/kill routing | 92%+ |
-| `mcpServer.test.js` | ux_invoke_shell handler, delegation to manager, context | 88%+ |
+### Frontend tests
 
-### Frontend Tests
+| File | Verified anchors and important tests |
+|---|---|
+| `frontend/src/test/useShellRunStore.test.ts` | `upserts snapshots by run id`; `appends output and applies max line trimming`; `hydrates active state from snapshots for reattach`; `marks exits as read-only terminal state`; `prunes old exited runs while retaining active runs`; `keeps the last N lines while preserving trailing newline` |
+| `frontend/src/test/ShellToolTerminal.test.tsx` | `replays transcript into xterm without spawning a terminal`; `paces xterm writes until the previous write callback completes`; `writes only the overlapping delta when transcript trimming drops old lines`; `splits large transcript writes into bounded xterm chunks`; `renders completed runs as read-only text without creating xterm`; `prefers colored stored transcript over plain final output after exit`; `collapses PowerShell startup blank rows in read-only output`; `prefers final output over prompt-only stored transcript after exit`; `sends input only while running`; `sends clipboard paste through shell_run_input`; `emits resize from fitted xterm dimensions`; `sends stop command and disables stop after exit`; `focuses xterm when terminal is running and session is active`; `does not focus xterm when session is not active` |
+| `frontend/src/test/useChatManager.test.ts` | `handles Shell V2 socket events by explicit shellRunId`; parallel shell output routing by explicit `shellRunId` |
+| `frontend/src/test/ToolStep.test.tsx` | `renders ShellToolTerminal for Shell V2 tool steps`; `uses the AcpUI UX icon for ux tools`; `returns undefined for non-file AcpUI UX tools even when a file path is present`; `returns undefined for shell commands` |
 
-Located in `frontend/src/test/`:
+Recommended targeted verification commands:
 
-| File | Key Tests | Coverage |
-|------|-----------|----------|
-| `useShellRunStore.test.ts` | upsert, append, mark exited, trim, prune | 93%+ |
-| `ShellToolTerminal.test.tsx` | xterm mount, callback-paced writes, trim overlap, read-only render, user input, resize, kill | 89%+ |
-| `useChatManager.test.ts` | socket listener setup, event routing to store | 85%+ |
+```powershell
+cd backend; npx vitest run test/shellRunManager.test.js test/shellRunHandlers.test.js test/acpUpdateHandler.test.js test/mcpServer.test.js test/mcpApi.test.js test/toolInvocationResolver.test.js test/toolCallState.test.js test/toolRegistry.test.js
+cd frontend; npx vitest run src/test/useShellRunStore.test.ts src/test/ShellToolTerminal.test.tsx src/test/useChatManager.test.ts src/test/ToolStep.test.tsx
+```
 
 ---
 
 ## How to Use This Guide
 
-### For Implementing Shell Features
+### For implementing/extending this feature
 
-1. **Understand the lifecycle** — Read Section "How It Works — End-to-End Flow" (Steps 1-12, which includes all major phases)
-2. **Check the contract** — Read "The Critical Contract" section to understand run states and concurrency
-3. **Identify the layer** — Is your feature:
-   - **Backend PTY management?** → `ShellRunManager` (Lines 113-460 in shellRunManager.js)
-   - **Tool preparation?** → `acpUpdateHandler.prepareShellRunForToolStart()` (Lines 104-142)
-   - **Socket routing?** → `shellRunHandlers.js` (Lines 26-84)
-   - **Frontend rendering?** → `ShellToolTerminal.tsx` (Lines 18-359)
-4. **Find exact code** — Use Component Reference table for file paths and line numbers
-5. **Write tests** — Use existing test files as templates; target 90%+ coverage
-6. **Test concurrency** — Ensure multiple runs don't interfere; use the concurrent execution example as a guide
+1. Start at `backend/mcp/coreMcpToolDefinitions.js` and `backend/services/mcpConfig.js` when changing tool advertisement or input schema.
+2. Use `backend/mcp/mcpServer.js` and `backend/routes/mcpApi.js` when changing execution context, MCP request metadata, or handler arguments.
+3. Use `backend/services/tools/toolInvocationResolver.js`, `toolCallState.js`, and `mcpExecutionRegistry.js` when changing identity, title, or sticky metadata behavior.
+4. Use `backend/services/tools/handlers/shellToolHandler.js` and `backend/services/shellRunManager.js` when changing shell lifecycle, state transitions, output handling, timeouts, or final result text.
+5. Use `backend/sockets/shellRunHandlers.js` and `frontend/src/components/ShellToolTerminal.tsx` when changing stdin, resize, paste, focus, or stop controls.
+6. Update backend and frontend tests from the Unit Tests section when changing contracts or rendering behavior.
 
-### For Debugging Shell Issues
+### For debugging issues with this feature
 
-1. **Check the logs** — Enable `LOG_FILE_PATH` in `.env`; search for `[SHELL RUN]` entries
-2. **Identify the phase** — Is the issue:
-   - **No terminal appears?** → Check acpUpdateHandler detects tool correctly (Step 2-3)
-   - **Output not streaming?** → Check shell_run_output socket events (Step 6)
-   - **Input not working?** → Check shell_run_input handler validation (Step 9)
-   - **Process won't exit?** → Check inactivity timer (Step 10, Gotcha 7)
-3. **Trace data** — Follow the flow in reverse from the symptom
-4. **Check contract** — Verify run states match expected machine (pending → starting → running → exiting → exited)
-5. **Inspect snapshot** — Call `shellRunManager.snapshot(runId)` to see current state in backend logs
-6. **Verify transcript** — Check `run.transcript` in store to see accumulated output
-7. **Run tests** — `cd backend && npm test shellRunManager.test.js` to isolate issue
+1. Confirm the ACP update resolves to `canonicalName: 'ux_invoke_shell'` in `resolveToolInvocation`.
+2. Confirm `toolCallState` has the expected `input`, `display.title`, and `toolSpecific.shellRunId` for `providerId/sessionId/toolCallId`.
+3. Confirm `shellRunManager.snapshot(runId)` has the expected state, command, cwd, transcript, exit code, and reason.
+4. Confirm the frontend timeline tool step has `shellRunId` and that `useShellRunStore.runs[runId]` is receiving snapshots/output.
+5. Confirm the socket is watching `session:<sessionId>` before testing input, resize, or stop controls.
+6. Reproduce high-output issues with `ShellToolTerminal` tests that exercise callback-paced writes and transcript trimming overlap.
 
 ---
 
 ## Summary
 
-`ux_invoke_shell` is a sophisticated terminal execution system that:
-
-1. **Detects tool calls** via strict naming pattern matching in acpUpdateHandler
-2. **Prepares runs early** before MCP execution, associating them with tool_call events
-3. **Spawns isolated PTY instances** on Windows (PowerShell) and Unix (bash) with full environment support
-4. **Sanitizes Windows startup terminal controls** before transcript storage/streaming
-5. **Streams output in real-time** via Socket.IO, allowing live rendering in xterm.js
-6. **Accepts user interaction** — input, resize, kill — routed back through socket handlers to the PTY
-7. **Manages lifecycle** with strict state machine (pending → starting → running → exiting → exited)
-8. **Enforces resource limits** — max lines, inactivity timeout (30 min), user termination handling
-9. **Returns formatted results** to the MCP tool call, distinguishing between completed, failed, user_terminated, timeout, error
-10. **Supports concurrency** with independent run IDs and no cross-contamination
-11. **Integrates seamlessly** with the Unified Timeline (tool starts → output chunks → tool exit)
-
-**Critical contract:**
-- Runs are identified by `runId` and stored in `ShellRunManager.runs`
-- Prepared runs are matched by `toolCallId` (primary) or `command + cwd` (fallback)
-- Optional run descriptions are stored on snapshots and render tool headers as `Invoke Shell: <description>`
-- The MCP tool call **blocks** until the shell process exits
-- Frontend demultiplexes output by `runId` to prevent output mixing
-- Transcripts are trimmed to `maxLines` for memory efficiency
-- Final text is formatted based on termination reason (completed, failed, user_terminated, timeout, error)
-
-Agents reading this doc can:
-- ✅ Add new shell-related features (timeout config, output filtering, etc.)
-- ✅ Debug streaming or interaction issues
-- ✅ Understand concurrent execution model
-- ✅ Integrate new providers with shell support
-- ✅ Extend frontend rendering (themes, panels, etc.)
-## Tool System V2 Notes
-
-`ux_invoke_shell` is now handled through the canonical ACP tool system:
-
-- Providers identify shell calls through their own `extractToolInvocation()` implementation.
-- `acpUpdateHandler.js` no longer crawls provider raw input or title strings for shell-specific
-  matching.
-- `toolInvocationResolver` merges provider extraction with cached MCP handler metadata.
-- `shellToolHandler` prepares the shell run and owns the `Invoke Shell: <description>` title.
-- The MCP handler in `backend/mcp/mcpServer.js` upserts authoritative `{ description, command,
-  cwd }` metadata into `toolCallState` when provider/session/tool-call metadata is present.
-
-This means future title changes should happen in the shell tool handler or MCP handler
-metadata, not in generic ACP update routing.
+- `ux_invoke_shell` is a core AcpUI MCP tool gated by `configuration/mcp.json` key `tools.invokeShell`.
+- The stdio proxy advertises the tool and forwards calls to `POST /api/mcp/tool-call` with provider/session/proxy context.
+- `mcpExecutionRegistry`, `toolInvocationResolver`, and `toolCallState` keep structured identity, input, titles, and shell-specific metadata sticky across MCP and ACP update timing.
+- `shellToolHandler.onStart` prepares a run and attaches `shellRunId` to the timeline event.
+- `ShellRunManager` owns PTY spawn, output streaming, transcript trimming, stdin, resize, kill, timeout, final text, and cleanup.
+- `useChatManager` stores shell snapshots and patches timeline events by explicit `shellRunId`.
+- `ToolStep` renders `ShellToolTerminal` for shell runs; active runs use xterm.js and exited runs use ANSI-to-HTML read-only rendering.
+- The critical contract is structured tool identity plus `toolCallId` and `shellRunId` correlation across backend and frontend boundaries.

@@ -1,8 +1,8 @@
-# Feature Doc — Session Forking
+# Feature Doc - Session Forking
 
-**Session forking allows users to branch a conversation at any message boundary, creating a detached copy with full conversation history up to that point. Merging a fork back to its parent captures a summary of the fork's work and injects it into the parent chat.**
+Session forking branches a chat at a selected assistant message, creates a provider-backed ACP clone with sliced UI history, and keeps the fork nested under its parent in the sidebar. Merge-back summarizes fork work through the fork ACP session, deletes the fork record, and injects the summary into the parent chat.
 
-This feature enables parallel exploration of conversations — testing different approaches, rolling back to a point to try something new, or branching into specialized sub-tasks — while maintaining full traceability and the ability to consolidate work back to the original chat.
+This feature crosses frontend message actions, Zustand session state, Socket.IO session handlers, provider session file cloning, SQLite fork metadata, title generation, and recursive sidebar rendering.
 
 ---
 
@@ -10,345 +10,282 @@ This feature enables parallel exploration of conversations — testing different
 
 ### What It Does
 
-- **Fork Session:** Creates a new session that includes all messages up to a selected message boundary (the "fork point"). The new session is marked with `forkedFrom: {parentUiId}` and `forkPoint: {messageIndex}` in the database, and appears in the sidebar indented under its parent.
-- **Auto-Orient:** After forking, sends a system message to the forked session explaining it is now detached, to prevent the agent from confusing fork context with parent context.
-- **Auto-Title:** Asynchronously generates a descriptive fork title from the last 2 user/assistant message pairs before the fork point.
-- **Merge Fork:** Consolidates a fork back to its parent by: generating a detailed summary of the fork's work, deleting the fork session, injecting the summary into the parent chat as a user message, and sending the same summary as a prompt to the parent's ACP session.
-- **Cascade Delete:** When a parent session is deleted, all of its fork descendants (and their descendants, recursively) are cleaned up automatically, removing DB records, ACP session files, and attachments.
-- **Hierarchy Display:** The sidebar renders fork sessions indented under their parent with a fork arrow (↳) and GitFork icon for visual distinction.
+- Creates a fork from an assistant message action in `AssistantMessage` and resolves the selected message to a `messageIndex` in the active `ChatSession.messages` array.
+- Emits the `fork_session` Socket.IO event from `useChatStore.handleForkSession`, then inserts the returned fork session into `useSessionLifecycleStore` and selects it.
+- Clones provider-owned ACP session files through `providerModule.cloneSession(oldAcpId, newAcpId, pruneAtTurn)` and loads the cloned session with `session/load` while draining replayed output.
+- Persists fork metadata in SQLite through `sessions.forked_from` and `sessions.fork_point`, exposed to the frontend as `ChatSession.forkedFrom` and `ChatSession.forkPoint`.
+- Sends a detached-context orientation prompt to the fork after frontend selection and starts fork title generation with `generateForkTitle`.
+- Merges a fork through the `merge_fork` Socket.IO event by silently capturing a fork summary with `statsCaptures`, cleaning up the fork ACP session, deleting the fork DB record, and sending the summary to the parent ACP session.
+- Renders fork trees recursively under parent sessions in `Sidebar` and `FolderItem`; `SessionItem` displays the `fork-arrow` marker and `GitFork` icon.
+- Cascades session deletion by scanning all sessions for `forkedFrom` descendants and cleaning their ACP session files, attachment directories, and DB rows.
 
 ### Why This Matters
 
-- **Branching Conversations:** Users can explore alternatives without losing the original thread.
-- **Undo-Friendly:** Fork to a prior point, try a new direction, merge back if useful or discard if not.
-- **Non-Linear Workflows:** Enable specialized sub-tasks that can be summarized back into the main conversation.
-- **Data Integrity:** Fork metadata (`forkedFrom`, `forkPoint`) is strictly typed and enforced in DB, preventing orphaned sessions and ensuring consistent hierarchy.
-- **Provider Isolation:** Fork metadata is provider-agnostic; the backend handles all cloning and file management via provider modules.
+- Forks let users explore alternatives while preserving the original chat context.
+- Merge-back turns fork work into parent-session context through the same prompt path agents already understand.
+- The UI uses `ChatSession.id` for hierarchy and selection, while backend streaming and rooms use `ChatSession.acpSessionId`.
+- Provider cloning keeps fork behavior generic; provider modules own the file-format details.
+- Fork metadata is shared with sub-agent hierarchy, so `isSubAgent` checks are required wherever UI behavior differs.
+
+Architectural role: frontend message action + session store feature, backend Socket.IO session lifecycle, provider clone contract, SQLite persistence, and sidebar rendering.
 
 ---
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### Fork Creation Flow
+1. Assistant message action resolves the fork boundary
 
-**Step 1: Fork Button Click & Message Index Resolution**
-- **File:** `frontend/src/components/AssistantMessage.tsx` (Function: `handleFork`, Lines 83-93)
-- User clicks GitFork icon on an assistant message; the component finds that message's index in the session's message array via `findIndex(m => m.id === message.id)`.
-- If the index is found, `useChatStore.getState().handleForkSession()` is invoked with the session ID and message index.
+File: `frontend/src/components/AssistantMessage.tsx` (Component: `AssistantMessage`, Handler: `handleFork`)
 
-```javascript
-// FILE: frontend/src/components/AssistantMessage.tsx (Lines 83-93)
+The fork button is rendered for completed assistant messages when the active session is not a sub-agent. `handleFork` reads the active session from `useSessionLifecycleStore`, finds the clicked message by `message.id`, and passes the message array index to `useChatStore.handleForkSession`.
+
+```tsx
+// FILE: frontend/src/components/AssistantMessage.tsx (Component: AssistantMessage, Handler: handleFork)
 const handleFork = () => {
   if (!socket || !activeSessionId || forking) return;
-  // ... finds message index ...
+  const session = useSessionLifecycleStore.getState().sessions.find(s => s.id === activeSessionId);
   const msgIndex = session.messages.findIndex(m => m.id === message.id);
-  if (msgIndex === -1) return;
   setForking(true);
   useChatStore.getState().handleForkSession(socket, activeSessionId, msgIndex, () => setForking(false));
 };
 ```
 
-**Step 2: Socket Emit & Backend Reception**
-- **File:** `frontend/src/store/useChatStore.ts` (Function: `handleForkSession`, Lines 100-140)
-- `handleForkSession` emits a `fork_session` socket event with `{ uiId: sessionId, messageIndex }`.
+2. The chat store emits `fork_session`
 
-```typescript
-// FILE: frontend/src/store/useChatStore.ts (Lines 100-105)
-handleForkSession: (socket, sessionId, messageIndex, onComplete) => {
-  // ...
-  socket.emit('fork_session', { uiId: sessionId, messageIndex }, (res: ForkSessionResponse) => {
-    // ...
-```
+File: `frontend/src/store/useChatStore.ts` (Store action: `handleForkSession`, Socket event: `fork_session`)
 
-**Step 3: Backend Fork Session Handler — ACP Session Cloning**
-- **File:** `backend/sockets/sessionHandlers.js` (Function: `socket.on('fork_session')`, Lines 214-268)
-- Handler fetches the parent session from DB, resolves the provider ID, and generates new IDs.
-- The handler calls `providerModule.cloneSession()`, which delegates to the provider to perform provider-specific session file cloning.
+`handleForkSession` emits `{ uiId, messageIndex }`. The callback must include `success`, `newUiId`, and `newAcpId`; optional model and provider config fields refine the local fork session.
 
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 214-224)
-socket.on('fork_session', async ({ uiId, messageIndex }, callback) => {
-  try {
-    const session = await db.getSession(uiId);
-    // ... resolves provider and client ...
-    const newAcpId = crypto.randomUUID();
-    const newUiId = `fork-${Date.now()}`;
-    // ... calls cloneSession ...
-    providerModule.cloneSession(oldAcpId, newAcpId, Math.ceil((messageIndex + 1) / 2));
-```
-
-**Step 4: Copy Attachments**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 226-229)
-- Attachment files are copied from the parent's attachment directory to the fork's directory.
-
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 226-229)
-const oldAttach = path.join(getAttachmentsRoot(providerId), uiId);
-if (fs.existsSync(oldAttach)) {
-  fs.cpSync(oldAttach, path.join(getAttachmentsRoot(providerId), newUiId), { recursive: true });
-}
-```
-
-**Step 5: Database Save with Fork Metadata**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 231-238)
-- Messages are sliced to `messageIndex + 1`, and the new session is saved to the database with fork metadata:
-  - `forkedFrom: uiId` — parent session UI ID
-  - `forkPoint: messageIndex` — 0-based message index where fork occurred
-
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 231-238)
-const forkedMessages = (session.messages || []).slice(0, messageIndex + 1);  // LINE 219
-await db.saveSession({
-  id: newUiId, acpSessionId: newAcpId, name: `${session.name} (fork)`,
-  model: session.model, messages: forkedMessages, isPinned: false,
-  cwd: session.cwd, folderId: session.folderId, forkedFrom: uiId,  // LINE 223
-  forkPoint: messageIndex, currentModelId: session.currentModelId,  // LINE 224
-  modelOptions: session.modelOptions, provider: providerId,
+```ts
+// FILE: frontend/src/store/useChatStore.ts (Store action: handleForkSession)
+socket.emit('fork_session', { uiId: sessionId, messageIndex }, (res: ForkSessionResponse) => {
+  if (!res?.success || !res.newUiId || !res.newAcpId) return;
+  const original = lifecycle.sessions.find(s => s.id === sessionId);
+  const forkedMessages = original.messages.slice(0, messageIndex + 1).map(m => ({ ...m, isStreaming: false }));
 });
 ```
 
-**Step 6: ACP Session Load & Drain**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 240-245)
-- The backend drains any pending output from the cloned ACP session (to discard stale data), then loads the session via `session/load` to initialize it in the daemon.
+3. The backend clones the provider ACP session
 
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 240-245)
+File: `backend/sockets/sessionHandlers.js` (Socket event: `fork_session`)
+
+The handler fetches the parent UI session from SQLite, resolves the provider runtime and provider module, generates a timestamp-based UI ID plus UUID ACP ID, and delegates provider-owned file cloning to `cloneSession`.
+
+```js
+// FILE: backend/sockets/sessionHandlers.js (Socket event: fork_session)
+const session = await db.getSession(uiId);
+const providerId = session.provider || getProvider().id;
+const runtime = providerRuntimeManager.getRuntime(providerId);
+const providerModule = await getProviderModule(providerId);
+const newAcpId = crypto.randomUUID();
+const newUiId = `fork-${Date.now()}`;
+
+providerModule.cloneSession(session.acpSessionId, newAcpId, Math.ceil((messageIndex + 1) / 2));
+```
+
+4. Attachments and fork metadata are saved
+
+File: `backend/sockets/sessionHandlers.js` (Socket event: `fork_session`, Helpers: `getAttachmentsRoot`, `db.saveSession`)
+
+Attachments are copied from the parent UI session directory to the fork UI session directory when the parent attachment directory exists. The fork row is inserted with sliced messages and metadata that drives hierarchy, merge validation, and title generation.
+
+```js
+// FILE: backend/sockets/sessionHandlers.js (Socket event: fork_session)
+const forkedMessages = (session.messages || []).slice(0, messageIndex + 1);
+await db.saveSession({
+  id: newUiId,
+  acpSessionId: newAcpId,
+  name: `${session.name} (fork)`,
+  messages: forkedMessages,
+  cwd: session.cwd,
+  folderId: session.folderId,
+  forkedFrom: uiId,
+  forkPoint: messageIndex,
+  currentModelId: session.currentModelId,
+  modelOptions: session.modelOptions,
+  provider: providerId
+});
+```
+
+5. The cloned ACP session is loaded and drained
+
+File: `backend/sockets/sessionHandlers.js` (Socket event: `fork_session`)
+File: `backend/services/sessionManager.js` (Function: `getMcpServers`)
+
+The backend starts a drain for the new ACP session, builds MCP server config scoped to the new `acpSessionId`, sends `session/load`, and waits for replayed history to finish before initializing metadata.
+
+```js
+// FILE: backend/sockets/sessionHandlers.js (Socket event: fork_session)
 acpClient.stream.beginDraining(newAcpId);
+const forkMcpServers = getMcpServers(providerId, { acpSessionId: newAcpId });
 await acpClient.transport.sendRequest('session/load', {
-  sessionId: newAcpId, cwd: session.cwd || process.cwd(),
-  mcpServers: getMcpServers(providerId)
+  sessionId: newAcpId,
+  cwd: session.cwd || process.cwd(),
+  mcpServers: forkMcpServers
 });
 await acpClient.stream.waitForDrainToFinish(newAcpId, 3000);
 ```
 
-**Step 7: Session Metadata Initialization**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 247-256)
-- The backend resolves the fork's model state from the parent session's saved state and initializes session metadata.
+6. Session metadata inherits model, config, and stats state
 
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 247-256)
-const { models: forkModels } = getProvider(providerId).config;
+File: `backend/sockets/sessionHandlers.js` (Socket event: `fork_session`, Helpers: `getKnownModelOptions`, `resolveModelSelection`)
+
+The backend resolves the active model from the parent session and stores runtime metadata under the fork ACP ID. Token stats are copied from `session.stats` when present, and `configOptions` are carried into metadata and callback payload.
+
+```js
+// FILE: backend/sockets/sessionHandlers.js (Socket event: fork_session)
 const knownModelOptions = getKnownModelOptions(session, null, forkModels);
 const resolvedModel = resolveModelSelection(session.currentModelId || session.model, forkModels, knownModelOptions);
 
 acpClient.sessionMetadata.set(newAcpId, {
-  model: resolvedModel.modelId, currentModelId: resolvedModel.modelId,
-  modelOptions: knownModelOptions, toolCalls: 0, successTools: 0, startTime: Date.now(),
-  usedTokens: 0, totalTokens: 0, promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '',
-  agentName: null, spawnContext: null, provider: runtime.providerId, configOptions: session.configOptions
+  model: resolvedModel.modelId,
+  currentModelId: resolvedModel.modelId,
+  modelOptions: knownModelOptions,
+  usedTokens: Number(session.stats?.usedTokens || 0),
+  totalTokens: Number(session.stats?.totalTokens || 0),
+  provider: runtime.providerId,
+  configOptions: session.configOptions
 });
 ```
 
-**Step 8: Callback & Frontend Session Construction**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 258-261); `frontend/src/store/useChatStore.ts` (Lines 111-131)
-- The backend calls back with fork metadata. The frontend constructs a `ChatSession` object, setting `forkedFrom: sessionId` and `forkPoint: messageIndex`.
+7. The frontend registers, selects, watches, and orients the fork
 
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 258-261)
-callback?.({
-  success: true, providerId: runtime.providerId, newUiId, newAcpId,
-  currentModelId: resolvedModel.modelId, modelOptions: knownModelOptions, configOptions: session.configOptions
-});
-```
+File: `frontend/src/store/useChatStore.ts` (Store action: `handleForkSession`, Socket event: `watch_session`, Store action: `handleSubmit`)
 
-```typescript
-// FILE: frontend/src/store/useChatStore.ts (Lines 111-128)
+The callback constructs a `ChatSession`, appends it to `useSessionLifecycleStore.sessions`, sets it active, fetches stats by ACP ID, subscribes to backend room updates with `watch_session`, and schedules an orientation prompt through normal prompt submission.
+
+```ts
+// FILE: frontend/src/store/useChatStore.ts (Store action: handleForkSession)
 const newSession: ChatSession = {
   id: res.newUiId,
   acpSessionId: res.newAcpId,
   name: `${original.name} (fork)`,
   messages: forkedMessages,
-  isTyping: false,
-  isWarmingUp: false,
-  model: original.model,
-  currentModelId: res.currentModelId ?? original.currentModelId,
-  modelOptions: mergeModelOptions(original.modelOptions, res.modelOptions),
-  cwd: original.cwd,
-  folderId: original.folderId,
-  forkedFrom: sessionId,  // LINE 124
-  forkPoint: messageIndex,  // LINE 125
-  configOptions: mergeProviderConfigOptions(original.configOptions, res.configOptions),
+  forkedFrom: sessionId,
+  forkPoint: messageIndex,
   provider: original.provider
 };
-```
 
-**Step 9: Session Registration & Socket Watch**
-- **File:** `frontend/src/store/useChatStore.ts` (Lines 130-134)
-- The new session is added to the session list, set as active, and a `watch_session` event is emitted to subscribe to updates from the backend.
-
-```typescript
-// FILE: frontend/src/store/useChatStore.ts (Lines 130-134)
 lifecycle.setSessions([...lifecycle.sessions, newSession]);
-lifecycle.setActiveSessionId(res.newUiId!);
-lifecycle.fetchStats(socket, res.newAcpId);
-
+lifecycle.setActiveSessionId(res.newUiId);
 socket.emit('watch_session', { sessionId: res.newAcpId });
+setTimeout(() => get().handleSubmit(socket, '<detached fork orientation prompt>'), 500);
 ```
 
-**Step 10: Async Orientation Message & Title Generation**
-- **File:** `frontend/src/store/useChatStore.ts` (Lines 136-138); `backend/sockets/sessionHandlers.js` (Line 263)
-- After 500ms, a system message is sent to the forked session to orient the agent that it is now detached.
-- In parallel, `generateForkTitle()` is invoked asynchronously (fire-and-forget) to generate a title from the fork point context.
+8. Fork title generation runs in a throwaway ACP session
 
-```typescript
-// FILE: frontend/src/store/useChatStore.ts (Lines 136-138)
-setTimeout(() => {
-  get().handleSubmit(socket, 'This is a conversation fork. You are now detached from the original session and acting as a new session with the existing history. If you are asked about work you did, only refer to work you did after this message. Acknowledge briefly.');
-}, 500);
+File: `backend/services/acpTitleGenerator.js` (Function: `generateForkTitle`)
+File: `backend/sockets/sessionHandlers.js` (Call site: `generateForkTitle(...)`)
+
+`generateForkTitle` uses messages through `forkPoint`, keeps the last two user messages and last two assistant messages, creates an internal title session, optionally sets the configured title-generation model, captures title output with `statsCaptures`, updates the DB name, and emits `session_renamed`.
+
+```js
+// FILE: backend/services/acpTitleGenerator.js (Function: generateForkTitle)
+const relevant = messages.slice(0, forkPoint + 1);
+const userMsgs = relevant.filter(m => m.role === 'user').slice(-2);
+const assistantMsgs = relevant.filter(m => m.role === 'assistant').slice(-2);
+
+acpClient.stream.statsCaptures.set(titleSessionId, { buffer: '' });
+await acpClient.transport.sendRequest('session/prompt', { sessionId: titleSessionId, prompt: [{ type: 'text', text: titlePrompt }] });
+const title = acpClient.stream.statsCaptures.get(titleSessionId)?.buffer?.trim();
+await db.updateSessionName(uiId, title);
+acpClient.io.emit('session_renamed', { providerId, uiId, newName: title });
 ```
 
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Line 263)
-generateForkTitle(acpClient, newUiId, session.messages || [], messageIndex).catch(() => {});
+9. Sidebar and folder views render recursive fork trees
+
+File: `frontend/src/components/Sidebar.tsx` (Component: `Sidebar`, Helpers: `rootSessions`, `getForksOf`, `getSubAgentsOf`, `renderChildren`)
+File: `frontend/src/components/FolderItem.tsx` (Component: `FolderItem`, Helper: `renderForkTree`)
+File: `frontend/src/components/SessionItem.tsx` (Component: `SessionItem`, CSS class: `fork-arrow`, Icon: `GitFork`)
+
+Root session lists exclude `forkedFrom` sessions and sub-agents. Forks are fetched by parent UI ID and rendered recursively, including forks of forks. Sub-agents share `forkedFrom` parent linkage but are filtered separately with `isSubAgent`.
+
+```tsx
+// FILE: frontend/src/components/Sidebar.tsx (Component: Sidebar)
+const rootSessions = filteredSessions.filter(s => !s.folderId && !s.forkedFrom && !s.isSubAgent);
+const getForksOf = (parentId: string) => filteredSessions.filter(s => s.forkedFrom === parentId && !s.isSubAgent);
+const getSubAgentsOf = (parentId: string) => filteredSessions.filter(s => s.isSubAgent && s.forkedFrom === parentId);
 ```
 
----
+10. Merge UI emits `merge_fork`
 
-### Merge Fork Flow
+File: `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`, Handler: `handleMergeFork`, CSS class: `merge-fork-pill`)
 
-**Step 1: Merge Fork Button Click**
-- **File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 303-313)
-- The "Merge Fork" pill appears only when `activeSession.forkedFrom` is defined and the session is not a sub-agent.
+The merge pill is visible when the active session has `forkedFrom` and is not a sub-agent. `handleMergeFork` emits `{ uiId: forkId }`, shows the merge overlay while awaiting the callback, switches to the parent on success, and removes the fork from local state after a short delay.
 
-```typescript
-// FILE: frontend/src/components/ChatInput/ChatInput.tsx (Lines 303-313)
-{activeSession?.forkedFrom && !activeSession?.isSubAgent && (
-  <button
-    className="chatinput-pill merge-fork-pill"
-    onClick={handleMergeFork}
-    disabled={merging || !!activeSession?.isTyping || !!activeSession?.isWarmingUp}
-    title="Summarize fork work and send to parent chat"
-  >
-    <GitMerge size={12} />
-    Merge Fork
-  </button>
-)}
-```
-
-**Step 2: Merge Handler & Socket Emit**
-- **File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 86-102)
-- `handleMergeFork` emits a `merge_fork` socket event with the fork's UI ID, sets `merging: true` for the loading overlay, and shows a merge progress overlay (Lines 175-182).
-
-```typescript
-// FILE: frontend/src/components/ChatInput/ChatInput.tsx (Lines 86-102)
+```tsx
+// FILE: frontend/src/components/ChatInput/ChatInput.tsx (Handler: handleMergeFork)
 const handleMergeFork = () => {
   if (!socket || !activeSession?.forkedFrom || merging) return;
-  setMerging(true);
   const forkId = activeSession.id;
   const parentId = activeSession.forkedFrom;
-  socket.emit('merge_fork', { uiId: forkId }, (res: { success?: boolean; parentUiId?: string; error?: string }) => {
-    setMerging(false);
+  socket.emit('merge_fork', { uiId: forkId }, (res) => {
     if (res.success) {
       useSessionLifecycleStore.getState().handleSessionSelect(socket, parentId);
-      setTimeout(() => {
-        useSessionLifecycleStore.setState(state => ({
-          sessions: state.sessions.filter(s => s.id !== forkId),
-        }));
-      }, 100);
+      setTimeout(() => useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.filter(s => s.id !== forkId)
+      })), 100);
     }
   });
 };
 ```
 
-**Step 3: Backend Merge Handler — Summary Capture Setup**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 386-436)
-- Handler validates the fork session has `forkedFrom` (Line 391) and retrieves the parent session (Line 392).
-- A `statsCaptures` buffer is created for the fork's ACP session ID (Line 397) — this will capture the summary text.
+11. The backend captures a fork summary and deletes the fork
 
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 402-417)
-socket.on('merge_fork', async ({ uiId }, callback) => {
-  try {
-    const forkSession = await db.getSession(uiId);
-    if (!forkSession?.forkedFrom || !forkSession.acpSessionId) return callback?.({ error: 'Not a valid fork session' });
-    const parentSession = await db.getSession(forkSession.forkedFrom);  // LINE 392
-    if (!parentSession?.acpSessionId) return callback?.({ error: 'Parent session not found' });
-    const pid = forkSession.provider || getProvider().id;
-    const acpClient = providerRuntimeManager.getClient(pid);
+File: `backend/sockets/sessionHandlers.js` (Socket event: `merge_fork`, Helpers: `statsCaptures`, `cleanupAcpSession`, `db.deleteSession`)
 
-    acpClient.stream.statsCaptures.set(forkSession.acpSessionId, { buffer: '' });  // LINE 397
-```
+The handler validates `forkedFrom` plus `acpSessionId`, resolves the parent session, captures the fork response silently, deletes capture state, removes provider-owned fork files, deletes the fork row, and callbacks with the parent UI ID.
 
-**Step 4: Generate Summary via ACP Prompt**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 412-416)
-- A prompt is sent to the fork's ACP session asking for a detailed summary of its work since the fork.
-- Output is silently captured via `statsCaptures` (initialized in Step 3) and accumulated in the buffer.
+```js
+// FILE: backend/sockets/sessionHandlers.js (Socket event: merge_fork)
+const forkSession = await db.getSession(uiId);
+if (!forkSession?.forkedFrom || !forkSession.acpSessionId) return callback?.({ error: 'Not a valid fork session' });
+const parentSession = await db.getSession(forkSession.forkedFrom);
+if (!parentSession?.acpSessionId) return callback?.({ error: 'Parent session not found' });
 
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 412-416)
-await acpClient.transport.sendRequest('session/prompt', {
-  sessionId: forkSession.acpSessionId,
-  prompt: [{ type: 'text', text: 'Create a highly detailed summary of everything you have done since the most recent fork, so you can inform the parent chat of your work.' }]
-});
-const summary = acpClient.stream.statsCaptures.get(forkSession.acpSessionId)?.buffer?.trim() || '(No summary generated)';  // LINE 402
-```
-
-**Step 5: Cleanup & DB Deletion**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 417-419)
-- The fork's ACP session files are cleaned up via `cleanupAcpSession()`, and the fork session is deleted from the database.
-
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 417-419)
+acpClient.stream.statsCaptures.set(forkSession.acpSessionId, { buffer: '' });
+await acpClient.transport.sendRequest('session/prompt', { sessionId: forkSession.acpSessionId, prompt: [summaryPrompt] });
+const summary = acpClient.stream.statsCaptures.get(forkSession.acpSessionId)?.buffer?.trim() || '(No summary generated)';
 acpClient.stream.statsCaptures.delete(forkSession.acpSessionId);
-await cleanupAcpSession(forkSession.acpSessionId, pid, 'fork-merge');  // LINE 404
-await db.deleteSession(uiId);  // LINE 405
-```
-
-**Step 6: Immediate Callback**
-- **File:** `backend/sockets/sessionHandlers.js` (Line 420)
-- The handler calls back immediately with `{ success: true, parentUiId }` so the frontend can switch to the parent session without waiting for the summary injection.
-
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Line 420)
+await cleanupAcpSession(forkSession.acpSessionId, pid, 'fork-merge');
+await db.deleteSession(uiId);
 callback?.({ success: true, parentUiId: forkSession.forkedFrom });
 ```
 
-**Step 7: Frontend Switch to Parent (Immediate)**
-- **File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 93-99)
-- Frontend switches to the parent session immediately (Line 94), then removes the fork from the sessions list after 100ms (Lines 95-99) to avoid flickering.
+12. The parent receives the merge summary
 
-```typescript
-// FILE: frontend/src/components/ChatInput/ChatInput.tsx (Lines 93-99)
-if (res.success) {
-  useSessionLifecycleStore.getState().handleSessionSelect(socket, parentId);
-  setTimeout(() => {
-    useSessionLifecycleStore.setState(state => ({
-      sessions: state.sessions.filter(s => s.id !== forkId),
-    }));
-  }, 100);
-}
-```
+File: `backend/sockets/sessionHandlers.js` (Socket event: `merge_fork`, Emitted event: `merge_message`, ACP method: `session/prompt`)
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket event: `merge_message`)
 
-**Step 8: Delayed Summary Injection to Parent (1000ms Delay)**
-- **File:** `backend/sockets/sessionHandlers.js` (Lines 422-431)
-- After 1000ms (allowing the callback and frontend updates to complete), the backend emits a `merge_message` event to the parent session's socket room.
+After the success callback, the backend emits `merge_message` to the parent ACP room, sends the same text to the parent ACP session as `session/prompt`, and emits `token_done`. The frontend appends `merge_message.text` as a user-role message to the matching parent `ChatSession`.
 
-```javascript
-// FILE: backend/sockets/sessionHandlers.js (Lines 422-431)
-setTimeout(async () => {
-  try {
-    const mergeMessage = `A forked child agent is informing you of their work:\n\n${summary}`;
-    io.to(`session:${parentSession.acpSessionId}`).emit('merge_message', { sessionId: parentSession.acpSessionId, text: mergeMessage });  // LINE 411
-    await acpClient.transport.sendRequest('session/prompt', { sessionId: parentSession.acpSessionId, prompt: [{ type: 'text', text: mergeMessage }] });  // LINE 412
-    io.to(`session:${parentSession.acpSessionId}`).emit('token_done', { sessionId: parentSession.acpSessionId });  // LINE 413
-  } catch (err) {
-    writeLog(`[MERGE ERR] ${err.message}`);
-  }
-}, 1000);
-```
-
-**Step 9: Frontend Receives merge_message Event**
-- **File:** `frontend/src/hooks/useChatManager.ts` (Lines 215-220)
-- The frontend's `merge_message` socket event handler injects the summary as a user-role message into the parent session's messages.
-
-```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 215-220)
+```ts
+// FILE: frontend/src/hooks/useChatManager.ts (Socket event: merge_message)
 socket.on('merge_message', (data: { sessionId: string; text: string }) => {
   useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => {
-      if (s.acpSessionId !== data.sessionId) return s;
-      return { ...s, messages: [...s.messages, { id: `merge-${Date.now()}`, role: 'user' as const, content: data.text }] };
-    }) }));
+    if (s.acpSessionId !== data.sessionId) return s;
+    return { ...s, messages: [...s.messages, { id: `merge-${Date.now()}`, role: 'user', content: data.text }] };
+  }) }));
 });
+```
+
+13. Deleting a parent cascades through descendants
+
+File: `backend/sockets/sessionHandlers.js` (Socket event: `delete_session`, Helper: `collectDescendants`)
+File: `frontend/src/components/Sidebar.tsx` (Handler: `handleRemoveSession`)
+
+The backend removes the requested session, scans `db.getAllSessions()` for recursive `forkedFrom` descendants, then cleans each descendant's ACP files, attachment directory, and DB row. The sidebar also removes the same descendant tree from local state immediately after a delete/archive action.
+
+```js
+// FILE: backend/sockets/sessionHandlers.js (Socket event: delete_session)
+const collectDescendants = (parentId) => {
+  for (const s of allSessions) {
+    if (s.forkedFrom === parentId) {
+      descendants.push(s);
+      collectDescendants(s.id);
+    }
+  }
+};
 ```
 
 ---
@@ -356,311 +293,259 @@ socket.on('merge_message', (data: { sessionId: string; text: string }) => {
 ## Architecture Diagram
 
 ```mermaid
-graph TB
-    subgraph Frontend["Frontend (React)"]
-        Fork["Fork Button Click"]
-        HandleFork["handleFork<br/>finds message index"]
-        Emit1["emit fork_session<br/>with uiId, messageIndex"]
-        ForkSession["Construct ChatSession<br/>forkedFrom, forkPoint"]
-        Display["Add to sessions list<br/>set active"]
-        
-        Merge["Merge Fork Pill"]
-        HandleMerge["handleMergeFork<br/>emit merge_fork"]
-        FrontendSwitch["Switch to parent<br/>remove fork"]
-        ReceiveMerge["merge_message handler<br/>inject summary msg"]
-    end
-    
-    subgraph Backend["Backend (Node.js)"]
-        Receive1["fork_session handler<br/>validate session"]
-        Clone["providerModule.cloneSession<br/>copy ACP files"]
-        CopyAttach["Copy attachments<br/>to new UI ID"]
-        DBSave["Save to DB<br/>forkedFrom, forkPoint"]
-        Load["session/load + drain<br/>initialize ACP"]
-        Meta["Init sessionMetadata<br/>resolve model"]
-        Callback1["Callback with<br/>newUiId, newAcpId"]
-        Title["generateForkTitle<br/>async"]
-        
-        ReceiveMerge["merge_fork handler<br/>validate fork"]
-        Stats["Set statsCaptures<br/>buffer"]
-        Prompt1["ACP prompt:<br/>generate summary"]
-        Cleanup["cleanupAcpSession<br/>delete from DB"]
-        Callback2["Callback success<br/>immediate"]
-        DelayedInject["1000ms delay<br/>inject to parent"]
-        PromptParent["Send summary prompt<br/>to parent ACP"]
-    end
-    
-    subgraph Database["SQLite"]
-        Sessions["sessions table<br/>+ fork metadata"]
-    end
-    
-    Fork --> HandleFork
-    HandleFork --> Emit1
-    
-    Emit1 --> Receive1
-    Receive1 --> Clone
-    Clone --> CopyAttach
-    CopyAttach --> DBSave
-    DBSave --> Load
-    Load --> Meta
-    Meta --> Callback1
-    Meta --> Title
-    
-    Callback1 --> ForkSession
-    ForkSession --> Display
-    Display --> Merge
-    
-    DBSave --> Sessions
-    
-    Merge --> HandleMerge
-    HandleMerge --> ReceiveMerge
-    
-    ReceiveMerge --> Stats
-    Stats --> Prompt1
-    Prompt1 --> Cleanup
-    Cleanup --> Callback2
-    Callback2 --> FrontendSwitch
-    Callback2 --> DelayedInject
-    DelayedInject --> PromptParent
-    PromptParent --> ReceiveMerge
-    ReceiveMerge --> ReceiveMerge
+flowchart TB
+  subgraph FE[Frontend]
+    AM[AssistantMessage handleFork]
+    CS[useChatStore handleForkSession]
+    CI[ChatInput handleMergeFork]
+    CM[useChatManager merge_message]
+    SB[Sidebar and FolderItem recursive render]
+    SI[SessionItem fork-arrow and GitFork]
+  end
+
+  subgraph BE[Backend Socket Handlers]
+    FS[fork_session]
+    MF[merge_fork]
+    DS[delete_session]
+  end
+
+  subgraph Provider[Provider Runtime]
+    Clone[providerModule.cloneSession]
+    Load[ACP session/load]
+    PromptFork[ACP session/prompt for fork summary]
+    PromptParent[ACP session/prompt to parent]
+  end
+
+  subgraph Services[Backend Services]
+    MCP[getMcpServers scoped proxy]
+    Title[generateForkTitle]
+    Cleanup[cleanupAcpSession]
+    Capture[StreamController statsCaptures]
+  end
+
+  subgraph DB[SQLite]
+    Sessions[sessions table forked_from and fork_point]
+  end
+
+  AM --> CS -->|fork_session| FS
+  FS --> Clone --> Load
+  FS --> MCP
+  FS --> Sessions
+  FS --> Title
+  FS -->|callback newUiId newAcpId| CS
+  CS --> SB --> SI
+  CS -->|watch_session| BE
+
+  CI -->|merge_fork| MF
+  MF --> Capture --> PromptFork
+  MF --> Cleanup --> Sessions
+  MF -->|callback parentUiId| CI
+  MF -->|merge_message| CM
+  MF --> PromptParent
+  CM --> SB
+
+  DS --> Cleanup
+  DS --> Sessions
+  SB -->|delete_session| DS
 ```
 
 ---
 
-## The Critical Contract: Fork Identity & Ownership
+## Critical Contract
 
-### Fork ID Format
-A fork is identified by **two fields** that together form the contract:
+### Session Identity Fields
 
-1. **`forkedFrom: string`** — The UI ID of the parent session. This is the single source of truth for fork lineage. There is no parent reference in the opposite direction (parent does not maintain a list of forks); instead, the sidebar queries `forkedFrom` at display time.
+- `ChatSession.id` / `sessions.ui_id`: UI identity for selection, sidebar hierarchy, attachment directories, and `forkedFrom` parent references.
+- `ChatSession.acpSessionId` / `sessions.acp_id`: ACP daemon identity for `session/load`, `session/prompt`, stream rooms, stats, and MCP proxy scope.
+- `ChatSession.forkedFrom` / `sessions.forked_from`: parent UI ID. Forks and sub-agents both use this field, so `isSubAgent` is required to distinguish fork UI from sub-agent UI.
+- `ChatSession.forkPoint` / `sessions.fork_point`: selected UI message index at creation time. It drives local message slicing and fork title context.
+- `ChatSession.isSubAgent` / `sessions.is_sub_agent`: sub-agent flag. Sub-agent rows can carry `forkedFrom` for parent linkage, but the visible merge UI excludes them.
 
-2. **`forkPoint: number`** — The 0-based index in the parent's message array where the fork was created. This is strictly read-only and used only to reconstruct the fork's initial message history and for title generation.
+### Fork Boundary Contract
 
-### Backend Fork ID
-- **UI ID:** `fork-${Date.now()}` — Millisecond-precision timestamp-based ID, not guaranteed unique but collision-unlikely in practice. Used for database keys, session selection, sidebar rendering.
-- **ACP ID:** `crypto.randomUUID()` — Globally unique UUID for the ACP daemon's session ID.
+The frontend sends a UI message index. The backend uses that index in two ways:
 
-### Critical Rules
+- `session.messages.slice(0, messageIndex + 1)` for persisted UI history.
+- `Math.ceil((messageIndex + 1) / 2)` as the `pruneAtTurn` argument for `providerModule.cloneSession`.
 
-✅ **Must enforce:**
-- A fork's `forkedFrom` must point to an existing session ID.
-- A fork's `forkPoint` must be a valid index within the parent's message array at the time of fork.
-- Forks are **never parent to other forks**; a fork has `forkedFrom` set, but cannot be a parent (sidebar filtering excludes forks from becoming parents to prevent deep nesting issues).
-- Sub-agents (sessions with `isSubAgent: true`) are never treated as forks via `forkedFrom`; they are tracked separately.
+A provider's `cloneSession(oldAcpId, newAcpId, pruneAtTurn)` must clone provider session files and interpret `pruneAtTurn` at whole-turn boundaries for that provider's transcript format. If a provider cannot prune accurately, the UI message history and ACP daemon context can diverge.
 
-❌ **Must prevent:**
-- Setting `forkedFrom` on a session that already has `forkedFrom` (no fork-of-fork). **Exception:** Sub-agents use `forkedFrom` for parent linkage and are orthogonal to fork UI hierarchy.
-- Deleting a parent session without cascading deletion of all descendants.
-- Merging a fork that has already been deleted or whose parent no longer exists.
+### Merge Summary Contract
 
-### Summary Capture Pattern
-Merge uses the `statsCaptures` pattern to silently capture ACP output:
+Merge-back depends on `StreamController.statsCaptures` being set before the fork summary prompt is sent. `acpUpdateHandler.handleUpdate` buffers `agent_message_chunk` output into the capture buffer when a session ID is present in `statsCaptures`; that keeps summary generation out of the visible stream.
 
-```javascript
-acpClient.stream.statsCaptures.set(sessionId, { buffer: '' });
-// ... send prompt ...
-const output = acpClient.stream.statsCaptures.get(sessionId)?.buffer;
-acpClient.stream.statsCaptures.delete(sessionId);
-```
+### Persistence Contract
 
-This ensures the summary is captured without polluting the UI or triggering stream events.
+`db.saveSession` inserts `forked_from`, `fork_point`, `is_sub_agent`, and `parent_acp_session_id` values. Its conflict update path preserves existing hierarchy fields. Create fork metadata before the first insert for the fork row; do not rely on a generic `saveSession` update to repoint an existing session.
+
+### Delete Contract
+
+Cascade delete is implemented by application code in `delete_session`, not by SQLite foreign keys. Any code path that deletes session rows directly must handle descendant cleanup itself or call the socket lifecycle path.
 
 ---
 
-## Data Flow & Rendering Pipeline
+## Configuration / Data Flow
 
-### Fork Session Data Structure
-**From database (raw):**
+### Provider Support
+
+File: `backend/services/providerLoader.js` (Default export contract: `cloneSession`, `getSessionPaths`, `deleteSessionFiles`)
+File: `backend/sockets/sessionHandlers.js` (Socket event: `fork_session`)
+
+A provider module must expose a usable `cloneSession(oldAcpId, newAcpId, pruneAtTurn)` implementation for complete fork support. The default provider loader supplies a no-op, so a provider without a real clone implementation can produce a DB fork whose ACP files are missing or incomplete.
+
+`cleanupAcpSession(acpSessionId, providerId, context)` delegates deletion to the provider module's session-file deletion behavior. Fork merge and session delete both depend on that provider cleanup path.
+
+### Runtime Configuration
+
+File: `backend/services/sessionManager.js` (Function: `getMcpServers`)
+File: `backend/services/acpTitleGenerator.js` (Functions: `generateTitle`, `generateForkTitle`, Helper: `getConfiguredModelId`)
+
+- `getMcpServers(providerId, { acpSessionId })` creates an MCP proxy binding scoped to the fork ACP session and passes the proxy ID to `stdio-proxy.js` through `ACP_UI_MCP_PROXY_ID`.
+- `generateForkTitle` uses provider config `models.titleGeneration`, then `models.default`, then the first provider model option when choosing the internal title model.
+- `generateForkTitle` chooses title-session `cwd` from `DEFAULT_WORKSPACE_CWD`, then `HOME`, then `process.cwd()`.
+
+### Database Shape
+
+File: `backend/database.js` (Functions: `initDb`, `saveSession`, `getAllSessions`, `getSession`)
+
 ```json
 {
   "ui_id": "fork-1735689600000",
-  "acp_id": "550e8400-e29b-41d4-a716-446655440000",
-  "name": "Session A (fork)",
-  "forked_from": "session-parent-ui",
-  "fork_point": 8,
-  "messages_json": "[... sliced messages from index 0 to 8 ...]",
-  "model": "test-flagship",
-  "current_model_id": "provider-model-id",
-  "provider": "provider-a"
+  "acp_id": "mock-acp-session-id",
+  "name": "Parent Chat (fork)",
+  "messages_json": "[sliced UI messages]",
+  "forked_from": "parent-ui-id",
+  "fork_point": 4,
+  "is_sub_agent": 0,
+  "parent_acp_session_id": null,
+  "provider": "test-provider"
 }
 ```
 
-**Frontend ChatSession (normalized):**
-```typescript
+### Frontend Session Shape
+
+File: `frontend/src/types.ts` (Interface: `ChatSession`)
+File: `frontend/src/store/useChatStore.ts` (Store action: `handleForkSession`)
+
+```ts
 {
-  id: "fork-1735689600000",
-  acpSessionId: "550e8400-e29b-41d4-a716-446655440000",
-  name: "Session A (fork)",
-  messages: [ /* 0 to 8 */ ],
-  forkedFrom: "session-parent-ui",
-  forkPoint: 8,
-  model: "test-flagship",
-  currentModelId: "provider-model-id",
-  provider: "provider-a",
+  id: 'fork-1735689600000',
+  acpSessionId: 'mock-acp-session-id',
+  name: 'Parent Chat (fork)',
+  messages: slicedMessages,
+  model: 'mock-model-id',
+  currentModelId: 'mock-model-id',
+  modelOptions: [],
+  cwd: 'D:/workspace',
+  folderId: null,
+  forkedFrom: 'parent-ui-id',
+  forkPoint: 4,
+  provider: 'test-provider',
   isTyping: false,
-  isWarmingUp: false,
-  isPinned: false
+  isWarmingUp: false
 }
 ```
 
-### Title Generation Data Flow
-**Input (from handler):**
-```javascript
-messages = [ /* full parent message array */ ]
-forkPoint = 8  // last message index to consider
-```
+### Socket Payloads
 
-**Processing (acpTitleGenerator.js):**
-```javascript
-relevant = messages.slice(0, forkPoint + 1)  // indices 0-8
-userMsgs = relevant.filter(m => m.role === 'user').slice(-2)  // last 2 user messages
-assistantMsgs = relevant.filter(m => m.role === 'assistant').slice(-2)  // last 2 assistant messages
-context = userMsgs + assistantMsgs  // concatenated as string (first 200 chars each)
-titlePrompt = `Generate a short chat title (max 6 words, no quotes) for this forked conversation. Here is the recent context:\n\n${context}`
-```
-
-**Output (to UI):**
-```javascript
-title = "Multi-agent Collaboration Strategy"  // max 6 words, no quotes
-// ... updated in DB via updateSessionName(), emitted via session_renamed event ...
-```
-
-### Merge Summary Data Flow
-**Capture (merge_fork handler):**
-```javascript
-statsCaptures.set(forkSessionId, { buffer: '' })
-// send prompt to ACP
-summary = statsCaptures.get(forkSessionId).buffer.trim()
-mergeMessage = `A forked child agent is informing you of their work:\n\n${summary}`
-```
-
-**Frontend Injection (merge_message handler):**
-```typescript
-// Received from backend
-{ sessionId: parentAcpSessionId, text: mergeMessage }
-// Injected as a user message
-messages.push({
-  id: `merge-${Date.now()}`,
-  role: 'user',
-  content: mergeMessage
-})
-// When ACP processes this message, it is visible in the chat timeline
-```
+| Event | Direction | Payload | Purpose |
+|---|---|---|---|
+| `fork_session` | Frontend to backend | `{ uiId, messageIndex }` | Request a fork from the selected UI session at a UI message index. |
+| `fork_session` callback | Backend to frontend | `{ success, providerId, newUiId, newAcpId, currentModelId, modelOptions, configOptions }` | Register and select the local fork session. |
+| `watch_session` | Frontend to backend | `{ sessionId: newAcpId }` | Subscribe to stream events for the fork ACP session. |
+| `session_renamed` | Backend to frontend | `{ providerId, uiId, newName }` | Apply generated fork title. |
+| `merge_fork` | Frontend to backend | `{ uiId: forkUiId }` | Request merge-back for a fork UI session. |
+| `merge_fork` callback | Backend to frontend | `{ success, parentUiId }` or `{ error }` | Switch UI to parent or show failure state. |
+| `merge_message` | Backend to frontend | `{ sessionId: parentAcpId, text }` | Append merge summary as a user message in the parent chat. |
+| `token_done` | Backend to frontend | `{ sessionId: parentAcpId }` | Mark parent stream completion after the merge prompt dispatch path. |
 
 ---
 
 ## Component Reference
 
-### Backend Files
+### Backend
 
-| File | Function(s) | Lines | Purpose |
-|------|-------------|-------|---------|
-| `backend/sockets/sessionHandlers.js` | `fork_session` handler | 210–268 | Creates fork: validates parent, generates IDs, clones ACP session, copies attachments, saves to DB, loads session, initializes metadata, calls back |
-| `backend/sockets/sessionHandlers.js` | `merge_fork` handler | 402–436 | Merges fork: validates fork, captures summary via ACP prompt, cleans up, deletes from DB, injects summary to parent after delay |
-| `backend/sockets/sessionHandlers.js` | `delete_session` handler | 167–201 | Deletes session: removes from DB, cleans ACP files, and cascades to all descendants (forks) recursively |
-| `backend/services/acpTitleGenerator.js` | `generateForkTitle()` | 61–106 | Generates descriptive title for fork from last 2 user/assistant message pairs before forkPoint; spawns ephemeral ACP session, generates title, cleans up |
-| `backend/services/acpCleanup.js` | `cleanupAcpSession()` | (via import) | Removes ACP session files (`.jsonl`, `.json`, task files) from the provider's session directory |
-| `backend/database.js` | Session table schema | 30–60 | Defines columns: `forked_from TEXT`, `fork_point INTEGER` for fork metadata storage |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket handlers | `backend/sockets/sessionHandlers.js` | Socket events `fork_session`, `merge_fork`, `delete_session`; helper `collectDescendants`; imports `cleanupAcpSession`, `generateForkTitle` | Creates forks, merges forks, and cascades descendant deletion. |
+| Database | `backend/database.js` | `initDb`, `saveSession`, `getAllSessions`, `getSession`; columns `forked_from`, `fork_point`, `is_sub_agent`, `parent_acp_session_id` | Persists and hydrates fork hierarchy metadata. |
+| Title generation | `backend/services/acpTitleGenerator.js` | `generateForkTitle`, `getConfiguredModelId`, `statsCaptures`, `session_renamed` | Generates asynchronous fork titles from context through `forkPoint`. |
+| Session manager | `backend/services/sessionManager.js` | `getMcpServers`, `getKnownModelOptions`, `resolveModelSelection`, `updateSessionModelMetadata` | Builds fork-scoped MCP server config and resolves model state. |
+| Provider loader | `backend/services/providerLoader.js` | Default module field `cloneSession`, `getProviderModule`, `getProvider` | Loads provider clone behavior and config. |
+| ACP cleanup | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | Removes provider-owned ACP session files after merge/delete/title generation. |
+| Update routing | `backend/services/acpUpdateHandler.js` | `handleUpdate`, `statsCaptures` checks | Buffers captured output instead of emitting it to visible chat streams. |
 
-### Frontend Files
+### Frontend
 
-| File | Function(s) / Component | Lines | Purpose |
-|------|------------------------|-------|---------|
-| `frontend/src/store/useChatStore.ts` | `handleForkSession()` | 100–140 | Socket emit fork_session, construct ChatSession with forkedFrom/forkPoint, add to list, set active, emit watch_session, send orientation prompt after 500ms |
-| `frontend/src/components/AssistantMessage.tsx` | `handleFork()` | 75–84 | Click handler: find message index, call handleForkSession, set forking state |
-| `frontend/src/components/AssistantMessage.tsx` | Fork button + overlay | 120–124, 204–211 | Display GitFork icon; show fork-overlay during creation |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | `handleMergeFork()` | 86–102 | Emit merge_fork, switch to parent, remove fork from list after 100ms |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | Merge fork pill | 303–313 | Display GitMerge icon; visible when `forkedFrom` exists, disabled during merge/typing |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | Merge overlay | 175–182 | Show "Merging fork..." with spinner during merge |
-| `frontend/src/hooks/useChatManager.ts` | `merge_message` handler | 215–220 | Receive fork summary from backend, inject as user message to parent session |
-| `frontend/src/components/Sidebar.tsx` | `rootSessions` filter | 96 | Exclude forks and sub-agents from root; only show actual root sessions |
-| `frontend/src/components/Sidebar.tsx` | `getForksOf()` filter | 97 | Query forks by parent ID; used for nesting |
-| `frontend/src/components/Sidebar.tsx` | `renderChildren()` | 254–292 | Recursively render forks indented under parent, with `fork-indent` style |
-| `frontend/src/components/SessionItem.tsx` | Fork icon & arrow | 42–46 | Display `↳` arrow and `GitFork` icon in blue for forked sessions |
-| `frontend/src/types.ts` | `ChatSession` type | 292–297 | TypeScript type: `forkedFrom?: string \| null`, `forkPoint?: number \| null` |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Assistant action | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `handleFork`, `GitFork`, `fork-overlay` | Resolves selected assistant message index and starts fork creation. |
+| Chat actions | `frontend/src/store/useChatStore.ts` | `handleForkSession`, `handleSubmit`, socket events `fork_session`, `watch_session` | Emits fork requests, constructs local fork sessions, sends orientation prompt. |
+| Merge UI | `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput`, `handleMergeFork`, `merge-fork-pill`, `merge-overlay`, `GitMerge` | Offers merge-back action for fork sessions and switches to parent after success. |
+| Socket listeners | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, socket event `merge_message` | Appends merge summary as a user message to the parent session. |
+| Sidebar | `frontend/src/components/Sidebar.tsx` | `rootSessions`, `getForksOf`, `getSubAgentsOf`, `renderChildren`, `handleRemoveSession` | Renders recursive fork/sub-agent trees and removes descendant local state on delete. |
+| Folder sidebar | `frontend/src/components/FolderItem.tsx` | `childSessions`, `getForksOf`, `getSubAgentsOf`, `renderForkTree` | Renders fork trees under sessions inside folders. |
+| Session row | `frontend/src/components/SessionItem.tsx` | `SessionItem`, `fork-arrow`, `GitFork`, `Bot` | Displays fork/sub-agent hierarchy indicators and fork icon. |
+| Types | `frontend/src/types.ts` | `ChatSession`, `forkedFrom`, `forkPoint`, `isSubAgent`, `parentAcpSessionId` | Defines frontend session hierarchy fields. |
 
-### Database Schema
+### Tests
 
-| Column | Type | Purpose |
-|--------|------|---------|
-| `forked_from` | TEXT | UI ID of parent session (nullable; NULL for root sessions) |
-| `fork_point` | INTEGER | 0-based message index where fork was created (nullable; NULL for root sessions) |
-| `is_sub_agent` | INTEGER | Boolean: 1 if sub-agent, 0 otherwise; orthogonal to fork system |
-| `parent_acp_session_id` | TEXT | ACP session ID of parent (for sub-agents); separate from fork metadata |
-
----
-
-## Gotchas & Important Notes
-
-### 1. **statsCaptures Must Be Set Before Prompt**
-**What goes wrong:** The merge handler sends a prompt to the fork's ACP session expecting the summary to be captured in `statsCaptures`, but if `statsCaptures` is not initialized first, the output streams to the UI or is lost.
-
-**Why:** The ACP daemon sends output as stream events, which are routed by the `acpUpdateHandler`. If `statsCaptures` is set, output is buffered; otherwise, it's processed as normal chat events.
-
-**How to avoid:** Always call `acpClient.stream.statsCaptures.set(sessionId, { buffer: '' })` **before** sending a prompt that you intend to capture silently. Clean up with `.delete()` after capturing.
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Backend socket lifecycle | `backend/test/sessionHandlers.test.js` | `handles fork_session`, `handles merge_fork`, `merge_fork returns error when parent session not found`, `handles delete_session with cascading child sessions`, `handles merge_fork when not a valid fork` | Covers backend fork, merge, validation, and cascade paths. |
+| Backend title generation | `backend/test/acpTitleGenerator.test.js` | `describe('generateForkTitle')`, `generates title from last 2 user and assistant messages`, `does nothing when messages are empty`, `only uses messages up to forkPoint` | Covers fork title context selection and rename emission. |
+| Backend persistence | `backend/test/database-exhaustive.test.js` | `hits all optional field branches in saveSession` | Exercises optional fork fields in `saveSession`. |
+| Backend capture routing | `backend/test/acpUpdateHandler.test.js` | `buffers text in statsCaptures if present` | Verifies silent capture buffering behavior. |
+| Backend stream controller | `backend/test/streamController.test.js` | `should isolate stats capture buffers between sessions` | Verifies capture buffers are session-scoped. |
+| Frontend store | `frontend/src/test/useChatStoreExtended.test.ts` | `describe('handleForkSession')`, `creates a forked session and switches to it` | Covers local fork creation, selection, and orientation prompt. |
+| Frontend socket listener | `frontend/src/test/useChatManager.test.ts` | `handles "merge_message" event` | Covers parent message injection after merge. |
+| Frontend sidebar | `frontend/src/test/Sidebar.test.tsx` | `deleting a parent session also removes its forks from the session list`, `forked sessions render indented under parent`, `forked sessions are NOT shown as root sessions`, `renders fork-of-fork nested under its parent`, `forks are rendered inside fork-indent containers` | Covers hierarchy rendering and local cascade behavior. |
+| Frontend folders | `frontend/src/test/FolderItem.test.tsx` | `renders fork-indent for forked sessions inside folders`, `shows fork arrow for forked sessions` | Covers folder-contained fork rendering. |
+| Frontend session row | `frontend/src/test/SessionItem.test.tsx` | `shows GitFork icon when session has forkedFrom`, `shows MessageSquare icon when session has no forkedFrom`, `fork icon takes priority over terminal icon when session has both forkedFrom and a terminal` | Covers row icon and arrow behavior. |
 
 ---
 
-### 2. **1000ms Delay Before Parent Injection Is Critical**
-**What goes wrong:** If the merge message is injected to the parent's ACP session before the frontend callback returns, the UI may flicker, the parent session switch may race with the fork deletion, or the summary may appear before the fork is removed from the sidebar.
+## Gotchas
 
-**Why:** The frontend needs time to switch to the parent and remove the fork session from the list before the backend injects the summary as an ACP prompt.
+1. `forkedFrom` is shared with sub-agents
 
-**How to avoid:** Never reduce the 1000ms delay without testing full fork/merge flow in the UI. The delay is intentionally generous to avoid race conditions.
+`forkedFrom` means parent UI session ID, not always fork UI. UI features that are fork-only must also check `!isSubAgent`; `Sidebar` and `FolderItem` keep forks and sub-agents in separate filters.
 
----
+2. Fork metadata is insert-time state in `saveSession`
 
-### 3. **Cascade Delete Uses getAllSessions() Scan, Not Foreign Keys**
-**What goes wrong:** If you delete a parent session and a fork descendant is somehow orphaned (due to DB corruption or partial deletion), the descendant will persist in the database and appear in the sidebar as a root session.
+`saveSession` inserts `forked_from` and `fork_point`, but its conflict update path does not overwrite those hierarchy fields. Set fork metadata on initial fork row creation.
 
-**Why:** SQLite migration approach does not enforce foreign key constraints on `forked_from`. The cascade is implemented in application code using `collectDescendants()`, which scans all sessions to find descendants.
+3. UI message index and provider turn count are different concepts
 
-**How to avoid:** Always delete parent sessions via the socket handler (line 144), never via direct DB calls. If you suspect orphaned forks, query sessions where `forked_from` points to a non-existent parent and manually clean them up.
+The backend passes `Math.ceil((messageIndex + 1) / 2)` to `cloneSession`. Provider implementations must translate that value to their own transcript turn boundary. Test provider clone logic when changing message grouping.
 
----
+4. Manual socket callers can send invalid fork boundaries
 
-### 4. **Fork's ACP Session Is Loaded, Not Created**
-**What goes wrong:** If you assume a forked ACP session is a freshly spawned session (via `session/new`), you may expect empty metadata or a clean slate. Instead, the forked session inherits the cloned state of the parent.
+The normal UI finds `messageIndex` from an existing message ID. The backend uses the provided index directly for slicing and pruning. Add backend validation before exposing programmatic fork creation outside the existing UI action.
 
-**Why:** The fork handler calls `providerModule.cloneSession()` first (which copies ACP session files), then `session/load` (which reloads from those files). The session starts with the parent's state, not a blank state.
+5. Forks are loaded clones
 
-**How to avoid:** Always call `session/load` with a drain before the session, and re-initialize `sessionMetadata` explicitly. Do not assume the daemon knows the session has been cloned; tell it via the `load` request.
+The fork ACP ID is loaded with `session/load` after provider file cloning. It is not created through `session/new`. Keep `beginDraining`, `session/load`, and `waitForDrainToFinish` together so replayed history does not stream into the visible timeline.
 
----
+6. `statsCaptures` must surround internal prompts
 
-### 5. **Orientation Message Sent After 500ms Delay**
-**What goes wrong:** If the orientation message is sent immediately after the fork callback, it may race with the initial session setup in the ACP daemon, causing the message to be dropped or processed out of order.
+Merge summaries and title generation depend on capture buffers. Set `statsCaptures` before `session/prompt`, read the buffer after prompt completion, and delete capture state even when follow-up cleanup is added.
 
-**Why:** The fork handler completes the callback, but the ACP daemon may still be settling after the `session/load` and metadata initialization.
+7. Merge summary appears as a user message
 
-**How to avoid:** The 500ms delay is intentional. Do not eliminate it. If you add a new fork feature that depends on the orientation message being received first, increase the delay if needed.
+The frontend `merge_message` handler appends `{ role: 'user' }` to the parent session, and the backend sends the same text as a parent `session/prompt`. This keeps UI context and ACP context aligned.
 
----
+8. Recursive fork trees are valid UI state
 
-### 6. **merge_message Injects a User Role, Not Assistant**
-**What goes wrong:** The merge summary appears in the timeline as if the **user** said it (because `role: 'user'`), not the assistant. When the backend then sends the same summary as a prompt to the parent's ACP session, the agent sees it as a user message, not a system message.
+`renderChildren` and `renderForkTree` recurse through `forkedFrom`, and tests cover fork-of-fork rendering. Do not flatten fork trees unless sidebar and deletion semantics are changed together.
 
-**Why:** This is intentional. The summary is context provided by the user (the fork), not a system directive. The agent should treat it as user input, which it is in the sense that it's information from a parallel exploration.
+9. Cascade cleanup is application-level
 
-**How to avoid:** If you need the summary to be treated as a system message, change the `role` in the `merge_message` handler (frontend) and adjust the ACP prompt accordingly (backend). Test that the agent understands the context correctly.
+SQLite does not enforce `forked_from` relationships. Use `delete_session` for parent deletion so descendants, attachment directories, and ACP files are cleaned consistently.
 
----
+10. `fork-${Date.now()}` is the UI ID format
 
-### 7. **Forks Don't Appear as Root; Sub-Agents Do**
-**What goes wrong:** You expect a forked session to appear as a root session in the sidebar, but it appears indented under the parent. You expect a sub-agent to appear indented, but it also uses `forkedFrom` and gets confused with forks.
-
-**Why:** The sidebar filter excludes both `forkedFrom` and `isSubAgent` from root sessions. Forks are filtered by `forkedFrom`, sub-agents by `isSubAgent`. Both use different hierarchies but look similar in the DB.
-
-**How to avoid:** Always check **both** `forkedFrom` and `isSubAgent` when querying sessions. The two systems are orthogonal. A session can be a fork (has `forkedFrom`) or a sub-agent (has `isSubAgent: true`), but not both in normal operation.
-
----
-
-### 8. **Title Generation Is Fully Fire-and-Forget**
-**What goes wrong:** You expect title generation to block or complete before the fork is fully ready. Instead, the title updates asynchronously after several seconds, and if title generation fails, the fork keeps the default name `${parentName} (fork)`.
-
-**Why:** Title generation spawns an ephemeral ACP session, which takes time. The fork handler does not wait for it (`.catch(() => {})`), so it runs in the background.
-
-**How to avoid:** If your UI depends on a finalized title before showing the fork, poll the session name from the backend or wait for the `session_renamed` event. Do not assume the title is final immediately after fork creation.
+Fork UI IDs use millisecond timestamps. The ACP ID is a UUID. Code that needs a globally unique transport identity must use `acpSessionId`, not the UI ID.
 
 ---
 
@@ -668,71 +553,87 @@ messages.push({
 
 ### Backend
 
-**File:** `backend/test/sessionHandlers.test.js`
+- `backend/test/sessionHandlers.test.js`
+  - `handles fork_session`
+  - `handles merge_fork`
+  - `merge_fork returns error when parent session not found`
+  - `handles delete_session with cascading child sessions`
+  - `handles merge_fork when not a valid fork`
+- `backend/test/acpTitleGenerator.test.js`
+  - `generates title from last 2 user and assistant messages`
+  - `does nothing when messages are empty`
+  - `only uses messages up to forkPoint`
+- `backend/test/database-exhaustive.test.js`
+  - `hits all optional field branches in saveSession`
+- `backend/test/acpUpdateHandler.test.js`
+  - `buffers text in statsCaptures if present`
+- `backend/test/streamController.test.js`
+  - `should isolate stats capture buffers between sessions`
 
-| Test Name | Lines | Scenario |
-|-----------|-------|----------|
-| `handles fork_session` | 188–195 | Fork creation: validates parent, calls cloneSession, saves to DB, returns success |
-| `handles merge_fork` | 205–218 | Merge: captures summary, deletes fork, emits merge_message, sends parent prompt |
-| `merge_fork returns error when parent session not found` | 220–230 | Error handling: parent doesn't exist |
-| `handles delete_session with cascading child sessions` | 458–467 | Cascade: parent deleted, fork child also deleted |
-| `handles merge_fork when not a valid fork` | 469–475 | Error: session has no forkedFrom field |
+Suggested focused backend commands:
 
-**File:** `backend/test/acpTitleGenerator.test.js`
-
-| Test Name | Lines | Scenario |
-|-----------|-------|----------|
-| `generates title from last 2 user and assistant messages` | 105–131 | Title gen: extracts last 2 pairs before forkPoint, generates via ACP |
-| `does nothing when messages are empty` | 133–136 | Edge case: empty messages array |
-| `only uses messages up to forkPoint` | 138–159 | Boundary: title generated only from messages[0 ... forkPoint] |
+```powershell
+cd backend; npx vitest run test/sessionHandlers.test.js test/acpTitleGenerator.test.js test/database-exhaustive.test.js
+cd backend; npx vitest run test/acpUpdateHandler.test.js test/streamController.test.js
+```
 
 ### Frontend
 
-**No dedicated unit tests for fork UI.** Fork state management is tested implicitly through session lifecycle tests.
+- `frontend/src/test/useChatStoreExtended.test.ts`
+  - `creates a forked session and switches to it`
+- `frontend/src/test/useChatManager.test.ts`
+  - `handles "merge_message" event`
+- `frontend/src/test/Sidebar.test.tsx`
+  - `deleting a parent session also removes its forks from the session list`
+  - `forked sessions render indented under parent`
+  - `forked sessions are NOT shown as root sessions`
+  - `renders fork-of-fork nested under its parent`
+  - `forks are rendered inside fork-indent containers`
+- `frontend/src/test/FolderItem.test.tsx`
+  - `renders fork-indent for forked sessions inside folders`
+  - `shows fork arrow for forked sessions`
+- `frontend/src/test/SessionItem.test.tsx`
+  - `shows GitFork icon when session has forkedFrom`
+  - `shows MessageSquare icon when session has no forkedFrom`
+  - `fork icon takes priority over terminal icon when session has both forkedFrom and a terminal`
+
+Suggested focused frontend commands:
+
+```powershell
+cd frontend; npx vitest run src/test/useChatStoreExtended.test.ts src/test/useChatManager.test.ts
+cd frontend; npx vitest run src/test/Sidebar.test.tsx src/test/FolderItem.test.tsx src/test/SessionItem.test.tsx
+```
 
 ---
 
 ## How to Use This Guide
 
-### For Implementing Fork Features
+### For implementing or extending this feature
 
-1. **Read the end-to-end flows** above for fork creation (Steps 1–10) and merge (Steps 1–9).
-2. **Reference the critical contract** section to understand `forkedFrom` and `forkPoint` are the foundation.
-3. **Check the component reference table** to find exact line numbers for any file you need to modify.
-4. **Consult the gotchas** before implementing a new feature to avoid common pitfalls (especially statsCaptures timing and cascade deletion).
-5. **Run the unit tests** to ensure your changes don't break existing fork/merge behavior:
-   ```bash
-   npx vitest run backend/test/sessionHandlers.test.js -t fork
-   npx vitest run backend/test/acpTitleGenerator.test.js -t generateForkTitle
-   ```
+1. Start at `AssistantMessage.handleFork` or `ChatInput.handleMergeFork`, depending on the UI action being changed.
+2. Follow the socket event into `backend/sockets/sessionHandlers.js` using `fork_session`, `merge_fork`, or `delete_session`.
+3. Keep `ChatSession.id` and `ChatSession.acpSessionId` separate in store updates and socket payloads.
+4. For fork creation, verify `providerModule.cloneSession`, `getMcpServers(providerId, { acpSessionId })`, `session/load`, and `sessionMetadata.set` stay in the same flow.
+5. For merge-back, verify `statsCaptures`, fork cleanup, `db.deleteSession`, `merge_message`, parent `session/prompt`, and `token_done` stay coordinated.
+6. Update tests in both the backend socket/title layer and the frontend store/sidebar layer when behavior changes.
 
-### For Debugging Fork/Merge Issues
+### For debugging issues with this feature
 
-1. **Check the sidebar:** Do forks appear indented under the parent? If not, check that `forkedFrom` is set in the DB and the session list includes it.
-2. **Inspect the DB:** Query the sessions table for the fork session:
-   ```sql
-   SELECT ui_id, name, forked_from, fork_point FROM sessions WHERE forked_from IS NOT NULL;
-   ```
-3. **Check socket events:** Is `fork_session` being received? Are `merge_message` and `token_done` events being emitted after the 1000ms delay?
-4. **Verify ACP session state:** Is the fork's ACP session properly initialized after `session/load`? Check logs for draining issues.
-5. **Test title generation:** Does the title update after fork creation? If not, check the backend logs for title generation errors.
-6. **Simulate merge:** Manually emit a `merge_fork` event from the browser console and verify the summary is captured and injected correctly.
+1. Verify the fork row in SQLite: `SELECT ui_id, acp_id, forked_from, fork_point, is_sub_agent FROM sessions WHERE ui_id = ?;`.
+2. Check the frontend session object for `id`, `acpSessionId`, `forkedFrom`, `forkPoint`, and `isSubAgent` in `useSessionLifecycleStore`.
+3. For missing fork output, inspect `fork_session`, provider `cloneSession`, `session/load`, and drain completion in `backend/sockets/sessionHandlers.js`.
+4. For missing fork title, inspect `generateForkTitle`, `models.titleGeneration`, `statsCaptures`, `db.updateSessionName`, and `session_renamed`.
+5. For missing merge summary, inspect `merge_fork`, `statsCaptures`, `merge_message`, parent ACP room `session:<parentAcpId>`, and the `useChatManager` listener.
+6. For orphaned children, inspect `delete_session.collectDescendants`, direct DB deletes, and `Sidebar.handleRemoveSession` local removal.
 
 ---
 
 ## Summary
 
-**Fork & Merge** is a core session branching feature:
-
-- **Fork Creation:** Clones the parent ACP session (via provider), copies attachments, saves DB metadata (`forkedFrom`, `forkPoint`), initializes ACP state, and generates a title asynchronously.
-- **Fork Identity:** UI ID is `fork-{timestamp}`, ACP ID is a UUID. The single lineage pointer is `forkedFrom: parentUiId`.
-- **Fork Hierarchy:** Sidebar filters root sessions (non-fork, non-sub-agent), then recursively renders forks indented under their parent using `renderChildren()`.
-- **Merge Flow:** Captures summary from fork's ACP session, deletes fork, switches UI to parent, then injects summary as user message and ACP prompt after 1000ms delay.
-- **Cascade Delete:** Deleting a parent automatically recursively deletes all fork descendants and their ACP session files.
-- **Title Generation:** Asynchronous, fire-and-forget. Uses last 2 message pairs before forkPoint to generate a concise title via ephemeral ACP session.
-
-**Critical Contract:** `forkedFrom` + `forkPoint` form the immutable fork metadata. Sidebar rendering, cascade delete, and merge validation all depend on this contract being enforced.
-
-**Why This Matters:** Forks enable parallel exploration of conversations without losing history, and merging summarizes divergent work back into the main thread. The strict metadata enforcement and provider-agnostic cloning ensure forks work identically across all AI providers.
-
----
+- Session forking starts from `AssistantMessage.handleFork` and flows through `useChatStore.handleForkSession` to the backend `fork_session` handler.
+- The backend clones provider-owned ACP files, copies attachments, saves `forkedFrom` and `forkPoint`, loads the cloned ACP session with drain protection, initializes metadata, and starts title generation.
+- The frontend registers the returned fork, selects it, watches the new ACP session, and sends an orientation prompt through normal prompt submission.
+- Sidebar and folder rendering use recursive `forkedFrom` trees, while `isSubAgent` separates sub-agent rows from fork rows.
+- Merge-back uses `merge_fork`, `statsCaptures`, `cleanupAcpSession`, `db.deleteSession`, `merge_message`, and parent `session/prompt` as one coordinated flow.
+- The critical contract is correct separation of UI identity, ACP identity, hierarchy fields, sub-agent flags, and provider clone turn boundaries.
+- When changing this feature, update backend socket/title tests and frontend store/sidebar tests together because fork behavior spans persistence, transport, and rendering.

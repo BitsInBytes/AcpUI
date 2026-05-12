@@ -10,7 +10,7 @@ Spawns an ACP daemon natively on the host OS, parses the JSON-RPC stream into a 
 - **Root README (this file):** platform overview, architecture, setup, and operational entry points.
 - **Backend guide:** [backend/README.md](backend/README.md) for human-readable backend responsibilities, structure, and ops commands.
 - **Frontend guide:** [frontend/README.md](frontend/README.md) for human-readable frontend responsibilities, structure, and build/test commands.
-- **Deep implementation docs:** [documents/](documents/) (`[Feature Doc] - *.md`) for exact technical breakdowns and line-level references.
+- **Deep implementation docs:** [documents/](documents/) (`[Feature Doc] - *.md`) for technical breakdowns with stable file/function/event anchors.
 
 ## Architecture
 
@@ -100,6 +100,8 @@ Example `providers.json`:
 ### 4. Configure Environment
 
 The `.env` file at the project root controls global settings. See `.env.example` for a template and full list of available variables.
+
+MCP tool availability is controlled by the JSON file referenced by `MCP_CONFIG`, which defaults to `configuration/mcp.json`. Core tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) are enabled there by default. Optional IO tools (`ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`) and `ux_google_web_search` are disabled by default. `ux_google_web_search` requires `googleSearch.apiKey` in the MCP config before it is advertised.
 
 ### 5. Configure SSL
 
@@ -280,7 +282,10 @@ The MCP server name that exposes these tools is defined in the provider's `provi
 - **Monaco editors** — JSON config editing with syntax highlighting for provider (user.json), workspaces, and commands
 
 ### Other
-- **Stdio MCP proxy** — Stdio MCP proxy spawned per ACP session — exposes UI-specific tools (shell, sub-agents) via /api/mcp/tool-call
+- **Stdio MCP proxy** — Stdio MCP proxy spawned per ACP session — exposes enabled UI-specific tools via /api/mcp/tool-call
+- **MCP tool config** — `configuration/mcp.json` controls `ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`, optional IO tools, and optional Google search
+- **Optional IO MCP tools** — `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, and `ux_web_fetch`
+- **Optional Google search MCP tool** — `ux_google_web_search` uses `googleSearch.apiKey` from `configuration/mcp.json`
 - **Sub-agent system** — `ux_invoke_subagents` spawns parallel AI agents with live streaming, sidebar nesting under parent chat, and permission inheritance
 - **Multi-perspective counsel** — `ux_invoke_counsel` spawns Advocate, Critic, Pragmatist + optional domain experts to evaluate decisions
 - **Shell execution** — `ux_invoke_shell` with interactive terminal interaction

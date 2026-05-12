@@ -62,7 +62,7 @@ When token refresh is needed, AcpUI automatically derives the OAuth client ID fr
 
 ## Configuring Agents and Tool Permissions
 
-AcpUI injects MCP tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) into your Codex sessions. Codex also has native built-in tools with overlapping functionality. For the best experience, you can configure AcpUI's enhanced versions as the preferred tools and manage their permissions.
+AcpUI injects core MCP tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) into your Codex sessions. When enabled in `configuration/mcp.json`, AcpUI can also advertise optional IO tools (`ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`) and `ux_google_web_search`. Codex also has native built-in tools with overlapping functionality. For the best experience, you can configure AcpUI's enhanced versions as the preferred tools and manage their permissions.
 
 ### 1. Block Codex's Built-In System Tools and Steer Tool Usage (Recommended for Better UX)
 
@@ -72,6 +72,7 @@ AcpUI's versions of these tools provide a superior user experience:
 - **`ux_invoke_shell`** — Live colored shell output with real-time streaming, interactive terminal with user input
 - **`ux_invoke_subagents`** — Agent orchestration view showing parallel agent execution with live progress
 - **`ux_invoke_counsel`** — Multi-perspective evaluation with Advocate, Critic, Pragmatist, and domain experts
+- **Optional IO/Search MCP tools** — Available only when enabled in `configuration/mcp.json` before creating the session
 
 #### Step 1: Disable Codex's Built-In System Tools
 

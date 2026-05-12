@@ -1,10 +1,15 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { getMcpServers, createToolHandlers, getMaxShellResultLines } from '../mcp/mcpServer.js';
 import { clearMcpProxyRegistry, getMcpProxyIdFromServers, resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
 import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
-import { toolCallState } from '../services/tools/index.js';
+import { mcpExecutionRegistry, toolCallState } from '../services/tools/index.js';
+import { resetMcpConfigForTests } from '../services/mcpConfig.js';
 import EventEmitter from 'events';
+import fsSync from 'fs';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 
 // Hoist Mocks
 const { mockPty } = vi.hoisted(() => ({
@@ -41,6 +46,10 @@ const { mockShellRunManager } = vi.hoisted(() => ({
     }
 }));
 
+const { mockGoogleWebSearch } = vi.hoisted(() => ({
+    mockGoogleWebSearch: vi.fn()
+}));
+
 const { mockAcpClient } = vi.hoisted(() => ({
     mockAcpClient: {
         transport: {
@@ -68,6 +77,9 @@ vi.mock('node-pty', () => ({ default: mockPty }));
 vi.mock('../services/logger.js', () => ({ writeLog: vi.fn(), setIo: vi.fn() }));
 vi.mock('../services/shellRunManager.js', () => ({
   shellRunManager: mockShellRunManager
+}));
+vi.mock('../services/ioMcp/googleWebSearch.js', () => ({
+  googleWebSearch: mockGoogleWebSearch
 }));
 vi.mock('../services/providerLoader.js', () => ({
   getProvider: mockGetProvider,
@@ -121,11 +133,73 @@ const DEFAULT_PROVIDER_CONFIG = {
   }
 };
 
+const BASE_MCP_CONFIG = {
+  tools: {
+    invokeShell: true,
+    subagents: true,
+    counsel: true,
+    io: false,
+    googleSearch: false
+  },
+  io: {
+    autoAllowWorkspaceCwd: true,
+    allowedRoots: ['*'],
+    maxReadBytes: 1048576,
+    maxWriteBytes: 1048576,
+    maxReplaceBytes: 1048576,
+    maxOutputBytes: 262144
+  },
+  webFetch: {
+    allowedProtocols: ['http:', 'https:'],
+    blockedHosts: [],
+    blockedHostPatterns: [],
+    blockedCidrs: [],
+    maxResponseBytes: 1048576,
+    timeoutMs: 15000,
+    maxRedirects: 5
+  },
+  googleSearch: {
+    apiKey: '',
+    timeoutMs: 15000,
+    maxOutputBytes: 262144
+  }
+};
+
+function useMcpConfig(overrides = {}) {
+  const dir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'acpui-mcp-config-'));
+  const configPath = path.join(dir, 'mcp.json');
+  const config = {
+    ...BASE_MCP_CONFIG,
+    ...overrides,
+    tools: {
+      ...BASE_MCP_CONFIG.tools,
+      ...(overrides.tools || {})
+    },
+    io: {
+      ...BASE_MCP_CONFIG.io,
+      ...(overrides.io || {})
+    },
+    webFetch: {
+      ...BASE_MCP_CONFIG.webFetch,
+      ...(overrides.webFetch || {})
+    },
+    googleSearch: {
+      ...BASE_MCP_CONFIG.googleSearch,
+      ...(overrides.googleSearch || {})
+    }
+  };
+  fsSync.writeFileSync(configPath, JSON.stringify(config), 'utf8');
+  vi.stubEnv('MCP_CONFIG', configPath);
+  resetMcpConfigForTests();
+  return configPath;
+}
+
 describe('mcpServer', () => {
   let mockIo;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    useMcpConfig();
     mockGetProvider.mockReturnValue(DEFAULT_PROVIDER_CONFIG);
     mockIo = new EventEmitter();
     mockIo.emit = vi.fn();
@@ -136,6 +210,7 @@ describe('mcpServer', () => {
     mockAcpClient.stream.statsCaptures.clear();
     mockAcpClient.transport.pendingRequests.clear();
     toolCallState.clear();
+    mcpExecutionRegistry.clear();
     clearMcpProxyRegistry();
     mockShellRunManager.startPreparedRun.mockResolvedValue({ content: [{ type: 'text', text: 'shell done' }] });
     
@@ -143,6 +218,12 @@ describe('mcpServer', () => {
       ? { _meta: { 'agent-meta': { options: { agent } } } }
       : undefined
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    resetMcpConfigForTests();
   });
 
   it('getMcpServers returns server config', () => {
@@ -183,6 +264,282 @@ describe('mcpServer', () => {
     ]));
   });
 
+  describe('core MCP feature flags', () => {
+    it('registers core handlers when MCP config enables them', () => {
+      useMcpConfig();
+
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_invoke_shell).toBeTypeOf('function');
+      expect(handlers.ux_invoke_subagents).toBeTypeOf('function');
+      expect(handlers.ux_invoke_counsel).toBeTypeOf('function');
+    });
+
+    it('omits invoke shell handler when MCP config disables it', () => {
+      useMcpConfig({ tools: { invokeShell: false } });
+
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_invoke_shell).toBeUndefined();
+      expect(handlers.ux_invoke_subagents).toBeTypeOf('function');
+      expect(handlers.ux_invoke_counsel).toBeTypeOf('function');
+    });
+
+    it('omits subagents handler when MCP config disables it', () => {
+      useMcpConfig({ tools: { subagents: false } });
+
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_invoke_shell).toBeTypeOf('function');
+      expect(handlers.ux_invoke_subagents).toBeUndefined();
+      expect(handlers.ux_invoke_counsel).toBeTypeOf('function');
+    });
+
+    it('omits counsel handler when MCP config disables it', () => {
+      useMcpConfig({ tools: { counsel: false } });
+
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_invoke_shell).toBeTypeOf('function');
+      expect(handlers.ux_invoke_subagents).toBeTypeOf('function');
+      expect(handlers.ux_invoke_counsel).toBeUndefined();
+    });
+  });
+
+  describe('optional IO MCP tools', () => {
+    it('does not register optional IO or Google handlers by default', () => {
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_read_file).toBeUndefined();
+      expect(handlers.ux_web_fetch).toBeUndefined();
+      expect(handlers.ux_google_web_search).toBeUndefined();
+      expect(handlers.read_file).toBeUndefined();
+      expect(handlers.web_fetch).toBeUndefined();
+      expect(handlers.google_web_search).toBeUndefined();
+    });
+
+    it('registers IO handlers when MCP config enables IO', () => {
+      useMcpConfig({ tools: { io: true } });
+
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_read_file).toBeTypeOf('function');
+      expect(handlers.ux_write_file).toBeTypeOf('function');
+      expect(handlers.ux_replace).toBeTypeOf('function');
+      expect(handlers.ux_list_directory).toBeTypeOf('function');
+      expect(handlers.ux_glob).toBeTypeOf('function');
+      expect(handlers.ux_grep_search).toBeTypeOf('function');
+      expect(handlers.ux_web_fetch).toBeTypeOf('function');
+      expect(handlers.read_file).toBeUndefined();
+    });
+
+    it('uses glob description for cached tool headers', async () => {
+      useMcpConfig({ tools: { io: true } });
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpui-io-mcp-'));
+      try {
+        const filePath = path.join(tmpDir, 'example.txt');
+        await fs.writeFile(filePath, 'hello', 'utf8');
+        const handlers = createToolHandlers(mockIo);
+
+        const result = await handlers.ux_glob({
+          providerId: 'provider-a',
+          acpSessionId: 'acp-1',
+          requestMeta: { toolCallId: 'tool-glob-1' },
+          description: 'Find text files',
+          pattern: '*.txt',
+          dir_path: tmpDir
+        });
+
+        expect(result.content[0].text).toContain(filePath);
+        expect(mockIo.to).toHaveBeenCalledWith('session:acp-1');
+        expect(mockIo.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+          type: 'tool_update',
+          id: 'tool-glob-1',
+          canonicalName: 'ux_glob',
+          isAcpUxTool: true,
+          title: 'Glob: Find text files',
+          titleSource: 'mcp_handler'
+        }));
+        expect(toolCallState.get('provider-a', 'acp-1', 'tool-glob-1')).toEqual(expect.objectContaining({
+          identity: expect.objectContaining({ canonicalName: 'ux_glob', mcpToolName: 'ux_glob' }),
+          input: expect.objectContaining({ description: 'Find text files', pattern: '*.txt' }),
+          display: expect.objectContaining({ title: 'Glob: Find text files', titleSource: 'mcp_handler' })
+        }));
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('uses grep description for cached tool headers', async () => {
+      useMcpConfig({ tools: { io: true } });
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpui-io-mcp-'));
+      try {
+        await fs.writeFile(path.join(tmpDir, 'grep.txt'), 'needle\n', 'utf8');
+        const handlers = createToolHandlers(mockIo);
+
+        const result = await handlers.ux_grep_search({
+          providerId: 'provider-a',
+          acpSessionId: 'acp-1',
+          requestMeta: { toolCallId: 'tool-grep-1' },
+          description: 'Find needles',
+          pattern: 'needle',
+          dir_path: tmpDir,
+          fixed_strings: true
+        });
+
+        expect(result.content[0].text).toContain('needle');
+        expect(toolCallState.get('provider-a', 'acp-1', 'tool-grep-1')).toEqual(expect.objectContaining({
+          display: expect.objectContaining({ title: 'Search: Find needles', titleSource: 'mcp_handler' })
+        }));
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('returns written content from write_file', async () => {
+      useMcpConfig({ tools: { io: true } });
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpui-io-mcp-'));
+      try {
+        const filePath = path.join(tmpDir, 'hello.ts');
+        const handlers = createToolHandlers(mockIo);
+
+        const result = await handlers.ux_write_file({
+          providerId: 'provider-a',
+          acpSessionId: 'acp-1',
+          requestMeta: { toolCallId: 'tool-write-1' },
+          file_path: filePath,
+          content: 'export const hello = true;\n'
+        });
+
+        expect(result.content[0].text).toBe('export const hello = true;\n');
+        await expect(fs.readFile(filePath, 'utf8')).resolves.toBe('export const hello = true;\n');
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('returns a diff from replace', async () => {
+      useMcpConfig({ tools: { io: true } });
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpui-io-mcp-'));
+      try {
+        const filePath = path.join(tmpDir, 'replace.ts');
+        await fs.writeFile(filePath, 'const value = 1;\n', 'utf8');
+        const handlers = createToolHandlers(mockIo);
+
+        const result = await handlers.ux_replace({
+          providerId: 'provider-a',
+          acpSessionId: 'acp-1',
+          requestMeta: { toolCallId: 'tool-replace-1' },
+          file_path: filePath,
+          old_string: 'const value = 1;',
+          new_string: 'const value = 2;'
+        });
+
+        expect(result.content[0].text).toContain('Index:');
+        expect(result.content[0].text).toContain('--- ');
+        expect(result.content[0].text).toContain('+++ ');
+        expect(result.content[0].text).toContain('-const value = 1;');
+        expect(result.content[0].text).toContain('+const value = 2;');
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('emits full directory path in list_directory title', async () => {
+      useMcpConfig({ tools: { io: true } });
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpui-io-mcp-'));
+      try {
+        const handlers = createToolHandlers(mockIo);
+
+        await handlers.ux_list_directory({
+          providerId: 'provider-a',
+          acpSessionId: 'acp-1',
+          requestMeta: { toolCallId: 'tool-list-1' },
+          dir_path: tmpDir
+        });
+
+        expect(mockIo.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+          id: 'tool-list-1',
+          title: `List Directory: ${tmpDir}`,
+          isAcpUxTool: true,
+          titleSource: 'mcp_handler'
+        }));
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('emits fetch URL title and structured web_fetch output', async () => {
+      useMcpConfig({ tools: { io: true } });
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: vi.fn(() => 'text/html') },
+        text: vi.fn().mockResolvedValue('<html><head><title>Docs</title></head><body><h1>Hello</h1></body></html>')
+      }));
+      const handlers = createToolHandlers(mockIo);
+
+      const result = await handlers.ux_web_fetch({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        requestMeta: { toolCallId: 'tool-fetch-1' },
+        url: 'https://example.test/docs'
+      });
+
+      expect(mockIo.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+        id: 'tool-fetch-1',
+        title: 'Fetch: https://example.test/docs',
+        isAcpUxTool: true,
+        titleSource: 'mcp_handler'
+      }));
+      expect(JSON.parse(result.content[0].text)).toEqual(expect.objectContaining({
+        type: 'web_fetch_result',
+        url: 'https://example.test/docs',
+        title: 'Docs',
+        text: 'Hello'
+      }));
+    });
+
+    it('registers Google search handler when MCP config enables Google search', () => {
+      useMcpConfig({ tools: { googleSearch: true }, googleSearch: { apiKey: 'configured-key' } });
+
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_google_web_search).toBeTypeOf('function');
+      expect(handlers.google_web_search).toBeUndefined();
+    });
+
+    it('does not register Google search handler when enabled without an MCP config API key', () => {
+      useMcpConfig({ tools: { googleSearch: true }, googleSearch: { apiKey: '' } });
+
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_google_web_search).toBeUndefined();
+    });
+
+    it('emits web search query title for google_web_search', async () => {
+      useMcpConfig({ tools: { googleSearch: true }, googleSearch: { apiKey: 'configured-key' } });
+      mockGoogleWebSearch.mockResolvedValue('search result');
+      const handlers = createToolHandlers(mockIo);
+
+      const result = await handlers.ux_google_web_search({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        requestMeta: { toolCallId: 'tool-search-1' },
+        query: 'latest docs'
+      });
+
+      expect(result.content[0].text).toBe('search result');
+      expect(mockIo.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+        id: 'tool-search-1',
+        title: 'Web Search: latest docs',
+        isAcpUxTool: true,
+        titleSource: 'mcp_handler'
+      }));
+    });
+  });
+
   describe('ux_invoke_shell', () => {
     it('defaults MAX_SHELL_RESULT_LINES to 1000 when env is not a positive integer', () => {
       expect(getMaxShellResultLines({})).toBe(1000);
@@ -221,6 +578,7 @@ describe('mcpServer', () => {
         type: 'tool_update',
         id: 'tool-1',
         canonicalName: 'ux_invoke_shell',
+        isAcpUxTool: true,
         title: 'Invoke Shell: Run test suite'
       }));
       expect(toolCallState.get('provider-a', 'acp-1', 'tool-1')).toEqual(expect.objectContaining({
@@ -785,21 +1143,44 @@ describe('mcpServer', () => {
     });
       });
 
-      describe('ux_invoke_counsel', () => {
-      it('returns error if no counsel agents are configured', async () => {
-      vi.mocked(loadCounselConfig).mockReturnValueOnce({ core: [], specialized: [] });
+  describe('ux_invoke_counsel', () => {
+    it('returns error if no counsel agents are configured', async () => {
+      vi.mocked(loadCounselConfig).mockReturnValueOnce({ core: [], optional: {} });
       const handlers = createToolHandlers(mockIo);
       const result = await handlers.ux_invoke_counsel({ question: 'What to do?' });
       expect(result.content[0].text).toContain('Error: No counsel agents configured');
+    });
+
+    it('runs counsel through the sub-agent invocation pipeline when the subagents tool is hidden', async () => {
+      useMcpConfig({ tools: { subagents: false } });
+      vi.mocked(loadCounselConfig).mockReturnValueOnce({
+        core: [{ name: 'Advocate', prompt: 'argue for' }],
+        optional: { security: { name: 'Security', prompt: 'evaluate security' } }
       });
+      const spy = vi.spyOn(subAgentInvocationManager, 'runInvocation')
+        .mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+      const handlers = createToolHandlers(mockIo);
 
-      it('runs counsel with specialized agents', async () => {
+      try {
+        expect(handlers.ux_invoke_subagents).toBeUndefined();
+        await handlers.ux_invoke_counsel({
+          question: 'help',
+          security: true,
+          providerId: 'provider-a',
+          acpSessionId: 'parent-acp'
+        });
 
-          const handlers = createToolHandlers(mockIo);
-          vi.spyOn(handlers, 'ux_invoke_subagents').mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
-
-          await handlers.ux_invoke_counsel({ question: 'help', specialized: true });
-          expect(handlers.ux_invoke_subagents).toHaveBeenCalled();
-      });
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({
+          providerId: 'provider-a',
+          parentAcpSessionId: 'parent-acp',
+          requests: [
+            expect.objectContaining({ name: 'Advocate', prompt: expect.stringContaining('help') }),
+            expect.objectContaining({ name: 'Security', prompt: expect.stringContaining('help') })
+          ]
+        }));
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 });

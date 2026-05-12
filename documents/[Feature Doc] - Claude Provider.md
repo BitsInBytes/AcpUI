@@ -1,1635 +1,633 @@
-# Feature Doc — Claude Provider
+# Feature Doc - Claude Provider
+
+This document is the Claude-specific sidecar for AcpUI's provider architecture. Read it together with `documents/[Feature Doc] - Provider System.md`.
+
+Claude is implemented in `providers/claude/` and integrates `claude-agent-acp` through the standard provider contract plus Claude-specific quota capture, tool normalization, context-usage replay, hooks, and project-scoped session files.
 
 ## Overview
 
-Claude is implemented via `claude-agent-acp`, the ACP daemon from the `@agentclientprotocol/claude-agent-acp` npm package. This document is a **sidecar supplement** to `[Feature Doc] - Provider System.md` and assumes you understand the provider contract. It exists solely to show how Claude specifically implements or deviates from that contract, with real code, line numbers, and Claude-specific terminology.
+### What It Does
 
-**Load this doc alongside `[Feature Doc] - Provider System.md` when working on the Claude provider.** This doc makes no sense in isolation.
+- Starts Claude ACP with provider-owned environment preparation in `prepareAcpEnvironment`.
+- Captures Anthropic quota headers through `providers/claude/quotaProxy.js` and emits `_anthropic/provider/status`.
+- Normalizes Claude ACP updates into AcpUI provider extensions and Unified Timeline events.
+- Resolves canonical MCP tool identity from `provider.json` `toolIdPattern` through `extractToolInvocation`.
+- Persists and replays context usage per session from `acp_session_context.json`.
+- Routes Claude config changes through `session/set_mode`, `session/set_model`, and `session/set_config_option`.
+- Applies Claude agent metadata through `_meta.claudeCode.options` during `session/new` and `session/load`.
+- Locates, clones, archives, restores, deletes, and parses Claude project-scoped session files.
 
----
+### Why This Matters
 
-## What Claude Implements
+- Claude ACP emits useful provider-specific data as standard `session/update` payloads, so `intercept` must convert selected updates into provider extensions.
+- Claude model selection and dynamic options share daemon payloads but use separate AcpUI contracts.
+- Claude MCP tool names follow the configured `mcp__{mcpName}__{toolName}` pattern; tool routing breaks if parsing moves into generic backend code.
+- Claude stores session history under project directories, so rehydration, fork, archive, and restore paths must use provider functions.
+- Claude quota status is visible only through HTTP response headers seen by the provider-owned proxy.
 
-Claude implements all required provider contract functions:
+### Architectural Role
 
-- **intercept()** — Transforms `config_option_update` and `available_commands_update` messages into Claude-specific extension events
-- **normalizeUpdate()** — Passes updates through unchanged
-- **extractToolOutput()** — Multi-stage lookup for tool output in various Claude data shapes
-- **extractFilePath()** — 5-step detection for file paths in tool metadata
-- **extractDiffFromToolCall()** — Extracts unified diffs from tool output
-- **extractToolInvocation()** — **V2 Tool Routing**: Extracts canonical identity and arguments using `toolIdPattern`
-- **normalizeTool()** — Strips MCP prefix using pattern and applies tool name aliases
-- **categorizeToolCall()** — Maps Claude's tool names to UI categories
-- **parseExtension()** — Routes Claude's `_anthropic/` protocol extensions
-- **prepareAcpEnvironment()** — **Unique to Claude**: Initializes context usage caching, starts the quota proxy, and injects `ANTHROPIC_BASE_URL`
-- **onPromptStarted() / onPromptCompleted()** — Explicit no-op lifecycle hooks required by the provider contract (Claude quota capture is proxy/header driven, not timer/prompt driven)
-- **emitCachedContext()** — Replays persisted context usage when the backend loads or hot-resumes a session; marks replay complete only after a metadata payload is actually emitted
-- **_emitCachedContext() / _loadContextState() / _saveContextState()** — **NEW**: Internal functions for persisting and replaying session context usage percentages across restarts
-- **performHandshake()** — Single `initialize` call (no auth pairing)
-- **setConfigOption()** — Routes to three different ACP methods based on optionId
-- **buildSessionParams()** — Always injects `disallowedTools`; optionally adds agent name
-- **setInitialAgent()** — Intentional no-op (agent applied at spawn time)
-- **getHooksForAgent()** — Reads Claude's `settings.json` hook map
-- **Session file operations** — `getSessionPaths()`, `cloneSession()`, `archiveSessionFiles()`, `restoreSessionFiles()`
-- **parseSessionHistory()** — Reconstructs Unified Timeline from Claude's JSONL format
+Claude is a provider-specific backend adapter. The frontend stays provider-agnostic and receives branding, model state, config options, Unified Timeline events, and provider status through Socket.IO.
 
-### Claude-Unique Characteristics
+## How It Works - End-to-End Flow
 
-| Aspect | Claude | General Pattern |
-|--------|--------|-----------------|
-| **Quota Capture** | Local HTTP proxy intercepts Anthropic headers | Varies by provider |
-| **Session Layout** | Project-scoped subdirectories `~/.claude/projects/{cwd}/` | Varies; may be flat |
-| **Tool ID Pattern** | `mcp__AcpUI__toolName` (DOUBLE underscore) | Varies by MCP registration |
-| **Agent Switching** | Spawn-time only via `_meta`; no post-spawn changes | Varies |
-| **Session Metadata** | JSONL mixes real user messages with internal entries; no clean flag | Varies |
+1. **Provider Load and Contract Binding**
 
----
+   Files: `backend/services/providerLoader.js` (Functions: `getProvider`, `bindProviderModule`, `getProviderModule`, `getProviderModuleSync`), `providers/claude/provider.json`, `providers/claude/branding.json`, `providers/claude/user.json`
 
-## How Claude Starts — Startup Flow
+   - `getProvider` loads `provider.json`, optional `branding.json`, and optional `user.json` from `providers/claude/`.
+   - `user.json` overrides matching provider fields for local daemon command, paths, and model defaults.
+   - `bindProviderModule` merges Claude exports with `DEFAULT_MODULE` and runs provider functions inside AsyncLocalStorage provider context.
+   - Claude code calls `getProvider()` without arguments inside provider exports because `bindProviderModule` supplies the provider context.
 
-### Step 1: Context Usage Persistence
+2. **Daemon Spawn and Environment Preparation**
 
-**File:** `providers/claude/index.js` (Lines 13–72)
+   Files: `backend/services/acpClient.js` (Class: `AcpClient`, Method: `start`), `providers/claude/index.js` (Function: `prepareAcpEnvironment`), `providers/claude/quotaProxy.js` (Function: `startClaudeQuotaProxy`)
 
-Claude now persists session context usage percentages across restarts. When a session is resumed, the cached context percentage is replayed immediately:
+   - `AcpClient.start` caches `this.providerModule`, builds the spawn command from provider config `command` and `args`, and calls `providerModule.prepareAcpEnvironment(childEnv, context)`.
+   - Claude `prepareAcpEnvironment` loads context cache state from `{paths.home}/acp_session_context.json`.
+   - Unless disabled by environment flags, `prepareAcpEnvironment` starts the quota proxy and injects `ANTHROPIC_BASE_URL` into the Claude ACP child environment.
 
-```javascript
-// FILE: providers/claude/index.js (Lines 13-72, abbreviated)
-let _emitProviderExtension = null;
-let _writeLog = null;
-let _sessionContextCache = new Map(); // sessionId -> contextUsagePercentage
-let _contextStateFile = null; // Path to persist context state
-let _sessionsWithInitialEmit = new Set(); // Track which sessions we've already emitted initial context for
+3. **Quota Proxy Request Forwarding**
 
-function _emitCachedContext(sessionId, config) {
-  if (!sessionId || _sessionsWithInitialEmit.has(sessionId)) return false;
-  const persistedPercent = _sessionContextCache.get(sessionId);
-  if (persistedPercent === undefined || !_emitProviderExtension) return false;
-  _emitProviderExtension(`${config.protocolPrefix}metadata`, {
-    sessionId,
-    contextUsagePercentage: persistedPercent
-  });
-  _sessionsWithInitialEmit.add(sessionId);
-  return true;
-}
+   File: `providers/claude/quotaProxy.js` (Functions: `startClaudeQuotaProxy`, `proxyRequest`, `extractClaudeQuotaHeaders`, `getLatestClaudeQuota`, `stopClaudeQuotaProxy`)
 
-function _loadContextState() {
-  try {
-    if (!_contextStateFile) return;
-    if (!fs.existsSync(_contextStateFile)) return;
-    const data = JSON.parse(fs.readFileSync(_contextStateFile, 'utf8'));
-    if (data && typeof data === 'object') {
-      _sessionContextCache = new Map(Object.entries(data));
-    }
-  } catch (err) {
-    _writeLog?.(`[CLAUDE CONTEXT STATE] Failed to load: ${err.message}`);
-  }
-}
+   - `startClaudeQuotaProxy` listens on loopback and forwards requests to `CLAUDE_QUOTA_PROXY_TARGET`, `ANTHROPIC_BASE_URL`, or `https://api.anthropic.com`.
+   - `proxyRequest` filters hop-by-hop headers, forwards the request, and passes response headers to `extractClaudeQuotaHeaders`.
+   - `extractClaudeQuotaHeaders` parses `anthropic-ratelimit-*` headers into quota fields such as `5h_utilization`, `7d_utilization`, `overage_utilization`, reset timestamps, `unified_status`, and `raw`.
 
-function _saveContextState() {
-  try {
-    if (!_contextStateFile) return;
-    const dir = path.dirname(_contextStateFile);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    const data = {};
-    for (const [sessionId, percent] of _sessionContextCache.entries()) {
-      data[sessionId] = percent;
-    }
-    const tempFile = `${_contextStateFile}.tmp`;
-    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
-    fs.renameSync(tempFile, _contextStateFile);
-  } catch (err) {
-    _writeLog?.(`[CLAUDE CONTEXT STATE] Failed to save: ${err.message}`);
-  }
-}
+4. **ACP Handshake**
+
+   Files: `backend/services/acpClient.js` (Method: `performHandshake`), `providers/claude/index.js` (Function: `performHandshake`), `providers/claude/provider.json` (Key: `clientInfo`)
+
+   - `AcpClient.performHandshake` calls `providerModule.performHandshake(this)` after process startup.
+   - Claude sends one JSON-RPC `initialize` request with `protocolVersion: 1`, file-system and terminal client capabilities, and `clientInfo` from `provider.json`.
+   - Claude provider tests assert that `authenticate` is not sent.
+
+5. **Session Create, Load, and MCP Proxy Binding**
+
+   Files: `backend/sockets/sessionHandlers.js` (Socket event: `create_session`, Helper: `captureModelState`), `backend/services/sessionManager.js` (Function: `getMcpServers`), `providers/claude/index.js` (Functions: `buildSessionParams`, `setInitialAgent`, `getMcpServerMeta`)
+
+   - `create_session` obtains Claude `sessionParams` from `buildSessionParams(requestAgent)`.
+   - `buildSessionParams` always returns `_meta.claudeCode.options.disallowedTools` with `Bash`, `PowerShell`, and `Agent`; it adds `_meta.claudeCode.options.agent` when an agent is supplied.
+   - `getMcpServers` builds the AcpUI stdio MCP proxy with env keys `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `BACKEND_PORT`, and `NODE_TLS_REJECT_UNAUTHORIZED`.
+   - Claude `getMcpServerMeta` returns `undefined`, so Claude MCP server entries do not include `_meta`.
+   - `setInitialAgent` is a no-op because Claude agent selection is applied through spawn-time `_meta` fields.
+
+6. **Model and Config State Capture**
+
+   Files: `backend/sockets/sessionHandlers.js` (Helper: `captureModelState`, Socket events: `set_session_model`, `set_session_option`), `backend/services/sessionManager.js` (Functions: `normalizeProviderConfigOptions`, `reapplySavedConfigOptions`, `setProviderConfigOption`, `setSessionModel`), `providers/claude/index.js` (Functions: `normalizeModelState`, `normalizeConfigOptions`, `setConfigOption`)
+
+   - `captureModelState` extracts model state from `session/new` or `session/load` responses, applies `normalizeModelState`, then saves model metadata.
+   - The same helper normalizes response-time `configOptions` through Claude `normalizeConfigOptions` and persists non-model options.
+   - Claude `normalizeConfigOptions` filters out option id `model` and maps option id `effort` to `kind: "reasoning_effort"`.
+   - `set_session_option` calls Claude `setConfigOption`; Claude routes `mode` to `session/set_mode`, `model` to `session/set_model`, and all other dynamic options to `session/set_config_option`.
+
+7. **Inbound Message Interception**
+
+   Files: `backend/services/acpClient.js` (Method: `handleAcpMessage`), `providers/claude/index.js` (Functions: `intercept`, `emitCachedContext`, `normalizeConfigOptions`)
+
+   - `handleAcpMessage` calls Claude `intercept(payload)` before routing any daemon message.
+   - `intercept` emits cached context for any message carrying a session id when a persisted context value exists.
+   - Claude `usage_update` updates the in-memory context cache and saves `acp_session_context.json`.
+   - Claude `config_option_update` becomes `_anthropic/config_options` with `replace: true` after model filtering; model-only updates return `null` and are swallowed.
+   - Claude `available_commands_update` becomes `_anthropic/commands/available`, prefixes command names with `/`, and maps `input.hint` to `meta.hint`.
+
+8. **Provider Extension Routing and Reconnect Replay**
+
+   Files: `backend/services/acpClient.js` (Methods: `handleProviderExtension`, `handleModelStateUpdate`), `backend/services/providerStatusMemory.js` (Functions: `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions`), `backend/sockets/index.js` (Functions: `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers`), `providers/claude/index.js` (Function: `parseExtension`)
+
+   - Any processed method with prefix `_anthropic/` is routed through `handleProviderExtension`.
+   - `handleProviderExtension` merges config-option payloads into session metadata, persists them through `db.saveConfigOptions`, and emits `provider_extension` globally.
+   - `rememberProviderStatusExtension` caches only provider-status payloads that include `params.status.sections`.
+   - `registerSocketHandlers` emits cached provider status extensions on client connection.
+   - Claude `parseExtension` maps `_anthropic/commands/available`, `_anthropic/metadata`, `_anthropic/compaction/status`, `_anthropic/provider/status`, and `_anthropic/config_options` into frontend extension types.
+
+9. **Tool Pipeline and Canonical Invocation**
+
+   Files: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`), `backend/services/tools/toolInvocationResolver.js` (Functions: `resolveToolInvocation`, `applyInvocationToEvent`), `providers/claude/index.js` (Functions: `normalizeTool`, `extractToolInvocation`, `categorizeToolCall`, `extractToolOutput`, `extractFilePath`, `extractDiffFromToolCall`), `providers/claude/provider.json` (Keys: `mcpName`, `toolIdPattern`, `toolCategories`)
+
+   - `handleUpdate` calls provider extractors for file paths, output, display title, category, and canonical identity.
+   - `normalizeTool` reads Claude `kind`, `_meta.claudeCode.toolName`, MCP title patterns, and tool input to produce readable titles.
+   - `extractToolInvocation` uses `matchToolIdPattern` with `toolIdPattern` to return canonical MCP identity fields.
+   - `resolveToolInvocation` merges provider identity with sticky `toolCallState` and centrally recorded MCP execution data.
+   - `applyInvocationToEvent` stamps `toolName`, `canonicalName`, `mcpServer`, `mcpToolName`, `isAcpUxTool`, title, file path, and category onto emitted tool events.
+
+10. **Hooks and Agent Context**
+
+    Files: `backend/services/hookRunner.js` (Function: `runHooks`), `backend/sockets/sessionHandlers.js` (Socket event: `create_session`), `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`), `providers/claude/index.js` (Constant: `CLAUDE_HOOK_MAP`, Function: `getHooksForAgent`), `providers/claude/provider.json` (Key: `cliManagedHooks`)
+
+    - Claude `provider.json` sets `cliManagedHooks` to an empty array, so AcpUI hook runner may invoke supported hooks.
+    - `getHooksForAgent` maps AcpUI hook types to Claude settings keys: `session_start` -> `SessionStart`, `pre_tool` -> `PreToolUse`, `post_tool` -> `PostToolUse`, and `stop` -> `Stop`.
+    - Claude hooks are read from `settings.json` next to the configured agents directory and returned as `{ command, matcher? }` entries.
+    - `create_session` runs `session_start` hooks when an agent is set and stores non-empty output in `spawnContext`.
+    - `handleUpdate` runs `post_tool` hooks for completed tool updates when session metadata includes an agent name and raw tool input.
+
+11. **JSONL Rehydration and Session Files**
+
+    Files: `backend/services/jsonlParser.js` (Function: `parseJsonlSession`), `backend/sockets/sessionHandlers.js` (Socket events: `rehydrate_session`, `get_session_history`), `providers/claude/index.js` (Functions: `getSessionPaths`, `findSessionDir`, `parseSessionHistory`), `providers/claude/ACP_PROTOCOL_SAMPLES.md`
+
+    - `parseJsonlSession(acpSessionId, providerId)` delegates file path resolution and parsing to the provider module.
+    - Claude `getSessionPaths` scans `paths.sessions` project subdirectories and returns `{ jsonl, json, tasksDir }` for the session id.
+    - Claude `parseSessionHistory` reconstructs user messages, assistant text, thought steps, tool steps, tool result output, and diff fallback output from Claude JSONL entries.
+    - Internal command/caveat messages are filtered during parsing and fork pruning.
+
+12. **Fork, Archive, Restore, and Delete**
+
+    Files: `backend/sockets/sessionHandlers.js` (Socket event: `fork_session`), `backend/sockets/archiveHandlers.js` (Socket events: `archive_session`, `restore_archive`, `delete_archive`, `list_archives`), `providers/claude/index.js` (Functions: `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`)
+
+    - `fork_session` asks Claude `cloneSession(sourceAcpId, forkAcpId, pruneAtTurn)` to copy/prune JSONL, JSON metadata, and task directory files inside the source project directory.
+    - `archive_session` calls Claude `archiveSessionFiles`, copies attachments, writes `session.json`, and removes the database session.
+    - Claude `archiveSessionFiles` writes `restore_meta.json` with the original `sessionDir` so restore targets the correct project directory.
+    - `restore_archive` calls Claude `restoreSessionFiles`, copies attachments, saves a restored DB session, and removes the archive folder after success.
+    - `deleteSessionFiles` removes Claude JSONL, JSON metadata, and task directory files for a session id.
+
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+  Frontend[Frontend React UI] -->|Socket.IO| Socket[backend/sockets/index.js]
+  Socket --> Sessions[backend/sockets/sessionHandlers.js]
+  Socket --> Archives[backend/sockets/archiveHandlers.js]
+
+  Sessions --> Runtime[providerRuntimeManager]
+  Runtime --> Client[AcpClient]
+  Client -->|spawn stdio| ClaudeACP[claude-agent-acp]
+  Client -->|prepareAcpEnvironment| ClaudeProvider[providers/claude/index.js]
+
+  ClaudeProvider -->|startClaudeQuotaProxy| QuotaProxy[providers/claude/quotaProxy.js]
+  ClaudeACP -->|HTTP via ANTHROPIC_BASE_URL| QuotaProxy
+  QuotaProxy -->|forward| Anthropic[Anthropic API]
+  QuotaProxy -->|onQuota| ClaudeProvider
+  ClaudeProvider -->|_anthropic/provider/status| Client
+  Client --> ProviderStatus[providerStatusMemory]
+  ProviderStatus --> Socket
+
+  Sessions -->|session/new session/load| Client
+  Sessions -->|getMcpServers| McpProxy[backend/mcp/stdio-proxy.js]
+  ClaudeACP -->|MCP tool call| McpProxy
+  McpProxy --> ToolRegistry[backend/services/tools]
+
+  ClaudeACP -->|JSON-RPC session/update| Client
+  Client -->|intercept| ClaudeProvider
+  Client --> UpdateHandler[acpUpdateHandler.handleUpdate]
+  UpdateHandler --> ToolResolver[toolInvocationResolver]
+  ToolResolver --> ToolRegistry
+  UpdateHandler -->|system_event token thought stats| Socket
+
+  ClaudeProvider -->|getSessionPaths parseSessionHistory| ClaudeFiles[paths.sessions project dirs]
+  ClaudeFiles --> JsonlParser[backend/services/jsonlParser.js]
+  Archives --> ClaudeProvider
 ```
 
-**Key:** Context state is stored at `~/.claude/acp_session_context.json` and automatically reloaded at startup. This allows the UI to display context usage immediately when resuming a session, before the next API call.
+## The Critical Contract
 
-### Step 2: prepareAcpEnvironment()
+### 1. Provider Context Contract
 
-**File:** `providers/claude/index.js` (Lines 502–539)
+Files: `backend/services/providerLoader.js` (Functions: `runWithProvider`, `bindProviderModule`, `getProvider`), `providers/claude/index.js` (All exports)
 
-Before Claude Code is spawned, the provider's `prepareAcpEnvironment()` is called. Claude uses this phase to initialize context caching and start a local HTTP proxy:
+Provider exports depend on AsyncLocalStorage context. Claude functions call `getProvider()` without arguments, so code must be executed through bound provider modules returned by `getProviderModule` or `getProviderModuleSync`.
 
-```javascript
-// FILE: providers/claude/index.js (Lines 502-539)
-export async function prepareAcpEnvironment(env, context = {}) {
-  _emitProviderExtension = context.emitProviderExtension || _emitProviderExtension;
-  _writeLog = context.writeLog || _writeLog;
+### 2. Tool Identity Contract
 
-  // Initialize context persistence
-  const { config } = getProvider();
-  const homePath = config.paths?.home || path.join(os.homedir(), '.claude');
-  _contextStateFile = path.join(homePath, 'acp_session_context.json');
-  _loadContextState();  // LINE 510: Load persisted context from disk
+Files: `providers/claude/provider.json` (Keys: `mcpName`, `toolIdPattern`), `providers/claude/index.js` (Functions: `normalizeTool`, `extractToolInvocation`), `backend/services/tools/toolInvocationResolver.js` (Function: `resolveToolInvocation`)
 
-  if (env.CLAUDE_QUOTA_PROXY === 'false' || env.CLAUDE_QUOTA_PROXY_ENABLED === 'false') {
-    return env;  // LINE 512-513: Can disable proxy entirely
-  }
+Claude must resolve canonical tool names from `toolIdPattern`, not from hardcoded MCP prefixes in backend generic code. `extractToolInvocation(update, context)` returns provider identity fields; `resolveToolInvocation` merges them with sticky state and classifies AcpUI-owned MCP tools as `acpui_mcp` when the tool belongs to the configured AcpUI MCP server.
 
-  let proxy;
-  try {
-    proxy = await startClaudeQuotaProxy({  // LINE 518: Start the HTTP proxy
-      env,
-      log: context.writeLog || (() => {}),
-      onQuota: quotaData => {
-        context.emitProviderExtension?.(
-          `${config.protocolPrefix}provider/status`,
-          { status: buildClaudeProviderStatus(quotaData) }
-        );  // LINE 522-524: Emit quota status via extension
-      }
-    });
-  } catch (err) {
-    context.writeLog?.(`[CLAUDE QUOTA] Proxy startup failed, continuing without quota capture: ${err?.message || String(err)}`);
-    return env;  // LINE 529: Gracefully degrade if proxy fails
-  }
-
-  context.writeLog?.(`[CLAUDE QUOTA] Injecting ANTHROPIC_BASE_URL=${proxy.baseUrl} for Claude ACP`);
-
-  const nextEnv = {
-    ...env,
-    ANTHROPIC_BASE_URL: proxy.baseUrl  // LINE 536: Inject proxy URL into child process env
-  };
-  return nextEnv;
-}
-```
-
-**Key:** Loads persisted context state, then returns the modified environment with `ANTHROPIC_BASE_URL` pointing to the local proxy.
-
-### Step 3: Daemon Spawn & Quota Proxy
-
-**File:** `providers/claude/quotaProxy.js` (Lines 20–65)
-
-The proxy is a singleton HTTP server:
-
-```javascript
-// FILE: providers/claude/quotaProxy.js (Lines 20-65)
-export async function startClaudeQuotaProxy({ env = process.env, log = () => {}, onQuota = () => {} } = {}) {
-  const target = resolveTarget(env);  // LINE 21: Resolve Anthropic target URL
-
-  if (proxyState?.server?.listening) {  // LINE 23: Reuse if already running
-    proxyState.onQuota = onQuota;
-    proxyState.log = log;
-    return { baseUrl: proxyState.baseUrl, target: proxyState.target.href, latestQuota: proxyState.latestQuota };
-  }
-
-  const state = {  // LINE 33-40: Initialize proxy state
-    server: null,
-    baseUrl: null,
-    target,
-    latestQuota: null,
-    onQuota,
-    log
-  };
-
-  state.server = http.createServer((request, response) => {
-    proxyRequest(state, request, response);  // LINE 43: Route every request through proxyRequest()
-  });
-
-  proxyState = state;
-
-  await new Promise((resolve, reject) => {
-    state.server.once('error', reject);
-    state.server.listen(0, '127.0.0.1', () => {  // LINE 50: Listen on loopback, let OS pick port
-      state.server.off('error', reject);
-      const address = state.server.address();
-      state.baseUrl = `http://127.0.0.1:${address.port}`;
-      resolve();
-    });
-  });
-
-  log(`[CLAUDE QUOTA] Proxy listening at ${state.baseUrl}, forwarding to ${target.origin}`);
-  // LINE 58: Log startup for debugging
-
-  return { baseUrl: state.baseUrl, target: target.href, latestQuota: state.latestQuota };
-}
-```
-
-**Why a proxy?** Claude Code makes API calls to Anthropic inside the spawned subprocess. Those requests include rate-limit headers in the response, but JSON-RPC doesn't carry HTTP response metadata. The proxy intercepts the requests, captures the headers, and emits them back via the `onQuota` callback.
-
-### Step 4: performHandshake()
-
-**File:** `providers/claude/index.js` (Lines 1083–1090)
-
-Once the subprocess is running, the provider performs ACP handshake:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 1083-1090)
-export async function performHandshake(acpClient) {
-  const { config } = getProvider();
-  await acpClient.transport.sendRequest('initialize', {  // LINE 1085: Single initialize call
-    protocolVersion: 1,
-    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
-    clientInfo: config.clientInfo || { name: 'ACP-UI', version: '1.0.0' }  // LINE 1088: From provider.json
-  });
-}
-```
-
-**Key:** Claude's handshake is a simple `initialize` request — no paired auth or session setup. The agent context (if any) was already applied at spawn time via `_meta.claudeCode.options.agent`.
-
----
-
-## Configuration Files
-
-### provider.json
-
-**File:** `providers/claude/provider.json` (Complete)
+Expected provider extraction shape:
 
 ```json
 {
-    "name": "Claude",
-    "protocolPrefix": "_anthropic/",
-    "mcpName": "AcpUI",
-    "defaultSystemAgentName": "auto",
-    "supportsAgentSwitching": false,
-    "cliManagedHooks": [],
-    "toolIdPattern": "mcp__{mcpName}__{toolName}",
-    "toolCategories": {
-        "read":  { "category": "file_read",  "isFileOperation": true },
-        "edit":  { "category": "file_edit",  "isFileOperation": true },
-        "write": { "category": "file_write", "isFileOperation": true },
-        "glob":  { "category": "glob",       "isFileOperation": true },
-        "grep":  { "category": "grep" }
-    },
-    "clientInfo": {
-        "name": "claude-code",
-        "version": "2.1.114"
-    }
+  "toolCallId": "tool-call-id",
+  "kind": "mcp",
+  "rawName": "mcp__AcpUI__ux_invoke_shell",
+  "canonicalName": "ux_invoke_shell",
+  "mcpServer": "AcpUI",
+  "mcpToolName": "ux_invoke_shell",
+  "input": { "description": "Run tests", "command": "npm test" },
+  "title": "Invoke Shell: Run tests",
+  "filePath": null,
+  "category": {}
 }
 ```
 
-**Critical fields:**
-- **`protocolPrefix: "_anthropic/"`** — All Claude extensions use this prefix (e.g., `_anthropic/config_options`, `_anthropic/provider/status`)
-- **`toolIdPattern: "mcp__{mcpName}__{toolName}"`** — **DOUBLE underscore**. Becomes `mcp__AcpUI__ux_invoke_shell`, etc. This is critical for normalizeTool() detection.
-- **`toolCategories`** — Uses SHORT tool names (`read`, `edit`, `write`), not the aliased names (`read_file`, etc.). The provider's normalizeTool() renames them.
-- **`supportsAgentSwitching: false`** — Agent is applied at spawn time only; cannot be changed post-creation.
+### 3. Model and Config Option Contract
 
-### branding.json
+Files: `providers/claude/index.js` (Functions: `normalizeModelState`, `normalizeConfigOptions`, `setConfigOption`), `backend/sockets/sessionHandlers.js` (Helper: `captureModelState`, Socket events: `set_session_model`, `set_session_option`)
 
-**File:** `providers/claude/branding.json` (Complete)
+Claude model state is first-class AcpUI model state. Generic config rendering receives only non-model options.
+
+- `normalizeConfigOptions` removes option id `model`.
+- Option id `effort` is emitted with `kind: "reasoning_effort"`.
+- `setConfigOption('mode')` sends `session/set_mode` with `modeId`.
+- `setConfigOption('model')` sends `session/set_model` with `modelId`.
+- Other option ids send `session/set_config_option` with `configId` and `value`, and response `configOptions` are normalized before returning.
+
+### 4. Context Usage Replay Contract
+
+Files: `providers/claude/index.js` (Functions: `_loadContextState`, `_saveContextState`, `_emitCachedContext`, `emitCachedContext`, `intercept`), `backend/sockets/sessionHandlers.js` (Helper: `emitCachedContext`), `backend/services/sessionManager.js` (Helper: `emitCachedContext`)
+
+Claude context usage percentage is persisted under `{paths.home}/acp_session_context.json`. `emitCachedContext(sessionId)` emits `_anthropic/metadata` at most once per process/session id when a cached value exists. This preserves footer and settings context indicators across hot session reuse and explicit session load paths.
+
+### 5. Session Path Contract
+
+Files: `providers/claude/index.js` (Functions: `findSessionDir`, `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`), `providers/claude/user.json.example` (Keys: `paths.sessions`, `paths.archive`)
+
+Claude sessions are project-scoped under `paths.sessions`. Any session operation must use `getSessionPaths` or `findSessionDir`; flat path assumptions fail for fork, rehydration, archive, and restore flows. Archive restore depends on `restore_meta.json` containing the original `sessionDir`.
+
+### 6. Provider Status Contract
+
+Files: `providers/claude/index.js` (Function: `buildClaudeProviderStatus`), `backend/services/providerStatusMemory.js` (Function: `rememberProviderStatusExtension`), `documents/[Feature Doc] - Provider Status Panel.md`
+
+Claude quota status must be emitted as `_anthropic/provider/status` with `params.status.sections` as an array. `providerStatusMemory` ignores payloads without that shape, so reconnect hydration depends on the status object returned by `buildClaudeProviderStatus`.
+
+## Configuration / Provider-Specific Behavior
+
+### Provider Configuration
+
+File: `providers/claude/provider.json`
+
+| Key | Current Value / Shape | Purpose |
+|---|---|---|
+| `name` | `Claude` | Provider identity label. |
+| `protocolPrefix` | `_anthropic/` | Prefix for Claude provider extensions. |
+| `mcpName` | `AcpUI` | MCP server name passed in `mcpServers` and used by `toolIdPattern`. |
+| `defaultSystemAgentName` | `auto` | Default system agent metadata used by higher-level provider flows. |
+| `supportsAgentSwitching` | `false` | Frontend/backend treat agent selection as spawn-time only. |
+| `cliManagedHooks` | `[]` | AcpUI hook runner may invoke supported hook types. |
+| `toolIdPattern` | `mcp__{mcpName}__{toolName}` | Canonical MCP tool id parser for Claude. |
+| `toolCategories` | `read`, `edit`, `write`, `glob`, `grep` | Claude tool category metadata. |
+| `clientInfo` | `{ name, version }` | Sent in `initialize`. |
+
+### Branding Configuration
+
+File: `providers/claude/branding.json`
+
+Branding fields include `title`, `assistantName`, `busyText`, `hooksText`, `warmingUpText`, `resumingText`, `inputPlaceholder`, `emptyChatMessage`, `notificationTitle`, `appHeader`, `sessionLabel`, and `modelLabel`. `backend/sockets/index.js` sends these through `branding` events.
+
+### Local Runtime Configuration
+
+Files: `providers/claude/user.json`, `providers/claude/user.json.example`
+
+`user.json` is local runtime configuration. The example file documents the portable schema:
+
+- `command` and `args`: daemon executable and arguments for `AcpClient.start`.
+- `defaultSubAgentName`: default AcpUI sub-agent name used by MCP sub-agent orchestration.
+- `paths.home`: Claude home directory used for `acp_session_context.json`.
+- `paths.sessions`: Claude project session directory root.
+- `paths.agents`: Claude agents directory; `getHooksForAgent` reads `settings.json` next to this directory.
+- `paths.attachments`: Claude attachment directory.
+- `paths.archive`: archive directory used by `archiveHandlers` and provider file operations.
+- `models.default`, `models.quickAccess`, `models.titleGeneration`, `models.subAgent`: model defaults and quick-select metadata.
+
+### Environment Flags
+
+Files: `providers/claude/index.js` (Function: `prepareAcpEnvironment`), `providers/claude/quotaProxy.js` (Functions: `resolveTarget`, `proxyRequest`)
+
+- `CLAUDE_QUOTA_PROXY=false` disables proxy startup and leaves the child environment unchanged.
+- `CLAUDE_QUOTA_PROXY_ENABLED=false` also disables proxy startup.
+- `CLAUDE_QUOTA_PROXY_TARGET` sets the upstream Anthropic-compatible target.
+- `ANTHROPIC_BASE_URL` is used as a target when `CLAUDE_QUOTA_PROXY_TARGET` is absent and the value is not a loopback URL.
+- `CLAUDE_QUOTA_PROXY_LOG_MISSES=true` logs responses that do not carry quota headers.
+
+### Claude Settings and Agent Metadata
+
+Files: `providers/claude/README.md`, `providers/claude/SESSION_META_DATA.md`, `providers/claude/index.js` (Functions: `buildSessionParams`, `getHooksForAgent`)
+
+- Claude agents live under the configured `paths.agents` directory or project `.claude/agents` directories according to Claude Code behavior.
+- AcpUI forwards agent selection through `_meta.claudeCode.options.agent` when `buildSessionParams(agent)` receives a truthy agent name.
+- AcpUI always disallows Claude-native `Bash`, `PowerShell`, and `Agent` tools for Claude ACP sessions so AcpUI-owned MCP tools handle shell and sub-agent workflows.
+- Claude `settings.json` permissions can allow or deny `mcp__AcpUI__*` tool visibility for Claude.
+- Claude settings hooks are read by `getHooksForAgent`; hook command output from `session_start` can become session spawn context.
+
+### Protocol Reference Files
+
+Files: `providers/claude/ACP_PROTOCOL_SAMPLES.md`, `providers/claude/SESSION_META_DATA.md`
+
+- `ACP_PROTOCOL_SAMPLES.md` lists Claude ACP payload shapes for `initialize`, `session/new`, `available_commands_update`, `session/set_model`, `session/set_config_option`, `session/set_mode`, `session/prompt`, and `session/load`.
+- `SESSION_META_DATA.md` documents Claude `_meta` fields including `systemPrompt`, `additionalRoots`, `claudeCode.options`, `claudeCode.emitRawSDKMessages`, and `gateway`.
+
+## Data Flow / Rendering Pipeline
+
+### A. Config Option Update Path
+
+Raw Claude daemon update:
 
 ```json
 {
-    "title": "Claude",
-    "assistantName": "Claude",
-    "busyText": "Claude is thinking...",
-    "hooksText": "⚙ Cleaning up...",
-    "warmingUpText": "Claude warming up...",
-    "resumingText": "Resuming...",
-    "inputPlaceholder": "Send a message...",
-    "emptyChatMessage": "Send a message to start chatting with Claude.",
-    "notificationTitle": "Claude",
-    "appHeader": "Claude",
-    "sessionLabel": "Claude Session",
-    "modelLabel": "Claude model"
+  "method": "session/update",
+  "params": {
+    "sessionId": "claude-session-id",
+    "update": {
+      "sessionUpdate": "config_option_update",
+      "configOptions": [
+        { "id": "model", "currentValue": "default" },
+        { "id": "effort", "currentValue": "high" },
+        { "id": "mode", "currentValue": "acceptEdits" }
+      ]
+    }
+  }
 }
 ```
 
-### user.json (Example)
-
-Claude's local config comes from `~/.claude/settings.json` (hooks, agents, workspace settings). AcpUI's local provider config can override `provider.json` via `user.json`:
+Claude provider normalization:
 
 ```json
 {
-    "command": "claude-agent-acp",
-    "args": [],
-    "paths": {
-        "sessions": "~/.claude/projects",
-        "agents": "~/.claude/agents",
-        "attachments": "~/.claude/attachments"
-    },
-    "models": {
-        "default": "claude-3-5-sonnet-20241022"
-    }
-}
-```
-
-**Note:** `paths.sessions` is `~/.claude/projects`, which is a **directory of subdirectories** (one per project/workspace). This is critical for `findSessionDir()`.
-
----
-
-## The Quota Proxy (Claude-Unique Feature)
-
-### Why It Exists
-
-Claude Code runs as a subprocess and makes API calls to Anthropic directly. Those calls include rate-limit headers in the HTTP response:
-- `anthropic-ratelimit-unified-5h-utilization`
-- `anthropic-ratelimit-unified-5h-reset`
-- `anthropic-ratelimit-unified-7d-utilization`
-- etc.
-
-These headers are NOT part of the JSON-RPC stream; they're HTTP-level metadata. The proxy intercepts the requests, captures the headers, and emits them back to AcpUI so the frontend can show quota status.
-
-### How It Works
-
-**Files:** `providers/claude/quotaProxy.js` (Lines 20–168), `providers/claude/index.js` (Lines 502–539, 545–611)
-
-1. `prepareAcpEnvironment()` calls `startClaudeQuotaProxy()` (Line 518 in index.js)
-2. The proxy listens on `127.0.0.1:0` (random port)
-3. The proxy URL is injected as `ANTHROPIC_BASE_URL` into the Claude Code subprocess
-4. Claude Code makes all Anthropic API calls through the proxy
-5. `proxyRequest()` forwards the request and captures the response headers (Lines 119–168 in quotaProxy.js)
-6. `extractClaudeQuotaHeaders()` parses the `anthropic-ratelimit-*` headers (Lines 78–117 in quotaProxy.js)
-7. The parsed quota data is passed to `onQuota` callback, which emits `_anthropic/provider/status` extension
-8. The frontend receives the extension and renders quota status
-
-### Extracting Quota Headers
-
-**File:** `providers/claude/quotaProxy.js` (Lines 78–117)
-
-```javascript
-// FILE: providers/claude/quotaProxy.js (Lines 78-117)
-export function extractClaudeQuotaHeaders(headers, { url, status } = {}) {
-  const raw = {};
-  for (const [key, value] of Object.entries(headers || {})) {
-    const lowerKey = key.toLowerCase();
-    if (!lowerKey.startsWith('anthropic-ratelimit-')) continue;  // LINE 82: Filter for quota headers
-    raw[lowerKey] = Array.isArray(value) ? value.join(', ') : String(value);
-  }
-
-  if (Object.keys(raw).length === 0) return null;  // LINE 86: No quota headers = return null
-
-  const fiveHourReset = parseResetSeconds(headers, 'anthropic-ratelimit-unified-5h-reset');
-  const sevenDayReset = parseResetSeconds(headers, 'anthropic-ratelimit-unified-7d-reset');
-  const overageReset = parseResetSeconds(headers, 'anthropic-ratelimit-unified-overage-reset');
-  const unifiedReset = parseResetSeconds(headers, 'anthropic-ratelimit-unified-reset');
-
-  return {  // LINE 93: Return structured quota data
-    source: 'acpui-claude-provider-proxy',
-    captured_at: new Date().toISOString(),
-    ...(url ? { url } : {}),
-    ...(status ? { status } : {}),
-    '5h_utilization': parseNumber(headerValue(headers, 'anthropic-ratelimit-unified-5h-utilization')),
-    '5h_status': headerValue(headers, 'anthropic-ratelimit-unified-5h-status'),
-    '5h_reset': fiveHourReset,
-    '5h_resets_at': resetSecondsToIso(fiveHourReset),
-    '7d_utilization': parseNumber(headerValue(headers, 'anthropic-ratelimit-unified-7d-utilization')),
-    '7d_status': headerValue(headers, 'anthropic-ratelimit-unified-7d-status'),
-    '7d_reset': sevenDayReset,
-    '7d_resets_at': resetSecondsToIso(sevenDayReset),
-    overage_utilization: parseNumber(headerValue(headers, 'anthropic-ratelimit-unified-overage-utilization')),
-    overage_status: headerValue(headers, 'anthropic-ratelimit-unified-overage-status'),
-    overage_reset: overageReset,
-    overage_resets_at: resetSecondsToIso(overageReset),
-    fallback_percentage: parseNumber(headerValue(headers, 'anthropic-ratelimit-unified-fallback-percentage')),
-    representative_claim: headerValue(headers, 'anthropic-ratelimit-unified-representative-claim'),
-    unified_status: headerValue(headers, 'anthropic-ratelimit-unified-status'),
-    unified_reset: unifiedReset,
-    unified_resets_at: resetSecondsToIso(unifiedReset),
-    raw  // LINE 115: Include raw headers for advanced UI display
-  };
-}
-```
-
-### Formatting for the UI
-
-**File:** `providers/claude/index.js` (Lines 545–611)
-
-The quota data is transformed into the provider status shape via `buildClaudeProviderStatus()`:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 545-611, abbreviated)
-export function buildClaudeProviderStatus(quotaData) {
-  const fiveHourItem = buildQuotaItem('five-hour', '5h', quotaData['5h_utilization'], quotaData['5h_status'], quotaData['5h_resets_at']);
-  const sevenDayItem = buildQuotaItem('seven-day', '7d', quotaData['7d_utilization'], quotaData['7d_status'], quotaData['7d_resets_at']);
-  const overageItem = buildQuotaItem('overage', 'Overage', quotaData.overage_utilization, quotaData.overage_status, quotaData.overage_resets_at);
-  
-  const limitItems = [fiveHourItem, sevenDayItem, overageItem].filter(Boolean);
-  
-  // LINE 556-564: Gather additional details (unified status, claim, fallback, etc.)
-  const details = [];
-  if (quotaData.unified_status) {
-    details.push({
-      id: 'unified-status',
-      label: 'Unified status',
-      value: capitalizeWords(String(quotaData.unified_status).replace(/_/g, ' ')),
-      tone: quotaData.unified_status === 'allowed' ? 'success' : 'warning'
-    });
-  }
-  // ... more details ...
-  
-  return {  // LINE 596-610: Render-ready structure
-    providerId: 'claude',
-    title: 'Claude',
-    updatedAt: quotaData.captured_at,
-    summary: {
-      title: 'Usage',
-      items: summaryItems
-    },
-    sections: [
-      { id: 'limits', title: 'Usage Windows', items: limitItems },
-      ...(details.length > 0 ? [{ id: 'details', title: 'Details', items: details }] : []),
-      // ... more sections ...
-    ]
-  };
-}
-```
-
-### Configuration
-
-- **Disable:** `CLAUDE_QUOTA_PROXY=false`
-- **Custom target:** `CLAUDE_QUOTA_PROXY_TARGET=https://api.anthropic.com` (override the default)
-
----
-
-## intercept() — Claude's Message Transforms
-
-Claude intercepts two specific message types and rewrites them into extension events.
-
-### Transform 1: config_option_update
-
-**File:** `providers/claude/index.js` (Lines 102–122)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 102-122)
-if (
-  payload.method === 'session/update' &&
-  payload.params?.update?.sessionUpdate === 'config_option_update' &&
-  payload.params?.update?.configOptions
-) {
-  const { config } = getProvider();
-  const options = normalizeConfigOptions(payload.params.update.configOptions);
-
-  // LINE 112: If no options left, return null to suppress the message
-  if (options.length === 0) return null;
-
-  return {  // LINE 114-120: Emit as _anthropic/config_options extension
-    method: `${config.protocolPrefix}config_options`,
-    params: {
-      sessionId: payload.params.sessionId,
-      options,
-      replace: true
-    }
-  };
-}
-```
-
-**Why filter 'model'?** Claude sends `model` in config options, but AcpUI has a dedicated model selector UI (`setConfigOption()` routes it to `session/set_model`). The config_option_update must not duplicate this.
-
-**Why remap 'effort' to 'reasoning_effort'?** The UI expects `kind: 'reasoning_effort'` (Claude's native name). The daemon sends `id: 'effort'`, so we rename it.
-
-### Transform 2: available_commands_update
-
-**File:** `providers/claude/index.js` (Lines 129–145)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 129-145)
-if (
-  payload.method === 'session/update' &&
-  payload.params?.update?.sessionUpdate === 'available_commands_update' &&
-  payload.params?.update?.availableCommands
-) {
-  const { config } = getProvider();
-  
-  const commands = payload.params.update.availableCommands.map(cmd => ({
-    name: cmd.name.startsWith('/') ? cmd.name : `/${cmd.name}`,  // LINE 136: Prepend '/'
-    description: cmd.description,
-    ...(cmd.input?.hint ? { meta: { hint: cmd.input.hint } } : {}),  // LINE 138: Map hint for UI
-  }));
-  
-  return {  // LINE 141: Emit as _anthropic/commands/available extension
-    id: payload.id,
-    method: `${config.protocolPrefix}commands/available`,
-    params: { commands }
-  };
-}
-```
-
-**Why prepend '/'?** Claude Code ACP omits the slash from command names (e.g., `"compact"`), but the UI expects `/compact`.
-
----
-
-## Tool Pipeline — How Claude Tools Are Normalized
-
-Claude's tool handling uses the V2 Tool Invocation system, which separates display normalization from canonical identity resolution.
-
-### 1. V2 Tool Invocation Routing
-
-**File:** `providers/claude/index.js` (Lines 404–444)
-
-Claude implements `extractToolInvocation()` to provide authoritative metadata for the backend tool registry. It uses `toolIdPattern` from `provider.json` to resolve the canonical tool name.
-
-```javascript
-export function extractToolInvocation(update = {}, context = {}) {
-  const event = context.event || {};
-  const { config } = getProvider();
-  const input = mergeInputObjects(collectInputObjects(
-    update.rawInput,
-    update.arguments,
-    update.params,
-    update.input,
-    update.toolCall?.arguments
-  ));
-
-  // Match the raw MCP tool id against the pattern to resolve canonical identity.
-  const rawId = update.title || update.kind || update?._meta?.claudeCode?.toolName || event.title || '';
-  const patternMatch = matchToolIdPattern(rawId, config);
-  const canonicalName = patternMatch?.toolName || event.toolName || '';
-
-  return {
-    toolCallId: update.toolCallId || event.id,
-    kind: patternMatch ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
-    rawName: update.kind || update?._meta?.claudeCode?.toolName || rawId || event.toolName || '',
-    canonicalName,
-    mcpServer: patternMatch?.mcpName,
-    mcpToolName: patternMatch?.toolName,
-    input,
-    title: event.title || update.title || '',
-    filePath: event.filePath,
-    category: categorizeToolCall({ ...event, toolName: canonicalName }) || {}
-  };
-}
-```
-
-### 2. Tool ID Pattern Detection
-
-**File:** `providers/claude/index.js` (Lines 338–343)
-
-Claude's tools come through with identifiers matching the pattern `mcp__{mcpName}__{toolName}` (note the **DOUBLE underscore**). `normalizeTool()` uses `matchToolIdPattern` to strip this prefix for display:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 336-341)
-const targetString = event.title || '';
-const titlePatternMatch = matchToolIdPattern(targetString, config);
-const kindPatternMatch = !titlePatternMatch ? matchToolIdPattern(toolName, config) : null;
-const patternMatch = titlePatternMatch || kindPatternMatch;
-
-if (patternMatch?.toolName) toolName = patternMatch.toolName;
-```
-
-**Critical:** The `toolIdPattern` in `provider.json` is the source of truth. For Claude, this is `mcp__{mcpName}__{toolName}`.
-
-### 3. Tool Name Aliases
-
-**File:** `providers/claude/index.js` (Lines 352–355)
-
-Claude's native tool names are short (`read`, `write`, `edit`). The provider aliases them to longer names for consistency:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 352-355)
-if (toolName === 'read') toolName = 'read_file';
-if (toolName === 'write') toolName = 'write_file';
-if (toolName === 'edit') toolName = 'edit_file';
-```
-
-**Important:** `toolCategories` in `provider.json` uses the SHORT names (`read`, `edit`, `write`). The aliases are applied in normalizeTool(), but categorizeToolCall() expects the short names.
-
-### 3. UX Tool Name Mapping
-
-**File:** `providers/claude/index.js` (Lines 366–368)
-
-For custom AcpUI tools, use readable names:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 366-368)
-const UX_TOOL_TITLES = {
-  ux_invoke_shell: 'Invoke Shell',
-  ux_invoke_subagents: 'Invoke Subagents',
-  ux_invoke_counsel: 'Invoke Counsel'
-};
-```
-
-### 4. Title Construction with Arguments
-
-**File:** `providers/claude/index.js` (Lines 372–401)
-
-For better visibility, the tool's filename or pattern is appended to the title:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 265-294, abbreviated)
-let argsStr = '';
-let argsObj = update?.rawInput || update?.arguments || update?.params;
-
-if (typeof argsObj === 'string') {
-  // LINE 270-273: Try regex extraction from streaming JSON
-  const pathMatch = argsObj.match(/"(?:file_)?path"\s*:\s*"([^"]+)"/);
-  if (pathMatch && pathMatch[1]) {
-    argsStr = path.basename(pathMatch[1]);
-  } else {
-    try {
-      argsObj = JSON.parse(argsObj);  // LINE 275: Parse if JSON
-    } catch {
-      argsObj = null;
-    }
-  }
-}
-
-if (argsObj && typeof argsObj === 'object') {
-  if (argsObj.file_path) argsStr = path.basename(argsObj.file_path);
-  else if (argsObj.path) argsStr = path.basename(argsObj.path);
-  else if (argsObj.pattern) argsStr = argsObj.pattern;
-}
-
-// LINE 289-293: Append to title for visibility
-if (argsStr && title && !title.toLowerCase().includes(argsStr.toLowerCase())) {
-  title += `: ${argsStr}`;
-}
-```
-
-### 5. Categorization
-
-**File:** `providers/claude/index.js` (Lines 302–320)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 302-320)
-export function categorizeToolCall(event) {
-  const { config } = getProvider();
-  const toolName = event.toolName;
-  if (!toolName) return null;
-
-  const metadata = (config.toolCategories || {})[toolName];  // LINE 308: Look up in provider.json
-  if (!metadata) return null;
-
-  const result = {
-    toolCategory: metadata.category,  // e.g., "file_read", "file_edit", "glob"
-    isFileOperation: metadata.isFileOperation || false,
-  };
-  return result;
-}
-```
-
-**Note:** This looks up the SHORT tool name (`read`, not `read_file`). The alias must be reversed or toolCategories must use the short name.
-
----
-
-## extractToolOutput() — Real-Time Streaming
-
-Claude sends tool output in multiple places as the tool executes. The provider performs a multi-stage lookup:
-
-**File:** `providers/claude/index.js` (Lines 178–233)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 178-233, abbreviated)
-export function extractToolOutput(update) {
-  // STAGE 1: Real-time streaming of write/edit content (Lines 181-197)
-  if (update.rawInput && update.sessionUpdate === 'tool_call_update' && update.status !== 'completed') {
-    let argsObj = null;
-    if (typeof update.rawInput === 'string') {
-      try {
-        argsObj = JSON.parse(update.rawInput);
-      } catch {}
-    } else {
-      argsObj = update.rawInput;
-    }
-    
-    if (argsObj) {
-      if (argsObj.content) return argsObj.content;  // write/edit content being streamed
-      if (argsObj.newStr) return argsObj.newStr;    // str_replace newStr
-    }
-  }
-
-  // STAGE 2: Check rawOutput or content array (Lines 199-204)
-  let outputArray = update.rawOutput || update.content;
-  if ((!outputArray || (Array.isArray(outputArray) && outputArray.length === 0)) && 
-      update._meta?.claudeCode?.toolResponse) {
-    // STAGE 3: Fallback to _meta.claudeCode.toolResponse
-    const toolResponse = extractClaudeToolResponse(update._meta.claudeCode.toolResponse);
-    if (toolResponse) return toolResponse;
-  }
-
-  // STAGE 4: String output with "successfully" filter (Lines 205-218)
-  if (typeof outputArray === 'string') {
-    if (update.content && Array.isArray(update.content) && update.content.length > 0) {
-      outputArray = update.content;  // Prefer content array if available
-    } else {
-      const toolName = update._meta?.claudeCode?.toolName?.toLowerCase() || '';
-      // Skip generic success messages for write/edit to preserve streaming code block
-      if (/successfully/i.test(outputArray) && (toolName === 'write' || toolName === 'edit' || toolName === 'strreplace')) {
-        return undefined;  // LINE 214: Don't output success message
-      }
-      return outputArray;
-    }
-  }
-
-  // STAGE 5: Content array text extraction (Lines 220-231)
-  if (outputArray && Array.isArray(outputArray)) {
-    const result = outputArray
-      .filter(c => c.type === 'text' || c.type === 'content')
-      .map(c => {
-        if (c.type === 'text') return c.text;
-        if (c.type === 'content' && c.content?.type === 'text') return c.content.text;
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n');
-    return result || undefined;
-  }
-  
-  return undefined;
-}
-```
-
-### Helper: extractClaudeToolResponse
-
-**File:** `providers/claude/index.js` (Lines 235–261)
-
-Recursively extracts text from nested tool response structures:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 137-157)
-function extractClaudeToolResponse(toolResponse) {
-  if (!toolResponse) return undefined;
-  if (typeof toolResponse === 'string') return toolResponse;
-
-  if (Array.isArray(toolResponse)) {
-    const result = toolResponse
-      .map(item => extractClaudeToolResponse(item))
-      .filter(Boolean)
-      .join('\n');
-    return result || undefined;
-  }
-
-  if (typeof toolResponse.text === 'string') return toolResponse.text;
-  if (typeof toolResponse.content === 'string') return toolResponse.content;
-  if (toolResponse.file?.content) return toolResponse.file.content;
-  if (Array.isArray(toolResponse.content)) return extractClaudeToolResponse(toolResponse.content);
-  if (toolResponse.content && typeof toolResponse.content === 'object') 
-    return extractClaudeToolResponse(toolResponse.content);
-  if (Array.isArray(toolResponse.filenames)) return toolResponse.filenames.join('\n') || undefined;
-
-  return undefined;
-}
-```
-
----
-
-## extractFilePath() — File Path Detection
-
-Claude embeds file paths in many places. The provider performs a 5-step lookup:
-
-**File:** `providers/claude/index.js` (Lines 266–305)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 161-201)
-export function extractFilePath(update, resolvePath) {
-  const title = (update.title || '').toLowerCase();
-
-  // STEP 1: Noise filtering (Lines 164-165)
-  if (title.startsWith('listing') || title.startsWith('running:')) return undefined;
-
-  // STEP 2: Content array (Lines 167-173)
-  if (update.content && Array.isArray(update.content)) {
-    for (const item of update.content) {
-      if (item.filePath) return resolvePath(item.filePath);
-      if (item.path) return resolvePath(item.path);
-    }
-  }
-
-  // STEP 3: _meta.claudeCode structure (Lines 175-176)
-  const toolResponseFilePath = update._meta?.claudeCode?.toolResponse?.file?.filePath;
-  if (typeof toolResponseFilePath === 'string') return resolvePath(toolResponseFilePath);
-
-  // STEP 4: Locations array (Lines 178-183)
-  if (update.locations && Array.isArray(update.locations)) {
-    for (const loc of update.locations) {
-      if (loc.path) return resolvePath(loc.path);
-    }
-  }
-
-  // STEP 5: Regex extraction from arguments (Lines 185-200)
-  let args = update.arguments || update.params || update.rawInput;
-  if (typeof args === 'string') {
-    // Handle streaming JSON: "path": "foo" or "file_path": "foo" or "target": "foo"
-    const pathMatch = args.match(/"(?:file_)?path|target"\s*:\s*"([^"]*)"/i);
-    if (pathMatch && pathMatch[1]) {
-      return resolvePath(pathMatch[1]);
-    }
-  } else if (args) {
-    const p = args.path || args.file_path || args.filePath || args.target;
-    if (p && typeof p === 'string') return resolvePath(p);
-  }
-
-  return undefined;
-}
-```
-
----
-
-## Session Files — Project-Scoped Layout
-
-Claude stores sessions in **project-scoped subdirectories**, not flat. This is critical for understanding file operations.
-
-### Layout
-
-```
-~/.claude/projects/
-├── {encoded-cwd}/
-│   ├── {sessionId}.jsonl
-│   ├── {sessionId}.json
-│   └── {sessionId}/
-│       └── (task files)
-├── {another-encoded-cwd}/
-│   └── ...
-```
-
-**Example:** If you're working in `/home/user/my-project`, Claude stores sessions under `~/.claude/projects/{encoded-path-of-my-project}/`.
-
-### findSessionDir()
-
-**File:** `providers/claude/index.js` (Lines 726–743)
-
-Locates the project subdirectory containing a session:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 573-590)
-function findSessionDir(sessionsRoot, acpId) {
-  // FAST PATH: Flat layout (for other providers, or future changes)
-  if (fs.existsSync(path.join(sessionsRoot, `${acpId}.jsonl`))) {  // LINE 575
-    return sessionsRoot;
-  }
-  
-  // SLOW PATH: Scan project subdirectories
-  try {
-    for (const entry of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      if (fs.existsSync(path.join(sessionsRoot, entry.name, `${acpId}.jsonl`))) {
-        return path.join(sessionsRoot, entry.name);  // LINE 583: Found it
-      }
-    }
-  } catch (err) {
-    // Directory doesn't exist or read error
-  }
-  
-  return sessionsRoot;  // LINE 589: Fallback to root
-}
-```
-
-**Key:** This function returns the directory containing the session files, not the files themselves.
-
-### getSessionPaths()
-
-**File:** `providers/claude/index.js` (Lines 745–753)
-
-Returns absolute paths for all session files:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 745-753)
-export function getSessionPaths(acpId) {
-  const { config } = getProvider();
-  const dir = findSessionDir(config.paths.sessions, acpId);  // LINE 747: Find the directory
-  
-  return {
-    jsonl: path.join(dir, `${acpId}.jsonl`),
-    json: path.join(dir, `${acpId}.json`),
-    tasksDir: path.join(dir, acpId),
-  };
-}
-```
-
-### cloneSession()
-
-**File:** `providers/claude/index.js` (Lines 755–816)
-
-Clones a session (for forking) into the same project subdirectory:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 602-663, abbreviated)
-export function cloneSession(oldAcpId, newAcpId, pruneAtTurn) {
-  const { config } = getProvider();
-  const sessionsRoot = config.paths.sessions;
-
-  // LINE 609: Both old and new sessions belong to the same project (same cwd)
-  const sessionDir = findSessionDir(sessionsRoot, oldAcpId);
-
-  const oldJsonl   = path.join(sessionDir, `${oldAcpId}.jsonl`);
-  const newJsonl   = path.join(sessionDir, `${newAcpId}.jsonl`);
-  // ... copy .json and tasks dir ...
-
-  if (fs.existsSync(oldJsonl)) {
-    const lines = fs.readFileSync(oldJsonl, 'utf-8').split('\n').filter(l => l.trim());
-    
-    if (pruneAtTurn != null) {
-      // LINE 620-645: Prune internal messages and count real user turns
-      let userTurnCount = 0;
-      let pruneAt = lines.length;
-      for (let i = 0; i < lines.length; i++) {
-        try {
-          const entry = JSON.parse(lines[i]);
-          if (entry.type === 'user') {
-            let isInternal = entry.isMeta === true;  // LINE 627: Check isMeta flag
-            
-            // LINE 628-634: Check for internal message markers in content
-            if (typeof entry.message?.content === 'string') {
-              const content = entry.message.content;
-              if (content.includes('<local-command-caveat>') ||
-                  content.includes('<command-name>') ||
-                  content.includes('<local-command-')) {
-                isInternal = true;
-              }
-            }
-            
-            if (!isInternal) {
-              userTurnCount++;
-            }
-          }
-          if (userTurnCount > pruneAtTurn) {
-            pruneAt = i;
-            break;
-          }
-        } catch {}
-      }
-      
-      // Write pruned JSONL with ID replacements
-      fs.writeFileSync(
-        newJsonl,
-        lines.slice(0, pruneAt)
-          .map(l => l.replaceAll(oldAcpId, newAcpId))
-          .join('\n') + '\n',
-        'utf-8'
-      );
-    } else {
-      // No pruning — clone all lines
-      const content = fs.readFileSync(oldJsonl, 'utf-8');
-      fs.writeFileSync(newJsonl, content.replaceAll(oldAcpId, newAcpId), 'utf-8');
-    }
-  }
-  
-  // Copy .json metadata file
-  if (fs.existsSync(oldJson)) {
-    let json = fs.readFileSync(oldJson, 'utf-8');
-    json = json.replaceAll(oldAcpId, newAcpId);
-    fs.writeFileSync(newJson, json, 'utf-8');
-  }
-  
-  // Copy tasks directory
-  if (fs.existsSync(oldTasksDir)) {
-    fs.cpSync(oldTasksDir, newTasksDir, { recursive: true });
-  }
-}
-```
-
-### archiveSessionFiles()
-
-**File:** `providers/claude/index.js` (Lines 825–847)
-
-Moves session files to an archive directory and saves the session's original directory path:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 825-847)
-export function archiveSessionFiles(acpId, archiveDir) {
-  const { config } = getProvider();
-  const paths = getSessionPaths(acpId);
-  
-  if (paths.jsonl && fs.existsSync(paths.jsonl)) {
-    fs.copyFileSync(paths.jsonl, path.join(archiveDir, `${acpId}.jsonl`));
-    fs.unlinkSync(paths.jsonl);
-  }
-  
-  // ... copy .json and tasks ...
-  
-  // CRITICAL: Save the exact session directory for restore (Lines 840-846)
-  const sessionDir = path.dirname(paths.jsonl);  // e.g., ~/.claude/projects/encoded-cwd/
-  fs.writeFileSync(
-    path.join(archiveDir, 'restore_meta.json'),
-    JSON.stringify({ sessionDir }, null, 2)  // LINE 845: Absolute path
-  );
-}
-```
-
-**Why?** When the session is restored, it must go back into its original project subdirectory. Without this metadata, restore would place it in the root and it would become invisible to Claude Code.
-
-### restoreSessionFiles()
-
-**File:** `providers/claude/index.js` (Lines 987–1020)
-
-Restores archived sessions to their original project subdirectories:
-
-```javascript
-// FILE: providers/claude/index.js (Lines 834-867, abbreviated)
-export function restoreSessionFiles(savedAcpId, archiveDir) {
-  const { config } = getProvider();
-  const sessionsRoot = config.paths.sessions;
-
-  // CRITICAL: Read the absolute path from restore_meta.json (Lines 841-850)
-  let targetDir = sessionsRoot;
-  const metaPath = path.join(archiveDir, 'restore_meta.json');
-  if (fs.existsSync(metaPath)) {
-    try {
-      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
-      if (meta.sessionDir) {
-        targetDir = meta.sessionDir;  // LINE 847: Use the saved absolute path
-      }
-    } catch { /* fall through */ }
-  }
-
-  if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
-
-  // Copy files into the exact directory
-  const jsonlSrc = path.join(archiveDir, `${savedAcpId}.jsonl`);
-  if (fs.existsSync(jsonlSrc)) {
-    fs.copyFileSync(jsonlSrc, path.join(targetDir, `${savedAcpId}.jsonl`));
-  }
-  // ... restore .json and tasks ...
-}
-```
-
----
-
-## Internal Message Detection
-
-Claude's JSONL format uses `type: "user"` for **both** real user messages **and** internal entries like tool results and local command caveats. There is no clean metadata flag, so the provider detects internal messages by inspecting content.
-
-### Detection Logic
-
-**Used in:** `cloneSession()` (Lines 763–776) and `parseSessionHistory()` (Lines 864–876)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 626-638, from cloneSession)
-if (entry.type === 'user') {
-  let isInternal = entry.isMeta === true;  // LINE 627: Check isMeta flag (may be absent)
-  
-  if (typeof entry.message?.content === 'string') {
-    const content = entry.message.content;
-    // LINE 630-633: Check for internal message markers
-    if (content.includes('<local-command-caveat>') ||
-        content.includes('<command-name>') ||
-        content.includes('<local-command-')) {
-      isInternal = true;
-    }
-  }
-  
-  if (!isInternal) {
-    userTurnCount++;  // LINE 637: Count only real user turns
-  }
-}
-```
-
-**Internal message markers:**
-- `<local-command-caveat>` — Caveat about local command execution
-- `<command-name>` — Marker for command execution
-- `<local-command-` — Various local command markers
-
----
-
-## parseSessionHistory() — Unified Timeline from JSONL
-
-Claude's JSONL is a sequence of `type: "user"` and `type: "assistant"` entries. The provider reconstructs AcpUI's Unified Timeline (alternating user + assistant messages with tool steps inside).
-
-**File:** `providers/claude/index.js` (Lines 852–985)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 699-832, abbreviated)
-export async function parseSessionHistory(filePath, Diff) {
-  if (!fs.existsSync(filePath)) return null;
-
-  try {
-    const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(l => l.trim());
-    const entries = lines.map(l => JSON.parse(l));
-
-    const messages = [];
-    let currentAssistant = null;
-
-    for (const entry of entries) {
-      if (entry.type === 'user') {  // LINE 710: User message
-        // LINE 711-735: Parse user content, check for internal markers
-        let isInternal = entry.isMeta === true;
-        let textContent = '';
-        let toolResults = [];
-
-        if (typeof entry.message?.content === 'string') {
-          const content = entry.message.content;
-          if (content.includes('<local-command-caveat>') ||
-              content.includes('<command-name>') ||
-              content.includes('<local-command-')) {
-            isInternal = true;
-          } else {
-            textContent = content;
-          }
-        } else if (Array.isArray(entry.message?.content)) {
-          for (const block of entry.message.content) {
-            if (block.type === 'text') {
-              textContent += block.text + '\n';
-            } else if (block.type === 'tool_result') {
-              toolResults.push(block);  // LINE 729: Collect tool results
-            }
-          }
-        }
-
-        // LINE 737-751: Match tool results back to tool steps
-        if (toolResults.length > 0 && currentAssistant) {
-          for (const res of toolResults) {
-            const toolStep = currentAssistant.timeline.find(
-              t => t.type === 'tool' && t.event.id === res.tool_use_id
-            );
-            if (toolStep) {
-              toolStep.event.status = res.is_error ? 'failed' : 'completed';
-              let outputText = '';
-              if (typeof res.content === 'string') {
-                outputText = res.content;
-              } else if (Array.isArray(res.content)) {
-                outputText = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-              }
-              toolStep.event.output = outputText || undefined;
-            }
-          }
-        }
-
-        // LINE 753-759: Emit real user messages (skip internal)
-        if (!isInternal && textContent.trim()) {
-          if (currentAssistant) {
-            messages.push(currentAssistant);
-            currentAssistant = null;
-          }
-          messages.push({
-            role: 'user',
-            content: textContent.trim(),
-            id: entry.uuid || entry.message?.id || Date.now().toString()
-          });
-        }
-
-      } else if (entry.type === 'assistant') {  // LINE 760: Assistant message
-        if (!currentAssistant) {
-          currentAssistant = {
-            role: 'assistant',
-            content: '',
-            id: entry.uuid || entry.message?.id || Date.now().toString(),
-            isStreaming: false,
-            timeline: []
-          };
-        }
-
-        // LINE 771-807: Process assistant message blocks
-        for (const block of entry.message?.content || []) {
-          if (block.type === 'text') {
-            if (currentAssistant.content) currentAssistant.content += '\n\n';
-            currentAssistant.content += block.text;
-          } else if (block.type === 'thinking') {
-            // LINE 776: Add thinking as thought step
-            currentAssistant.timeline.push({ type: 'thought', content: block.thinking });
-          } else if (block.type === 'tool_use') {
-            // LINE 778-791: Add tool step with fallback diff
-            const inp = block.input || {};
-            const titleArg = inp.path || inp.filePath || inp.file_path || inp.command || inp.pattern || inp.query || '';
-            const title = titleArg ? `Running ${block.name}: ${titleArg}` : `Running ${block.name}`;
-
-            let fallbackOutput = null;
-            const isWrite = ['write', 'write_file', 'strReplace', 'str_replace', 'edit'].includes(block.name);
-            
-            // LINE 785-791: Generate diff as fallback for write/edit tools
-            if (isWrite && inp.command === 'strReplace' && inp.newStr) {
-              fallbackOutput = Diff.createPatch(inp.path || 'file', inp.oldStr || '', inp.newStr, 'old', 'new');
-            } else if (isWrite && inp.newStr && inp.oldStr) {
-              fallbackOutput = Diff.createPatch(inp.path || 'file', inp.oldStr, inp.newStr, 'old', 'new');
-            } else if (isWrite && inp.content) {
-              fallbackOutput = Diff.createPatch(inp.path || 'file', '', inp.content, 'old', 'new');
-            }
-
-            currentAssistant.timeline.push({
-              type: 'tool',
-              isCollapsed: true,
-              event: {
-                id: block.id,
-                title,
-                status: 'pending_result',
-                output: null,
-                _fallbackOutput: fallbackOutput,
-                startTime: Date.now(),
-                endTime: Date.now()
-              }
-            });
-          }
-        }
-      }
-    }
-
-    // LINE 812-814: Flush final assistant message
-    if (currentAssistant) {
-      messages.push(currentAssistant);
-    }
-
-    // LINE 816-826: Apply fallback outputs for tools with no result
-    for (const msg of messages) {
-      for (const step of (msg.timeline || [])) {
-        if (step.type === 'tool' && step.event) {
-          if (!step.event.output && step.event._fallbackOutput) {
-            step.event.output = step.event._fallbackOutput;
-          }
-          delete step.event._fallbackOutput;
-        }
-      }
-    }
-
-    return messages;
-  } catch (err) {
-    throw new Error(`Failed to parse ${filePath}: ${err.stack}`);
-  }
-}
-```
-
----
-
-## Agent Support — Spawn-Time Only
-
-Claude agents are applied at subprocess spawn time via the `_meta` field and cannot be changed post-creation.
-
-### buildSessionParams()
-
-**File:** `providers/claude/index.js` (Lines 1077–1081)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 1077-1081)
-export function buildSessionParams(agent) {
-  const options = { disallowedTools: ['Bash', 'PowerShell', 'Agent'] };  // LINE 1078: Always injected
-  if (agent) options.agent = agent;  // LINE 1079: Add agent name if provided
-  return { _meta: { claudeCode: { options } } };  // LINE 1080: Return _meta structure
-}
-```
-
-**Key:** This ALWAYS returns an object, even if agent is `null`. The `disallowedTools` are always present because:
-- `Bash` and `PowerShell` are replaced by AcpUI's custom `ux_invoke_shell`
-- `Agent` is not supported (agents are defined in Claude's CLI, not via ACP)
-
-### setInitialAgent()
-
-**File:** `providers/claude/index.js` (Lines 1060–1063)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 907-910)
-export async function setInitialAgent(acpClient, sessionId, agent) {
-  // Agent is applied at subprocess spawn time via buildSessionMeta — nothing to do post-creation.
-  return;
-}
-```
-
-**Why a no-op?** Agent context is baked into the Claude Code subprocess at spawn time. Once it's running, you cannot change the agent. If you need a different agent, you must create a new session.
-
-### The _meta Field
-
-See `providers/claude/SESSION_META_DATA.md` for complete reference. Key structure:
-
-```javascript
-{
-  _meta: {
-    claudeCode: {
-      options: {
-        agent: "my-agent-name",           // Agent name from ~/.claude/agents/
-        disallowedTools: ['Bash', ...]    // Tools to hide from Claude
-      }
-    },
-    systemPrompt: { append: "..." },      // Optional system prompt additions
-    additionalRoots: ["C:/path"]          // Additional context directories
-  }
-}
-```
-
----
-
-## setConfigOption() — Three Routing Rules
-
-Claude has three different ACP methods for setting configuration, depending on the option type:
-
-**File:** `providers/claude/index.js` (Lines 678–714)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 523-561)
-export async function setConfigOption(acpClient, sessionId, optionId, value) {
-  if (optionId === 'mode') {
-    // LINE 530-533: Mode uses session/set_mode
-    return acpClient.transport.sendRequest('session/set_mode', {
-      sessionId,
-      modeId: value
-    });
-  }
-
-  if (optionId === 'model') {
-    // LINE 537-540: Model uses session/set_model
-    return acpClient.transport.sendRequest('session/set_model', {
-      sessionId,
-      modelId: value
-    });
-  }
-
-  // LINE 544-548: Effort and other dynamic options use set_config_option
-  const result = await acpClient.transport.sendRequest('session/set_config_option', {
-    sessionId,
-    configId: optionId,
-    value: value
-  });
-  
-  // LINE 549: Normalize result (filter model, remap effort)
-  return normalizeClaudeConfigResult(result);
-}
-
-// LINE 552-561: Filter and remap results
-function normalizeClaudeConfigResult(result) {
-  if (!Array.isArray(result?.configOptions)) return result;
-
-  return {
-    ...result,
-    configOptions: result.configOptions
-      .filter(option => option?.id !== 'model')  // Remove 'model' — AcpUI has its own model UI
-      .map(option => 
-        option.id === 'effort' 
-          ? { ...option, kind: 'reasoning_effort' }  // Remap 'effort' to expected kind
-          : option
-      )
-  };
-}
-```
-
----
-
-## Hooks — settings.json Hook Map
-
-Claude's hooks come from `~/.claude/settings.json`, not from agent YAML files. The provider maps AcpUI hook types to Claude's PascalCase conventions.
-
-### Hook Type Mapping
-
-**File:** `providers/claude/index.js` (Lines 1037–1058)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 884-889)
-const CLAUDE_HOOK_MAP = {
-  session_start: 'SessionStart',    // Runs at session creation
-  pre_tool: 'PreToolUse',            // Runs before tool execution
-  post_tool: 'PostToolUse',          // Runs after tool completes
-  stop: 'Stop',                      // Runs when session stops
-};
-
-// FILE: providers/claude/index.js (Lines 891-905)
-export async function getHooksForAgent(_agentName, hookType) {
-  const nativeKey = CLAUDE_HOOK_MAP[hookType];
-  if (!nativeKey) return [];  // LINE 893: Unknown hook type
-  
-  const { config } = getProvider();
-  const settingsPath = path.join(
-    path.dirname(config.paths.agents),  // Parent of ~/.claude/agents/
-    'settings.json'                      // Read ~/.claude/settings.json
-  );
-  
-  try {
-    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-    const entries = settings?.hooks?.[nativeKey] ?? [];  // LINE 898: e.g., hooks.SessionStart
-    
-    // LINE 899-901: Extract commands from hook entries
-    return entries.flatMap(entry =>
-      (entry.hooks ?? []).map(h => ({
-        command: h.command,
-        ...(entry.matcher ? { matcher: entry.matcher } : {})
-      }))
-    ).filter(e => e?.command);
-  } catch {
-    return [];  // No settings file or parse error
-  }
-}
-```
-
-### settings.json Structure
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": { "projectPath": "/path/to/project" },
-        "hooks": [
-          { "command": "echo 'Session started'" }
-        ]
-      }
+  "method": "_anthropic/config_options",
+  "params": {
+    "sessionId": "claude-session-id",
+    "options": [
+      { "id": "effort", "currentValue": "high", "kind": "reasoning_effort" },
+      { "id": "mode", "currentValue": "acceptEdits" }
     ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          { "command": "echo 'About to run a tool'" }
-        ]
-      }
+    "replace": true
+  }
+}
+```
+
+Backend handling:
+
+- `AcpClient.handleProviderExtension` merges the authoritative option snapshot into `sessionMetadata`.
+- `db.saveConfigOptions` persists the incoming normalized options.
+- Socket.IO emits `provider_extension` with provider id and merged params.
+
+### B. Tool Invocation Path
+
+Raw Claude MCP tool update can identify an AcpUI tool through `title`, `kind`, or `_meta.claudeCode.toolName`:
+
+```json
+{
+  "sessionUpdate": "tool_call",
+  "toolCallId": "tool-call-id",
+  "title": "mcp__AcpUI__ux_invoke_shell",
+  "rawInput": {
+    "description": "Run backend tests",
+    "command": "npm test"
+  }
+}
+```
+
+Claude extraction output from `extractToolInvocation`:
+
+```json
+{
+  "toolCallId": "tool-call-id",
+  "kind": "mcp",
+  "rawName": "mcp__AcpUI__ux_invoke_shell",
+  "canonicalName": "ux_invoke_shell",
+  "mcpServer": "AcpUI",
+  "mcpToolName": "ux_invoke_shell",
+  "input": {
+    "description": "Run backend tests",
+    "command": "npm test"
+  },
+  "title": "Invoke Shell: Run backend tests",
+  "category": {}
+}
+```
+
+Backend resolver output stamped onto `system_event`:
+
+```json
+{
+  "type": "tool_start",
+  "toolName": "ux_invoke_shell",
+  "canonicalName": "ux_invoke_shell",
+  "mcpServer": "AcpUI",
+  "mcpToolName": "ux_invoke_shell",
+  "isAcpUxTool": true,
+  "title": "Invoke Shell: Run backend tests"
+}
+```
+
+### C. Quota Status Path
+
+Quota proxy extraction from Anthropic headers:
+
+```json
+{
+  "source": "acpui-claude-provider-proxy",
+  "captured_at": "2026-04-18T18:23:14.941Z",
+  "5h_utilization": 0.59,
+  "5h_status": "allowed",
+  "7d_utilization": 0.6,
+  "7d_status": "allowed",
+  "overage_utilization": 0,
+  "unified_status": "allowed",
+  "raw": {
+    "anthropic-ratelimit-unified-5h-utilization": "0.59"
+  }
+}
+```
+
+Provider status output from `buildClaudeProviderStatus`:
+
+```json
+{
+  "providerId": "claude",
+  "title": "Claude",
+  "summary": {
+    "title": "Usage",
+    "items": [
+      { "id": "five-hour", "label": "5h", "value": "59%", "tone": "info" },
+      { "id": "seven-day", "label": "7d", "value": "60%", "tone": "warning" }
     ]
-  }
+  },
+  "sections": [
+    { "id": "limits", "title": "Usage Windows", "items": [] },
+    { "id": "details", "title": "Details", "items": [] },
+    { "id": "raw", "title": "Raw Headers", "items": [] }
+  ]
 }
 ```
 
----
+The emitted provider extension is `_anthropic/provider/status`; `providerStatusMemory` caches it for reconnect hydration.
 
-## Extension Methods (_anthropic/ prefix)
+### D. JSONL Rehydration Path
 
-Claude emits custom protocol events prefixed with `_anthropic/`. The provider's `parseExtension()` routes these:
-
-**File:** `providers/claude/index.js` (Lines 471–500)
-
-```javascript
-// FILE: providers/claude/index.js (Lines 324-353)
-export function parseExtension(method, params) {
-  const { config } = getProvider();
-  if (!method.startsWith(config.protocolPrefix)) return null;  // LINE 327: Must start with "_anthropic/"
-
-  const type = method.slice(config.protocolPrefix.length);
-  let result = null;
-
-  switch (type) {
-    case 'commands/available':  // LINE 333: Slash commands
-      result = { type: 'commands', commands: params.commands };
-      break;
-    case 'metadata':  // LINE 336: Context usage
-      result = { type: 'metadata', sessionId: params.sessionId, contextUsagePercentage: params.contextUsagePercentage };
-      break;
-    case 'compaction/status':  // LINE 339: Session compaction state
-      result = { type: 'compaction', sessionId: params.sessionId, status: params.status, summary: params.summary };
-      break;
-    case 'provider/status':  // LINE 342: Quota status (from quota proxy)
-      result = { type: 'provider_status', status: params.status };
-      break;
-    case 'config_options':  // LINE 345: Dynamic options (effort, mode)
-      result = { type: 'config_options', sessionId: params.sessionId, options: params.options };
-      break;
-    default:
-      result = { type: 'unknown', method, params };  // LINE 349: Unknown extension
-  }
-  
-  return result;  // LINE 352: Return normalized form
-}
-```
-
----
+- `sessionHandlers` calls `parseJsonlSession(acpSessionId, providerId)` for `rehydrate_session` and `get_session_history` when DB messages need provider history.
+- `parseJsonlSession` calls Claude `getSessionPaths(acpSessionId)` and `parseSessionHistory(filePath, Diff)`.
+- Claude `parseSessionHistory` returns AcpUI message objects with `role`, `content`, `id`, optional `timeline`, and tool event objects.
+- Tool result entries update matching timeline steps by `tool_use_id`; write/edit fallback diffs are generated with `Diff.createPatch` when result output is missing.
 
 ## Component Reference
 
-### providers/claude/index.js
-
-| Lines | Function | Purpose |
-|-------|----------|---------|
-| 13–72 | Context caching state + helpers | Module-level caching for context usage percentages |
-| 20–30 | _emitCachedContext() | Replay cached context usage; one-shot marker per session |
-| 35–47 | _loadContextState() | Load context state from disk at startup |
-| 52–72 | _saveContextState() | Persist context state to disk (atomic write) |
-| 78–149 | intercept() | Transform config_option_update and available_commands_update messages |
-| 151–154 | emitCachedContext() | Public API to emit cached context |
-| 156–158 | normalizeModelState() | Passes model state through unchanged |
-| 163–165 | normalizeUpdate() | Passes updates through unchanged |
-| 167–173 | normalizeConfigOptions() | Filter model, remap effort to reasoning_effort |
-| 178–233 | extractToolOutput() | Multi-stage tool output lookup |
-| 235–261 | extractClaudeToolResponse() helper | Recursive response parsing |
-| 266–305 | extractFilePath() | 5-step file path detection |
-| 310–325 | extractDiffFromToolCall() | Diff extraction |
-| 330–402 | normalizeTool() | Tool normalization and title construction |
-| 404–444 | extractToolInvocation() | V2 canonical tool identity extraction |
-| 449–467 | categorizeToolCall() | Tool categorization using provider.json |
-| 471–500 | parseExtension() | Route _anthropic/ extensions |
-| 502–539 | prepareAcpEnvironment() | Initialize context caching; start quota proxy; inject ANTHROPIC_BASE_URL |
-| 541–543 | getQuotaState() | Return latest quota data |
-| 545–611 | buildClaudeProviderStatus() | Format quota for UI |
-| 678–705 | setConfigOption() | Route mode/model/effort to ACP methods |
-| 707–714 | normalizeClaudeConfigResult() | Filter model, remap effort |
-| 726–743 | findSessionDir() | Locate session directory in project subdirs |
-| 745–753 | getSessionPaths() | Return session file paths |
-| 755–816 | cloneSession() | Clone session with internal message detection |
-| 818–823 | deleteSessionFiles() | Delete session files |
-| 825–847 | archiveSessionFiles() | Archive with restore_meta.json |
-| 852–985 | parseSessionHistory() | JSONL to Unified Timeline |
-| 987–1020 | restoreSessionFiles() | Restore using restore_meta.json |
-| 1037–1058 | CLAUDE_HOOK_MAP + getHooksForAgent() | Hook lookup from settings.json |
-| 1060–1063 | setInitialAgent() | Intentional no-op |
-| 1069–1071 | onPromptStarted() / onPromptCompleted() | Required prompt lifecycle hooks (intentional no-op for Claude) |
-| 1077–1081 | buildSessionParams() | Build _meta for session creation |
-| 1083–1090 | performHandshake() | Send initialize request |
-
-### providers/claude/quotaProxy.js
-
-| Lines | Function | Purpose |
-|-------|----------|---------|
-| 20–65 | startClaudeQuotaProxy() | Start HTTP proxy, listen on loopback |
-| 67–72 | stopClaudeQuotaProxy() | Stop and clean up proxy |
-| 74–76 | getLatestClaudeQuota() | Return cached quota data |
-| 78–117 | extractClaudeQuotaHeaders() | Parse anthropic-ratelimit-* headers |
-| 119–168 | proxyRequest() | HTTP forwarding with header capture |
-| 170–188 | resolveTarget() | Resolve Anthropic base URL from env |
-| 190–196 | buildUpstreamUrl() | Construct upstream request URL |
-| 198–206 | filterHeaders() | Remove hop-by-hop headers |
-
-### Configuration Files
-
-| File | Purpose |
-|------|---------|
-| `providers/claude/provider.json` | Provider identity, tool patterns, categories |
-| `providers/claude/branding.json` | UI text and labels |
-| `providers/claude/user.json` | Local overrides (optional) |
-| `providers/claude/README.md` | Install and runtime guide |
-| `providers/claude/SESSION_META_DATA.md` | _meta field reference |
-| `providers/claude/ACP_PROTOCOL_SAMPLES.md` | Full captured protocol examples |
-
----
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Provider | `providers/claude/index.js` | `intercept`, `emitCachedContext`, `normalizeConfigOptions`, `parseExtension` | Claude update interception and provider extension parsing. |
+| Provider | `providers/claude/index.js` | `prepareAcpEnvironment`, `getQuotaState`, `buildClaudeProviderStatus` | Context state load, quota proxy integration, provider status shape. |
+| Provider | `providers/claude/index.js` | `normalizeTool`, `extractToolInvocation`, `categorizeToolCall`, `extractToolOutput`, `extractFilePath`, `extractDiffFromToolCall` | Tool display, canonical identity, output, path, and diff extraction. |
+| Provider | `providers/claude/index.js` | `setConfigOption`, `normalizeModelState`, `buildSessionParams`, `setInitialAgent`, `performHandshake`, `getMcpServerMeta` | Claude ACP handshake, config, model, MCP metadata, and agent contracts. |
+| Provider | `providers/claude/index.js` | `findSessionDir`, `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, `parseSessionHistory` | Claude session file lifecycle and JSONL replay. |
+| Provider | `providers/claude/index.js` | `CLAUDE_HOOK_MAP`, `getHooksForAgent`, `onPromptStarted`, `onPromptCompleted` | Hook mapping and no-op prompt lifecycle hooks. |
+| Provider | `providers/claude/quotaProxy.js` | `startClaudeQuotaProxy`, `proxyRequest`, `extractClaudeQuotaHeaders`, `getLatestClaudeQuota`, `stopClaudeQuotaProxy` | Quota proxy lifecycle and header parsing. |
+| Backend | `backend/services/providerLoader.js` | `getProvider`, `bindProviderModule`, `getProviderModule`, `getProviderModuleSync` | Loads config files and binds provider functions to context. |
+| Backend | `backend/services/acpClient.js` | `start`, `handleAcpMessage`, `handleProviderExtension`, `handleModelStateUpdate` | Daemon lifecycle, interception, extension routing, model/config state. |
+| Backend | `backend/services/acpUpdateHandler.js` | `handleUpdate` | Unified Timeline event emission and tool pipeline integration. |
+| Backend | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Canonical tool identity merge and event stamping. |
+| Backend | `backend/services/sessionManager.js` | `getMcpServers`, `normalizeProviderConfigOptions`, `reapplySavedConfigOptions`, `loadSessionIntoMemory`, `setSessionModel` | MCP proxy config, hot-load behavior, model/config state handling. |
+| Backend | `backend/sockets/sessionHandlers.js` | `create_session`, `fork_session`, `set_session_model`, `set_session_option`, `captureModelState`, `emitCachedContext` | Session creation/load/fork and provider config/model orchestration. |
+| Backend | `backend/services/jsonlParser.js` | `parseJsonlSession` | Delegates JSONL parsing to Claude provider. |
+| Backend | `backend/sockets/archiveHandlers.js` | `archive_session`, `restore_archive`, `delete_archive`, `list_archives` | Archive/restore orchestration calling Claude file operations. |
+| Backend | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtension`, `getLatestProviderStatusExtensions`, `clearProviderStatusExtension` | Provider status cache for reconnect bootstrap. |
+| Backend | `backend/sockets/index.js` | `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers` | Emits provider registry, branding, readiness, and cached status. |
+| Backend | `backend/services/hookRunner.js` | `runHooks` | Executes Claude settings hooks through provider hook lookup. |
+| Config | `providers/claude/provider.json` | `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `clientInfo`, `supportsAgentSwitching`, `cliManagedHooks` | Provider contract keys. |
+| Config | `providers/claude/branding.json` | Branding text keys | UI labels and messages emitted by backend socket bootstrap. |
+| Config | `providers/claude/user.json.example` | `command`, `args`, `paths.*`, `models.*`, `defaultSubAgentName` | Portable local override schema. |
+| Config | `providers/claude/user.json` | Local override keys | Machine-specific runtime values loaded by `getProvider`. |
+| Docs | `providers/claude/README.md` | Runtime flow, provider status, agent support, session files, context usage persistence | Operator and provider behavior reference. |
+| Docs | `providers/claude/SESSION_META_DATA.md` | `_meta.systemPrompt`, `_meta.additionalRoots`, `_meta.claudeCode.options`, `_meta.gateway` | Claude session metadata reference. |
+| Docs | `providers/claude/ACP_PROTOCOL_SAMPLES.md` | `initialize`, `session/new`, `available_commands_update`, `session/set_model`, `session/set_config_option`, `session/load`, tool flow | Claude ACP payload reference. |
+| Tests | `providers/claude/test/index.test.js` | `Claude Provider` suite | Claude provider unit coverage. |
+| Tests | `backend/test/toolInvocationResolver.test.js` | `toolInvocationResolver` suite | Canonical tool identity and sticky merge coverage. |
+| Tests | `backend/test/sessionHandlers.test.js` | `Session Handlers` suite | Session create/load, agent params, config/model socket behavior. |
+| Tests | `backend/test/sessionManager.test.js` | `sessionManager` suite | MCP proxy config and hot-load lifecycle coverage. |
+| Tests | `backend/test/acpClient.test.js` | `AcpClient Service` suite | Extension and model/config handling coverage. |
+| Tests | `backend/test/providerStatusMemory.test.js` | `providerStatusMemory` suite | Provider status cache behavior. |
+| Tests | `backend/test/jsonlParser.test.js` | `jsonlParser` suite | Provider-owned JSONL parsing delegation. |
+| Tests | `backend/test/providerContract.test.js` | `provider contract exports` suite | Required provider export surface. |
+| Tests | `backend/test/sockets-index.test.js` | `Socket Index Handler` suite | Cached provider status emission on connect. |
+| Tests | `backend/test/mcpServer.test.js` | `mcpServer` suite, `getMcpServers` tests | MCP server config and optional tool handler behavior. |
 
 ## Gotchas & Important Notes
 
-### 1. toolIdPattern is DOUBLE underscore
-Claude's pattern is `mcp__AcpUI__toolName` (two underscores between `mcp` and `AcpUI`). Some other daemons use single underscores. If the detection in normalizeTool() (Line 338) doesn't match, tools won't be recognized.
+1. **`toolIdPattern` is the MCP identity source**
+   - Claude tool identity uses `mcp__{mcpName}__{toolName}` from `provider.json`.
+   - Generic backend code should not contain Claude-specific MCP string parsing.
+   - Add or change parsing in `extractToolInvocation` and provider-local tests.
 
-**Avoid:** Comparing to other daemon patterns without checking the actual value in provider.json.
+2. **Model option is filtered from generic config**
+   - Claude emits model as both model state and a config option.
+   - AcpUI renders model through model-state UI, so `normalizeConfigOptions` removes option id `model`.
+   - Model-only `config_option_update` payloads are swallowed by `intercept`.
 
-### 2. Tool name aliases are context-dependent
-Claude sends tool names as `'read'`, `'write'`, `'edit'` (short). The provider aliases them to `'read_file'`, etc. (Lines 352–355). But `toolCategories` in provider.json uses the SHORT names. If categorizeToolCall() looks up the aliased name, it won't find it.
+3. **`effort` needs `kind: "reasoning_effort"`**
+   - The frontend relies on the `reasoning_effort` kind to render reasoning controls consistently.
+   - Response-time config capture and extension-time config capture both call Claude normalization.
 
-**Avoid:** Mixing short vs. long names in the lookup chain. normalizeTool() should always apply aliases before categorizeToolCall() runs.
+4. **`buildSessionParams` is always part of Claude session create/load**
+   - The function always returns `_meta.claudeCode.options.disallowedTools`.
+   - Agent metadata is added only when the requested agent value is truthy.
+   - Backend tests assert that returned params are spread into both `session/new` and `session/load`.
 
-### 3. buildSessionParams ALWAYS returns an object
-Even if agent is `null`, the function returns `{ _meta: { claudeCode: { options: { disallowedTools: [...] } } } }`. This is intentional — disallowedTools must always be injected to hide CLI-managed tools.
+5. **`setInitialAgent` intentionally does no post-create mutation**
+   - Claude agent context is applied through `_meta.claudeCode.options.agent` during daemon session creation/load.
+   - Runtime agent switching UI is gated by `supportsAgentSwitching: false`.
 
-**Avoid:** Treating the return value as optional or null-able. It's always an object.
+6. **Context replay is one emission per session id per process**
+   - `_sessionsWithInitialEmit` prevents duplicate `_anthropic/metadata` emissions.
+   - If no cached value exists, the session is not marked consumed and can emit after a later `usage_update` persists context.
 
-### 4. Session files are in project-scoped subdirectories
-`~/.claude/projects/{encoded-cwd}/{sessionId}.jsonl` is not flat. The findSessionDir() function (Lines 726–743) must scan subdirectories. If you assume sessions are at `~/.claude/projects/{sessionId}.jsonl`, you will miss project-scoped sessions.
+7. **Provider status memory caches status-shaped extensions only**
+   - `rememberProviderStatusExtension` requires `params.status.sections`.
+   - `_anthropic/config_options`, `_anthropic/metadata`, and command extensions are broadcast but not provider-status cache entries.
 
-**Avoid:** Direct path construction like `path.join(sessionsRoot, sessionId + '.jsonl')`. Always use findSessionDir().
+8. **Claude session files are project-scoped**
+   - `findSessionDir` scans project subdirectories below `paths.sessions`.
+   - `restore_meta.json` stores the exact project directory for restore.
+   - Fork pruning filters internal local-command entries before counting user turns.
 
-### 5. 'model' option is filtered out
-intercept() (Lines 102–122) removes `'model'` from config_option_update because AcpUI has its own model UI. If you see a config_option_update with only `{ id: 'model', ... }`, intercept() returns `null` (suppresses it).
+9. **Hook lookup reads Claude settings, not agent markdown**
+   - `getHooksForAgent` reads `settings.json` next to `paths.agents`.
+   - Hook entries are flattened from Claude settings hook arrays and may carry `matcher` values.
 
-**Avoid:** Assuming every config_option_update produces an extension event. Some are filtered out.
-
-### 6. 'effort' is renamed to 'reasoning_effort'
-The ACP daemon sends `id: 'effort'`, but the UI expects `kind: 'reasoning_effort'`. Both intercept() (Line 108) and normalizeClaudeConfigResult() (Line 710) apply this remap. If you look for `option.id === 'effort'` on the UI side, you'll get `undefined`.
-
-**Avoid:** Hardcoding 'effort' as the identifier. Use 'reasoning_effort' in UI code.
-
-### 7. Internal messages use type:"user" with no clean flag
-Claude's JSONL mixes real user messages and internal entries (tool results, command caveats) all under `type: "user"`. Detection is by content inspection (isMeta flag + XML markers). Older sessions may lack the isMeta flag entirely.
-
-**Avoid:** Assuming every `type: "user"` entry is a real turn. Always check for markers (Lines 763–776, 864–876).
-
-### 8. Quota data appears only after first Anthropic API call
-The proxy starts empty. Quota data is populated only after Claude Code makes an API call to Anthropic and receives rate-limit headers. Launching AcpUI without sending a prompt won't show quota.
-
-**Avoid:** Expecting quota status at boot. Wait for the first API call.
-
-### 9. The proxy is a singleton
-Once started, the proxy reuses its state (Lines 23–30). If `ANTHROPIC_BASE_URL` is already set to a loopback address, the proxy still starts but resolveTarget() (Line 21) may override it depending on the safety checks.
-
-**Avoid:** Assuming multiple proxy instances. There's only one per provider.
-
-### 10. archiveSessionFiles saves restore_meta.json with absolute path
-The sessionDir is saved as an absolute path (Line 845). Without this metadata, restoreSessionFiles() falls back to the root directory, and the session becomes invisible to Claude Code (which only sees sessions in project subdirs).
-
-**Avoid:** Skipping the restore_meta.json step. It's critical for correct restoration.
-
-### 11. Context state persists across restarts
-Lines 13–72 introduce context usage caching. The context percentage is loaded from disk at startup (Line 510 in prepareAcpEnvironment) and replayed to the UI immediately on session load (via _emitCachedContext). This allows sessions to show their cached context usage percentage even before the next API call.
-
-**Avoid:** Assuming context state is always empty at startup. Always call _loadContextState() in prepareAcpEnvironment().
-
----
-
-## Existing References
-
-- **`providers/claude/ACP_PROTOCOL_SAMPLES.md`** — Full captured protocol with real request/response JSON examples. Load this when debugging protocol issues.
-- **`providers/claude/SESSION_META_DATA.md`** — Complete reference for the `_meta` field in `session/new` and `session/load` requests.
-- **`providers/claude/README.md`** — Installation, configuration, and runtime guide for operators.
-
----
+10. **Quota status appears after proxied Anthropic responses**
+    - Loading the app or creating a quiet session does not produce quota headers by itself.
+    - Header misses are logged for `HEAD` requests or when `CLAUDE_QUOTA_PROXY_LOG_MISSES=true`.
 
 ## Unit Tests
 
-Test files: `providers/claude/test/index.test.js`
+### Claude Provider Tests
 
-Run tests:
-```bash
-npm test -- providers/claude
-```
+File: `providers/claude/test/index.test.js`
 
----
+Important test names:
+
+- `performHandshake` -> `sends initialize with clientInfo from provider config`
+- `performHandshake` -> `does not send authenticate`
+- `prepareAcpEnvironment` -> `returns the provided environment unchanged when proxy capture is disabled`
+- `prepareAcpEnvironment` -> `emits persisted context for a loaded session on request`
+- `prepareAcpEnvironment` -> `does not consume initial replay when cached context is unavailable`
+- `prepareAcpEnvironment` -> `starts a provider-owned proxy and injects ANTHROPIC_BASE_URL`
+- `prompt lifecycle hooks` -> `exports onPromptStarted and onPromptCompleted as no-op hooks`
+- `intercept` -> `normalizes available_commands_update`
+- `intercept` -> `normalizes non-model config_option_update`
+- `intercept` -> `emits an authoritative snapshot when effort is absent for the active model`
+- `intercept` -> `swallows model-only config_option_update`
+- `extractToolOutput` -> `extracts object-shaped Claude toolResponse file content`
+- `extractToolOutput` -> `extracts filename lists from Claude toolResponse`
+- `normalizeConfigOptions` -> `matches Claude config option normalization for response-time capture`
+- `parseExtension` -> `parses provider status extensions`
+- `buildClaudeProviderStatus` -> `translates quota headers into summary and full detail sections`
+- `buildClaudeProviderStatus` -> `shows overage in the summary only when overage is above zero and marks high usage as danger`
+- `quota proxy header parsing` -> `parses Anthropic rate-limit headers without depending on header casing`
+- `extractFilePath` -> `extracts from object-shaped Claude toolResponse file path`
+- `setConfigOption` -> `uses session/set_model for model config fallbacks`
+- `setConfigOption` -> `normalizes returned config options for effort changes`
+- `normalizeTool` -> `normalizes optional AcpUI MCP tool titles without server prefixes`
+- `normalizeTool` -> `extracts canonical MCP invocation metadata`
+- `getHooksForAgent` -> `reads SessionStart hooks from settings.json`
+- `getHooksForAgent` -> `preserves matcher from outer entry`
+- `buildSessionParams` -> `_meta` and `disallowedTools` cases for provided, undefined, null, and empty agent values
+
+### Backend Contract and Integration Tests
+
+- `backend/test/providerContract.test.js` -> `provider contract exports` / `every provider explicitly exports every contract function`
+- `backend/test/toolInvocationResolver.test.js` -> `toolInvocationResolver` / `uses provider extraction as canonical tool identity`
+- `backend/test/toolInvocationResolver.test.js` -> `toolInvocationResolver` / `reuses cached identity and title for incomplete updates`
+- `backend/test/toolInvocationResolver.test.js` -> `toolInvocationResolver` / `marks registered AcpUI UX tool names without relying on a ux prefix`
+- `backend/test/toolInvocationResolver.test.js` -> `toolInvocationResolver` / `prefers centrally recorded MCP execution details over provider generic titles`
+- `backend/test/sessionHandlers.test.js` -> `Session Handlers` / `captures normalized config options returned by session/new`
+- `backend/test/sessionHandlers.test.js` -> `Session Handlers` / `calls buildSessionParams with agent and spreads result into session/new`
+- `backend/test/sessionHandlers.test.js` -> `Session Handlers` / `calls buildSessionParams with agent and spreads result into session/load`
+- `backend/test/sessionHandlers.test.js` -> `Session Handlers` / `set_session_option routes through provider contract setConfigOption`
+- `backend/test/sessionHandlers.test.js` -> `Session Handlers` / `handles create_session skipping load for hot sessions`
+- `backend/test/sessionHandlers.test.js` -> `Session Handlers` / `handles create_session performing load for cold sessions with dbSession`
+- `backend/test/sessionManager.test.js` -> `sessionManager` / `should return server config if mcpName exists`
+- `backend/test/sessionManager.test.js` -> `sessionManager` / `should attach _meta when getMcpServerMeta returns a value`
+- `backend/test/sessionManager.test.js` -> `sessionManager` / `should perform full hot-load lifecycle`
+- `backend/test/acpClient.test.js` -> `AcpClient Service` / `handles handleProviderExtension config_options with replace: true`
+- `backend/test/acpClient.test.js` -> `AcpClient Service` / `should capture state for pending-new`
+- `backend/test/providerStatusMemory.test.js` -> `providerStatusMemory` / `remembers the latest provider status extension`
+- `backend/test/providerStatusMemory.test.js` -> `providerStatusMemory` / `ignores extensions that are not provider status payloads`
+- `backend/test/providerStatusMemory.test.js` -> `providerStatusMemory` / `keeps provider status memory isolated by provider id`
+- `backend/test/jsonlParser.test.js` -> `jsonlParser` / `delegates parsing to providerModule`
+- `backend/test/sockets-index.test.js` -> `Socket Index Handler` / `emits cached provider status on connection`
+- `backend/test/mcpServer.test.js` -> `mcpServer` / `getMcpServers returns server config`
+- `backend/test/mcpServer.test.js` -> `mcpServer` / `getMcpServers omits _meta when getMcpServerMeta returns undefined`
 
 ## How to Use This Guide
 
-### For Implementing or Extending Claude Features
+### For implementing or extending Claude provider behavior
 
-1. **Start here:** Read the "Overview" section to understand what Claude-specific behavior you're dealing with.
-2. **Understand the flow:** Read the relevant section (e.g., "The Quota Proxy", "Tool Pipeline", "Session Files").
-3. **Find the code:** Use the exact line numbers to navigate to `index.js` or `quotaProxy.js`.
-4. **Check for gotchas:** Review the gotchas section for edge cases.
-5. **Reference the protocol:** For protocol details, see `ACP_PROTOCOL_SAMPLES.md`.
+1. Start with `providers/claude/index.js` and identify the provider contract function involved.
+2. Check `providers/claude/provider.json` for `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `supportsAgentSwitching`, and `cliManagedHooks` before changing protocol behavior.
+3. For MCP tool behavior, update `normalizeTool`, `extractToolInvocation`, provider tests, and backend `toolInvocationResolver` expectations together.
+4. For config/model behavior, update `normalizeConfigOptions`, `setConfigOption`, `captureModelState` expectations, and session handler tests together.
+5. For quota behavior, update `quotaProxy.js`, `buildClaudeProviderStatus`, provider status memory expectations, and provider status panel docs if the frontend status shape changes.
+6. For session files, update `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `parseSessionHistory`, and the provider's session operation tests together.
+7. For hooks or agents, update `buildSessionParams`, `getHooksForAgent`, `supportsAgentSwitching`, `cliManagedHooks`, and session handler tests together.
 
-### For Debugging Issues with Claude
+### For debugging Claude provider issues
 
-1. **Identify the problem:** Is it about tools, sessions, quota, hooks, or something else?
-2. **Locate the function:** Use the Component Reference table to find the relevant function.
-3. **Read the code:** Jump to the exact lines and trace the execution.
-4. **Check gotchas:** See if the issue matches a known gotcha.
-5. **Check the logs:** Look for `[CLAUDE QUOTA]` messages (from quotaProxy) or `[CLAUDE]` messages in the provider logs.
-
-### For Adding a New Feature
-
-1. **Understand the contract:** Read the Provider System doc first.
-2. **See how Claude does it:** Load the relevant section in this doc.
-3. **Follow the pattern:** Replicate the structure for your new feature.
-4. **Test internal messages:** If dealing with sessions, always test with fork pruning (internal message detection).
-5. **Test the proxy:** If adding features that make API calls, verify quota capture works.
-
----
+1. Spawn/env issue: inspect `AcpClient.start`, `prepareAcpEnvironment`, `user.json`, and `quotaProxy.js` startup logs.
+2. Missing quota status: inspect `extractClaudeQuotaHeaders`, `buildClaudeProviderStatus`, `_anthropic/provider/status`, and `providerStatusMemory` cache shape.
+3. Missing slash commands: inspect `intercept` handling of `available_commands_update` and frontend provider extension parsing.
+4. Missing config options: inspect `intercept`, `normalizeConfigOptions`, `handleProviderExtension`, and `captureModelState`.
+5. Wrong tool title or handler: inspect `toolIdPattern`, `normalizeTool`, `extractToolInvocation`, `resolveToolInvocation`, and `toolRegistry.dispatch`.
+6. Missing context indicator after resume: inspect `acp_session_context.json`, `emitCachedContext`, session handler hot/cold resume paths, and `loadSessionIntoMemory`.
+7. Rehydrate/fork/archive issue: inspect `findSessionDir`, `getSessionPaths`, `parseSessionHistory`, `cloneSession`, `restore_meta.json`, and archive socket handlers.
+8. Hook issue: inspect `provider.json` `cliManagedHooks`, `getHooksForAgent`, `settings.json`, and `runHooks` matcher filtering.
 
 ## Summary
 
-Claude is AcpUI's reference provider implementation. It demonstrates the full contract:
-
-- **Quota proxy** — Unique to Claude; shows how a provider can inject environment setup and capture metadata.
-- **intercept() transforms** — Specific rewrites for config_option_update and available_commands_update.
-- **Tool pipeline** — Complete normalization from MCP IDs to UI categories.
-- **Session files** — Project-scoped filesystem layout with internal message detection for fork pruning.
-- **Unified Timeline reconstruction** — parseSessionHistory() maps Claude's JSONL format to the Unified Timeline.
-- **Agent support** — Spawn-time only; demonstrates why some provider features are immutable post-creation.
-- **Hook system** — settings.json integration shows provider-specific configuration lookup.
-- **Three config methods** — setConfigOption() routing demonstrates protocol flexibility.
-
-The critical contract: **Claude's implementation is not the only way to implement these functions.** Other providers will handle tools, sessions, and config differently. This doc shows how Claude does it; use the Provider System doc to understand the generic patterns.
-
-**When working on Claude provider code, always load this doc alongside `[Feature Doc] - Provider System.md`.**
+- Claude provider is a full provider contract implementation centered in `providers/claude/index.js`.
+- Claude quota status comes from provider-owned HTTP proxy header capture and is emitted as `_anthropic/provider/status`.
+- Claude tool routing depends on `toolIdPattern`, `extractToolInvocation`, `toolInvocationResolver`, and sticky tool state.
+- Claude model state is first-class; generic config options filter `model` and mark `effort` as `reasoning_effort`.
+- Claude agent selection is spawn-time `_meta.claudeCode.options.agent`; runtime agent switching is disabled for this provider.
+- Claude context usage is persisted in `acp_session_context.json` and replayed through `_anthropic/metadata`.
+- Claude hooks are read from Claude settings and executed by AcpUI when `cliManagedHooks` permits the hook type.
+- Claude session files are project-scoped, so session lifecycle code must use provider path and archive helpers.

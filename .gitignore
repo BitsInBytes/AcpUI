@@ -15,6 +15,7 @@ backend/.ssl/
 configuration/commands.json
 configuration/workspaces.json
 configuration/providers.json
+configuration/mcp.json
 providers/**/user.json
 
 # --- Build & Output ---

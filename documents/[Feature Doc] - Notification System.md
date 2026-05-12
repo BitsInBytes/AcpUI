@@ -1,8 +1,8 @@
 # Notification System
 
-A multi-modal notification system that alerts users when background sessions complete, supporting desktop notifications (Windows toast via Web Notifications API), audio notifications (MP3 playback), and environment variable configuration. Notifications are scoped to background sessions only and include workspace context in the notification body.
+The notification system alerts users when background chat sessions finish and when main-chat permission requests need attention. It combines environment-backed defaults, Socket.IO hydration, Zustand state, native browser notifications, and MP3 playback.
 
-**Why this matters:** Notifications are the primary feedback mechanism for long-running background agents. Understanding the decision logic (when to notify, when to suppress), desktop permission flow, audio fallback patterns, and environment variable defaults is critical for extending notifications to new events, debugging silent failures, or implementing notification preferences UI.
+This guide matters because notification behavior is split across backend socket hydration, frontend completion handling, stream finalization, browser permission state, provider branding, and a pure helper that only decides whether a completed session is eligible for the desktop/body notification path.
 
 ---
 
@@ -10,263 +10,261 @@ A multi-modal notification system that alerts users when background sessions com
 
 ### What It Does
 
-- **Background session detection** — Suppress notifications for the currently active session; only notify for sessions running in the background
-- **Desktop notifications** — Display Windows toast notifications via Web Notifications API when configured and permitted
-- **Audio notifications** — Play a notification sound (MP3) when session completes, configurable independently from desktop notifications
-- **Workspace awareness** — Include workspace context in notification body if session CWD matches a configured workspace path
-- **Environment configuration** — Control default notification behavior via `.env` variables (NOTIFICATION_SOUND, NOTIFICATION_DESKTOP)
-- **Permission management** — Request and respect browser notification permissions; gracefully degrade if permission denied
+- Hydrates notification defaults from backend environment variables through the `sidebar_settings` socket event.
+- Stores `notificationSound` and `notificationDesktop` in `useSystemStore` for completion handlers.
+- Requests browser desktop notification permission when desktop notifications are enabled and permission is still `default`.
+- Emits `token_done` when prompt processing, prompt errors, stale sessions, and fork merge parent prompts finish.
+- Plays `/memory-sound.mp3` for background completion paths and main-chat permission requests.
+- Shows a native `Notification` for eligible non-sub-agent background sessions when desktop notifications are enabled and browser permission is `granted`.
+- Adds workspace context to the desktop notification body when a session `cwd` exactly matches a configured workspace path.
 
 ### Why This Matters
 
-- **User attention:** Desktop/audio notifications are the only way to alert users of background work completion; critical for long-running agents
-- **Distraction reduction:** Only notifying for background sessions prevents notification spam for active work
-- **Accessibility:** Independent sound/desktop toggles allow users to choose their preferred feedback mode
-- **Configuration consistency:** Env-based defaults sync across backend → frontend at connection time
-- **Sub-agent exclusion:** Sub-agents should never notify (spawned agents are implementation details, not user-facing work)
+- Background agents can finish while the user is reading another session, so completion feedback must use ACP session identity rather than UI tab identity.
+- Desktop notification permission is browser-owned state, while notification defaults are backend-owned environment state.
+- Audio has more than one call site; completion sounds and permission-request sounds are controlled by different paths.
+- Provider branding supplies the desktop notification title, so the UI must avoid hardcoded provider names.
+- Tests cover the pure helper and several socket events, but browser API side effects need focused tests when behavior changes.
 
 ### Architectural Role
 
-- **Frontend:** `notificationHelper.ts` with decision logic, `useChatManager` hook receiving `token_done` events, `useSystemStore` managing settings
-- **Backend:** Socket handlers emitting `token_done` event on session completion, `sidebar_settings` emitting config on connect
-- **Environment layer:** `.env` variables control defaults (NOTIFICATION_SOUND, NOTIFICATION_DESKTOP)
-- **Browser API:** Native Web Notifications API for desktop notifications, HTML5 Audio API for sound playback
+- Backend socket layer: `backend/sockets/index.js`, `backend/sockets/promptHandlers.js`, `backend/sockets/sessionHandlers.js`, and `backend/sockets/systemSettingsHandlers.js`.
+- Frontend socket layer: `frontend/src/hooks/useSocket.ts` and `frontend/src/hooks/useChatManager.ts`.
+- Frontend state layer: `frontend/src/store/useSystemStore.ts`, `frontend/src/store/useSessionLifecycleStore.ts`, and `frontend/src/store/useStreamStore.ts`.
+- Pure notification logic: `frontend/src/utils/notificationHelper.ts`.
+- Browser APIs and assets: `Notification`, `Audio`, `frontend/public/memory-sound.mp3`, and `/vite.svg`.
 
 ---
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### Step 1: Backend Emits Notification Config on Socket Connect
-**File:** `backend/sockets/index.js` (Lines 78–82)
+### 1. Backend Hydrates Notification Defaults on Socket Connection
 
-When a client connects, the server emits the notification configuration from environment variables:
+File: `backend/sockets/index.js` (Function: `registerSocketHandlers`, Socket event: `sidebar_settings`)
+
+`registerSocketHandlers` sends notification defaults to each connecting socket along with the sidebar delete mode.
 
 ```javascript
-// FILE: backend/sockets/index.js (Lines 78-82)
+// FILE: backend/sockets/index.js (Function: registerSocketHandlers, Socket event: sidebar_settings)
 socket.emit('sidebar_settings', {
   deletePermanent: String(process.env.SIDEBAR_DELETE_PERMANENT || '').trim().toLowerCase() === 'true',
-  notificationSound: process.env.NOTIFICATION_SOUND !== 'false',  // LINE 80 - Defaults to true
-  notificationDesktop: process.env.NOTIFICATION_DESKTOP === 'true',  // LINE 81 - Defaults to false
+  notificationSound: process.env.NOTIFICATION_SOUND !== 'false',
+  notificationDesktop: process.env.NOTIFICATION_DESKTOP === 'true',
 });
 ```
 
-**Key defaults:**
-- `NOTIFICATION_SOUND` defaults to **true** unless explicitly set to `'false'`
-- `NOTIFICATION_DESKTOP` defaults to **false** unless explicitly set to `'true'`
+`NOTIFICATION_SOUND` is enabled unless the exact string is `false`. `NOTIFICATION_DESKTOP` is enabled only when the exact string is `true`.
 
----
+### 2. Frontend Stores Settings and Requests Desktop Permission
 
-### Step 2: Frontend Receives Config and Updates Store
-**File:** `frontend/src/hooks/useSocket.ts` (Lines 57–61)
+File: `frontend/src/hooks/useSocket.ts` (Function: `getOrCreateSocket`, Socket event: `sidebar_settings`)
+
+The singleton socket stores the settings in `useSystemStore`. Browser permission is requested only when desktop notifications are enabled and the browser reports `Notification.permission === 'default'`.
 
 ```typescript
-// FILE: frontend/src/hooks/useSocket.ts (Lines 57-61)
-_socket.on('sidebar_settings', (data: { 
-  deletePermanent: boolean; 
-  notificationSound: boolean; 
-  notificationDesktop: boolean 
-}) => {
+// FILE: frontend/src/hooks/useSocket.ts (Function: getOrCreateSocket, Socket event: sidebar_settings)
+_socket.on('sidebar_settings', (data: { deletePermanent: boolean; notificationSound: boolean; notificationDesktop: boolean }) => {
   useSystemStore.getState().setDeletePermanent(data.deletePermanent);
-  useSystemStore.getState().setNotificationSettings(data.notificationSound, data.notificationDesktop);  // LINE 59
-  if (data.notificationDesktop && Notification.permission === 'default') {
-    Notification.requestPermission();  // LINE 61 - Request permission if needed
-  }
+  useSystemStore.getState().setNotificationSettings(data.notificationSound, data.notificationDesktop);
+  if (data.notificationDesktop && Notification.permission === 'default') Notification.requestPermission();
 });
 ```
 
-**Key behavior:**
-- Settings stored in Zustand `useSystemStore` (lines 31–32)
-- If desktop notifications enabled AND permission is `'default'`, request permission
-- Permission request returns a Promise; resolving to `'granted'`, `'denied'`, or `'default'`
+### 3. Store Defaults Exist Before Socket Hydration
 
----
+File: `frontend/src/store/useSystemStore.ts` (Store: `useSystemStore`, State: `notificationSound`, `notificationDesktop`, Action: `setNotificationSettings`)
 
-### Step 3: User Starts/Switches to Different Session
-**Frontend State:**
-
-The active session ID is tracked in `useSessionLifecycleStore`:
+The store defaults match `.env.example`: sound enabled, desktop disabled. `setNotificationSettings` is an in-memory Zustand update; runtime socket hydration supplies the backend values.
 
 ```typescript
-// From useSessionLifecycleStore
-const activeSessionId = useSessionLifecycleStore.getState().activeSessionId;
-const sessions = useSessionLifecycleStore.getState().sessions;
-const activeSession = sessions.find(s => s.id === activeSessionId);
+// FILE: frontend/src/store/useSystemStore.ts (Store: useSystemStore)
+notificationSound: true,
+notificationDesktop: false,
+setNotificationSettings: (sound: boolean, desktop: boolean) => set({
+  notificationSound: sound,
+  notificationDesktop: desktop
+}),
 ```
 
----
+### 4. Backend Emits Completion Events
 
-### 1. Backend Turn Completion
-**File:** `backend/sockets/promptHandlers.js` (Function: `registerPromptHandlers`, Lines 18, 32, 132, 148)
+File: `backend/sockets/promptHandlers.js` (Function: `registerPromptHandlers`, Socket event: `prompt`, Emit: `token_done`)
 
-The backend emits `token_done` when an agent finishes its response. This event includes the `sessionId`, which the frontend uses to determine if a notification is needed.
+Prompt handling emits `token_done` on success and on recoverable error paths. The event payload uses ACP `sessionId`, not frontend UI session ID.
 
 ```javascript
-// FILE: backend/sockets/promptHandlers.js (Lines 18, 32, 132, 148)
-io.to('session:' + sessionId).emit('token_done', { providerId, sessionId, ... });
-```
-
-**Emission points:**
-- Line 132: Successful completion
-- Line 32: Session expired error
-- Line 148: Prompt processing error
-- Line 18: Invalid provider error
-
-**Event shape:**
-```typescript
-{
-  providerId: string;     // Provider identifier
-  sessionId: string;      // ACP session ID of completed session
-  error?: boolean;        // Optional error flag
-}
-```
-
----
-
-### Step 5: Frontend Receives `token_done` Event
-**File:** `frontend/src/hooks/useChatManager.ts` (Lines 257–271)
-
-```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 257-271)
-socket.on('token_done', (data: StreamDoneData) => {
-  onStreamDone(socket, data);  // LINE 258 - Process stream completion (update UI, etc.)
-  
-  // Get notification settings from store
-  const { notificationSound, notificationDesktop, workspaceCwds, branding } = useSystemStore.getState();  // LINE 259
-  
-  // Find active session to check if this is a background session
-  const activeAcpId = useSessionLifecycleStore.getState().sessions
-    .find(s => s.id === useSessionLifecycleStore.getState().activeSessionId)?.acpSessionId;  // LINE 260
-  
-  // Find the completed session
-  const session = useSessionLifecycleStore.getState().sessions
-    .find(s => s.acpSessionId === data.sessionId);  // LINE 262
-  
-  // Skip notifications for sub-agents
-  if (session && !session.isSubAgent) {  // LINE 263 - Only notify for user-facing sessions
-    
-    // Check if should notify using helper logic
-    const result = shouldNotifyHelper(
-      data.sessionId,  // ACP ID of completed session
-      activeAcpId,  // ACP ID of active session
-      session.name,  // Session display name
-      workspaceCwds as readonly { path: string; label: string }[],  // Available workspaces
-      session.cwd,  // Session working directory
-      { notificationSound, notificationDesktop }  // User settings
-    );
-    
-    if (result) {
-      // Play sound if enabled
-      if (result.shouldSound) {  // LINE 265
-        try { 
-          new Audio('/memory-sound.mp3').play()?.catch(() => {});  // Play notification sound
-        } 
-        catch { /* audio unavailable */ } 
-      }
-      
-      // Show desktop notification if enabled and permitted
-      if (result.shouldDesktop && Notification.permission === 'granted') {  // LINE 267
-        new Notification(branding.notificationTitle, {  // LINE 268
-          body: result.body,  // "Session Name (Workspace) agent has finished"
-          icon: '/vite.svg'
-        });
-      }
-    }
-  }
+// FILE: backend/sockets/promptHandlers.js (Function: registerPromptHandlers, Emit: token_done)
+io.to('session:' + sessionId).emit('token_done', {
+  providerId: resolvedProviderId,
+  sessionId,
 });
 ```
 
----
+Error paths include `error: true`:
 
-### Step 6: Helper Function Determines If Should Notify
-**File:** `frontend/src/utils/notificationHelper.ts` (Lines 17–37)
+```javascript
+// FILE: backend/sockets/promptHandlers.js (Function: registerPromptHandlers, Emit: token_done error)
+io.to('session:' + sessionId).emit('token_done', {
+  providerId: resolvedProviderId,
+  sessionId,
+  error: true,
+});
+```
+
+File: `backend/sockets/sessionHandlers.js` (Function: `registerSessionHandlers`, Socket event: `merge_fork`, Emit: `token_done`)
+
+Fork merge prompts the parent session asynchronously and emits `token_done` for the parent ACP session after the merge prompt resolves.
+
+```javascript
+// FILE: backend/sockets/sessionHandlers.js (Function: registerSessionHandlers, Socket event: merge_fork)
+io.to(`session:${parentSession.acpSessionId}`).emit('merge_message', {
+  sessionId: parentSession.acpSessionId,
+  text: mergeMessage
+});
+await acpClient.transport.sendRequest('session/prompt', {
+  sessionId: parentSession.acpSessionId,
+  prompt: [{ type: 'text', text: mergeMessage }]
+});
+io.to(`session:${parentSession.acpSessionId}`).emit('token_done', {
+  sessionId: parentSession.acpSessionId
+});
+```
+
+### 5. Frontend Dispatches Completion Through Stream Finalization
+
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket event: `token_done`)
+
+`useChatManager` always sends completion data to `useStreamStore.onStreamDone` before running the desktop/body notification path.
 
 ```typescript
-// FILE: frontend/src/utils/notificationHelper.ts (Lines 17-37)
+// FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager, Socket event: token_done)
+socket.on('token_done', (data: StreamDoneData) => {
+  onStreamDone(socket, data);
+  const { notificationSound, notificationDesktop, workspaceCwds, branding } = useSystemStore.getState();
+  const activeAcpId = useSessionLifecycleStore.getState().sessions
+    .find(s => s.id === useSessionLifecycleStore.getState().activeSessionId)?.acpSessionId;
+  const session = useSessionLifecycleStore.getState().sessions.find(s => s.acpSessionId === data.sessionId);
+  // desktop/body path continues below
+});
+```
+
+### 6. Stream Finalization Marks Unread State and Plays Background Sound
+
+File: `frontend/src/store/useStreamStore.ts` (Store action: `onStreamDone`, Search token: `isBackground`)
+
+After the stream queue drains or times out, `onStreamDone` marks the session as not typing, sets `hasUnreadResponse` when the completed UI session is not active, saves a snapshot, fetches stats, and plays the completion sound for background sessions when `notificationSound` is true.
+
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: onStreamDone, Search token: isBackground)
+const activeId = state.activeSessionId;
+const isBackground = state.sessions.some(s => s.acpSessionId === sessionId && s.id !== activeId);
+if (isBackground && useSystemStore.getState().notificationSound) {
+  try { new Audio('/memory-sound.mp3').play()?.catch(() => {}); }
+  catch { /* audio may not be available */ }
+}
+```
+
+This sound path is completion-scoped and does not create a desktop notification.
+
+### 7. Completion Eligibility Uses the Active ACP Session ID
+
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket event: `token_done`, Helper: `shouldNotifyHelper`)
+
+The desktop/body path finds the completed `ChatSession` by `acpSessionId`, skips sub-agent sessions, and passes ACP IDs into `shouldNotifyHelper`.
+
+```typescript
+// FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager, Socket event: token_done)
+const activeAcpId = useSessionLifecycleStore.getState().sessions
+  .find(s => s.id === useSessionLifecycleStore.getState().activeSessionId)?.acpSessionId;
+const session = useSessionLifecycleStore.getState().sessions.find(s => s.acpSessionId === data.sessionId);
+if (session && !session.isSubAgent) {
+  const result = shouldNotifyHelper(
+    data.sessionId,
+    activeAcpId,
+    session.name,
+    workspaceCwds as readonly { path: string; label: string }[],
+    session.cwd,
+    { notificationSound, notificationDesktop }
+  );
+}
+```
+
+The `activeSessionId` store field is a UI ID. It must be resolved to the active session's `acpSessionId` before comparison with `token_done.sessionId`.
+
+### 8. The Pure Helper Builds the Notification Result
+
+File: `frontend/src/utils/notificationHelper.ts` (Function: `shouldNotify`, Interfaces: `NotificationSettings`, `NotificationResult`)
+
+`shouldNotify` is pure. It suppresses active-session completions and unnamed sessions, performs exact workspace path matching, and returns the settings values unchanged.
+
+```typescript
+// FILE: frontend/src/utils/notificationHelper.ts (Function: shouldNotify)
 export function shouldNotify(
-  sessionAcpId: string,  // ACP ID of completed session
-  activeAcpId: string | null | undefined,  // ACP ID of currently active session
-  sessionName: string | undefined,  // Display name
-  workspaceCwds: readonly { path: string; label: string }[],  // Configured workspaces
-  sessionCwd: string | null | undefined,  // Session working directory
-  settings: NotificationSettings  // User's notification preferences
-): NotificationResult | null
-```
+  sessionAcpId: string,
+  activeAcpId: string | null | undefined,
+  sessionName: string | undefined,
+  workspaceCwds: readonly { path: string; label: string }[],
+  sessionCwd: string | null | undefined,
+  settings: NotificationSettings
+): NotificationResult | null {
+  if (sessionAcpId === activeAcpId) return null;
+  if (!sessionName) return null;
 
-**Decision logic (lines 23–37):**
+  const wsLabel = sessionCwd ? workspaceCwds.find(w => w.path === sessionCwd)?.label : undefined;
+  const body = `${sessionName}${wsLabel ? ` (${wsLabel})` : ''} agent has finished`;
 
-```typescript
-// Only notify if this is NOT the active session
-if (sessionAcpId === activeAcpId) {  // LINE 26
-  return null;  // Active session; suppress notification
-}
-
-// Only notify if session has a name
-if (!sessionName) {  // LINE 27
-  return null;  // No name; can't notify
-}
-
-// Find workspace label if session CWD matches a configured workspace
-let wsLabel: string | undefined;
-const matchingWorkspace = workspaceCwds.find(ws => ws.path === sessionCwd);  // LINE 28
-if (matchingWorkspace) {
-  wsLabel = matchingWorkspace.label;  // LINE 29
-}
-
-// Build notification body
-const body = `${sessionName}${wsLabel ? ` (${wsLabel})` : ''} agent has finished`;  // LINE 30
-
-// Return notification result with user settings
-return {  // LINE 31
-  shouldSound: settings.notificationSound,
-  shouldDesktop: settings.notificationDesktop,
-  body
-};
-```
-
-**Returns:**
-- `null` if should NOT notify (active session, missing name, etc.)
-- `NotificationResult` with `shouldSound`, `shouldDesktop`, and `body` string
-
----
-
-### Step 7: Frontend Plays Sound (If Enabled)
-**File:** `frontend/src/hooks/useChatManager.ts` (Line 265)
-
-```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Line 265-266)
-if (result.shouldSound) {
-  try { 
-    new Audio('/memory-sound.mp3').play()?.catch(() => {});  // Play async, ignore errors
-  } 
-  catch { /* audio unavailable */ } 
+  return {
+    shouldSound: settings.notificationSound,
+    shouldDesktop: settings.notificationDesktop,
+    body,
+  };
 }
 ```
 
-**Sound file:** `/memory-sound.mp3` served from `frontend/public/memory-sound.mp3`
+### 9. Completion Side Effects Use Browser APIs
 
-**Error handling:** If audio fails to play (e.g., browser muted, network issue), silently continues.
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket event: `token_done`, Browser APIs: `Audio`, `Notification`)
 
----
-
-### Step 8: Frontend Shows Desktop Notification (If Enabled & Permitted)
-**File:** `frontend/src/hooks/useChatManager.ts` (Lines 267–269)
+When `shouldNotifyHelper` returns a result, `useChatManager` plays the same MP3 if `result.shouldSound` is true. It creates a native desktop notification only when `result.shouldDesktop` is true and browser permission is `granted`.
 
 ```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 267-269)
-if (result.shouldDesktop && Notification.permission === 'granted') {  // LINE 267
-  new Notification(branding.notificationTitle, {  // LINE 268 - Title from branding config
-    body: result.body,  // "Session Name (Workspace) agent has finished"
-    icon: '/vite.svg'  // Icon served from frontend public folder
+// FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager, Socket event: token_done)
+if (result) {
+  if (result.shouldSound) {
+    try { new Audio('/memory-sound.mp3').play()?.catch(() => {}); }
+    catch { /* audio unavailable */ }
+  }
+  if (result.shouldDesktop && Notification.permission === 'granted') {
+    new Notification(branding.notificationTitle, { body: result.body, icon: '/vite.svg' });
+  }
+}
+```
+
+The notification title comes from `useSystemStore.branding.notificationTitle`, which is hydrated from provider branding through the backend `branding` socket event. The store fallback title is `ACP UI`.
+
+### 10. Main Permission Requests Play a Separate Attention Sound
+
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket event: `permission_request`)
+
+Main-chat permission requests play `/memory-sound.mp3` before entering the unified timeline. Sub-agent permission requests are routed to `useSubAgentStore.setPermission` and return before this sound path.
+
+```typescript
+// FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager, Socket event: permission_request)
+const subAgent = agents.find(a => a.acpSessionId === evtData.sessionId);
+if (subAgent) {
+  useSubAgentStore.getState().setPermission(subAgent.acpSessionId, {
+    id: evtData.id,
+    sessionId: evtData.sessionId,
+    options: evtData.options || [],
+    toolCall: evtData.toolCall,
   });
+  return;
 }
+new Audio('/memory-sound.mp3').play()?.catch(() => {});
+onStreamEvent({ ...event, type: 'permission_request' });
 ```
 
-**Desktop notification properties:**
-- **Title:** Sourced from `branding.notificationTitle` (defined per-provider in `branding.json`)
-- **Body:** Generated by `shouldNotify()`, includes session name and optional workspace label
-- **Icon:** Static `/vite.svg` icon
-
-**Permission check (line 267):** Only shows if `Notification.permission === 'granted'`. If permission is `'denied'`, notification is suppressed silently.
+This permission-request sound does not consult `notificationSound` or `notificationDesktop`.
 
 ---
 
@@ -274,389 +272,214 @@ if (result.shouldDesktop && Notification.permission === 'granted') {  // LINE 26
 
 ```mermaid
 graph TB
-    subgraph Backend["Backend (Node.js)"]
-        Config["sockets/index.js<br/>(sidebar_settings)"]
-        Event["promptHandlers.js<br/>(token_done)"]
-    end
-    
-    subgraph Frontend["Frontend (React + Zustand)"]
-        Socket["useSocket.ts<br/>(receives sidebar_settings)"]
-        Store["useSystemStore<br/>notificationSound<br/>notificationDesktop"]
-        Manager["useChatManager.ts<br/>(token_done listener)"]
-        Helper["notificationHelper.ts<br/>shouldNotify()"]
-    end
-    
-    subgraph BrowserAPI["Browser APIs"]
-        Audio["HTML5 Audio API<br/>/memory-sound.mp3"]
-        Desktop["Web Notifications API<br/>new Notification()"]
-        Permission["Permission Manager<br/>Notification.permission"]
-    end
-    
-    subgraph Environment[".env Configuration"]
-        VarSound["NOTIFICATION_SOUND<br/>(default: true)"]
-        VarDesktop["NOTIFICATION_DESKTOP<br/>(default: false)"]
-    end
-    
-    VarSound -->|reads| Config
-    VarDesktop -->|reads| Config
-    Config -->|emit| Socket
-    Socket -->|update| Store
-    Socket -->|request permission| Permission
-    
-    Event -->|emit token_done| Manager
-    Manager -->|read settings| Store
-    Manager -->|check active session| Manager
-    Manager -->|call| Helper
-    Helper -->|check background| Helper
-    Helper -->|find workspace| Helper
-    Helper -->|return result| Manager
-    Manager -->|play if enabled| Audio
-    Manager -->|show if permitted| Desktop
+  Env[".env / process.env\nNOTIFICATION_SOUND\nNOTIFICATION_DESKTOP"] --> BackendIndex["backend/sockets/index.js\nregisterSocketHandlers"]
+  BackendIndex -->|"sidebar_settings"| UseSocket["frontend/src/hooks/useSocket.ts\ngetOrCreateSocket"]
+  UseSocket -->|"setNotificationSettings"| SystemStore["frontend/src/store/useSystemStore.ts\nnotificationSound / notificationDesktop"]
+  UseSocket -->|"Notification.requestPermission"| BrowserPermission["Browser Notification.permission"]
+
+  PromptHandlers["backend/sockets/promptHandlers.js\nregisterPromptHandlers"] -->|"token_done"| ChatManager["frontend/src/hooks/useChatManager.ts\nuseChatManager"]
+  SessionHandlers["backend/sockets/sessionHandlers.js\nmerge_fork"] -->|"token_done"| ChatManager
+  ChatManager -->|"onStreamDone"| StreamStore["frontend/src/store/useStreamStore.ts\nonStreamDone"]
+  StreamStore -->|"background + notificationSound"| AudioApi["Audio('/memory-sound.mp3')"]
+  ChatManager -->|"non-sub-agent session"| Helper["frontend/src/utils/notificationHelper.ts\nshouldNotify"]
+  Helper -->|"NotificationResult"| ChatManager
+  ChatManager -->|"shouldSound"| AudioApi
+  ChatManager -->|"shouldDesktop + granted"| DesktopApi["new Notification(title, body, icon)"]
+  SystemStore --> ChatManager
+  SystemStore --> StreamStore
+  BrowserPermission --> DesktopApi
+
+  WorkspaceConfig["workspace_cwds\n{ path, label }"] --> SystemStore
+  Branding["branding\nnotificationTitle"] --> SystemStore
+
+  PermissionEvent["permission_request"] --> ChatManager
+  ChatManager -->|"main-chat permission"| AudioApi
+  ChatManager -->|"sub-agent permission"| SubAgentStore["useSubAgentStore.setPermission"]
 ```
 
 ---
 
-## The Critical Contract: Notification Triggers & Suppression
+## Critical Contract
 
-### When Notifications Fire
+### Event and ID Contract
 
-**Notification fires (returns non-null from `shouldNotify()`) when:**
-1. ✅ Completed session is **NOT** the active session (`sessionAcpId !== activeAcpId`)
-2. ✅ Session has a valid **name** (`sessionName` is truthy)
-3. ✅ User has enabled notification setting (`notificationSound` OR `notificationDesktop`)
+- `sidebar_settings` payload fields are `deletePermanent`, `notificationSound`, and `notificationDesktop`.
+- `token_done.sessionId` is an ACP session ID. It must be compared to `ChatSession.acpSessionId`, not `ChatSession.id` or `activeSessionId` directly.
+- `StreamDoneData` in `frontend/src/types.ts` contains `sessionId` and optional `error`.
+- `useChatManager` calls `onStreamDone(socket, data)` for all `token_done` events before running completion notification side effects.
 
-### When Notifications Suppress
+### Eligibility Contract
 
-**Notification returns null (suppresses) when:**
-1. ❌ Completed session **IS** the active session
-2. ❌ Session has no **name** (unnamed sessions don't notify)
-3. ❌ Session is a **sub-agent** (`isSubAgent === true`) — line 263
-4. ❌ Both sound AND desktop disabled in settings
-5. ❌ Desktop notification permission is `'denied'` (sound still plays if enabled)
+- `shouldNotify` returns `null` when the completed ACP session is the active ACP session.
+- `shouldNotify` returns `null` when `sessionName` is missing.
+- `shouldNotify` does not check sub-agent status; `useChatManager` performs `!session.isSubAgent` before calling it.
+- `shouldNotify` does not check browser permission; `useChatManager` checks `Notification.permission === 'granted'` before creating `new Notification`.
+- `shouldNotify` returns settings values unchanged, so callers decide which side effects run.
 
-### Workspace Label Logic
+### Audio Contract
 
-Workspace label is **included in body** when:
-- Session's `cwd` **exactly matches** a configured workspace's `path` (line 28 of helper)
-- Workspace has a `label` (e.g., "Project-A", "My-App")
-- Example body: `"Session Name (Project-A) agent has finished"`
+- Completion audio is controlled by `notificationSound` in both `useStreamStore.onStreamDone` and the `useChatManager` `token_done` result path.
+- Main-chat `permission_request` audio is independent of `notificationSound` and `notificationDesktop`.
+- All audio paths use `/memory-sound.mp3`, served by `frontend/public/memory-sound.mp3`.
+- Audio playback failures are caught or ignored; no UI error is shown.
 
-If **no match**, workspace label is **omitted**:
-- Example body: `"Session Name agent has finished"`
+### Desktop Notification Contract
+
+- Desktop notification opt-in starts with `NOTIFICATION_DESKTOP=true` on the backend.
+- Permission prompting happens in `useSocket.ts` during `sidebar_settings` handling when browser permission is `default`.
+- Desktop notification display happens in `useChatManager.ts` during `token_done` handling when browser permission is `granted`.
+- The title is `branding.notificationTitle`; the fallback branding title in `useSystemStore` is `ACP UI`.
+- The body is built by `shouldNotify` as `Session Name agent has finished` or `Session Name (Workspace Label) agent has finished`.
 
 ---
 
-## Configuration / Environment Variables
+## Configuration/Data Flow
 
-### .env Variables
+### Environment Keys
 
-| Variable | Default | Type | Purpose |
-|----------|---------|------|---------|
-| `NOTIFICATION_SOUND` | `true` | boolean string | Enable/disable audio notification |
-| `NOTIFICATION_DESKTOP` | `false` | boolean string | Enable/disable desktop notification |
-| `UI_NOTIFICATION_DELAY_MS` | `2000` | number string | *(Currently unused in code)* |
+| Key | Runtime parser | Default behavior | Purpose |
+|---|---|---|---|
+| `NOTIFICATION_SOUND` | `backend/sockets/index.js` (`process.env.NOTIFICATION_SOUND !== 'false'`) | Enabled when unset or any value other than exact `false` | Controls completion sounds in `useStreamStore.onStreamDone` and `useChatManager` `token_done` result path |
+| `NOTIFICATION_DESKTOP` | `backend/sockets/index.js` (`process.env.NOTIFICATION_DESKTOP === 'true'`) | Disabled unless exact `true` | Controls browser permission request and desktop notification side effect |
+| `SIDEBAR_DELETE_PERMANENT` | `backend/sockets/index.js` (`String(...).trim().toLowerCase() === 'true'`) | Disabled unless truthy after trim/lowercase parsing | Shares the `sidebar_settings` payload but is not notification-specific |
+| `UI_NOTIFICATION_DELAY_MS` | Declared in `.env.example`; no backend or frontend notification source reads this key | No runtime notification effect | Reserved configuration key in the example file |
 
-**Resolution logic (backend/sockets/index.js line 80–81):**
+### Runtime Configuration Flow
+
+```text
+.env / process.env
+  -> backend/sockets/index.js registerSocketHandlers
+  -> socket.emit('sidebar_settings', { notificationSound, notificationDesktop })
+  -> frontend/src/hooks/useSocket.ts getOrCreateSocket
+  -> useSystemStore.setNotificationSettings(sound, desktop)
+  -> frontend/src/store/useStreamStore.ts onStreamDone
+  -> frontend/src/hooks/useChatManager.ts token_done
+```
+
+### Environment Editing Flow
+
+File: `frontend/src/components/SystemSettingsModal.tsx` (Component: `SystemSettingsModal`, Socket events: `get_env`, `update_env`)
+
+The Environment tab fetches current variables with `get_env` and sends edits with `update_env`.
+
+```typescript
+// FILE: frontend/src/components/SystemSettingsModal.tsx (Component: SystemSettingsModal, Handler: updateEnv)
+const updateEnv = (key: string, value: string) => {
+  setEnvVars(prev => ({ ...prev, [key]: value }));
+  socket?.emit('update_env', { key, value });
+};
+```
+
+File: `backend/sockets/systemSettingsHandlers.js` (Function: `registerSystemSettingsHandlers`, Socket events: `get_env`, `update_env`)
+
+`update_env` writes `.env` and updates `process.env[key]` in the running backend process.
+
 ```javascript
-notificationSound: process.env.NOTIFICATION_SOUND !== 'false',  // Defaults to true
-notificationDesktop: process.env.NOTIFICATION_DESKTOP === 'true',  // Defaults to false
+// FILE: backend/sockets/systemSettingsHandlers.js (Function: registerSystemSettingsHandlers, Socket event: update_env)
+fs.writeFileSync(ENV_PATH, content, 'utf8');
+process.env[key] = value;
+callback?.({ success: true });
 ```
 
-- `NOTIFICATION_SOUND`: Truthy unless explicitly set to string `'false'`
-- `NOTIFICATION_DESKTOP`: Truthy only if explicitly set to string `'true'`
+Notification store hydration still flows through `sidebar_settings`; existing sockets do not receive a dedicated notification-settings event from `update_env`.
 
-### Branding Configuration
+### Workspace and Branding Data Flow
 
-Each provider defines its notification title in `branding.json`:
-
-```json
-{
-  "notificationTitle": "My Provider"  // Shown in desktop notification title bar
-}
-```
-
-Fallback: If not defined, defaults to `"ACP UI"` (useSystemStore.ts line 39)
-
----
-
-## Data Flow / Rendering Pipeline
-
-### Configuration Flow: .env → Backend → Frontend Store
-
-```
-.env file
-  ├─ NOTIFICATION_SOUND=true (or 'false')
-  └─ NOTIFICATION_DESKTOP=false (or 'true')
-    ↓
-Backend reads on startup
-    ↓
-backend/sockets/index.js:80-81 parses to boolean
-    ↓
-On socket connect: emit 'sidebar_settings' with boolean values
-    ↓
-Frontend receives via useSocket.ts:57-61
-    ↓
-setNotificationSettings() updates useSystemStore
-    ↓
-useChatManager.ts reads from store on token_done
-```
-
-### Notification Flow: Session Complete → Sound + Desktop
-
-```
-Agent finishes work in background session
-    ↓
-Backend emits 'token_done' { sessionId, providerId }
-    ↓
-Frontend receives in useChatManager.ts:258
-    ↓
-onStreamDone() updates UI (message history, etc.)
-    ↓
-Get settings from useSystemStore:
-  - notificationSound: true/false
-  - notificationDesktop: true/false
-  - workspaceCwds: { path, label }[]
-  - branding: { notificationTitle: "My Provider" }
-    ↓
-Get active session from useSessionLifecycleStore
-    ↓
-Find completed session by acpSessionId
-    ↓
-Check: Is sub-agent? → SKIP if true
-    ↓
-Call shouldNotify() with:
-  - sessionId (completed)
-  - activeAcpId (current)
-  - sessionName
-  - workspaceCwds
-  - sessionCwd
-  - { notificationSound, notificationDesktop }
-    ↓
-shouldNotify() logic:
-  1. Return null if sessionId === activeAcpId (suppress active)
-  2. Return null if !sessionName (no name)
-  3. Find workspace label if cwd matches
-  4. Build body: "${name}${wsLabel ? ` (${wsLabel})` : ''} agent has finished"
-  5. Return { shouldSound, shouldDesktop, body }
-    ↓
-If result:
-  ├─ shouldSound? → Play /memory-sound.mp3 via Audio API
-  └─ shouldDesktop & permission granted? → Show notification
-```
+- `workspace_cwds` is emitted by `backend/sockets/index.js` from `loadWorkspaces()` and stored with `useSystemStore.setWorkspaceCwds` in `frontend/src/hooks/useSocket.ts`.
+- `branding` is emitted by `backend/sockets/index.js` from provider config and stored with `useSystemStore.setProviderBranding` in `frontend/src/hooks/useSocket.ts`.
+- `shouldNotify` reads workspace labels through its `workspaceCwds` argument and requires exact string equality between `session.cwd` and `workspace.path`.
+- `new Notification` reads the title from `useSystemStore.getState().branding.notificationTitle`.
 
 ---
 
 ## Component Reference
 
-### Frontend Files
+### Backend
 
-| File | Key Functions/Exports | Lines | Purpose |
-|------|----------------------|-------|---------|
-| `frontend/src/utils/notificationHelper.ts` | `shouldNotify()` | 17–37 | Decision logic: when to notify, workspace label detection, body building |
-| | `NotificationSettings` interface | 6–9 | Type for user notification preferences |
-| | `NotificationResult` interface | 11–15 | Type for notification outcome (shouldSound, shouldDesktop, body) |
-| `frontend/src/hooks/useChatManager.ts` | `token_done` event listener | 257–271 | Receives completion event, calls shouldNotify(), plays sound, shows notification |
-| `frontend/src/hooks/useSocket.ts` | `sidebar_settings` event listener | 57–61 | Receives config from backend, updates store, requests permission |
-| `frontend/src/store/useSystemStore.ts` | `notificationSound` state | 31 | Boolean flag for sound preference |
-| | `notificationDesktop` state | 32 | Boolean flag for desktop notification preference |
-| | `setNotificationSettings()` | 176 | Setter for both notification preferences |
-| | `notificationTitle` in branding | 39 | Title shown in desktop notification (from provider branding) |
-| `frontend/src/test/notificationHelper.test.ts` | Test suite | Full file | 6 test cases (active session, background session, workspace labels, settings) |
-| `frontend/public/memory-sound.mp3` | Audio asset | N/A | Notification sound file |
+| Area | File | Stable Anchors | Purpose |
+|---|---|---|---|
+| Socket hydration | `backend/sockets/index.js` | `registerSocketHandlers`, `sidebar_settings`, `workspace_cwds`, `branding`, `buildBrandingPayload`, `getProviderPayloads` | Sends notification defaults, workspace paths, and provider branding to connecting clients |
+| Prompt completion | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, `prompt`, `token_done`, `autoSaveTurn`, `statsCaptures` | Emits `token_done` for successful prompts and error completions |
+| Fork merge completion | `backend/sockets/sessionHandlers.js` | `registerSessionHandlers`, `merge_fork`, `merge_message`, `token_done` | Emits parent-session completion after merge prompt injection |
+| Environment editing | `backend/sockets/systemSettingsHandlers.js` | `registerSystemSettingsHandlers`, `get_env`, `update_env`, `ENV_PATH` | Reads/writes `.env` and updates `process.env` |
+| Example config | `.env.example` | `NOTIFICATION_SOUND`, `NOTIFICATION_DESKTOP`, `UI_NOTIFICATION_DELAY_MS` | Documents default notification-related keys |
 
-### Backend Files
+### Frontend
 
-| File | Key Functions | Lines | Purpose |
-|------|------------------|-------|---------|
-| `backend/sockets/index.js` | Socket initialization | 78–82 | Emits `sidebar_settings` with notification config on connect |
-| | `sidebar_settings` event | 78–82 | Sends NOTIFICATION_SOUND and NOTIFICATION_DESKTOP to frontend |
-| `backend/sockets/promptHandlers.js` | `token_done` emission | 19, 33, 127, 143 | Emits event when session completes (success or error) |
-| | Successful completion | 127 | Main emission point for normal completion |
-| | Error emissions | 19, 33, 143 | Also emit on session error |
-
-### Environment Configuration
-
-| Variable | File | Default | Purpose |
-|----------|------|---------|---------|
-| `NOTIFICATION_SOUND` | `.env` | `true` | Backend sends to frontend; enables sound playback |
-| `NOTIFICATION_DESKTOP` | `.env` | `false` | Backend sends to frontend; enables desktop notifications |
-| `UI_NOTIFICATION_DELAY_MS` | `.env` | `2000` | *(Currently unused; could be used for debouncing)* |
+| Area | File | Stable Anchors | Purpose |
+|---|---|---|---|
+| Socket singleton | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `sidebar_settings`, `workspace_cwds`, `branding`, `Notification.requestPermission` | Receives backend settings and starts browser permission flow |
+| Completion dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `token_done`, `permission_request`, `shouldNotifyHelper`, `new Audio`, `new Notification` | Handles completion side effects and permission-request audio |
+| Stream finalization | `frontend/src/store/useStreamStore.ts` | `useStreamStore`, `onStreamDone`, `isBackground`, `save_snapshot`, `fetchStats` | Marks responses complete, sets unread state, saves snapshots, plays background completion sound |
+| Notification helper | `frontend/src/utils/notificationHelper.ts` | `NotificationSettings`, `NotificationResult`, `shouldNotify` | Pure completion eligibility and body builder |
+| System state | `frontend/src/store/useSystemStore.ts` | `notificationSound`, `notificationDesktop`, `setNotificationSettings`, `branding.notificationTitle`, `setProviderBranding`, `setWorkspaceCwds` | Holds notification settings, branding title, and workspace labels |
+| Environment UI | `frontend/src/components/SystemSettingsModal.tsx` | `SystemSettingsModal`, `get_env`, `update_env`, `updateEnv` | General environment variable editor that can edit notification keys |
+| Types | `frontend/src/types.ts` | `StreamDoneData`, `ProviderBranding`, `WorkspaceCwd` | Shared frontend shapes used by notification flow |
+| Asset | `frontend/public/memory-sound.mp3` | Static asset path `/memory-sound.mp3` | MP3 used by completion and permission-request audio paths |
 
 ---
 
-## Gotchas & Important Notes
+## Gotchas
 
-### 1. **Active Session Check: sessionId vs activeAcpId Must Match**
-**What breaks:** If you compare wrong ID types (UI ID vs ACP ID), active session suppression fails and notifications spam the active session.
+### 1. ACP Session IDs and UI Session IDs Are Different
 
-**Why it happens:** Sessions have two IDs: `ui_id` (frontend) and `acpSessionId` (backend). `token_done` comes with `sessionId` (ACP ID), but stores track both.
+`token_done.sessionId` is an ACP session ID. `useSessionLifecycleStore.activeSessionId` is a UI session ID. Resolve the active `ChatSession` first and compare against its `acpSessionId`.
 
-**How to avoid it:**
-```typescript
-// ❌ Wrong: comparing different ID types
-const activeId = useSessionLifecycleStore.getState().activeSessionId;  // UI ID
-if (data.sessionId === activeId) { /* ... */ }  // Comparing ACP ID to UI ID
+Search anchors: `frontend/src/hooks/useChatManager.ts` (`token_done`, `activeAcpId`), `frontend/src/utils/notificationHelper.ts` (`shouldNotify`).
 
-// ✅ Correct: extract ACP ID from active session
-const activeAcpId = useSessionLifecycleStore.getState().sessions
-  .find(s => s.id === useSessionLifecycleStore.getState().activeSessionId)?.acpSessionId;
-if (data.sessionId === activeAcpId) { /* ... */ }
-```
+### 2. Completion Audio Has Two Call Sites
 
----
+`useStreamStore.onStreamDone` can play the background completion sound after queue drain. `useChatManager` can also play sound from the `shouldNotify` result. Keep both paths in sync when changing completion sound semantics.
 
-### 2. **Sub-Agents Never Notify: isSubAgent Flag Is Critical**
-**What breaks:** If you skip the `isSubAgent` check, spawn notifications for every background sub-agent, spamming the user with "Agent has finished" for internal operations.
+Search anchors: `frontend/src/store/useStreamStore.ts` (`onStreamDone`, `isBackground`), `frontend/src/hooks/useChatManager.ts` (`token_done`, `result.shouldSound`).
 
-**Why it happens:** Sub-agents are spawned by parent agents for parallel work (e.g., running 3 sub-agents in parallel). Users see no UI for them; notifications are noise.
+### 3. Permission-Request Audio Is Separate From Completion Settings
 
-**How to avoid it:** Always check `isSubAgent` before calling `shouldNotify()` (line 263):
-```typescript
-if (session && !session.isSubAgent) {  // Skip sub-agents
-  const result = shouldNotify(...);
-}
-```
+Main-chat `permission_request` audio does not read `notificationSound` or `notificationDesktop`. It plays `/memory-sound.mp3` before adding the permission request to the timeline. Sub-agent permission requests return through `useSubAgentStore.setPermission` first.
 
----
+Search anchors: `frontend/src/hooks/useChatManager.ts` (`permission_request`, `useSubAgentStore.setPermission`).
 
-### 3. **Desktop Notification Permission Is Persistent at Browser Level**
-**What breaks:** If user denies permission, it can't be requested again without clearing site permissions in browser settings.
+### 4. Desktop Permission Is Browser State
 
-**Why it happens:** `Notification.permission` persists across page reloads. Denied → Denied (unless user manually clears).
+`Notification.requestPermission()` runs only when `sidebar_settings.notificationDesktop` is true and browser permission is `default`. If permission is `denied`, the completion path checks `Notification.permission === 'granted'` and suppresses desktop notifications.
 
-**How to avoid it:** Request permission **proactively** when user enables desktop notifications in settings:
-```typescript
-if (data.notificationDesktop && Notification.permission === 'default') {
-  Notification.requestPermission();  // LINE 61: Request before using
-}
-```
+Search anchors: `frontend/src/hooks/useSocket.ts` (`Notification.requestPermission`), `frontend/src/hooks/useChatManager.ts` (`Notification.permission`).
 
-Alternatively, ask user to manually allow notifications if permission is denied:
-```typescript
-if (result.shouldDesktop && Notification.permission === 'denied') {
-  console.warn('Desktop notifications denied. Allow in browser settings.');
-}
-```
+### 5. Environment Boolean Parsing Is Exact for Notification Keys
 
----
+`NOTIFICATION_SOUND=false` disables sound. Other values, including `False`, `0`, or an unset variable, enable sound. `NOTIFICATION_DESKTOP=true` enables desktop notifications. Other values disable desktop notifications.
 
-### 4. **Audio Playback May Fail Silently in Muted or Restricted Contexts**
-**What breaks:** Sound doesn't play, but no error is shown (wrapped in try/catch).
+Search anchor: `backend/sockets/index.js` (`sidebar_settings`).
 
-**Why it happens:** Browsers restrict audio playback in certain contexts (muted tabs, autoplay policies, permissions).
+### 6. Workspace Labels Require Exact Path Equality
 
-**How to avoid it:**
-```typescript
-// Log failures for debugging
-if (result.shouldSound) {
-  new Audio('/memory-sound.mp3').play()
-    ?.catch(err => console.warn('Audio play failed:', err));
-}
-```
+`shouldNotify` compares `session.cwd` to `workspace.path` with exact string equality. Case, slash style, trailing separators, and path normalization differences prevent workspace labels from appearing in the notification body.
 
----
+Search anchors: `frontend/src/utils/notificationHelper.ts` (`workspaceCwds.find`), `frontend/src/hooks/useSocket.ts` (`workspace_cwds`).
 
-### 5. **Workspace Label Requires Exact Path Match**
-**What breaks:** Session runs in `/projects/my-app/` but workspace is configured as `/projects/my-app`, so no label is included.
+### 7. Sub-Agent Desktop Notifications Are Gated in `useChatManager`
 
-**Why it happens:** `workspaceCwds` is an array of `{ path, label }`. Path comparison is exact string match (line 28 of helper).
+`useChatManager` checks `!session.isSubAgent` before calling `shouldNotifyHelper` for the desktop/body path. `shouldNotify` itself has no sub-agent parameter.
 
-**How to avoid it:** Ensure workspace paths in `workspaces.json` match exactly what sessions use:
-```json
-{
-  "workspaces": [
-    { "label": "Project-A", "path": "C:\\repos\\project-a" }
-  ]
-}
-```
+Search anchors: `frontend/src/hooks/useChatManager.ts` (`token_done`, `isSubAgent`), `frontend/src/utils/notificationHelper.ts` (`shouldNotify`).
 
-And sessions should have `cwd` that exactly matches `"C:\\repos\\project-a"`.
+### 8. Audio Failures Are Silent
 
----
+Completion audio catches synchronous construction failures and ignores rejected `play()` promises. Permission-request audio ignores rejected `play()` promises. Browser autoplay policy, muted tabs, missing assets, or fetch failures do not surface an in-app error.
 
-### 6. **Environment Variable Defaults Are Counterintuitive**
-**What breaks:** You set `NOTIFICATION_DESKTOP=false` expecting it to stay off, but code treats absence as `true`.
+Search anchors: `frontend/src/hooks/useChatManager.ts` (`new Audio('/memory-sound.mp3')`), `frontend/src/store/useStreamStore.ts` (`new Audio('/memory-sound.mp3')`).
 
-**Why it happens:** Line 80 uses `!== 'false'` (defaults true), not `=== 'true'` (defaults false).
+### 9. `update_env` Does Not Push Notification Settings to Existing Sockets
 
-**How to avoid it:** Understand the logic:
-```javascript
-// NOTIFICATION_SOUND
-notificationSound: process.env.NOTIFICATION_SOUND !== 'false'
-// Truthy: not set, or set to anything except 'false'
-// Falsy: set to 'false'
+`update_env` updates `.env` and `process.env`, but notification store values are hydrated by `sidebar_settings` on socket connection. A notification-specific live update requires an emitted event and a frontend handler.
 
-// NOTIFICATION_DESKTOP
-notificationDesktop: process.env.NOTIFICATION_DESKTOP === 'true'
-// Truthy: set to 'true'
-// Falsy: not set, or set to anything except 'true'
-```
+Search anchors: `backend/sockets/systemSettingsHandlers.js` (`update_env`), `backend/sockets/index.js` (`sidebar_settings`), `frontend/src/hooks/useSocket.ts` (`sidebar_settings`).
 
-To disable sound: `NOTIFICATION_SOUND=false`
-To enable desktop: `NOTIFICATION_DESKTOP=true`
+### 10. Desktop Title Depends on Active Branding
 
----
+`new Notification` uses `useSystemStore.branding.notificationTitle`. If branding is missing this field, the store fallback title is `ACP UI`.
 
-### 7. **Notification Body Includes Session Name; Truncation Not Implemented**
-**What breaks:** Very long session names exceed notification width; text overflows.
-
-**Why it happens:** No truncation logic (line 30 of helper just concatenates).
-
-**How to avoid it:** Add truncation:
-```typescript
-const truncatedName = sessionName.length > 30 ? sessionName.substring(0, 27) + '...' : sessionName;
-const body = `${truncatedName}${wsLabel ? ` (${wsLabel})` : ''} agent has finished`;
-```
-
----
-
-### 8. **Sound File Must Exist at `/memory-sound.mp3` at Runtime**
-**What breaks:** If the audio file doesn't exist or 404s, `play()` fails silently.
-
-**Why it happens:** Path is hardcoded (line 265), no existence check before playing.
-
-**How to avoid it:** Verify file exists in build:
-```bash
-ls frontend/public/memory-sound.mp3
-```
-
-Alternatively, catch and log errors:
-```typescript
-new Audio('/memory-sound.mp3').play()?.catch(e => console.error('Audio failed:', e));
-```
-
----
-
-### 9. **Branding notificationTitle Falls Back to "ACP UI" if Undefined**
-**What breaks:** Provider's branding doesn't include `notificationTitle`; notification shows "ACP UI" instead of provider name.
-
-**Why it happens:** `branding.notificationTitle` defaults to "ACP UI" (useSystemStore line 39).
-
-**How to avoid it:** Ensure every provider's `branding.json` includes `notificationTitle`:
-```json
-{
-  "notificationTitle": "My Provider Name"
-}
-```
-
----
-
-### 10. **Settings Not Persisted Across Browser Reloads**
-**What breaks:** User toggles desktop notifications ON in settings, reloads page, and it's OFF again.
-
-**Why it happens:** Settings come from backend `.env`, not persisted in browser localStorage.
-
-**How to avoid it:** Add user-level persistence (localStorage) or provide System Settings UI to change `.env`:
-```typescript
-// In Zustand actions, persist to localStorage
-setNotificationSettings: (sound, desktop) => {
-  localStorage.setItem('notificationSound', String(sound));
-  localStorage.setItem('notificationDesktop', String(desktop));
-  set({ notificationSound: sound, notificationDesktop: desktop });
-}
-```
-
-Or ensure backend remembers user preferences via database.
+Search anchors: `frontend/src/store/useSystemStore.ts` (`branding.notificationTitle`), `frontend/src/hooks/useSocket.ts` (`branding`), `frontend/src/hooks/useChatManager.ts` (`new Notification`).
 
 ---
 
@@ -664,79 +487,77 @@ Or ensure backend remembers user preferences via database.
 
 ### Frontend Tests
 
-**File:** `frontend/src/test/notificationHelper.test.ts`
+| File | Test Names | Verified Behavior |
+|---|---|---|
+| `frontend/src/test/notificationHelper.test.ts` | `returns null when sessionId matches activeAcpId`; `returns notification result for background session`; `includes workspace label in body when cwd matches`; `excludes workspace label when no cwd match`; `respects sound/desktop settings independently`; `returns null when sessionName is undefined` | Pure `shouldNotify` eligibility, body generation, workspace labels, and settings propagation |
+| `frontend/src/test/useSocket.test.ts` | `handles "sidebar_settings" event` | `setDeletePermanent` and `setNotificationSettings` are called from socket payload |
+| `frontend/src/test/useChatManager.test.ts` | `handles "token_done" event`; `handles "permission_request" for sub-agent` | `token_done` dispatches to `onStreamDone`; sub-agent permission requests route to sub-agent state |
+| `frontend/src/test/useStreamStore.test.ts` | `ensureAssistantMessage creates a placeholder message`; `onStreamToken queues text and triggers typewriter`; stream finalization tests around `onStreamDone` behavior | Stream store lifecycle that completion notification sound depends on |
 
-| Test Name | What It Tests | Purpose |
-|-----------|-------------|---------|
-| `returns null when sessionId matches activeAcpId` | Suppresses notification for active session | Active session guard |
-| `returns notification result for background session` | Notifies when session is in background | Main notification flow |
-| `includes workspace label when cwd matches workspace path` | Workspace context in body | Workspace-aware notifications |
-| `excludes workspace label when no matching path` | No label if path doesn't match | Workspace path matching |
-| `respects independent sound and desktop settings` | Sound and desktop can toggle independently | Setting independence |
-| `returns null when sessionName is undefined` | Suppresses if no name | Name validation |
+Run focused frontend tests:
 
-**Run:** `cd frontend && npx vitest run notificationHelper.test.ts`
+```powershell
+cd frontend; .\node_modules\.bin\vitest.cmd run src/test/notificationHelper.test.ts src/test/useSocket.test.ts src/test/useChatManager.test.ts src/test/useStreamStore.test.ts
+```
+
+### Backend Tests
+
+| File | Test Names | Verified Behavior |
+|---|---|---|
+| `backend/test/sockets-index.test.js` | `emits sidebar_settings on connection` | Socket connection emits `sidebar_settings` payload |
+| `backend/test/promptHandlers.test.js` | `should handle incoming prompt and send to ACP`; `should handle prompt errors and emit error token`; `should reject prompts to sessions not loaded in current process`; `outer catch emits error token/token_done and does not call onPromptCompleted when onPromptStarted throws` | Prompt success and error paths emit `token_done` with ACP `sessionId` |
+| `backend/test/sessionHandlers.test.js` | `handles merge_fork`; `merge_fork returns error when parent session not found`; `handles merge_fork when not a valid fork` | Fork merge flow prompts the parent session and covers merge validation errors |
+| `backend/test/subAgentHandlers.test.js` | `emits sub_agent_snapshot for each running sub-agent matching parentAcpSessionId` | Sub-agent snapshot flow that shares room/session context with main completion handling |
+
+Run focused backend tests:
+
+```powershell
+cd backend; .\node_modules\.bin\vitest.cmd run test/sockets-index.test.js test/promptHandlers.test.js test/sessionHandlers.test.js test/subAgentHandlers.test.js
+```
+
+### Coverage Boundaries
+
+- Direct frontend tests cover `shouldNotify`, `sidebar_settings`, `token_done` dispatch, and sub-agent permission routing.
+- Direct frontend tests do not assert `new Notification` construction, `Notification.requestPermission`, or MP3 playback side effects.
+- Direct backend tests assert `sidebar_settings` emission and `token_done` emission paths, but `sockets-index.test.js` only asserts `deletePermanent` within the `sidebar_settings` payload.
 
 ---
 
 ## How to Use This Guide
 
-### For Adding Notifications to New Events
+### For Implementing or Extending This Feature
 
-1. **Identify the trigger event** — Where does work complete? (e.g., `token_done`, merge complete, export done)
-2. **Emit event from backend** with `{ sessionId, providerId }` and relevant context
-3. **Listen in frontend** — Add socket listener in appropriate hook or store
-4. **Call `shouldNotify()`** with session context (activeAcpId, name, cwd, workspaceCwds, settings)
-5. **Conditionally play sound and show notification** based on returned result
-6. **Test edge cases:** Active session, sub-agents, missing names, workspace matching
-7. **Update this Feature Doc** with new event details
-
-**Checklist:**
-- [ ] Backend emits event with sessionId and providerId
-- [ ] Frontend listens for event in appropriate hook
-- [ ] Calls shouldNotify() with correct parameters
-- [ ] Plays sound if enabled and not in error state
-- [ ] Shows desktop notification if enabled and permission granted
-- [ ] Skips notifications for sub-agents
-- [ ] Tests cover active session, background session, workspace labels
-- [ ] Feature Doc updated with new event
+1. Start at `backend/sockets/index.js` (`registerSocketHandlers`, `sidebar_settings`) when changing environment defaults or socket payload shape.
+2. Update `frontend/src/hooks/useSocket.ts` (`sidebar_settings`) when adding a frontend store field or browser permission behavior.
+3. Update `frontend/src/store/useSystemStore.ts` (`notificationSound`, `notificationDesktop`, `setNotificationSettings`) when changing notification state shape.
+4. Use `frontend/src/utils/notificationHelper.ts` (`shouldNotify`) for pure eligibility or body-format changes.
+5. Update both completion audio call sites when changing sound semantics: `frontend/src/store/useStreamStore.ts` (`onStreamDone`) and `frontend/src/hooks/useChatManager.ts` (`token_done`).
+6. Keep permission-request audio changes separate in `frontend/src/hooks/useChatManager.ts` (`permission_request`).
+7. Use `frontend/src/types.ts` (`StreamDoneData`, `ProviderBranding`) when changing payload or branding type contracts.
+8. Add or update tests in the frontend and backend test files listed above.
 
 ### For Debugging Notification Issues
 
-1. **Check `.env` variables** — Verify `NOTIFICATION_SOUND` and `NOTIFICATION_DESKTOP` are set correctly
-2. **Check browser console** — Look for errors in audio playback or notification creation
-3. **Check permissions** — `Notification.permission` should be `'granted'` for desktop notifications
-4. **Check active session** — Is the completed session actually the active session? (suppresses notification)
-5. **Check sub-agent flag** — Is `isSubAgent === true`? (skips notification)
-6. **Check session name** — Is it defined and non-empty? (required for notification)
-7. **Check workspace config** — Does session cwd match any configured workspace path?
-8. **Check audio file** — Is `/memory-sound.mp3` accessible (check network tab in DevTools)?
-
-**Debugging checklist:**
-- [ ] Notification settings received from backend? (check sidebar_settings in DevTools)
-- [ ] token_done event emitted and received? (check WebSocket messages)
-- [ ] shouldNotify() returns non-null? (add console.log)
-- [ ] Active session check passes? (sessionId !== activeAcpId)
-- [ ] Session name defined? (not empty/undefined)
-- [ ] Sub-agent flag checked? (not isSubAgent)
-- [ ] Sound file exists? (curl /memory-sound.mp3 from browser)
-- [ ] Desktop notification permission granted? (Notification.permission === 'granted')
-- [ ] Browser allows notifications? (not muted, not denied)
+1. Inspect backend `sidebar_settings` values in `backend/sockets/index.js` and the runtime values of `NOTIFICATION_SOUND` and `NOTIFICATION_DESKTOP`.
+2. Confirm the frontend receives `sidebar_settings` in `frontend/src/hooks/useSocket.ts` and that `useSystemStore.setNotificationSettings` is called.
+3. Check `Notification.permission` in the browser console for desktop notifications.
+4. Verify `token_done` carries an ACP `sessionId` and that the matching `ChatSession.acpSessionId` exists in `useSessionLifecycleStore`.
+5. Compare the completed session's UI ID against `activeSessionId`; compare the completed session's ACP ID against `activeAcpId`.
+6. Check `session.isSubAgent` before expecting a desktop notification from the `token_done` path.
+7. Check `session.name`; `shouldNotify` returns `null` when it is missing.
+8. Check `session.cwd` and `workspaceCwds` for exact path equality when workspace labels are absent.
+9. Verify `/memory-sound.mp3` exists in `frontend/public` and is served by the frontend build.
+10. Use the focused tests above to separate helper logic failures from socket dispatch and browser side-effect issues.
 
 ---
 
 ## Summary
 
-The **Notification System** alerts users when background sessions complete via desktop notifications, audio playback, or both—all configurable via environment variables and scoped to background-only sessions. Its architecture pivots on a decision function (`shouldNotify()`) that suppresses notifications for active sessions, sub-agents, and sessions without names, while enriching notification body with workspace context if available.
-
-**Key patterns:**
-- **Active session suppression:** No notification if completed session is currently active
-- **Sub-agent exclusion:** Spawned agents never notify (implementation details)
-- **Workspace awareness:** Include workspace label in body if session CWD matches configured path
-- **Independent toggles:** Sound and desktop notifications can be enabled/disabled separately
-- **Permission-aware:** Desktop notifications only shown if user has granted permission
-- **Error tolerant:** Audio and notification failures silently degrade (try/catch wrapping)
-
-**Critical contract:** Notifications fire when `sessionId !== activeAcpId` AND session has a name AND user has enabled setting AND (for desktop) permission is granted.
-
-**Why agents should care:** Notifications are a key user feedback mechanism for long-running background work. Understanding suppression logic, workspace matching, permission flow, and environment variable defaults allows you to extend notifications to new events (fork merge, export done, deployment complete), debug silent notification failures, or implement custom notification preferences without re-reading the entire codebase.
+- Notification defaults enter the app through `sidebar_settings` from `backend/sockets/index.js`.
+- `NOTIFICATION_SOUND` is disabled only by exact `false`; `NOTIFICATION_DESKTOP` is enabled only by exact `true`.
+- `token_done.sessionId` is an ACP session ID and must be matched against `ChatSession.acpSessionId`.
+- `useStreamStore.onStreamDone` handles stream finalization, unread state, snapshot saving, stats fetch, and one background completion sound path.
+- `useChatManager` handles the desktop/body completion path through `shouldNotify` and browser APIs.
+- `shouldNotify` is pure: it checks active session identity, requires a session name, performs exact workspace matching, and returns settings values unchanged.
+- Main-chat `permission_request` audio is separate from completion notifications and does not consult notification settings.
+- Desktop notification display depends on `Notification.permission === 'granted'` and uses `branding.notificationTitle` for the title.

@@ -4,7 +4,7 @@ This provider integrates AcpUI with the Gemini CLI operating in ACP (Agent Clien
 
 ## Configuring Tool Permissions
 
-AcpUI injects MCP tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) into your Gemini sessions. Gemini also has native system tools with overlapping functionality. For the best experience, you should configure AcpUI's enhanced versions as the preferred tools.
+AcpUI injects core MCP tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) into your Gemini sessions. When enabled in `configuration/mcp.json`, AcpUI can also advertise optional IO tools (`ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`) and `ux_google_web_search`. Gemini also has native system tools with overlapping functionality. For the best experience, you should configure AcpUI's enhanced versions as the preferred tools.
 
 ### 1. Block Gemini's System Tools (Recommended for Better UX)
 
@@ -13,6 +13,7 @@ AcpUI injects MCP tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_co
 However, AcpUI's versions of these tools provide a superior user experience:
 - **`ux_invoke_shell`** — Live colored shell output with real-time streaming
 - **`ux_invoke_subagents`** — Agent orchestration view showing parallel agent execution, not just raw output
+- **Optional IO/Search MCP tools** — Available only when enabled in `configuration/mcp.json` before creating the session
 
 To get the best experience, exclude Gemini's native system tools so the LLM uses AcpUI's enhanced versions:
 

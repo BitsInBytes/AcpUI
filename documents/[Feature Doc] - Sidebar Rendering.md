@@ -1,690 +1,479 @@
-# Feature Doc — Sidebar Rendering
+# Feature Doc - Sidebar Rendering
 
-**AcpUI's sidebar is a hierarchical, real-time UI panel that displays sessions organized by provider, folder, and fork nesting. It's driven by five Zustand stores, uses localStorage for two persistent state fields (sidebar pinned, folder expanded IDs), and applies CSS state classes in real-time to show typing/unread/permission-awaiting indicators with animated breathing glows. The sidebar does not handle feature logic (forking, archiving, drag-drop semantics) — those are separate docs. This doc focuses purely on how it renders, updates, and animates.**
+AcpUI's sidebar renders the provider-scoped chat tree: provider stacks, folders, root sessions, forked sessions, sub-agent sessions, real-time status classes, workspace launch controls, archive access, and provider status panels. The implementation is split across React components, Zustand stores, Socket.IO event handlers, CSS state classes, and folder persistence contracts.
 
-Understanding the sidebar's rendering architecture is critical for any UI work: debugging display bugs, adding new session indicators, optimizing re-renders, or implementing new sidebar sections.
+Agents working in this area need the exact rendering contract because a small mismatch between `session.provider`, `folder.providerId`, `folderId`, `forkedFrom`, and runtime stream flags can hide sessions or place them in the wrong part of the tree.
 
 ---
 
 ## Overview
 
-### What It Renders
+### What It Does
 
-The sidebar displays:
-
-- **Provider Stacks**: Sessions grouped by AI provider, with collapsible accordions. Only one provider at a time shows full content.
-- **Folder Tree**: Hierarchical folders with recursive nesting. Folders expand/collapse, with child count badges.
-- **Session List**: Chat sessions as rows within folders or at root. Sessions show name, icons (indicating fork/sub-agent/terminal status), pin status, and notes indicator.
-- **Session States**: Real-time animations for typing (blue breathe glow), unread responses (bold + solid border), and permission-awaiting (green glow).
-- **Fork/Sub-Agent Nesting**: Forked sessions and sub-agents appear indented under their parent session with a fork indicator.
-- **Workspace Menu**: Clickable workspaces for creating new chats in specific directories.
-- **Archive Browser**: Modal for browsing and restoring archived sessions.
-- **Provider Status Panels**: Optional status cards at the bottom of each provider stack (quota, spend, etc.).
+- Renders one provider stack per `ProviderSummary` in `useSystemStore.orderedProviderIds`, with a default provider fallback when backend provider metadata is unavailable.
+- Displays root folders and root sessions for the expanded provider, and renders nested folder trees through `FolderItem`.
+- Renders forked sessions and sub-agent sessions beneath their parent session through `Sidebar.renderChildren` and `FolderItem.renderForkTree`.
+- Applies visual state classes from `ChatSession` flags: `active`, `pinned`, `typing`, `unread`, `awaiting-permission`, and `popped-out`.
+- Handles drag/drop for moving sessions between folders, moving folders under folders, and dropping sessions or folders back to the provider root.
+- Exposes provider-scoped new chat, new folder, archive restore/delete, provider status, sidebar pin, sidebar collapse, search, and resize controls.
 
 ### Why This Matters
 
-- **Real-Time Feedback**: Socket events instantly update session flags (typing, unread), triggering CSS animations that give immediate visual feedback.
-- **Persistence**: Folder expansion and sidebar pin state are localStorage-backed, so user preferences survive page refreshes.
-- **Multi-Provider**: Only one provider's sessions are visible at a time (via `expandedProviderId`), preventing overwhelming UI with many providers.
-- **Deep Nesting**: Sessions can be organized into folders and forks, supporting complex project hierarchies.
-- **Performance**: Sidebar uses memoization (`filteredSessions`) and localStorage caching to avoid redundant updates.
+- The sidebar is the main navigation surface for active, background, forked, archived, and sub-agent work.
+- Provider and folder identity are matched in the frontend, so stale or missing `provider` and `providerId` fields create display bugs without throwing runtime errors.
+- Streaming and permission state are rendered through CSS classes, so store flags must be updated consistently by socket handlers and stream stores.
+- Drag/drop updates both backend folder persistence and optimistic frontend session state.
+- Search changes the tree shape by flattening matching sessions and hiding folder recursion while the query is active.
 
 ### Architectural Role
 
-**Sidebar consumes:**
-1. State from five Zustand stores (session list, folders, UI state, provider config, canvas terminals)
-2. Socket events (typing, unread, session renamed, sub-agent created)
-3. localStorage (sidebar pinned, folder expanded IDs)
-
-**Sidebar emits:**
-1. Socket events (session select, new chat, archive, rename, etc.)
-2. localStorage writes (sidebar width resize, folder expand/collapse)
+The sidebar is a frontend rendering and interaction layer. It consumes backend data through Socket.IO, stores normalized state in Zustand, persists small UI preferences in `localStorage`, and emits folder/session/archive actions back to backend socket handlers. Folder persistence is backed by `backend/database.js` and `backend/sockets/folderHandlers.js`.
 
 ---
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### 1. App Boot & Socket Hydration
-**File:** `frontend/src/hooks/useSocket.ts` (Lines 42-56)
+### 1. Socket Bootstrap Loads Provider, Workspace, Branding, and Sidebar Settings
 
-When the frontend starts, `useSocket.ts` establishes a Socket.IO connection and receives provider metadata:
+File: `frontend/src/hooks/useSocket.ts` (Function: `getOrCreateSocket`)
+
+The socket singleton registers metadata listeners once and writes them into `useSystemStore`. Sidebar rendering depends on `providers`, `workspace_cwds`, `branding`, and `sidebar_settings`.
 
 ```typescript
-// FILE: frontend/src/hooks/useSocket.ts (Lines 42-56)
-socket.on('providers', (payload) => {
-  useSystemStore.getState().setProviders(payload.defaultProviderId || null, payload.providers || []);
+// FILE: frontend/src/hooks/useSocket.ts (Function: getOrCreateSocket)
+_socket.on('providers', (data) => {
+  useSystemStore.getState().setProviders(data.defaultProviderId || null, data.providers || []);
+});
+_socket.on('workspace_cwds', (data) => {
+  useSystemStore.getState().setWorkspaceCwds(data.cwds);
+});
+_socket.on('branding', (data) => {
+  if (data.providerId) useSystemStore.getState().setProviderBranding(data);
+  else useSystemStore.setState({ branding: data });
+});
+_socket.on('sidebar_settings', (data) => {
+  useSystemStore.getState().setDeletePermanent(data.deletePermanent);
+  useSystemStore.getState().setNotificationSettings(data.notificationSound, data.notificationDesktop);
 });
 ```
 
-socket.on('branding', (payload) => {
-  useSystemStore.setState({ branding: payload });
-});
+The provider list becomes `effectiveProviders` inside `Sidebar`, and workspace entries determine whether the primary new chat control starts immediately or opens `WorkspacePickerModal`.
 
-socket.on('workspace_cwds', (payload) => {
-  useSystemStore.setState({ workspaceCwds: payload.cwds });
-});
-```
+### 2. Initial Session Metadata Loads Into the Session Lifecycle Store
 
-The sidebar will display provider stacks based on `orderedProviderIds` received here.
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`)
+File: `frontend/src/store/useSessionLifecycleStore.ts` (Action: `handleInitialLoad`)
 
----
-
-### 2. Folder Tree Load
-**File:** `frontend/src/store/useFolderStore.ts` (Lines 45-50)
-
-The `loadFolders()` action emits a socket event to load the folder tree from the backend:
+`useChatManager` calls `handleInitialLoad` when a socket is available. The store emits `load_sessions`, normalizes model fields, clears runtime startup flags, and builds the notes indicator map.
 
 ```typescript
-// FILE: frontend/src/store/useFolderStore.ts (Lines 45-50)
-loadFolders: async () => {
-  const response = await socket.emitAsync('load_folders', { providerId });
-  set(state => ({
-    folders: response.folders
-  }));
-}
-```
-
-The `expandedFolderIds` are already loaded from localStorage (Lines 21-26) when the store initializes. Now the folder tree structure is ready.
-
----
-
-### 3. Session List Load
-**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 99-113)
-
-The `handleInitialLoad` action populates the session list from the backend:
-
-```typescript
-// FILE: frontend/src/store/useSessionLifecycleStore.ts (Lines 99-113)
+// FILE: frontend/src/store/useSessionLifecycleStore.ts (Action: handleInitialLoad)
 socket.emit('load_sessions', (res: LoadSessionsResponse) => {
-  if (res && res.sessions) {
-    const notesMap: Record<string, boolean> = {};
-    res.sessions.forEach((s: ChatSession & { hasNotes?: boolean }) => {
-      if (s.hasNotes) notesMap[s.id] = true;
-    });
-    set({
-      sessions: res.sessions.map((s: ChatSession) => applyModelState(
-        { ...s, isTyping: false, isWarmingUp: false },
-        { currentModelId: s.currentModelId, modelOptions: s.modelOptions }
-      )),
-      sessionNotes: notesMap
-    });
-  }
+  const notesMap: Record<string, boolean> = {};
+  res.sessions.forEach((s: ChatSession & { hasNotes?: boolean }) => {
+    if (s.hasNotes) notesMap[s.id] = true;
+  });
+  set({
+    sessions: res.sessions.map((s: ChatSession) => applyModelState(
+      { ...s, isTyping: false, isWarmingUp: false },
+      { currentModelId: s.currentModelId, modelOptions: s.modelOptions }
+    )),
+    sessionNotes: notesMap
+  });
 });
 ```
 
-Each session object contains flags like `isPinned`, `folderId`, `forkedFrom`, `isSubAgent` that control its rendering.
+### 3. Folder Metadata Loads Once on Sidebar Mount
 
----
+File: `frontend/src/components/Sidebar.tsx` (Component: `Sidebar`, Effect: `loadFolders`)
+File: `frontend/src/store/useFolderStore.ts` (Action: `loadFolders`)
+File: `backend/sockets/folderHandlers.js` (Function: `registerFolderHandlers`, Socket event: `load_folders`)
 
-### 4. Sidebar Component Mount & State Binding
-**File:** `frontend/src/components/Sidebar.tsx` (Lines 15-54)
-
-The `Sidebar` component mounts and subscribes to store state:
+`Sidebar` calls `loadFolders` on mount. The store emits `load_folders` without a provider filter; folders carry `providerId`, and `Sidebar` filters them per provider during render.
 
 ```typescript
-// FILE: frontend/src/components/Sidebar.tsx (Lines 15-54)
-function Sidebar() {
-  // Read stores
-  const sessions = useSessionLifecycleStore(s => s.sessions);
-  const activeSessionId = useSessionLifecycleStore(s => s.activeSessionId);
-  const { isSidebarOpen, isSidebarPinned, expandedProviderId } = useUIStore();
-  const folders = useFolderStore(s => s.folders);
-  const expandedFolderIds = useFolderStore(s => s.expandedFolderIds);
-  const { orderedProviderIds, providersById } = useSystemStore();
-  
-  // Local state
-  const [searchQuery, setSearchQuery] = useState('');
-  const [sidebarWidth, setSidebarWidth] = useState(
-    parseInt(localStorage.getItem('sidebarWidth') || '312', 10)
-  );
-  
-  // Memoized derived
-  const filteredSessions = useMemo(
-    () => sessions.filter(s => s.name.toLowerCase().includes(searchQuery.toLowerCase())),
-    [sessions, searchQuery]
-  );
+// FILE: frontend/src/store/useFolderStore.ts (Action: loadFolders)
+loadFolders: () => {
+  const socket = useSystemStore.getState().socket;
+  socket?.emit('load_folders', (res: { folders?: Folder[] }) => {
+    if (res.folders) set({ folders: res.folders });
+  });
 }
 ```
 
-The sidebar is now bound to all store state. Any update to `sessions[]`, `expandedProviderId`, or `isSidebarOpen` will trigger a re-render.
-
----
-
-### 5. Provider Stack Rendering (Accordion)
-**File:** `frontend/src/components/Sidebar.tsx` (Lines 318-366)
-
-The sidebar loops over `orderedProviderIds` and renders a `provider-stack` for each:
-
-```typescript
-// FILE: frontend/src/components/Sidebar.tsx (Lines 318-366)
-<div className="sessions-list">
-  {effectiveProviders.map(p => {
-    const isExpanded = expandedProviderId === p.providerId;
-    const pSessions = filteredSessions.filter(s => s.provider === p.providerId && !s.folderId && !s.forkedFrom && !s.isSubAgent);
-    const pFolders = folders.filter(f => f.provider === p.providerId && !f.parentId);
-    
-    return (
-      <div key={p.providerId} className={`provider-stack ${isExpanded ? 'expanded' : ''}`}>
-        <div className="provider-stack-header" onClick={() => setExpandedProviderId(isExpanded ? null : p.providerId)}>
-          {p.label}
-        </div>
-        
-        {isExpanded && (
-          <div className="provider-stack-content">
-            {/* Root folders */}
-            {pFolders.map(f => (
-              <FolderItem key={f.id} folder={f} folders={folders} sessions={pSessions} {...otherProps} />
-            ))}
-            
-            {/* Root sessions */}
-            {pSessions.map(s => (
-              <SessionItem key={s.id} session={s} isActive={activeSessionId === s.id} {...handlers} />
-            ))}
-            
-            {/* Fork tree for each session */}
-            {pSessions.map(s => renderChildren(s, 0))}
-            
-            <ProviderStatusPanel providerId={p.providerId} />
-          </div>
-        )}
-      </div>
-    );
-  })}
-</div>
+```javascript
+// FILE: backend/sockets/folderHandlers.js (Function: registerFolderHandlers, Socket event: load_folders)
+socket.on('load_folders', async (callback) => {
+  const folders = await getAllFolders();
+  callback?.({ folders });
+});
 ```
 
-**Key point:** Only one provider stack is expanded at a time (controlled by `expandedProviderId` from `useUIStore`).
+### 4. Sidebar Derives Provider, Search, Root Session, and Root Folder State
 
----
+File: `frontend/src/components/Sidebar.tsx` (Component: `Sidebar`, Derived state: `currentExpandedId`, `filteredSessions`, `rootSessions`, `rootFolders`)
 
-### 6. Folder Recursion & Expansion
-**File:** `frontend/src/components/FolderItem.tsx` (Lines 22-225)
-
-When a folder is clicked, `useFolderStore.toggleFolder()` is called:
+The visible provider is resolved from `expandedProviderId`, `activeProviderId`, `defaultProviderId`, or the first provider. A null `expandedProviderId` still displays the active/default provider through `currentExpandedId`.
 
 ```typescript
-// FILE: frontend/src/components/FolderItem.tsx (Lines 131-138)
-function FolderItem({ folder, folders, sessions, onDropSession, onDropFolder, depth, ...props }) {
-  const { expandedFolderIds, toggleFolder } = useFolderStore();
-  const isExpanded = expandedFolderIds.has(folder.id);
-  
-  const handleToggleExpand = () => {
-    toggleFolder(folder.id);  // Updates store + localStorage
+// FILE: frontend/src/components/Sidebar.tsx (Component: Sidebar, Derived state)
+const currentExpandedId = expandedProviderId || activeProviderId || defaultProviderId || effectiveProviders[0]?.providerId;
+const filteredSessions = searchQuery
+  ? sessions.filter(s => s.name.toLowerCase().includes(searchQuery.toLowerCase()))
+  : sessions;
+const rootSessions = filteredSessions.filter(s => !s.folderId && !s.forkedFrom && !s.isSubAgent);
+const rootFolders = folders.filter(f => !f.parentId);
+```
+
+Search changes the input to provider rendering: when `searchQuery` is set, provider sessions use all matching sessions instead of only root sessions, and folder rendering is skipped.
+
+### 5. Provider Stacks Render the Expanded Provider and Collapsed Activity Summaries
+
+File: `frontend/src/components/Sidebar.tsx` (Component: `Sidebar`, Render block: `effectiveProviders.map`)
+
+For each provider, `Sidebar` computes root sessions, root folders, and activity indicators. The expanded provider renders workspace controls, utility controls, the folder/session tree, and `ProviderStatusPanel`. A collapsed provider renders only sessions that are typing or unread.
+
+```tsx
+// FILE: frontend/src/components/Sidebar.tsx (Component: Sidebar, Render block: effectiveProviders.map)
+const isExpanded = currentExpandedId === p.providerId;
+const pSessions = (searchQuery ? filteredSessions : rootSessions)
+  .filter(s => (s.provider || activeProviderId || defaultProviderId || 'default') === p.providerId);
+const pFolders = isExpanded ? rootFolders.filter(f => f.providerId === p.providerId) : [];
+const allPSessions = sessions.filter(s => (s.provider || activeProviderId || defaultProviderId || 'default') === p.providerId);
+const isTyping = allPSessions.some(s => s.isTyping);
+const hasUnreadResponse = !isExpanded && !isTyping && allPSessions.some(s => s.hasUnreadResponse);
+```
+
+Provider stack headers toggle `setExpandedProviderId(isExpanded ? null : p.providerId)`. The displayed label is `p.branding?.title || p.label || p.providerId`.
+
+### 6. Workspace and Utility Controls Stay Inside the Expanded Provider Content
+
+File: `frontend/src/components/Sidebar.tsx` (Handlers: `handlePrimaryNew`, `handleNew`, `handleCreateFolderSubmit`, `handleShowArchives`)
+File: `frontend/src/components/WorkspacePickerModal.tsx` (Component: `WorkspacePickerModal`)
+File: `frontend/src/components/ArchiveModal.tsx` (Component: `ArchiveModal`)
+
+The primary new chat button uses the only workspace directly, opens `WorkspacePickerModal` when multiple workspaces exist, or starts without a cwd when none exist. The new folder modal calls `createFolder(name, null, currentExpandedId || null)`. Archive actions emit provider-scoped archive socket events using `currentExpandedId`.
+
+```typescript
+// FILE: frontend/src/components/Sidebar.tsx (Handlers: handleNew, handleCreateFolderSubmit)
+const handleNew = (cwd?: string, agent?: string) => {
+  if (currentExpandedId) useSystemStore.setState({ activeProviderId: currentExpandedId });
+  handleNewChat(socket, undefined, cwd, agent);
+};
+
+createFolder(name, null, currentExpandedId || null);
+```
+
+### 7. FolderItem Recursively Renders Child Folders and Folder Sessions
+
+File: `frontend/src/components/FolderItem.tsx` (Component: `FolderItem`, Function: `renderForkTree`)
+File: `frontend/src/store/useFolderStore.ts` (Action: `toggleFolder`)
+
+`FolderItem` reads `expandedFolderIds` and folder actions from `useFolderStore`. It renders child folders recursively and renders direct child sessions whose `folderId` equals the folder ID and whose `forkedFrom` is not set.
+
+```tsx
+// FILE: frontend/src/components/FolderItem.tsx (Component: FolderItem)
+const isExpanded = expandedFolderIds.has(folder.id);
+const childFolders = folders.filter(f => f.parentId === folder.id);
+const childSessions = sessions.filter(s => s.folderId === folder.id && !s.forkedFrom);
+
+{isExpanded && (
+  <div className="folder-children">
+    {childFolders.map(cf => <FolderItem key={cf.id} folder={cf} depth={depth + 1} />)}
+    {childSessions.map(session => <SessionItem key={session.id} session={session} />)}
+  </div>
+)}
+```
+
+Folder rows use `paddingLeft: depth * 16 + 8`. Folder sessions use `paddingLeft: (depth + 1) * 16`.
+
+### 8. Drag/Drop Moves Sessions and Folders
+
+File: `frontend/src/components/Sidebar.tsx` (Handlers: `handleRootDrop`, `handleDropSession`, `handleDropFolder`)
+File: `frontend/src/components/FolderItem.tsx` (Handlers: `handleDrop`, `handleFolderDragStart`, Function: `isDescendant`)
+File: `frontend/src/store/useFolderStore.ts` (Actions: `moveSessionToFolder`, `moveFolder`)
+File: `backend/sockets/folderHandlers.js` (Socket events: `move_session_to_folder`, `move_folder`)
+
+Session drags use the `DataTransfer` key `session-id`; folder drags use `folder-id`. Dropping on the root `sessions-list` clears the parent folder. Dropping on a folder assigns the target folder. Folder-on-folder drops call `isDescendant` to prevent cycles.
+
+```typescript
+// FILE: frontend/src/components/Sidebar.tsx (Handlers: handleDropSession, handleRootDrop)
+const handleDropSession = (sessionId: string, folderId: string | null) => {
+  moveSessionToFolder(sessionId, folderId);
+  useSessionLifecycleStore.setState(state => ({
+    sessions: state.sessions.map(s => s.id === sessionId ? { ...s, folderId } : s)
+  }));
+};
+```
+
+```typescript
+// FILE: frontend/src/components/FolderItem.tsx (Handler: handleDrop)
+if (sessionId) {
+  onDropSession(sessionId, folder.id);
+} else if (dragFolderId && dragFolderId !== folder.id) {
+  if (!isDescendant(dragFolderId, folder.id, folders)) {
+    onDropFolder(dragFolderId, folder.id);
+  }
+}
+```
+
+### 9. SessionItem Applies State Classes, Icons, Actions, and Pop-Out Behavior
+
+File: `frontend/src/components/SessionItem.tsx` (Component: `SessionItem`)
+File: `frontend/src/components/Sidebar.css` (Classes: `.session-item`, `.typing`, `.unread`, `.awaiting-permission`, `.popped-out`)
+File: `frontend/src/lib/sessionOwnership.ts` (Functions: `isSessionPoppedOut`, `openPopout`, `focusPopout`)
+
+`SessionItem` builds its class string directly from session flags and pop-out ownership. It selects an icon in this order: sub-agent, fork, terminal, normal chat. Terminal presence is derived from `useCanvasStore.terminals`.
+
+```tsx
+// FILE: frontend/src/components/SessionItem.tsx (Component: SessionItem)
+className={`session-item ${isActive ? 'active' : ''} ${session.isPinned ? 'pinned' : ''} ${session.isTyping ? 'typing' : ''} ${session.hasUnreadResponse ? 'unread' : ''} ${session.isAwaitingPermission ? 'awaiting-permission' : ''} ${isSessionPoppedOut(session.id) ? 'popped-out' : ''}`}
+
+{session.isSubAgent ? <Bot />
+  : session.forkedFrom ? <GitFork />
+  : hasTerminal ? <Terminal />
+  : <MessageSquare />}
+```
+
+Sub-agent sessions show only a delete action when they are not typing. Regular sessions show pin, rename, settings, pop-out, and archive/delete actions.
+
+### 10. Forks and Sub-Agents Render Beneath Their Parent UI Session
+
+File: `frontend/src/components/Sidebar.tsx` (Function: `renderChildren`, Selectors: `getForksOf`, `getSubAgentsOf`)
+File: `frontend/src/components/FolderItem.tsx` (Function: `renderForkTree`)
+
+Root sessions and folder sessions render their descendants through recursive helpers. Both helpers match descendants by UI session ID through `forkedFrom`.
+
+```typescript
+// FILE: frontend/src/components/Sidebar.tsx (Selectors: getForksOf, getSubAgentsOf)
+const getForksOf = (parentId: string) => filteredSessions.filter(s => s.forkedFrom === parentId && !s.isSubAgent);
+const getSubAgentsOf = (parentId: string) => filteredSessions.filter(s => s.isSubAgent && s.forkedFrom === parentId);
+```
+
+`parentAcpSessionId` is retained on sub-agent sessions, but the sidebar tree lookup uses `forkedFrom`.
+
+### 11. Stream Events Update Sidebar State Through useStreamStore
+
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket events: `thought`, `token`, `system_event`, `permission_request`, `token_done`, `session_renamed`)
+File: `frontend/src/store/useStreamStore.ts` (Actions: `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`)
+File: `frontend/src/store/useChatStore.ts` (Action: `handleRespondPermission`)
+
+`useChatManager` routes socket events into `useStreamStore`. Stream actions set `isTyping` for thoughts, tokens, and system events; permission requests set `isAwaitingPermission`; completion clears typing after the queue drains and marks inactive sessions with `hasUnreadResponse`.
+
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Actions: onStreamToken, onStreamEvent)
+useSessionLifecycleStore.setState(state => ({
+  sessions: state.sessions.map(s => s.acpSessionId === sessionId ? { ...s, isTyping: true } : s)
+}));
+
+useSessionLifecycleStore.setState(state => ({
+  sessions: state.sessions.map(s => s.acpSessionId === sessionId ? {
+    ...s,
+    isTyping: true,
+    isAwaitingPermission: event.type === 'permission_request' ? true : s.isAwaitingPermission
+  } : s)
+}));
+```
+
+`handleRespondPermission` clears `isAwaitingPermission` and emits `respond_permission`. `handleSessionSelect` clears `hasUnreadResponse` for the selected UI session.
+
+### 12. Sub-Agent Socket Events Materialize Sidebar Sessions Lazily
+
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket events: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_completed`)
+File: `frontend/src/store/useSubAgentStore.ts` (Actions: `addAgent`, `setStatus`, `completeAgent`)
+
+`sub_agents_starting` clears old sub-agent sidebar sessions for the parent UI session. `sub_agent_started` and `sub_agent_snapshot` register pending sub-agents, but the sidebar `ChatSession` is created when the first token or sub-agent system event arrives.
+
+```typescript
+// FILE: frontend/src/hooks/useChatManager.ts (Handler: wrappedOnStreamToken)
+if (pendingSubAgents.has(data.sessionId)) {
+  const pending = pendingSubAgents.get(data.sessionId)!;
+  pendingSubAgents.delete(data.sessionId);
+  const subSession = {
+    id: pending.uiId,
+    acpSessionId: pending.acpSessionId,
+    name: pending.name,
+    provider: pending.providerId,
+    messages: [],
+    isTyping: true,
+    isWarmingUp: false,
+    isSubAgent: true,
+    parentAcpSessionId: pending.parentSessionId,
+    forkedFrom: pending.parentUiId,
   };
-  
-  const childFolders = folders.filter(f => f.parentId === folder.id);
-  const childSessions = sessions.filter(s => s.folderId === folder.id && !s.forkedFrom && !s.isSubAgent);
-  
-  return (
-    <div className="folder-tree-item">
-      <div className="folder-row" onClick={handleToggleExpand}>
-        <ChevronDown style={{ transform: isExpanded ? 'rotate(0deg)' : 'rotate(-90deg)' }} />
-        <span className="folder-count">{childFolders.length + childSessions.length}</span>
-      </div>
-      
-      {isExpanded && (
-        <div className="folder-children">
-          {childFolders.map(cf => (
-            <FolderItem key={cf.id} folder={cf} depth={depth + 1} {...props} />
-          ))}
-          {childSessions.map(cs => (
-            <SessionItem key={cs.id} session={cs} {...props} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
+  useSessionLifecycleStore.setState(state => ({ sessions: [...state.sessions, subSession] }));
 }
 ```
 
-**Indentation:** Each folder adds `depth * 16px` padding (line 139). Child components get `depth + 1`.
+### 13. User Selection, Rename, Pin, Delete, Resize, and Collapse Update Stores Immediately
 
----
+File: `frontend/src/components/Sidebar.tsx` (Handlers: `handleSelect`, `handleRemoveSession`, `onResizeStart`)
+File: `frontend/src/store/useSessionLifecycleStore.ts` (Actions: `handleSessionSelect`, `handleTogglePin`, `handleRenameSession`)
+File: `frontend/src/store/useUIStore.ts` (Actions: `setSidebarOpen`, `setSidebarPinned`, `toggleSidebarPinned`)
 
-### 7. Session Rendering with State Classes
-**File:** `frontend/src/components/SessionItem.tsx` (Lines 37-100)
-
-Each session renders as a row with state-based CSS classes:
-
-```typescript
-// FILE: frontend/src/components/SessionItem.tsx (Lines 37-100)
-function SessionItem({ session, isActive, onSelect, ...props }) {
-  const className = `session-item ${isActive ? 'active' : ''} ${session.isPinned ? 'pinned' : ''} ${session.isTyping ? 'typing' : ''} ${session.hasUnreadResponse ? 'unread' : ''} ${session.isWarmingUp ? 'warming' : ''} ${session.isSubAgent ? 'sub-agent' : ''}`;
-  
-  return (
-    <div className={className} onClick={onSelect}>
-      {/* Fork indicator */}
-      {session.forkedFrom && <span className="fork-arrow">↳</span>}
-      
-      {/* Icon selection based on session type */}
-      {session.isSubAgent ? (
-        <Bot size={16} style={{ color: '#10b981' }} />
-      ) : session.forkedFrom ? (
-        <GitFork size={16} style={{ color: '#3b82f6' }} />
-      ) : session.hasTerminal ? (
-        <Terminal size={16} style={{ color: '#10b981' }} />
-      ) : (
-        <MessageSquare size={16} />
-      )}
-      
-      {/* Session name */}
-      <span className="session-name">{session.name}</span>
-      
-      {/* Notes indicator */}
-      {sessionNotes[session.id] && <StickyNote size={12} />}
-      
-      {/* Action buttons (hidden by default, shown on hover via CSS) */}
-      <div className="session-actions">
-        {/* pin, rename, settings, archive, delete buttons */}
-      </div>
-    </div>
-  );
-}
-```
-
-**CSS classes applied dynamically:**
-- `.active` → highlighted background
-- `.typing` → blue breathing glow
-- `.pinned` → blue left border
-- `.unread` → solid border + bold text
-- `.awaiting-permission` → green breathing glow
-- `.sub-agent` → green bot icon
-
----
-
-### 8. Fork & Sub-Agent Nesting
-**File:** `frontend/src/components/Sidebar.tsx` (Lines 255-292)
-
-Below each root session, the `renderChildren` function recursively nests forks and sub-agents:
+Selecting a session calls `handleSessionSelect`, clears unread state, hydrates history when needed, and collapses the sidebar if it is not pinned. Pin and rename update local session state and emit `save_snapshot`. `Sidebar.handleRemoveSession` emits `archive_session` or `delete_session`, removes descendants with matching `forkedFrom`, and clears the active session when the active ID is removed.
 
 ```typescript
-// FILE: frontend/src/components/Sidebar.tsx (Lines 255-292)
-const renderChildren = (parent, depth) => {
-  const forks = getForksOf(parent.id);  // sessions where forkedFrom === parent.id
-  const subAgents = getSubAgentsOf(parent.id);  // sessions where parentAcpSessionId === parent.acpId && isSubAgent
-  
-  return forks.concat(subAgents).map(child => (
-    <div key={child.id} style={{ paddingLeft: `${depth * 12}px` }}>
-      <SessionItem 
-        session={child}
-        isActive={activeSessionId === child.id}
-        {...handlers}
-      />
-      {renderChildren(child, depth + 1)}  // Recursive nesting
-    </div>
-  ));
-};
+// FILE: frontend/src/store/useSessionLifecycleStore.ts (Action: handleSessionSelect)
+set(state => ({
+  activeSessionId: uiId,
+  sessions: state.sessions.map(s => s.id === uiId ? { ...s, hasUnreadResponse: false } : s)
+}));
 ```
 
-Each child gets `depth * 12px` indentation, creating a visual hierarchy.
-
----
-
-### 9. Search Filtering
-**File:** `frontend/src/components/Sidebar.tsx` (Lines 91-93)
-
-When the user types in the search box, `filteredSessions` is recomputed:
-
-```typescript
-// FILE: frontend/src/components/Sidebar.tsx (Lines 91-93)
-const filteredSessions = useMemo(
-  () => sessions.filter(s => s.name.toLowerCase().includes(searchQuery.toLowerCase())),
-  [sessions, searchQuery]
-);
-```
-
-**Critical side effect:** When search is active, folder rendering is skipped (line 386 in Sidebar.tsx):
-
-```typescript
-{!searchQuery && pFolders.map(f => <FolderItem ... />)}
-{filteredSessions.map(s => <SessionItem ... />)}
-```
-
-This flattens the hierarchy during search, showing only matching sessions.
-
----
-
-### 10. Real-Time State Updates via Socket
-**File:** `frontend/src/hooks/useChatManager.ts` (Lines 198-369)
-
-When the user opens a background chat, socket events update the session flags:
-
-```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 198-207)
-socket.on('token', (event) => {
-  // Session is actively streaming
-  useSessionLifecycleStore.setState(state => ({
-    sessions: state.sessions.map(s =>
-      s.id === event.sessionId ? { ...s, isTyping: true } : s
-    )
-  }));
-});
-
-socket.on('token_done', (event) => {
-  // Streaming finished
-  useSessionLifecycleStore.setState(state => ({
-    sessions: state.sessions.map(s =>
-      s.id === event.sessionId ? { ...s, isTyping: false, hasUnreadResponse: true } : s
-    )
-  }));
-});
-```
-
-**No re-render per token:** Only the store updates; React re-renders once per token (not per character). CSS animations handle the visual effect.
-
----
-
-### 11. Sub-Agent Creation (Lazy)
-**File:** `frontend/src/hooks/useChatManager.ts` (Lines 176-196)
-
-When sub-agents are spawned, they're created lazily on first token (avoiding ghost empty tabs):
-
-```typescript
-// FILE: frontend/src/hooks/useChatManager.ts (Lines 325-359)
-socket.on('sub_agent_started', (event) => {
-  useSubAgentStore.setState(state => ({
-    agents: [...state.agents, event]
-  }));
-  
-  // Lazy: session created here if needed
-  // If not, session will be created when sub-agent emits first token
-});
-
-// In wrappedOnStreamToken (lines 176-196):
-const wrapped_onStreamToken = (event) => {
-  if (subAgentRegistry[event.sessionId] && !sessionExists(event.sessionId)) {
-    // Lazily create session if not already exist
-    createSubAgentSessionSilently(event);
-  }
-  useStreamStore.onStreamToken(event);
-};
-```
-
-This prevents empty "warming up" tabs for sub-agents that don't immediately produce output.
-
----
-
-### 12. User Selection & Unread Clear
-**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 214-234)
-
-When the user clicks a session, `handleSessionSelect` clears the unread flag:
-
-```typescript
-// FILE: frontend/src/store/useSessionLifecycleStore.ts (Lines 214-234)
-handleSessionSelect: (socket, uiId) => {
-  const { sessions } = get();
-  const session = sessions.find(s => s.id === uiId);
-  if (!session) return;
-  maybeHydrateContextUsage(session);
-  const contextUsageBySession = useSystemStore.getState().contextUsageBySession;
-  const hasCachedContext = session.acpSessionId
-    ? Object.prototype.hasOwnProperty.call(contextUsageBySession, session.acpSessionId)
-    : false;
-
-  set(state => ({
-    activeSessionId: uiId,
-    sessions: state.sessions.map(s =>
-      s.id === uiId ? { ...s, hasUnreadResponse: false } : s
-    )
-  }));
-
-  if (session.acpSessionId && !session.isWarmingUp && session.messages.length > 0) {
-    if (!hasCachedContext) get().hydrateSession(socket, uiId);
-    return;
-  }
-  get().hydrateSession(socket, uiId);
-};
-```
-
-The `.unread` CSS class is removed from the session, and the session gets `.active` applied instead.
+Sidebar width is persisted under `acpui-sidebar-width`. Pinned state is persisted by `useUIStore` under `isSidebarPinned`.
 
 ---
 
 ## Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Browser: React                            │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │ Sidebar.tsx (502 lines)                                     ││
-│  │ ├─ Local state: searchQuery, sidebarWidth (localStorage)    ││
-│  │ ├─ loop: orderedProviderIds → provider-stack               ││
-│  │ │   ├─ expandedProviderId controls visibility               ││
-│  │ │   └─ pFolders → FolderItem (recursive)                    ││
-│  │ │       └─ pSessions → SessionItem                          ││
-│  │ │           └─ renderChildren(session, depth) → fork nesting││
-│  │ └─ ProviderStatusPanel (if provider has status)             ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │ Zustand Stores (State Management)                           ││
-│  │                                                              ││
-│  │ useSessionLifecycleStore (Line 43-70)                       ││
-│  │ ├─ sessions[] {id, name, isPinned, isTyping, ...}          ││
-│  │ ├─ activeSessionId                                          ││
-│  │ ├─ sessionNotes {id: hasNotes}                              ││
-│  │ └─ actions: handleSessionSelect (clears unread)             ││
-│  │                                                              ││
-│  │ useFolderStore (Line 6-17)                                  ││
-│  │ ├─ folders[] {id, name, parentId, provider}                ││
-│  │ ├─ expandedFolderIds (Set) — localStorage-backed            ││
-│  │ └─ toggleFolder(id) — updates localStorage                  ││
-│  │                                                              ││
-│  │ useUIStore (Line 5-41)                                      ││
-│  │ ├─ isSidebarOpen / isSidebarPinned (localStorage)           ││
-│  │ ├─ expandedProviderId (null or string)                      ││
-│  │ └─ setters for each state                                   ││
-│  │                                                              ││
-│  │ useSystemStore (Line 12-72)                                 ││
-│  │ ├─ orderedProviderIds                                       ││
-│  │ ├─ providersById {id: {label, branding}}                   ││
-│  │ ├─ workspaceCwds [{label, path, agent}]                    ││
-│  │ ├─ branding {name, models, ...}                             ││
-│  │ └─ slashCommands, customCommands                            ││
-│  │                                                              ││
-│  │ useCanvasStore (partial)                                    ││
-│  │ └─ terminals[] — used by SessionItem for terminal icon      ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │ CSS (Sidebar.css, 951 lines)                                ││
-│  │ ├─ State classes: .active, .typing, .unread, .pinned        ││
-│  │ ├─ Animations: breatheGlow (2s blue), greenBreatheGlow      ││
-│  │ ├─ Responsive: mobile overlay vs desktop collapsible        ││
-│  │ └─ Drag states: .drag-over                                  ││
-│  └─────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-             │ Socket.IO
-             │
-        [BACKEND]
-```
+```mermaid
+flowchart TD
+  Backend[Backend Socket.IO]
+  FolderHandlers[backend/sockets/folderHandlers.js]
+  Database[(SQLite: folders table and sessions.folder_id)]
+  UseSocket[frontend/src/hooks/useSocket.ts]
+  ChatManager[frontend/src/hooks/useChatManager.ts]
+  SystemStore[useSystemStore]
+  SessionStore[useSessionLifecycleStore]
+  FolderStore[useFolderStore]
+  UIStore[useUIStore]
+  CanvasStore[useCanvasStore]
+  StreamStore[useStreamStore]
+  Sidebar[Sidebar.tsx]
+  FolderItem[FolderItem.tsx]
+  SessionItem[SessionItem.tsx]
+  Css[Sidebar.css]
+  Modals[ArchiveModal and WorkspacePickerModal]
+  ProviderStatus[ProviderStatusPanel]
 
-**Data Flow:**
-- User clicks session → `handleSessionSelect` socket emit → backend replies → `sessions[]` updated locally → `.active` class applied
-- Backend emits `token` for background session → `isTyping: true` set → `.typing` class → `breatheGlow` CSS animation
-- User expands folder → `toggleFolder()` → localStorage written → `expandedFolderIds` updated → FolderItem children render
-- Provider accordion clicked → `expandedProviderId` set → only that provider's content visible
+  Backend -->|providers, branding, workspace_cwds, sidebar_settings| UseSocket
+  UseSocket --> SystemStore
+  Backend -->|thought, token, system_event, permission_request, token_done, sub_agent_*| ChatManager
+  ChatManager --> StreamStore
+  ChatManager --> SessionStore
+  ChatManager --> SystemStore
+  Sidebar -->|load_folders, create_folder, move_folder, move_session_to_folder| FolderStore
+  FolderStore --> FolderHandlers
+  FolderHandlers --> Database
+  Database --> FolderHandlers
+  FolderHandlers --> FolderStore
+  SystemStore --> Sidebar
+  SessionStore --> Sidebar
+  FolderStore --> Sidebar
+  UIStore --> Sidebar
+  CanvasStore --> SessionItem
+  Sidebar --> FolderItem
+  Sidebar --> SessionItem
+  FolderItem --> SessionItem
+  Sidebar --> Modals
+  Sidebar --> ProviderStatus
+  SessionItem --> Css
+  FolderItem --> Css
+  Sidebar --> Css
+```
 
 ---
 
-## The Critical Contract: Session Flags & Folder State
+## Critical Contract
 
-The sidebar's rendering is entirely driven by these two data shapes:
+The sidebar depends on three contracts: provider identity, tree identity, and runtime status flags.
 
-### Session Flags
+### Provider Identity Contract
 
-Every session object has these runtime flags that control its visual state:
+`Sidebar` renders provider stacks from `ProviderSummary.providerId`. Sessions are included in a provider stack when `session.provider` matches the provider ID, with a fallback to the active/default provider for sessions without a provider. Root folders are included only when `folder.providerId` matches the provider ID.
 
 ```typescript
+// FILE: frontend/src/components/Sidebar.tsx (Provider matching)
+const pSessions = (searchQuery ? filteredSessions : rootSessions)
+  .filter(s => (s.provider || activeProviderId || defaultProviderId || 'default') === p.providerId);
+const pFolders = isExpanded ? rootFolders.filter(f => f.providerId === p.providerId) : [];
+```
+
+If `folder.providerId` is missing or mismatched, the folder does not render in provider content. If `session.provider` is missing, the active/default provider fallback controls where the session appears.
+
+### Tree Identity Contract
+
+Root sessions, folder sessions, forks, and sub-agents are mutually distinguished by `folderId`, `forkedFrom`, and `isSubAgent`.
+
+```typescript
+// FILE: frontend/src/components/Sidebar.tsx and frontend/src/components/FolderItem.tsx (Tree selectors)
+rootSessions = filteredSessions.filter(s => !s.folderId && !s.forkedFrom && !s.isSubAgent);
+childSessions = sessions.filter(s => s.folderId === folder.id && !s.forkedFrom);
+forks = sessions.filter(s => s.forkedFrom === parentId && !s.isSubAgent);
+subAgents = sessions.filter(s => s.isSubAgent && s.forkedFrom === parentId);
+```
+
+A fork or sub-agent must use its parent UI session ID in `forkedFrom`. A folder child session must use an existing `folder.id` in `folderId`.
+
+### Runtime Status Contract
+
+`SessionItem` does not compute status. It only maps fields to classes and actions.
+
+```typescript
+// FILE: frontend/src/types.ts (Interface: ChatSession, Sidebar-relevant fields)
 interface ChatSession {
-  id: string;                      // Unique UI session ID
-  name: string;                    // Display name
-  provider: string;                // Provider ID
-  folderId: string | null;         // null = root; else = parent folder ID
-  forkedFrom: string | null;       // null = not fork; else = parent session ID
-  isSubAgent: boolean;             // true = shows bot icon, restricted actions
-  isPinned: boolean;               // Affects sort order & .pinned CSS class
-  isTyping: boolean;               // .typing CSS class → breatheGlow animation
-  hasUnreadResponse: boolean;      // .unread CSS class → bold + solid border
-  isWarmingUp: boolean;            // Loading state indicator
-  parentAcpSessionId: string;      // For sub-agents: parent ACP session ID
-  // ... other fields (model, messages, etc.)
+  id: string;
+  acpSessionId: string | null;
+  name: string;
+  provider?: string | null;
+  folderId?: string | null;
+  forkedFrom?: string | null;
+  isSubAgent?: boolean;
+  parentAcpSessionId?: string | null;
+  isPinned?: boolean;
+  isTyping: boolean;
+  isWarmingUp: boolean;
+  hasUnreadResponse?: boolean;
+  isAwaitingPermission?: boolean;
 }
 ```
 
-**Critical invariants:**
-
-1. **`folderId` must exist:** If a session has `folderId: "folder-123"`, that folder must exist in `useFolderStore.folders`. If not, the session disappears from sidebar.
-2. **`forkedFrom` implies nesting:** If `forkedFrom: "parent-id"`, the session renders as a child of `parent-id` via `renderChildren()`, not as a root session.
-3. **`isSubAgent` controls behavior:** Sub-agent sessions have restricted actions (no pin, rename, settings). Icons are always bot (green).
-4. **`isPinned` affects sort:** Pinned sessions sort first, then unpinned (controlled in `handleTogglePin`, line 320-327).
-5. **`isTyping` triggers animation:** Without this flag set, the `.typing` class never applies, and `breatheGlow` never plays.
-6. **`hasUnreadResponse` persists:** Set by backend on `token_done`, cleared by `handleSessionSelect` (line 226).
-
-### Folder Expansion State
-
-```typescript
-// useFolderStore
-expandedFolderIds: Set<string>;     // Which folder IDs are expanded
-
-// localStorage key: 'acpui-expanded-folders'
-// Format: JSON stringified array of folder IDs
-```
-
-**Critical invariants:**
-
-1. **Expansion is per-folder, not per-provider:** A folder remains expanded regardless of which provider is active.
-2. **localStorage persists across page refreshes:** `expandedFolderIds` are saved/loaded (lines 21-26, 28-30).
-3. **Expansion doesn't affect visibility if provider is collapsed:** If provider X's accordion is collapsed (`expandedProviderId !== X`), its folders are hidden regardless of expansion state.
-
-### Provider Accordion State
-
-```typescript
-// useUIStore
-expandedProviderId: string | null;  // Which provider's accordion is open
-
-// Only one provider at a time can have expandedProviderId === itself
-// null = all providers collapsed
-```
-
-**Critical invariants:**
-
-1. **Only one provider shows content:** If `expandedProviderId === "my-provider"`, only that provider's sessions/folders render. All others hidden.
-2. **Collapsed provider shows unread indicator:** If provider is collapsed but has typing/unread sessions, a small indicator shows (line 331-334).
+The stream layer owns `isTyping`, `hasUnreadResponse`, and `isAwaitingPermission`. Session lifecycle actions own selected-session unread clearing, pin sorting, rename state, and hydration.
 
 ---
 
-## CSS Architecture & State Classes
+## Configuration / Data Flow
 
-All sidebar animations and visual states are driven by CSS classes applied to the session row based on session flags.
+### localStorage Keys
 
-### State Classes
+| Key | Owner | Shape | Purpose |
+|---|---|---|---|
+| `isSidebarPinned` | `frontend/src/store/useUIStore.ts` | String boolean | Initializes `isSidebarOpen` and `isSidebarPinned`; updated by `setSidebarPinned` and `toggleSidebarPinned`. |
+| `acpui-expanded-folders` | `frontend/src/store/useFolderStore.ts` | JSON array of folder IDs | Initializes and persists `expandedFolderIds`. |
+| `acpui-sidebar-width` | `frontend/src/components/Sidebar.tsx` | Numeric string | Restores the sidebar width when open. |
+| `isAutoScrollDisabled` | `frontend/src/store/useUIStore.ts` | String boolean | Stored in the same UI store, not used by sidebar rendering. |
 
-| Class | Condition | Visual Effect | CSS |
-|-------|-----------|---------------|----|
-| `.active` | `isActive === true` | Background highlight, text primary color | `bg-color: var(--user-msg-bg)` |
-| `.pinned` | `isPinned === true` | Blue left border 3px, light blue bg | `border-left: 3px var(--accent-color)` |
-| `.typing` | `isTyping === true` | Pulsing blue glow around element | `animation: breatheGlow 2s infinite` |
-| `.unread` | `hasUnreadResponse === true` | Bold text, solid left border 3px, blue bg | `font-weight: 600; border-left: 3px solid` |
-| `.awaiting-permission` | Permission pending | Pulsing green glow, green border | `animation: greenBreatheGlow 1.5s` |
-| `.sub-agent` | `isSubAgent === true` | Restricted actions (no pin/rename) | N/A (React logic) |
-| `.popped-out` | (external state) | Reduced opacity, faded border | `opacity: 0.5; border-color: faded` |
+### Socket Events
 
-### Animations
+| Direction | Event | Owner | Purpose |
+|---|---|---|---|
+| Backend to frontend | `providers` | `useSocket.getOrCreateSocket` | Sets provider order, default provider, and provider summaries. |
+| Backend to frontend | `branding` | `useSocket.getOrCreateSocket` | Sets global or provider branding. |
+| Backend to frontend | `workspace_cwds` | `useSocket.getOrCreateSocket` | Provides workspace choices for new chat. |
+| Backend to frontend | `sidebar_settings` | `useSocket.getOrCreateSocket` | Sets archive/delete mode and notification settings. |
+| Backend to frontend | `session_renamed` | `useChatManager` | Updates a session title by UI session ID. |
+| Backend to frontend | `thought`, `token`, `system_event`, `permission_request`, `token_done` | `useChatManager`, `useStreamStore` | Drives typing, unread, permission, and stream completion flags. |
+| Backend to frontend | `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_completed` | `useChatManager`, `useSubAgentStore` | Maintains sub-agent state and sidebar sessions. |
+| Frontend to backend | `load_folders`, `create_folder`, `rename_folder`, `delete_folder`, `move_folder`, `move_session_to_folder` | `useFolderStore`, `folderHandlers.js` | Persists folder tree changes. |
+| Frontend to backend | `save_snapshot` | `useSessionLifecycleStore`, `useStreamStore`, `useChatStore` | Persists session metadata after pin, rename, stream completion, or permission response. |
+| Frontend to backend | `archive_session`, `delete_session`, `list_archives`, `restore_archive`, `delete_archive` | `Sidebar` | Handles sidebar archive/delete UI. |
 
-#### breatheGlow (2s loop)
-```css
-@keyframes breatheGlow {
-  0% {
-    box-shadow: inset 0 0 5px rgba(59, 130, 246, 0.2);
-    background: rgba(59, 130, 246, 0.05);
-  }
-  50% {
-    box-shadow: inset 0 0 15px rgba(59, 130, 246, 0.4);
-    background: rgba(59, 130, 246, 0.1);
-  }
-  100% {
-    box-shadow: inset 0 0 5px rgba(59, 130, 246, 0.2);
-    background: rgba(59, 130, 246, 0.05);
-  }
-}
-```
-Applied to `.session-item.typing` — creates pulsing blue glow effect.
+### Persistence Data
 
-#### greenBreatheGlow (1.5s loop)
-```css
-@keyframes greenBreatheGlow {
-  0% {
-    box-shadow: inset 0 0 5px rgba(16, 185, 129, 0.2);
-    background: rgba(16, 185, 129, 0.05);
-  }
-  50% {
-    box-shadow: inset 0 0 20px rgba(16, 185, 129, 0.5);
-    background: rgba(16, 185, 129, 0.15);
-  }
-  100% {
-    box-shadow: inset 0 0 5px rgba(16, 185, 129, 0.2);
-    background: rgba(16, 185, 129, 0.05);
-  }
-}
-```
-Applied to `.session-item.awaiting-permission` — creates pulsing green glow effect.
+File: `backend/database.js` (Table: `folders`, Functions: `getAllFolders`, `createFolder`, `renameFolder`, `deleteFolder`, `moveFolder`, `moveSessionToFolder`)
 
-### Responsive Behavior
+The `folders` table stores `id`, `name`, `parent_id`, `position`, `created_at`, and `provider_id`. Session folder membership is stored on `sessions.folder_id`. `deleteFolder` reparents child folders and sessions to the deleted folder's parent. `moveSessionToFolder` updates `sessions.folder_id` by UI session ID.
 
-#### Mobile (≤ 768px)
-```css
-.sidebar {
-  position: fixed;
-  left: 0;
-  top: 0;
-  height: 100%;
-  width: 312px;
-  transform: translateX(-100%);           /* Off-screen by default */
-  transition: transform 300ms ease-out;
-  z-index: 1000;                          /* Above content */
-}
+### Rendering Pipeline
 
-.sidebar.open {
-  transform: translateX(0);               /* Slide in */
-}
-```
-
-Sidebar slides in from left as an overlay when opened.
-
-#### Desktop (≥ 769px)
-```css
-.sidebar {
-  position: relative;
-  width: 312px;
-  transition: width 300ms ease-out, opacity 300ms ease-out;
-  flex-shrink: 0;                         /* Doesn't compress */
-}
-
-.sidebar:not(.open) {
-  width: 0;                               /* Collapses to 0 */
-  opacity: 0;                             /* Fade out */
-  overflow: hidden;                       /* Hide contents */
-}
-```
-
-Sidebar width toggles 0 ↔ 312px with smooth transitions.
-
-### Indentation & Nesting
-
-```typescript
-// FolderItem (Line 139 in FolderItem.tsx)
-<div style={{ paddingLeft: `${depth * 16}px` }}>
-
-// SessionItem inside folder (via renderChildren, Line 263 in Sidebar.tsx)
-<div style={{ paddingLeft: `${(depth + 1) * 12}px` }}>
-
-// Fork indicator
-<span className="fork-arrow">↳</span>  /* Positioned absolutely, blue color */
-```
-
-Each nesting level adds indentation: folders at 16px per level, sessions at 12px per level.
+1. Backend folder rows and session rows are loaded through socket callbacks.
+2. `useSystemStore`, `useSessionLifecycleStore`, `useFolderStore`, `useUIStore`, and `useCanvasStore` hold current frontend state.
+3. `Sidebar` derives provider-scoped session and folder lists.
+4. `FolderItem` recursively expands folders based on `expandedFolderIds`.
+5. `Sidebar.renderChildren` and `FolderItem.renderForkTree` recursively render forks and sub-agents.
+6. `SessionItem` maps flags to icons, actions, and CSS classes.
+7. `Sidebar.css` supplies responsive layout, drag-over states, and status animations.
 
 ---
 
@@ -692,193 +481,158 @@ Each nesting level adds indentation: folders at 16px per level, sessions at 12px
 
 ### Frontend Components
 
-| Component | File | Lines | Props | Key State | Purpose |
-|-----------|------|-------|-------|-----------|---------|
-| **Sidebar** | `Sidebar.tsx` | 15-502 | None | `searchQuery`, `sidebarWidth`, `showArchives`, `newFolderName` (localStorage-backed) | Main sidebar container; renders provider stacks, folders, sessions |
-| **SessionItem** | `SessionItem.tsx` | 19-100 | `session`, `isActive`, `onSelect`, `onRename`, `onTogglePin`, `onArchive`, `onSettings` | `isEditing`, `editName` | Individual session row; applies state classes based on session flags |
-| **FolderItem** | `FolderItem.tsx` | 22-225 | `folder`, `folders`, `sessions`, `depth`, `onSelect`, `onDrop*` | `isEditing`, `editName`, `isDragOver` | Folder node; recursively renders child folders and sessions |
-| **WorkspacePickerModal** | `WorkspacePickerModal.tsx` | 13-61 | `workspaces`, `onSelect`, `onClose` | `search` | Modal for selecting workspace CWD when creating new chat |
-| **ProviderStatusPanel** | `ProviderStatusPanel.tsx` | 9-158 | `providerId` | `isDetailsOpen` | Renders provider status cards (quota, spend); only visible if provider emits status |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Sidebar shell | `frontend/src/components/Sidebar.tsx` | Component `Sidebar`; handlers `handleSelect`, `handleNew`, `handlePrimaryNew`, `handleShowArchives`, `handleRestore`, `handleRemoveSession`, `handleDropSession`, `handleDropFolder`, `handleRootDrop`, `renderChildren`, `onResizeStart` | Main provider stack, search, workspace, archive, folder, session, drag/drop, resize, and footer renderer. |
+| Folder tree | `frontend/src/components/FolderItem.tsx` | Component `FolderItem`; function `renderForkTree`; handlers `handleDrop`, `handleFolderDragStart`, `startEdit`, `saveEdit`; function `isDescendant` | Recursive folder renderer with rename/delete/subfolder controls and folder/session drop targets. |
+| Session row | `frontend/src/components/SessionItem.tsx` | Component `SessionItem`; handlers `handleStartEdit`, `handleSaveEdit`; functions `isSessionPoppedOut`, `openPopout`, `focusPopout` | Applies session classes, icons, notes indicator, sub-agent action restrictions, edit mode, and pop-out behavior. |
+| Styling | `frontend/src/components/Sidebar.css` | Classes `.sidebar`, `.sessions-list`, `.provider-stack`, `.provider-stack-header`, `.collapsed-running`, `.folder-row`, `.folder-row.drag-over`, `.session-item`, `.typing`, `.unread`, `.awaiting-permission`, `.popped-out`, `.sidebar-resize-handle`; keyframes `breatheGlow`, `greenBreatheGlow` | Layout, responsive behavior, status animations, drag-over feedback, and row states. |
+| Archive modal | `frontend/src/components/ArchiveModal.tsx` | Component `ArchiveModal` | Lists, filters, restores, and deletes archive folder entries passed by `Sidebar`. |
+| Workspace picker | `frontend/src/components/WorkspacePickerModal.tsx` | Component `WorkspacePickerModal` | Lets the user choose a workspace cwd and optional agent when multiple workspaces exist. |
+| Provider status | `frontend/src/components/ProviderStatusPanel.tsx` | Component `ProviderStatusPanel`; prop `providerId` | Renders provider status inside expanded provider content. |
 
-### Store State (Sidebar-Relevant Fields)
+### Stores and Hooks
 
-| Store | File | Lines | Fields (Sidebar) |
-|-------|------|-------|------------------|
-| `useSessionLifecycleStore` | `useSessionLifecycleStore.ts` | 72-79 | `sessions[]`, `activeSessionId`, `sessionNotes {id: hasNotes}` |
-| `useFolderStore` | `useFolderStore.ts` | 6-17 | `folders[]`, `expandedFolderIds` (localStorage: `acpui-expanded-folders`) |
-| `useUIStore` | `useUIStore.ts` | 5-41 | `isSidebarOpen`, `isSidebarPinned` (localStorage: `isSidebarPinned`), `expandedProviderId` |
-| `useSystemStore` | `useSystemStore.ts` | 12-72 | `orderedProviderIds`, `providersById`, `workspaceCwds`, `branding`, `slashCommands` |
-| `useCanvasStore` | `useCanvasStore.ts` | 5-29 | `terminals[]` (used for terminal icon in SessionItem) |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket bootstrap | `frontend/src/hooks/useSocket.ts` | Function `getOrCreateSocket`; hook `useSocket`; events `providers`, `branding`, `workspace_cwds`, `sidebar_settings` | Loads provider/workspace/branding/settings data used by the sidebar. |
+| Chat event routing | `frontend/src/hooks/useChatManager.ts` | Hook `useChatManager`; handlers for `session_renamed`, `token_done`, `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_completed`; local map `pendingSubAgents` | Routes stream and sub-agent events into stores that drive sidebar state. |
+| Sessions | `frontend/src/store/useSessionLifecycleStore.ts` | Store `useSessionLifecycleStore`; actions `handleInitialLoad`, `handleSessionSelect`, `handleNewChat`, `handleTogglePin`, `handleRenameSession`, `setSessions` | Holds session list, active session, notes map, selection behavior, pin sorting, and rename persistence. |
+| Folders | `frontend/src/store/useFolderStore.ts` | Store `useFolderStore`; actions `loadFolders`, `createFolder`, `renameFolder`, `deleteFolder`, `moveFolder`, `moveSessionToFolder`, `toggleFolder`; constant `EXPANDED_KEY` | Holds folder tree and expanded state, emits folder socket events, and applies optimistic folder/session updates. |
+| UI | `frontend/src/store/useUIStore.ts` | Store `useUIStore`; actions `setSidebarOpen`, `setSidebarPinned`, `toggleSidebarPinned`, `setExpandedProviderId`, `setSettingsOpen` | Holds sidebar open/pinned state, expanded provider state, and session settings modal target. |
+| System | `frontend/src/store/useSystemStore.ts` | Store `useSystemStore`; actions `setProviders`, `setProviderBranding`, `setWorkspaceCwds`, `setDeletePermanent`, `setProviderStatus`, `getBranding` | Holds provider order, provider summaries, workspace list, delete mode, and provider status data. |
+| Canvas | `frontend/src/store/useCanvasStore.ts` | Store `useCanvasStore`; field `terminals` | Lets `SessionItem` show the terminal icon for sessions with open terminal tabs. |
+| Stream | `frontend/src/store/useStreamStore.ts` | Store `useStreamStore`; actions `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `ensureAssistantMessage`, `processBuffer` | Sets typing, unread, and permission flags while managing the message stream. |
+| Permission response | `frontend/src/store/useChatStore.ts` | Action `handleRespondPermission` | Clears `isAwaitingPermission` and emits `respond_permission`. |
 
-### CSS
+### Backend and Persistence
 
-| File | Lines | Key Classes |
-|------|-------|------------|
-| `Sidebar.css` | 1-951 | `.sidebar`, `.session-item`, `.session-item.active/typing/unread/pinned`, `.folder-row`, `.provider-stack`, `.breatheGlow`, `.greenBreatheGlow`, responsive media queries |
-
----
-
-## Gotchas & Important Notes
-
-### 1. Session Must Have folderId Set Correctly
-**What breaks:** Session disappears from sidebar, even though it exists in the database.
-
-**Why:** The sidebar filters sessions by `folderId`. If a session's `folderId` points to a non-existent folder, it's filtered out during rendering.
-
-**How to avoid:** Always ensure that when a folder is deleted, its sessions have `folderId` cleared to `null`. Backend handles this (cascade delete).
-
----
-
-### 2. localStorage Keys Must Match Exactly
-**What breaks:** Folder expansion state lost after page refresh; sidebar pinned state resets.
-
-**Why:** Two fields are localStorage-backed: `expandedFolderIds` (key: `acpui-expanded-folders`) and `isSidebarPinned` (key: `isSidebarPinned`). If the key name changes in code but not everywhere it's referenced, state diverges.
-
-**How to verify:** Check `useFolderStore.ts` Lines 19, 21, 28 for `acpui-expanded-folders` key. Check `useUIStore.ts` Lines 45-46, 68, 73 for `isSidebarPinned` key. Ensure consistent.
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Folder socket API | `backend/sockets/folderHandlers.js` | Function `registerFolderHandlers`; events `load_folders`, `create_folder`, `rename_folder`, `delete_folder`, `move_folder`, `move_session_to_folder` | Backend folder CRUD and move event handlers. |
+| Database | `backend/database.js` | Table `folders`; functions `getAllFolders`, `createFolder`, `renameFolder`, `deleteFolder`, `moveFolder`, `moveSessionToFolder`; session fields `folder_id`, `provider` | Stores folder hierarchy, folder provider ownership, and session folder membership. |
+| Prompt completion | `backend/sockets/promptHandlers.js` | Socket event `token_done` | Emits completion events consumed by `useChatManager` and `useStreamStore`. |
+| Title updates | `backend/services/acpTitleGenerator.js` | Socket event `session_renamed` | Emits UI session title updates consumed by `useChatManager`. |
+| Sub-agents | `backend/mcp/subAgentInvocationManager.js` | Socket event `sub_agent_started` | Emits sub-agent metadata consumed by `useChatManager`. |
 
 ---
 
-### 3. Only One Provider's Accordion Can Be Expanded
-**What breaks:** Multiple provider stacks show content simultaneously, UI looks cluttered or performance lags.
+## Gotchas
 
-**Why:** `expandedProviderId` is singular (string | null), not an array. Only one provider at a time has full content visibility.
+1. **`expandedProviderId` is not the only expansion source**
 
-**How to enforce:** When a provider stack header is clicked, set `setExpandedProviderId(p.providerId === expandedProviderId ? null : p.providerId)`. This toggle-closes any open provider and opens the clicked one.
+   `Sidebar` uses `currentExpandedId = expandedProviderId || activeProviderId || defaultProviderId || firstProvider`. A null `expandedProviderId` still displays the active/default provider.
 
----
+2. **Folders require `providerId` to render in provider content**
 
-### 4. Search Suppresses Folder Rendering
-**What breaks:** User searches for a session, folder structure disappears, then user expects folders to reappear when search is cleared — but UI is momentarily inconsistent.
+   Root folders are filtered with `folder.providerId === p.providerId`. A folder with a missing or mismatched `providerId` is present in `useFolderStore.folders` but absent from the provider stack.
 
-**Why:** During search, `searchQuery` is non-empty → line 386 in `Sidebar.tsx` skips folder rendering → only filtered sessions shown flat.
+3. **`load_folders` returns every folder**
 
-**How to handle:** This is intentional UX. Folders are hidden during search to show only matching sessions. When search is cleared, folders re-appear. No bug here, just unexpected if not documented.
+   The backend `load_folders` handler does not accept a provider filter. Provider scoping is a frontend render filter based on each folder's `providerId`.
 
----
+4. **Search flattens sessions and hides folders**
 
-### 5. renderChildren Recursion Has No Depth Limit
-**What breaks:** Very deeply nested forks cause rendering lag or reach React recursion limit.
+   With `searchQuery` set, provider sessions are sourced from all matching `filteredSessions`, folder rendering is skipped, and recursive fork rendering from `Sidebar.renderChildren` is skipped. Matching folder sessions, forks, and sub-agent sessions can appear as direct search results.
 
-**Why:** `renderChildren(session, depth)` recursively calls itself for each fork. No depth limit is enforced.
+5. **Sub-agent nesting uses `forkedFrom`, not `parentAcpSessionId`**
 
-**How to mitigate:** The depth limit is practical (users rarely fork more than 3-4 levels). If needed, add a check: `if (depth > 10) return null;`.
+   The sidebar tree selectors use `isSubAgent && s.forkedFrom === parentId`. `parentAcpSessionId` is useful metadata, but it does not place the row in the tree.
 
----
+6. **`moveSessionToFolder` only emits from the store**
 
-### 6. Lazy Sub-Agent Session Creation
-**What breaks:** Sub-agent tab appears and immediately disappears, or empty ghost tab appears.
+   `useFolderStore.moveSessionToFolder` emits the backend event. `Sidebar.handleDropSession` performs the optimistic local `session.folderId` update. Calling the store action directly does not update `useSessionLifecycleStore.sessions`.
 
-**Why:** Sub-agents are created on `sub_agent_started` event, but the session is only added to `sessions[]` when the first token arrives (line 176-196 in `useChatManager.ts`).
+7. **Folder deletion reparents instead of discarding children**
 
-**How to prevent:** The lazy creation pattern is intentional — it prevents empty "warming up" tabs. If you need sub-agent sessions to appear immediately, modify `wrappedOnStreamToken` to create sessions eagerly.
+   `useFolderStore.deleteFolder` and `backend/database.js` move child folders and child sessions to the deleted folder's parent. Do not assume folder deletion clears every descendant to root.
 
----
+8. **Cycle prevention is local to folder-on-folder drops**
 
-### 7. CSS Animations Won't Play Without CSS Class
-**What breaks:** Session is typing, but no blue glow appears.
+   `FolderItem.isDescendant` prevents dropping a folder into its own descendant. Root drops and session drops do not need that check.
 
-**Why:** The animation only plays if `.typing` CSS class is applied. If `session.isTyping` is never set to `true`, the class is never added.
+9. **Sub-agent rows do not use a `.sub-agent` CSS class**
 
-**How to debug:** In React DevTools, inspect the session-item element. Check its class list — should include `typing` if actively streaming. If not, check that the `isTyping` flag is being updated by socket event.
+   Sub-agent behavior is controlled by `session.isSubAgent` inside `SessionItem`. Styling comes through icon choice and restricted actions, not a dedicated row class.
 
----
+10. **Collapsed provider unread state is suppressed while typing exists**
 
-### 8. Drag & Drop Has Cycle Prevention
-**What breaks:** Folder A is moved into folder B, but then folder B is moved into folder A, creating a cycle.
+   `hasUnreadResponse` for the provider header is computed only when the provider is collapsed and no session in that provider is typing. Collapsed content still lists sessions with `isTyping` or `hasUnreadResponse`.
 
-**Why:** `isDescendant()` check (Lines 228-235 in `FolderItem.tsx`) prevents cycles, but only if the check is called before the move.
+11. **Permission state is a session flag plus a timeline response**
 
-**How to verify:** When folder drag-drop handler runs (`handleDropFolder`), it calls `isDescendant(targetFolderId, sourceFolderId)`. Only allow drop if false.
-
----
-
-### 9. Pinned Sessions Re-Sort on handleTogglePin
-**What breaks:** Pinned sessions don't move to the top, sort order is wrong.
-
-**Why:** `handleTogglePin` (Line 320-327 in `useSessionLifecycleStore.ts`) mutates the `isPinned` flag and re-sorts `sessions[]`. If this sort logic is missing, pinning has no visual effect on order.
-
-**How to verify:** Check that `handleTogglePin` includes:
-```typescript
-sessions: state.sessions
-  .map(s => s.id === id ? { ...s, isPinned: !s.isPinned } : s)
-  .sort((a, b) => (b.isPinned ? 1 : 0) - (a.isPinned ? 1 : 0))
-```
-
----
-
-### 10. Sub-Agent Sessions Must Have isSubAgent Flag
-**What breaks:** Sub-agent session shows pin/rename/settings buttons (should be hidden).
-
-**Why:** `SessionItem` checks `session.isSubAgent` to restrict actions (lines 70-75). If flag is not set, actions are shown.
-
-**How to enforce:** When creating a sub-agent session, ensure `isSubAgent: true` is set in the session object. Backend does this via `sub_agent_started` event.
+   `useStreamStore.onStreamEvent` sets `isAwaitingPermission` on permission requests. `useChatStore.handleRespondPermission` clears the flag and annotates the matching permission step with the selected response.
 
 ---
 
 ## Unit Tests
 
-### Test Files
+### Frontend Tests
 
-| File | Lines | Coverage |
-|------|-------|----------|
-| `frontend/src/test/Sidebar.test.tsx` | 100+ | Session rendering, pinned status, typing indicators, unread states, store integration |
-| `frontend/src/test/SidebarExtended.test.tsx` | 73 | Provider stacks, search filtering, new chat handler, sidebar toggle |
+| File | Test names / describe blocks | Coverage |
+|---|---|---|
+| `frontend/src/test/Sidebar.test.tsx` | `renders session list with pinned status indicators`; `applies typing class when a session is typing`; `renders a typing session outside the provider content when collapsed`; `renders an unread session outside the provider content when collapsed`; `marks a collapsed provider header as unread when one of its chats has an unread response`; `applies awaiting-permission class when a session is awaiting permission`; `filters sessions by search input`; `new folder button opens the app modal and creates a folder`; `drag and drop session to root calls moveSessionToFolder with null`; `deleting a parent session also removes its forks from the session list`; `forked sessions render indented under parent`; `renders resize handle when sidebar is open`; `restores width from localStorage` | Sidebar rendering, state classes, collapsed provider summaries, search, workspace controls, archive modal, new folder modal, root drag/drop, fork cascade removal, pop-out class, and resize persistence. |
+| `frontend/src/test/SidebarExtended.test.tsx` | `renders session items in the correct provider stack`; `filters sessions based on search input`; `handles "New Chat" click`; `toggles pinned state of sidebar` | Provider stack rendering with mocked child components and top-level interactions. |
+| `frontend/src/test/FolderItem.test.tsx` | `renders folder name`; `shows child count`; `expands on click to show children`; `enters rename mode on right-click`; `saves rename on Enter`; `handles drop of session onto folder`; `handles drop of folder onto folder`; `renders fork-indent for forked sessions inside folders`; `shows fork arrow for forked sessions` | Folder recursion, counts, rename flow, drag/drop callbacks, and fork rendering inside folders. |
+| `frontend/src/test/SessionItem.test.tsx` | `has active class when isActive is true`; `calls onSelect when clicked`; `enters edit mode when rename button is clicked`; `shows only delete button for sub-agent when not typing`; `hides delete button for sub-agent when typing`; `shows "Archive Chat" when deletePermanent is false`; `shows "Delete Chat" when deletePermanent is true`; `shows GitFork icon when session has forkedFrom`; `shows Terminal icon when session has a terminal in canvas store`; `fork icon takes priority over terminal icon when session has both forkedFrom and a terminal` | Session row classes, action gating, delete/archive title, icon priority, and terminal indicator. |
+| `frontend/src/test/useFolderStore.test.ts` | `createFolder emits and updates local state`; `deleteFolder reparents sub-folders and sessions`; `loadFolders emits and sets folders`; `renameFolder emits and updates local state`; `moveFolder emits and updates local state`; `moveSessionToFolder emits socket event`; `toggleFolder manages expanded set` | Folder store socket calls, optimistic state, reparenting, and expansion persistence state. |
+| `frontend/src/test/useChatManager.test.ts` | `handles "sub_agents_starting" - clears old sidebar sessions immediately`; `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`; `creates lazy sub-agent session with provider on first token`; `creates lazy sub-agent session with provider on first system_event`; `handles "session_renamed" event`; `handles "token_done" event` | Realtime sidebar updates from title, completion, and sub-agent socket events. |
+| `frontend/src/test/useStreamStore.test.ts` | `onStreamToken queues text and triggers typewriter`; `onStreamDone marks message as finished and saves snapshot` | Stream-driven typing and completion behavior used by sidebar state classes. |
 
-### Test Execution
+### Backend Tests
+
+| File | Test names / describe blocks | Coverage |
+|---|---|---|
+| `backend/test/folderHandlers.test.js` | `load_folders returns all folders`; `create_folder creates and returns folder`; `create_folder defaults name to New Folder`; `rename_folder calls db and returns success`; `delete_folder calls db and returns success`; `move_folder calls db and returns success`; `move_session_to_folder calls db and returns success`; error path tests for each event; null parent/folder ID tests | Backend folder socket contract used by `useFolderStore` and drag/drop. |
+| `backend/test/database-exhaustive.test.js` | Folder operation coverage through `renameFolder`, `moveFolder`, `getAllFolders`, `moveSessionToFolder`, `deleteFolder` | Database folder functions and failure paths. |
+
+### Targeted Test Commands
 
 ```bash
+# Frontend sidebar rendering and store coverage
 cd frontend
-npx vitest run                           # Run all tests
-npx vitest run Sidebar.test.tsx          # Run sidebar tests specifically
-npx vitest run --coverage                # With coverage report
+npx vitest run src/test/Sidebar.test.tsx src/test/SidebarExtended.test.tsx src/test/FolderItem.test.tsx src/test/SessionItem.test.tsx src/test/useFolderStore.test.ts src/test/useChatManager.test.ts src/test/useStreamStore.test.ts
+
+# Backend folder socket coverage
+cd backend
+npx vitest run test/folderHandlers.test.js
 ```
 
 ---
 
 ## How to Use This Guide
 
+### For Implementing or Extending Sidebar Features
+
+1. Start with `frontend/src/components/Sidebar.tsx` and identify whether the feature belongs to provider stacks, folder rendering, session rows, root drag/drop, utility controls, or footer controls.
+2. Check the owning store before adding component state. Use `useSessionLifecycleStore` for sessions, `useFolderStore` for folders, `useUIStore` for sidebar UI state, `useSystemStore` for provider/workspace/config data, and `useCanvasStore` for terminal indicators.
+3. If the feature affects session row visuals, update `SessionItem` and `Sidebar.css` together and add tests in `SessionItem.test.tsx` or `Sidebar.test.tsx`.
+4. If the feature affects folder state, update `useFolderStore`, `FolderItem`, `backend/sockets/folderHandlers.js`, and relevant frontend/backend tests.
+5. If the feature affects stream or sub-agent indicators, trace through `useChatManager` and `useStreamStore` before changing `Sidebar`.
+6. Keep provider-specific examples out of this generic doc. Use provider IDs and placeholder names in code and tests.
+
 ### For Debugging Sidebar Issues
 
-1. **Session not appearing:** Check `sessions[]` in DevTools. Does it have `folderId` pointing to an existing folder? Is `provider` correct?
-2. **No blue glow on typing:** Check if `.typing` class is on the element. If not, check `isTyping` flag. Verify socket event is firing.
-3. **Folder won't expand:** Check `expandedFolderIds` in DevTools. Is the folder ID in the set? If not, `toggleFolder()` wasn't called or localStorage failed.
-4. **Pinned sessions not moving:** Manually trigger sort. Check `handleTogglePin` in `useSessionLifecycleStore.ts`.
-5. **Sub-agent ghost tab:** Check if sub-agent session is being created on `sub_agent_started` or on first token. Expected: lazy creation on first token.
-
-### For Implementing New Sidebar Features
-
-1. **New session indicator (e.g., "archived"):** Add a new CSS class and flag to the session object. Add CSS class to SessionItem className string.
-2. **New folder feature:** Add action to FolderItem component and wire to `useFolderStore` action.
-3. **New provider status:** Emit status from backend, render in ProviderStatusPanel.
-4. **Keyboard shortcuts:** Listen in Sidebar component, call appropriate handler (select, delete, etc.).
-
-### For Optimizing Sidebar Performance
-
-1. **Reduce re-renders:** Use `useMemo` for `filteredSessions`, `rootSessions`, derived lists.
-2. **Virtualize long lists:** If 1000+ sessions, use `react-virtual` or `react-window` for scrolling.
-3. **Debounce search:** Add 300ms debounce to `searchQuery` state to avoid filtering on every keystroke.
-4. **Lazy load folders:** Load child folders only when expanded, not all at once.
+1. **Session missing from provider stack:** Inspect `session.provider`, `activeProviderId`, `defaultProviderId`, `folderId`, `forkedFrom`, and `isSubAgent`. Root sessions require no `folderId`, no `forkedFrom`, and no `isSubAgent`.
+2. **Folder missing:** Inspect `folder.providerId` and `folder.parentId`. Provider content renders root folders only when `folder.providerId` matches the provider ID.
+3. **Folder session missing:** Inspect `session.folderId` and verify it matches an existing `folder.id`. Expand the folder by checking `useFolderStore.expandedFolderIds`.
+4. **Fork or sub-agent misplaced:** Inspect `forkedFrom`. The value must be the parent UI session ID.
+5. **Typing glow missing:** Inspect `session.isTyping` and confirm `useStreamStore.onStreamToken`, `onStreamThought`, or `onStreamEvent` receives the ACP session ID matching `session.acpSessionId`.
+6. **Unread marker missing:** Inspect `session.hasUnreadResponse`, active session ID, and `useStreamStore.onStreamDone`. Collapsed provider headers do not show unread class while any session in that provider is typing.
+7. **Permission glow stuck or missing:** Inspect `session.isAwaitingPermission`, `useStreamStore.onStreamEvent`, and `useChatStore.handleRespondPermission`.
+8. **Drag/drop does not persist:** Check `DataTransfer` keys (`session-id`, `folder-id`), `useFolderStore.moveSessionToFolder`, `useFolderStore.moveFolder`, and backend `folderHandlers.js` events.
+9. **Width or pin state resets:** Check `acpui-sidebar-width` and `isSidebarPinned` in `localStorage`.
+10. **Search result shape is surprising:** Search intentionally hides folders and recursive child rendering from provider content.
 
 ---
 
 ## Summary
 
-The AcpUI sidebar is a **hierarchical, real-time UI** that:
-
-1. **Renders a multi-layer hierarchy:** Providers → Folders → Sessions → Forks/Sub-agents, with collapsible accordions and recursive nesting
-2. **Drives all visuals from session flags:** `isPinned`, `isTyping`, `hasUnreadResponse`, `isWarmingUp` directly control CSS classes and animations
-3. **Uses five Zustand stores** to provide state: sessions, folders (with localStorage-backed expansion), UI state (sidebar open/pinned), system config (providers, branding), and canvas terminals
-4. **Persists two fields to localStorage:** `isSidebarPinned` (sidebar open/closed) and `acpui-expanded-folders` (folder expansion state)
-5. **Animates in real-time via CSS:** `breatheGlow` (blue, 2s) for typing, `greenBreatheGlow` (green, 1.5s) for permissions
-6. **Responds to socket events instantly:** Typing, unread, sub-agent creation update session flags → CSS classes apply → animations fire
-7. **Supports deep hierarchy:** Sessions can be organized into folders and forks with unlimited nesting depth and indentation
-
-**The critical contract is the session object's flags:** `isPinned`, `isTyping`, `hasUnreadResponse`, `isWarmingUp`, `folderId`, `forkedFrom`, `isSubAgent`. Violate these contracts and sidebar display breaks.
-
-Agents should be able to:
-- ✅ Understand why a session doesn't appear (folderId check)
-- ✅ Debug missing animations (CSS class check)
-- ✅ Add a new session indicator (flag + CSS class + component update)
-- ✅ Optimize long session lists (virtualization, debouncing)
-- ✅ Understand provider stack accordion logic (only one expanded at a time)
-- ✅ Trace a typing animation from socket event to CSS animation
+- `Sidebar` is the provider-scoped orchestrator for sidebar search, provider stacks, workspace controls, archive controls, folders, root sessions, fork nesting, sub-agent nesting, drag/drop, resizing, and footer actions.
+- `FolderItem` owns recursive folder rendering, folder actions, folder drop targets, and fork rendering inside expanded folders.
+- `SessionItem` owns row state classes, icon priority, edit mode, notes indicator, pop-out behavior, and action restrictions for sub-agents.
+- `useSessionLifecycleStore`, `useFolderStore`, `useUIStore`, `useSystemStore`, `useCanvasStore`, and `useStreamStore` are all part of the rendering contract.
+- Provider matching uses `session.provider` and `folder.providerId`; tree matching uses `folderId`, `forkedFrom`, and `isSubAgent`.
+- Realtime status classes come from `isTyping`, `hasUnreadResponse`, `isAwaitingPermission`, and pop-out ownership.
+- Drag/drop uses `session-id` and `folder-id` data transfer keys and persists through `move_session_to_folder` and `move_folder`.
+- The critical contract is to keep provider identity, tree identity, and runtime status flags synchronized across socket handlers, stores, and row components.

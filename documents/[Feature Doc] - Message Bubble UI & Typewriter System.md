@@ -1,498 +1,800 @@
 # Message Bubble UI & Typewriter System
 
-The typewriter system decouples network message arrival from UI render rate, feeding incremental mutations to the message pipeline. The bubble UI renders messages as a Unified Timeline of discrete, collapsible steps (thoughts, tools, text, permissions). Together, they create smooth, live-streaming chat bubbles that don't freeze the UI.
+This feature turns backend stream events into a unified assistant timeline and renders that timeline with adaptive typewriter updates, memoized markdown, permission controls, and tool-output panels.
+
+This area is high-risk because correctness depends on per-session stream isolation, event ordering, sticky tool metadata, shell-run routing, and collapse-state synchronization.
 
 ---
 
 ## Overview
 
 ### What It Does
-
-**Typewriter (Streaming) System:**
-- Queues incoming ACP tokens, events, and thoughts per session in `streamQueues[acpId]`
-- Drains on a 32ms timer with adaptive speed (buffers >500 chars flush fully, <100 chars drain at 1/5 speed)
-- Three-phase processing: events (immediate), thoughts (typewriter), tokens (typewriter)
-- Detects file edits and plan.md creation to trigger canvas callbacks
-- useChatManager and useStreamStore handle shell description updates and use canonicalName for tool identification
-- Preserves shell output (`$ ` prefix) across tool updates
-- Injects `RESPONSE_DIVIDER` between tool output and subsequent prose (only when backtick count is even)
-
-**Bubble UI (Rendering) System:**
-- Renders messages as `Message[]` containing a `Unified Timeline` of `TimelineStep` objects
-- Each step is independently collapsible (thoughts, tools) or always-open (text, permissions)
-- Manages collapse state per message: streaming shows only last 3 tools/thoughts, completed hides all except manually toggled
-- Implements `MemoizedMarkdown` that splits content into settled (memoized) and active (streaming) blocks
-- Detects and renders diffs, ANSI colors, shell JSON, file reads, and raw JSON with priority rendering
-- Supports error markers (`:::ERROR:::...:::END_ERROR:::`) for error reporting
+- Queues `token`, `thought`, and `system_event` payloads per ACP session in `streamQueues[acpSessionId]`.
+- Drains each session queue through `processBuffer` in event, thought, and token phases.
+- Adapts typewriter speed by buffer size while keeping `Message.content` and `Message.timeline` synchronized.
+- Renders a single `Message.timeline` with `thought`, `tool`, `text`, and `permission` steps.
+- Preserves sticky tool metadata across `tool_start`, `tool_update`, and `tool_end` events.
+- Routes shell-run socket events by `shellRunId` into `useShellRunStore` and `ShellToolTerminal`.
+- Renders markdown in stable blocks while streaming and renders tool output through specialized formatters.
 
 ### Why This Matters
+- The timeline is the assistant message contract consumed by rendering, snapshot persistence, fork controls, and permission handling.
+- Event ordering controls whether thoughts, tools, text, and permissions appear in the same order as the agent action stream.
+- Metadata merge rules keep file paths, MCP tool names, shell run IDs, and sub-agent invocation IDs attached to the correct tool step.
+- Markdown and output rendering can be expensive during active streams; memoized settled blocks and typewriter pacing keep the UI responsive.
+- Per-session queue keys prevent cross-session stream bleed when background sessions and sub-agents stream at the same time.
 
-- **Decoupled Render Rate** — Network jitter doesn't cause UI freezes; adaptive speed scales with buffer depth
-- **Unified Timeline** — All streaming output (thoughts, tools, text) appears in chronological order with consistent styling
-- **Collapse Management** — Users can expand tools/thoughts to inspect details without losing context
-- **Memoization** — Completed blocks never re-render; only the in-progress tail updates per tick
-- **Tool Context** — Tool steps preserve file paths, status, output, and timestamps for canvas integration
-- **Smart Rendering** — Output is intelligently formatted (diff > ANSI > JSON > plain text) to maximize readability
+Architectural role: frontend runtime and rendering pipeline, backed by normalized backend stream contracts.
 
 ---
 
-## How It Works — End-to-End
+## How It Works - End-to-End Flow
 
-### Flow A: Token Streaming → Text Bubble
+1. Backend normalizes ACP updates and emits stream events
+- File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`)
+- File: `backend/services/permissionManager.js` (Class: `PermissionManager`, Methods: `handleRequest`, `respond`)
+- Socket events emitted: `token`, `thought`, `system_event`, `stats_push`, `permission_request`.
 
-1. **ACP Daemon Sends Token** — Backend receives `session/update` with type `agent_message_chunk` containing text token.
+```javascript
+// FILE: backend/services/acpUpdateHandler.js (Function: handleUpdate)
+if (update.sessionUpdate === 'agent_message_chunk') {
+  acpClient.io.to('session:' + sessionId).emit('token', { providerId, sessionId, text });
+}
 
-2. **Socket Listener Dispatches** — `useChatManager` socket listener (Lines: 103-160) receives the message and calls `useStreamStore.getState().onStreamToken(data)` (frontend/src/store/useStreamStore.ts:108-132).
+if (update.sessionUpdate === 'agent_thought_chunk') {
+  acpClient.io.to('session:' + sessionId).emit('thought', { providerId, sessionId, text });
+}
 
-3. **Token Queued** — `onStreamToken` (Function: `onStreamToken`, Lines: 108-132) enqueues a queue entry `{type:'token', data: prefix+text}` and sets `isTyping: true` on the session.
+if (update.sessionUpdate === 'tool_call') {
+  acpClient.io.to('session:' + sessionId).emit('system_event', eventToEmit);
+}
+```
 
-4. **processBuffer Processes Phase 3** — `useStreamStore.processBuffer` runs on 32ms timer (Function: `processBuffer`, Lines: 214-416). Phase 1 handles events (immediate), Phase 2 drains thoughts with adaptive speed. Phase 3 (Lines: 360-405) drains token queue.
-   - Calculate adaptive rate: `bufLen > 500 ? bufLen : bufLen > 100 ? ceil(bufLen/3) : max(1, ceil(bufLen/5))` (Line: 361)
-   - Extract `nextChars = batchedText.substring(0, charsPerTick)` (Line: 362)
-   - Push remaining back onto queue if needed (Line: 365)
-   - Append `nextChars` to the active text step or create new text step (Lines: 377-380)
+`handleUpdate` delegates provider-specific update normalization to `providerModule.normalizeUpdate`, provider-specific tool display normalization to `providerModule.normalizeTool`, generic tool identity resolution to `resolveToolInvocation`, and handler enrichment to `toolRegistry.dispatch`.
 
-5. **Message Timeline Updated** — `updateSession.messages` maps over messages, finds `activeMsgId`, updates the last timeline step of type 'text' or creates new step (Lines: 372-385). React detects mutation and schedules re-render.
+2. Permission requests use a separate backend event
+- File: `backend/services/permissionManager.js` (Method: `handleRequest`)
+- File: `frontend/src/store/useChatStore.ts` (Action: `handleRespondPermission`)
+- Socket events: `permission_request`, `respond_permission`, `save_snapshot`.
 
-6. **MemoizedMarkdown Processes** — AssistantMessage renders last text step via `<MemoizedMarkdown content={step.content} isStreaming={!!isStreaming} />` (frontend/src/components/AssistantMessage.tsx:180-184). `splitIntoBlocks` parses content with mdast into top-level blocks (frontend/src/components/MemoizedMarkdown.tsx:34-72):
-   - Parses markdown into mdast tree using gfm extension (Lines: 38-42)
-   - Extracts settled blocks (all except last child) by slicing at position offsets (Lines: 54-65)
-   - Treats last block as "active" (streaming) (Lines: 67-69)
+```javascript
+// FILE: backend/services/permissionManager.js (Method: handleRequest)
+io.to('session:' + sessionId).emit('permission_request', {
+  id,
+  providerId,
+  sessionId,
+  ...params
+});
+```
 
-7. **Settled Blocks Memoized** — Settled blocks render via `MemoizedBlock.displayName = 'MemoizedBlock'` (Line: 24), a React.memo component that never re-renders on content match (Lines: 16-23). Only the active block re-renders each 32ms tick (Lines: 112-117).
+The frontend stores the selected permission option in the matching timeline step and emits `respond_permission` with `providerId`, request `id`, `optionId`, optional `toolCallId`, and `sessionId`.
 
-8. **Active Block Renders** — The active (trailing) block renders as plain ReactMarkdown without memoization, allowing live character-by-character updates (Lines: 113-117). This creates the typewriter effect while settled blocks remain stable.
+3. Socket listeners route stream payloads into stores
+- File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`)
+- Store actions: `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`.
+- Socket events listened to: `thought`, `token`, `system_event`, `permission_request`, `token_done`, `stats_push`.
 
-### Flow B: Tool Call Lifecycle
+```typescript
+// FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager)
+socket.on('thought', onStreamThought);
+socket.on('token', wrappedOnStreamToken);
+socket.on('system_event', onStreamEvent);
+socket.on('permission_request', (event: StreamEventData) => {
+  onStreamEvent({ ...event, type: 'permission_request' });
+});
+```
 
-1. **ACP Emits tool_start** — Backend sends `tool_call` update with status 'in_progress'. Socket listener dispatches `onStreamEvent(event)` (frontend/src/store/useStreamStore.ts:123-141), enqueuing `{type:'event', data: event}` with `isProcessActiveByAcp[sessionId] = true` (Line: 132).
+`permission_request` checks `useSubAgentStore` first. Sub-agent permissions are stored on the matching sub-agent entry; main-session permissions enter the message timeline through `onStreamEvent`.
 
-2. **Phase 1: Event Processing (Immediate)** — `processBuffer` scans queue for events before tokens (Lines: 239-313). **Exception:** If `tool_start` is found but thoughts precede it in queue, processing stops to let thoughts drain first (Lines: 242-243). This prevents thought text from splitting mid-word when the tool_start collapses the thought step.
+4. Assistant placeholder creation anchors each ACP stream
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `ensureAssistantMessage`)
+- Store fields: `activeMsgIdByAcp`, `useSessionLifecycleStore.sessions`.
 
-3. **Process tool_start** — When `tool_start` event is processed (Lines: 250-254):
-   - Collapse all prior steps: `for (let i=0; i<t.length; i++) t[i] = {...t[i], isCollapsed: true}` (Line: 252)
-   - Remove placeholder thought if present: `if (t[0]?.content === '_Thinking..._') t.shift()` (Line: 253)
-   - Create new tool step: `t.push({type: 'tool', event: {...action.data, status: 'in_progress', startTime: Date.now()}, isCollapsed: false})` (Line: 254)
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: ensureAssistantMessage)
+const newMsgId = `assistant-${Date.now()}`;
+set(state => ({
+  activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [acpSessionId]: newMsgId }
+}));
+```
 
-4. **Tool Step Rendered** — `CanvasPane` / `AssistantMessage` renders ToolStep (frontend/src/components/ToolStep.tsx:83-143). Title shows, status indicator appears (Lines: 100-102), expand/collapse button enabled.
+The placeholder message has `role: 'assistant'`, empty `content`, empty `timeline`, `isStreaming: true`, and `turnStartTime`. Every stream mutation for that ACP session targets this active message ID.
 
-5. **tool_update Arrives** — Event with status 'in_progress' but new output. Phase 1 finds existing tool step by id (Lines: 256-257) and merges output (Lines: 286). **Key logic:** If existing output starts with `$ ` (shell streaming), the new output does NOT overwrite (Line: 286): `(existingStep.event.output?.startsWith('$ ') ? existingStep.event.output : output)`. This preserves live shell output.
+5. Tokens and thoughts enqueue per session
+- File: `frontend/src/store/useStreamStore.ts` (Store actions: `onStreamThought`, `onStreamToken`)
+- Queue items: `{ type: 'thought', data }`, `{ type: 'token', data }`.
+- Store fields: `streamQueues`, `isProcessActiveByAcp`, `displayedContentByMsg`.
 
-6. **Tool Title Resolution** — If title changes, picks the best one (Lines: 266-279). Priority:
-   - For `ux_invoke_shell`, prefer `Invoke Shell: <description>` (from `snapshot.description`) if present.
-   - Otherwise, prefer longer/most detailed title.
-   - Prefer titles with colons (filename:args format).
-   - Fall back to appending filename from filePath.
-   This ensures `Invoke Shell: Run test suite` is preferred over a generic `Invoke Shell` or provider-specific command string.
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: onStreamToken)
+if (isProcessActiveByAcp[sessionId]) {
+  const existingContent = activeMsgId ? displayedContentByMsg[activeMsgId] : '';
+  const backticks = (existingContent.match(/`/g) || []).length;
+  if (existingContent.trim().length > 0 && backticks % 2 === 0) {
+    prefix = '\n\n:::RESPONSE_DIVIDER:::\n\n';
+  }
+}
+queue.push({ type: 'token', data: prefix + (text || '') });
+```
 
-7. **_fallbackOutput Cached** — On first tool_update with output, cache as `_fallbackOutput` (Lines: 296-297). Used later during JSONL rehydration if browser reload happens mid-stream.
+`:::RESPONSE_DIVIDER:::` separates prose after tool or event activity. Backtick parity blocks divider insertion while a code span or fence is open.
 
-8. **tool_end Completes** — Event with status 'completed'. Same merge logic as tool_update. If filePath is present and status is 'completed', trigger canvas callbacks (Lines: 301-304): `onFileEdited(filePath)` and if ends with `plan.md`, also `onOpenFileInCanvas(filePath)` (Line: 303).
+6. System events enqueue and mark process activity
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `onStreamEvent`)
+- Queue item: `{ type: 'event', data: StreamEventData }`.
+- Session flag: `isAwaitingPermission` for `permission_request`.
 
-9. **ToolStep Renders Output** — Calls `renderToolOutput(step.event.output)` (frontend/src/components/ToolStep.tsx:126), which applies priority rendering:
-   - **Diff detection** (Lines: renderToolOutput.tsx:52) — If contains unified diff markers, render as colored diff
-   - **Create-only diff** (Lines: 59) — All additions, no removals → render as syntax-highlighted code
-   - **ANSI detection** (Lines: 87) — Contains escape codes → render with ansiToHtml color conversion
-   - **Shell JSON** (Lines: 84) — Extract `{stdout,stderr}` from JSON
-   - **File read** (Lines: 107) — Syntax highlight using file extension, auto-strip line numbers if >80% of lines have them
-   - **JSON** (Lines: 147) — Pretty-print with syntax highlighting
-   - **Fallback** (Line: 158) — Plain `<pre>` text
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: onStreamEvent)
+queue.push({ type: 'event', data: event });
+return {
+  isProcessActiveByAcp: { ...state.isProcessActiveByAcp, [sessionId]: true },
+  streamQueues: { ...state.streamQueues, [sessionId]: queue }
+};
+```
 
-10. **Canvas Hoist Button** — If filePath is detected (Lines: ToolStep.tsx:104-112), show "Open in Canvas" button. Clicking calls `onOpenInCanvas(filePath)`, which emits `canvas_read_file` to read current file state and add to canvas.
+This marker lets the next response token decide whether to insert the response divider.
 
-### Flow C: Thought Streaming
+7. `processBuffer` phase 1 scans events before tokens
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `processBuffer`, Phase 1 event scan)
+- Timeline mutations: permission append, tool append, tool merge.
 
-1. **ACP Emits agent_thought_chunk** — Socket listener dispatches `onStreamThought(data)` (frontend/src/store/useStreamStore.ts:73-88), enqueuing `{type:'thought', data: text || ''}` and setting `isProcessActiveByAcp[sessionId] = true` (Line: 83).
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: processBuffer)
+while (eventScanIdx < queue.length && queue[eventScanIdx].type !== 'token') {
+  if (queue[eventScanIdx].type === 'event') {
+    if (queue[eventScanIdx].data?.type === 'tool_start' && eventScanIdx > 0) break;
+    const action = queue.splice(eventScanIdx, 1)[0];
+    // permission_request, tool_start, tool_update, and tool_end mutate the timeline
+  } else {
+    eventScanIdx++;
+  }
+}
+```
 
-2. **Phase 2: Thought Draining** — After Phase 1 events complete, if queue[0].type === 'thought' (Line: 317), batch all thought items and drain at adaptive speed identical to tokens (Lines: 318-334). New thought step created or last thought step appended (Lines: 341-345).
+Events are processed immediately up to the first token. `tool_start` waits when thoughts precede it so the active thought step can finish as one thought block. `tool_update`, `tool_end`, and `permission_request` can update visible steps without collapsing the active thought.
 
-3. **Phase 1 tool_start Exception** — If a `tool_start` event is encountered while thoughts are in queue, Phase 1 stops (Lines: 242-243). This allows Phase 2 to finish draining thoughts before the tool collapses and hides them.
+8. Tool starts append an in-progress tool step
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `processBuffer`, branch: `type === 'tool_start'`)
+- Helper functions: `shellRunPatch`, `isShellDescriptionTitle`.
 
-### Flow D: Permission Request
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: processBuffer)
+t.push({
+  type: 'tool',
+  event: {
+    ...action.data,
+    ...shellRunPatch(action.data.shellRunId),
+    status: 'in_progress',
+    startTime: Date.now()
+  },
+  isCollapsed: false
+});
+```
 
-1. **ACP Sends permission_request** — Event with `type: 'permission_request'`, `options: [{optionId, name, kind}]`, and optional `toolCall: {toolCallId, title}` (frontend/src/types.ts:204-211).
+All earlier timeline steps are collapsed. If a matching shell snapshot exists in `useShellRunStore.runs`, `shellRunPatch` copies `shellState`, `command`, `cwd`, and the description-derived title into the tool event.
 
-2. **Immediately Queued** — `onStreamEvent` enqueues as event (not held by tool_start exception). Phase 1 processes it (Lines: useStreamStore.ts:250):  `t.push({type: 'permission', request: action.data, isCollapsed: false})`.
+9. Tool updates merge by `SystemEvent.id`
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `processBuffer`, branches: `type === 'tool_update'`, `type === 'tool_end'`)
+- Sticky fields: `title`, `titleSource`, `toolName`, `canonicalName`, `mcpServer`, `mcpToolName`, `isAcpUxTool`, `toolCategory`, `isShellCommand`, `isFileOperation`, `filePath`, `shellRunId`, `invocationId`, `_fallbackOutput`.
 
-3. **PermissionStep Renders** — (frontend/src/components/PermissionStep.tsx:12-47) Shows prompt text from `step.request.toolCall?.title || 'The agent is requesting permission...'` (Line: 24). For each option, render a button with class based on `opt.kind` (allow_always, allow_once, reject_once) (Line: 30). Buttons disabled after response (Line: 32).
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: processBuffer)
+const idx = t.findLastIndex(s => s.type === 'tool' && s.event.id === id);
+t[idx] = {
+  ...existingStep,
+  event: {
+    ...existingStep.event,
+    status: status || existingStep.event.status,
+    output: (existingStep.event.shellRunId ? existingStep.event.output : output) || existingStep.event.output,
+    filePath: filePath || existingStep.event.filePath,
+    title: bestTitle,
+    titleSource: bestTitleSource || action.data.titleSource || existingStep.event.titleSource,
+    toolName: action.data.toolName || existingStep.event.toolName,
+    canonicalName: action.data.canonicalName || existingStep.event.canonicalName
+  },
+  isCollapsed: false
+};
+```
 
-4. **User Responds** — Click triggers `onRespond(step.request.id, opt.optionId, step.request.toolCall?.toolCallId)` (frontend/src/components/AssistantMessage.tsx:148), which calls backend via `socket.emit('respond_permission', ...)`. Backend records response, continues streaming.
+The merge preserves terminal-owned shell output for `shellRunId` steps, keeps authoritative handler titles, carries file context forward, and stores the first streamed output on `_fallbackOutput` for reload paths.
+
+10. File edits can trigger canvas refresh and plan opening
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `processBuffer`, callbacks: `onFileEdited`, `onOpenFileInCanvas`)
+- Callback origins: `useChatManager(scrollToBottom, onFileEdited, onOpenFileInCanvas)`.
+
+When a completed tool update includes `filePath`, `processBuffer` calls `onFileEdited(filePath)`. Paths ending in `plan.md` also call `onOpenFileInCanvas(filePath)` when that callback is provided.
+
+11. `processBuffer` phase 2 drips thought text
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `processBuffer`, Phase 2 thought typewriter)
+- Timeline step: `{ type: 'thought', content, isCollapsed }`.
+
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: processBuffer)
+const thoughtCharsPerTick =
+  thoughtBufLen > 500 ? thoughtBufLen :
+  thoughtBufLen > 100 ? Math.ceil(thoughtBufLen / 3) :
+  Math.max(1, Math.ceil(thoughtBufLen / 5));
+```
+
+Adjacent thought queue items are batched, a partial chunk is appended to an open thought step, and the remaining thought text is unshifted back onto the queue. A `_Thinking..._` placeholder is removed before real thought or text content renders.
+
+12. `processBuffer` phase 3 drips assistant text
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `processBuffer`, Phase 3 token typewriter)
+- Store fields: `displayedContentByMsg`, `settledLengthByMsg`.
+
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (Store action: processBuffer)
+const prevContent = newDisplayedContent[activeMsgId] || '';
+const newContent = prevContent + nextChars;
+newDisplayedContent[activeMsgId] = newContent;
+newSettledLength[activeMsgId] = prevContent.length;
+```
+
+Token chunks update both `message.content` and the latest `text` timeline step. If the latest step is not `text`, existing steps are collapsed and a new `text` step is appended.
+
+13. Stream completion finalizes the active assistant message
+- File: `frontend/src/store/useStreamStore.ts` (Store action: `onStreamDone`)
+- Socket events: `token_done`, `save_snapshot`.
+
+`onStreamDone` waits until the session queue is empty or times out after 10 seconds. It clears `isTyping` when compaction is not active, sets `isStreaming: false`, records `turnEndTime`, marks still-running tools as terminal states, emits `save_snapshot`, and triggers `fetchStats`.
+
+14. Shell-run socket events patch the matching tool step
+- File: `frontend/src/hooks/useChatManager.ts` (Helpers: `patchShellRunToolStep`, `shellRunSnapshotPatch`)
+- File: `frontend/src/store/useShellRunStore.ts` (Actions: `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`)
+- Socket events: `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit`.
+
+```typescript
+// FILE: frontend/src/hooks/useChatManager.ts (Helper: patchShellRunToolStep)
+timeline: message.timeline?.map(entry => {
+  if (entry.type !== 'tool' || entry.event.shellRunId !== runId) return entry;
+  return { ...entry, event: { ...entry.event, ...patch } };
+}) || message.timeline
+```
+
+Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message timeline receives status and display metadata patches without scanning tool titles.
+
+15. Sub-agent events coordinate panel rendering and child sessions
+- File: `frontend/src/hooks/useChatManager.ts` (Handlers: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_completed`, `subAgentSystemHandler`)
+- File: `frontend/src/store/useSubAgentStore.ts` (Actions: `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent`)
+- File: `frontend/src/components/SubAgentPanel.tsx` (Component: `SubAgentPanel`, Prop: `invocationId`)
+
+`sub_agent_started` stores agent metadata and stamps `invocationId` onto the in-progress `ux_invoke_subagents` or `ux_invoke_counsel` tool step. `ToolStep` passes that `invocationId` to `SubAgentPanel`, which filters visible agents to the invocation that created the panel.
+
+16. Message rendering flows through message-list components
+- File: `frontend/src/components/MessageList/MessageList.tsx` (Component: `MessageList`)
+- File: `frontend/src/components/HistoryList.tsx` (Component: `HistoryList`)
+- File: `frontend/src/components/ChatMessage.tsx` (Component: `ChatMessage`)
+- File: `frontend/src/components/AssistantMessage.tsx` (Component: `AssistantMessage`)
+
+`MessageList` selects the active session and slices messages by `visibleCount`. `HistoryList` memoizes message iteration. `ChatMessage` routes divider, user, and assistant messages. Assistant messages receive `localCollapsed`, `toggleCollapse`, `markdownComponents`, `acpSessionId`, and `providerId`.
+
+17. Collapse policy is computed in `ChatMessage`
+- File: `frontend/src/components/ChatMessage.tsx` (State: `localCollapsed`, Ref: `manuallyToggled`)
+- Step fields: `TimelineStep.isCollapsed`.
+
+```typescript
+// FILE: frontend/src/components/ChatMessage.tsx (Component: ChatMessage)
+if (!isStreaming) {
+  if (step.type === 'tool') updates[idx] = true;
+  else if (step.type === 'thought') updates[idx] = true;
+} else {
+  const last3Tools = toolIndices.slice(-3);
+  const last3Thoughts = thoughtIndices.slice(-3);
+  if (step.type === 'tool') updates[idx] = !last3Tools.includes(idx);
+  else if (step.type === 'thought') updates[idx] = !last3Thoughts.includes(idx);
+}
+```
+
+Explicit `step.isCollapsed` values from the stream store take priority unless the user toggles that index. While streaming, the last three tools and thoughts stay expanded by default. After streaming, tools and thoughts collapse by default, text and permissions stay expanded.
+
+18. Assistant timeline steps render by type
+- File: `frontend/src/components/AssistantMessage.tsx` (Component: `AssistantMessage`, Function: `renderContentWithErrors`)
+- Child components: `MemoizedMarkdown`, `ToolStep`, `PermissionStep`.
+
+```tsx
+// FILE: frontend/src/components/AssistantMessage.tsx (Component: AssistantMessage)
+if (step.type === 'text') return renderContentWithErrors(step.content);
+if (step.type === 'permission') return <PermissionStep step={step} onRespond={...} />;
+if (step.type === 'tool') return <ToolStep step={step} ... />;
+```
+
+`AssistantMessage` renders text, tool, permission, and thought steps in timeline order. It also exposes copy-all, fork-from-message, archive, hook-running, elapsed-turn, and fork-overlay UI states.
+
+19. Markdown renders settled blocks and an active tail
+- File: `frontend/src/components/MemoizedMarkdown.tsx` (Component: `MemoizedMarkdown`, Function: `splitIntoBlocks`, Memoized component: `MemoizedBlock`)
+- Libraries: `react-markdown`, `remark-gfm`, `mdast-util-from-markdown`, `micromark-extension-gfm`, `mdast-util-gfm`.
+
+```tsx
+// FILE: frontend/src/components/MemoizedMarkdown.tsx (Component: MemoizedMarkdown)
+const { settled, active } = useMemo(
+  () => (isStreaming ? splitIntoBlocks(content) : { settled: [], active: content }),
+  [content, isStreaming]
+);
+```
+
+Streaming content is parsed into top-level mdast blocks. All blocks except the last one render through `MemoizedBlock`; the last block renders in `.streaming-block`. Completed messages render as a single markdown document.
+
+20. Tool steps route specialized panels and output formatting
+- File: `frontend/src/components/ToolStep.tsx` (Component: `ToolStep`, Function: `getFilePathFromEvent`)
+- File: `frontend/src/components/ShellToolTerminal.tsx` (Component: `ShellToolTerminal`)
+- File: `frontend/src/components/SubAgentPanel.tsx` (Component: `SubAgentPanel`)
+- File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutput`)
+
+`ToolStep` renders AcpUI UX tool branding when `isAcpUxTool` is true, a timer from `useElapsed`, an optional canvas hoist button from `getFilePathFromEvent`, `ShellToolTerminal` for `shellRunId`, `SubAgentPanel` for `ux_invoke_subagents` and `ux_invoke_counsel`, and `renderToolOutput` for non-shell output.
 
 ---
 
 ## Architecture Diagram
 
 ```mermaid
-graph TB
-  subgraph "Backend → Frontend Socket"
-    ACP["ACP Daemon<br/>(AI messages)"]
-    Socket["Socket.IO<br/>(stream events)"]
-  end
+flowchart LR
+  ACP[ACP daemon update] --> BE[backend/services/acpUpdateHandler.js\nhandleUpdate]
+  PERM[ACP permission request] --> PM[backend/services/permissionManager.js\nPermissionManager.handleRequest]
 
-  subgraph "Frontend Stream Pipeline"
-    OnToken["onStreamToken<br/>(enqueue token)"]
-    OnEvent["onStreamEvent<br/>(enqueue event)"]
-    OnThought["onStreamThought<br/>(enqueue thought)"]
-    OnDone["onStreamDone<br/>(finalize turn)"]
-    ProcessBuffer["processBuffer<br/>(3-phase drain)"]
-  end
+  BE -->|token| CM[frontend/src/hooks/useChatManager.ts\nuseChatManager]
+  BE -->|thought| CM
+  BE -->|system_event| CM
+  BE -->|stats_push| CM
+  PM -->|permission_request| CM
 
-  subgraph "Frontend Store & State"
-    StreamStore["useStreamStore<br/>(streamQueues, displayedContent)"]
-    SessionStore["useSessionLifecycleStore<br/>(sessions, messages)"]
-  end
+  CM -->|onStreamThought/onStreamToken/onStreamEvent| SS[frontend/src/store/useStreamStore.ts\nstreamQueues + processBuffer]
+  CM -->|shell_run_*| SH[frontend/src/store/useShellRunStore.ts\nruns by runId]
+  CM -->|sub_agent_*| SA[frontend/src/store/useSubAgentStore.ts\nagents by invocationId]
 
-  subgraph "Frontend UI Rendering"
-    MessageList["MessageList<br/>(visibleCount slice)"]
-    HistoryList["HistoryList<br/>(memo wrapper)"]
-    ChatMessage["ChatMessage<br/>(collapse manager)"]
-    AssistantMsg["AssistantMessage<br/>(timeline router)"]
-    ToolStep["ToolStep<br/>(collapse + output)"]
-    PermissionStep["PermissionStep<br/>(options)"]
-    MemoMarkdown["MemoizedMarkdown<br/>(settled + active)"]
-    RenderOutput["renderToolOutput<br/>(diff/ANSI/JSON)"]
-  end
+  SS --> SL[frontend/src/store/useSessionLifecycleStore.ts\nsessions/messages]
+  SH --> SL
+  SA --> SP[frontend/src/components/SubAgentPanel.tsx]
 
-  ACP -->|tokens/events| Socket
-  Socket -->|listener| OnToken
-  Socket -->|listener| OnEvent
-  Socket -->|listener| OnThought
-  Socket -->|listener| OnDone
-  OnToken -->|enqueue| StreamStore
-  OnEvent -->|enqueue| StreamStore
-  OnThought -->|enqueue| StreamStore
-  ProcessBuffer -->|drain & mutate| StreamStore
-  StreamStore -->|message updates| SessionStore
-  SessionStore -->|render| MessageList
-  MessageList -->|slice messages| HistoryList
-  HistoryList -->|map| ChatMessage
-  ChatMessage -->|route| AssistantMsg
-  AssistantMsg -->|render timeline| ToolStep
-  AssistantMsg -->|render timeline| PermissionStep
-  AssistantMsg -->|render timeline| MemoMarkdown
-  ToolStep -->|render output| RenderOutput
-  MemoMarkdown -->|parse + split| SettledActiveBlocks["Settled blocks<br/>(memoized)<br/>Active block<br/>(streaming)"]
+  SL --> ML[MessageList]
+  ML --> HL[HistoryList]
+  HL --> CMSG[ChatMessage]
+  CMSG --> AMSG[AssistantMessage]
 
-  style StreamStore fill:#e8f5e9
-  style SessionStore fill:#e8f5e9
-  style ProcessBuffer fill:#fff9c4
+  AMSG --> MD[MemoizedMarkdown]
+  AMSG --> TOOL[ToolStep]
+  AMSG --> PERMSTEP[PermissionStep]
+  TOOL --> TERM[ShellToolTerminal]
+  TOOL --> SP
+  TOOL --> OUT[renderToolOutput]
 ```
-
-**Data Flow Caption:** Socket events → useStreamStore queues → processBuffer drains with adaptive speed → Message/timeline mutations → React render → Component tree renders timeline steps → MemoizedMarkdown splits blocks → only active block re-renders each 32ms tick.
 
 ---
 
-## The Critical Contracts
+## The Critical Contract: Timeline Integrity and Event Merge
 
-### Message & Timeline Shape
+The message bubble system depends on the `TimelineStep` contract and per-ACP-session queue ownership.
+
+- File: `frontend/src/types.ts` (Types: `Message`, `TimelineStep`, `SystemEvent`, `PermissionRequest`, `StreamEventData`, `StreamTokenData`)
+- File: `frontend/src/store/useStreamStore.ts` (Store fields: `streamQueues`, `activeMsgIdByAcp`, `displayedContentByMsg`, `settledLengthByMsg`)
 
 ```typescript
-// FILE: frontend/src/types.ts (Lines 228-239)
-export interface Message {
-  id: string;                      // e.g., "assistant-{timestamp}"
-  role: 'user' | 'assistant' | 'system' | 'divider';
-  content: string;                 // Full text content (may contain :::DIVIDER:::)
-  timeline?: TimelineStep[];       // Array of discrete steps
-  isStreaming?: boolean;           // True while receiving new data
-  isArchived?: boolean;            // True if archived
-  turnStartTime?: number;          // Timestamp when turn began
-  turnEndTime?: number;            // Timestamp when turn completed (undefined = still streaming)
-  attachments?: Attachment[];      // User-attached images/files
-}
-
-// FILE: frontend/src/types.ts (Lines 213-217)
-export type TimelineStep = 
+// FILE: frontend/src/types.ts (Type: TimelineStep)
+export type TimelineStep =
   | { type: 'thought'; content: string; isCollapsed?: boolean }
   | { type: 'tool'; event: SystemEvent; isCollapsed?: boolean }
   | { type: 'text'; content: string; isCollapsed?: boolean }
   | { type: 'permission'; request: PermissionRequest; response?: string; isCollapsed?: boolean };
-
-// FILE: frontend/src/types.ts (Lines 175-196)
-export interface SystemEvent {
-  id: string;                      // Event ID
-  title: string;                   // Tool name/action description
-  status: 'in_progress' | 'completed' | 'failed' | 'pending_result';
-  output?: string;                 // Tool output
-  filePath?: string;               // Path if this is a file operation
-  toolCategory?: string;           // e.g., 'file_read', 'file_edit', 'glob'
-  toolName?: string;               // e.g., 'ux_invoke_shell', 'ux_invoke_subagents'
-  canonicalName?: string;          // Authoritative tool name
-  mcpServer?: string;              // MCP server name
-  mcpToolName?: string;            // MCP specific tool name
-  isShellCommand?: boolean;        // True if this is a shell command
-  _fallbackOutput?: string;        // Cached output for JSONL rehydration
-  startTime?: number;              // Timestamp when tool started
-  endTime?: number;                // Timestamp when tool ended (undefined = in_progress)
-  invocationId?: string;           // Sub-agent batch correlation ID
-  shellRunId?: string;             // Shell process correlation ID
-}
 ```
 
-### Adaptive Typewriter Algorithm
+Rules:
+1. Every stream payload targets the ACP session in `sessionId`; queue keys are ACP session IDs, not UI session IDs.
+2. `ensureAssistantMessage` owns the mapping from `activeMsgIdByAcp[acpSessionId]` to the active assistant placeholder.
+3. `tool_update` and `tool_end` merge into the latest tool step whose `event.id` matches `StreamEventData.id`.
+4. Tool merges preserve sticky metadata fields when an update omits them.
+5. Shell-run output is owned by `useShellRunStore` when `SystemEvent.shellRunId` exists; generic tool-end output does not overwrite that transcript path.
+6. `message.content` and the latest `text` timeline step stay synchronized during token drains.
+7. Collapse UI reads `TimelineStep.isCollapsed` and preserves user toggles in `ChatMessage.manuallyToggled` while the component is mounted.
+8. Permission responses update the matching permission timeline step and emit `respond_permission` for the same ACP session.
 
-The buffer drain speed adapts to buffer size:
-
-```typescript
-// FILE: frontend/src/store/useStreamStore.ts (Lines 360-361)
-const bufferLen = batchedText.length;
-const charsPerTick = bufferLen > 500 ? bufferLen : bufferLen > 100 ? Math.ceil(bufferLen / 3) : Math.max(1, Math.ceil(bufferLen / 5));
-```
-
-| Buffer Size | Drain Rate | Reschedule |
-|---|---|---|
-| > 500 chars | Flush entire buffer (1× speed) | 32ms |
-| 100–500 chars | Drain at 1/3 speed | 32ms |
-| < 100 chars | Drain at 1/5 speed | 32ms |
+Breaking this contract causes duplicated tool cards, detached shell transcripts, lost file paths, missing permission state, split thought blocks, stale copy/fork content, or cross-session stream bleed.
 
 ---
 
-## Key Mechanics & Behaviors
+## Configuration / Provider-Specific Behavior
 
-### 1. RESPONSE_DIVIDER Injection
+This is a generic feature doc. Provider-specific behavior reaches the message bubble system only through normalized stream fields and provider hooks.
 
-When a tool event completes and prose follows, inject `\n\n:::RESPONSE_DIVIDER:::\n\n` to visually separate output from text. **Critical:** Only inject when backtick count is even (no open code block).
+### Backend provider hooks
+- File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`)
+- Provider hooks called by `handleUpdate`: `normalizeUpdate`, `extractFilePath`, `extractDiffFromToolCall`, `extractToolOutput`, `normalizeTool`, `categorizeToolCall`.
+- Tool-system anchors: `resolveToolInvocation`, `applyInvocationToEvent`, `toolRegistry.dispatch`, `toolCallState.upsert`.
+
+A provider module must normalize raw ACP updates into generic stream events before the frontend sees them. Tool events should include stable display and identity fields when available:
 
 ```typescript
-// FILE: frontend/src/store/useStreamStore.ts (Lines 101-106)
-let prefix = '';
-if (isProcessActiveByAcp[sessionId]) {
-  const activeMsgId = activeMsgIdByAcp[sessionId];
-  const existingContent = activeMsgId ? displayedContentByMsg[activeMsgId] : '';
-  if (existingContent && existingContent.trim().length > 0) {
-    const backticks = (existingContent.match(/`/g) || []).length;
-    if (backticks % 2 === 0) prefix = '\n\n:::RESPONSE_DIVIDER:::\n\n';
-  }
+// FILE: frontend/src/types.ts (Interface: SystemEvent)
+interface SystemEvent {
+  id: string;
+  title: string;
+  status: 'in_progress' | 'completed' | 'failed' | 'pending_result';
+  output?: string;
+  filePath?: string;
+  toolName?: string;
+  canonicalName?: string;
+  titleSource?: 'unknown' | 'cached' | 'provider' | 'tool_handler' | 'mcp_handler' | string;
+  mcpServer?: string;
+  mcpToolName?: string;
+  isAcpUxTool?: boolean;
+  toolCategory?: string;
+  isShellCommand?: boolean;
+  isFileOperation?: boolean;
+  shellRunId?: string;
+  invocationId?: string;
 }
 ```
 
-Why: If open code fence exists, injecting `:::` inside the fence breaks syntax. The even-backtick check ensures the fence is closed.
+### Frontend feature assumptions
+- `StreamEventData.sessionId` is an ACP session ID.
+- `StreamEventData.type` uses `tool_start`, `tool_update`, `tool_end`, or `permission_request` for timeline mutations.
+- `StreamEventData.id` is stable across a tool start/update/end sequence.
+- `shellRunId` is stable across `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, and `shell_run_exit`.
+- `invocationId` is stable for one sub-agent or counsel invocation and is used by `SubAgentPanel` filtering.
+- `toolCategory` and `isFileOperation` guide `ToolStep.getFilePathFromEvent` and canvas hoisting.
 
-### 2. Tool Title Resolution
+---
 
-When a tool's title might change across updates, choose the best title using a priority system:
+## Data Flow / Rendering Pipeline
 
-```typescript
-// FILE: frontend/src/store/useStreamStore.ts (Lines 266-279)
-let bestTitle = incomingTitle || existingStep.event.title;
-const existingTitle = existingStep.event.title || '';
-
-// Prefer longer titles (more detail)
-if (existingTitle.length > (bestTitle || '').length || 
-    (existingTitle.includes(':') && !bestTitle?.includes(':'))) {
-  bestTitle = existingTitle;
-}
-
-// Append filename if filePath present and not already in title
-if (mergedFilePath) {
-  const filename = mergedFilePath.split(/[/\\]/).pop();
-  if (filename && bestTitle && !bestTitle.toLowerCase().includes(filename.toLowerCase())) {
-    bestTitle += `: ${filename}`;
-  }
-}
+### Token pipeline
+```text
+backend handleUpdate(agent_message_chunk)
+-> socket event token { providerId, sessionId, text }
+-> useChatManager token listener
+-> useStreamStore.onStreamToken
+-> streamQueues[sessionId].push({ type: 'token', data })
+-> useStreamStore.processBuffer token phase
+-> Message.content and latest TimelineStep.text update
+-> AssistantMessage.renderContentWithErrors
+-> MemoizedMarkdown
 ```
 
-### 3. Shell Output Preservation
-
-Tool output starting with `$ ` indicates live shell streaming. Never overwrite it with a later update:
-
-```typescript
-// FILE: frontend/src/store/useStreamStore.ts (Line 286)
-output: (existingStep.event.output?.startsWith('$ ') ? existingStep.event.output : output) || existingStep.event.output,
+### Thought pipeline
+```text
+backend handleUpdate(agent_thought_chunk)
+-> socket event thought { providerId, sessionId, text }
+-> useStreamStore.onStreamThought
+-> streamQueues[sessionId].push({ type: 'thought', data })
+-> useStreamStore.processBuffer thought phase
+-> latest open TimelineStep.thought updates or a new thought step is appended
+-> AssistantMessage thought block
+-> MemoizedMarkdown
 ```
 
-Why: If a shell tool is streaming output in real-time, the `tool_update` events contain partial output. We don't want to replace the accumulated `$ ` output with an intermediate snapshot.
-
-### 4. Collapse Management During Streaming
-
-While streaming, show only the last 3 tools and last 3 thoughts; collapse the rest. After streaming ends, collapse all tools/thoughts unless manually toggled.
-
-```typescript
-// FILE: frontend/src/components/ChatMessage.tsx (Lines 107-120)
-const toolIndices = timeline.map((step, idx) => step.type === 'tool' ? idx : -1).filter(idx => idx !== -1);
-const thoughtIndices = timeline.map((step, idx) => step.type === 'thought' ? idx : -1).filter(idx => idx !== -1);
-const last3Tools = toolIndices.slice(-3);
-const last3Thoughts = thoughtIndices.slice(-3);
-
-timeline.forEach((step, idx) => {
-  if (manuallyToggled.current.has(idx)) return;  // Respect user's toggle
-  if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
-  else if (step.type === 'tool') updates[idx] = !last3Tools.includes(idx);
-  else if (step.type === 'thought') updates[idx] = !last3Thoughts.includes(idx);
-  else if (step.type === 'text') updates[idx] = false;
-});
+### Tool pipeline
+```text
+backend handleUpdate(tool_call or tool_call_update)
+-> provider hooks and tool registry enrich SystemEvent
+-> socket event system_event
+-> useStreamStore.onStreamEvent
+-> processBuffer event phase
+-> TimelineStep.tool append or merge by event.id
+-> ToolStep
+-> ShellToolTerminal, SubAgentPanel, or renderToolOutput
 ```
 
-### 5. manuallyToggled Ref Persistence
-
-User toggles are tracked in a `Set<number>` ref to survive across streaming updates:
-
-```typescript
-// FILE: frontend/src/components/ChatMessage.tsx (Lines 171-177)
-toggleCollapse={(idx) => {
-  manuallyToggled.current.add(idx);
-  setLocalCollapsed(prev => {
-    const current = prev[idx] ?? timeline?.[idx]?.isCollapsed ?? false;
-    return { ...prev, [idx]: !current };
-  });
-}}
+### Shell-run pipeline
+```text
+socket shell_run_prepared/shell_run_snapshot/shell_run_started/shell_run_output/shell_run_exit
+-> useChatManager shell-run handlers
+-> useShellRunStore.upsertSnapshot/markStarted/appendOutput/markExited
+-> useChatManager.patchShellRunToolStep by shellRunId
+-> ToolStep sees event.shellRunId
+-> ShellToolTerminal renders live xterm or read-only terminal output
 ```
 
-The `manuallyToggled` Set is checked in the collapse effect (Line 100) and excluded from auto-sync: if a user manually expands a tool, it stays expanded even when the streaming collapse logic would auto-collapse it.
+### Permission pipeline
+```text
+PermissionManager.handleRequest
+-> socket event permission_request
+-> useChatManager checks useSubAgentStore.agents
+-> main-session permission: useStreamStore.onStreamEvent({ type: 'permission_request' })
+-> processBuffer appends TimelineStep.permission
+-> PermissionStep onRespond
+-> useChatStore.handleRespondPermission
+-> socket event respond_permission and save_snapshot
+```
 
-### 6. renderToolOutput Priority Chain
+### Markdown pipeline
+```text
+TimelineStep.text or TimelineStep.thought content
+-> AssistantMessage.renderContentWithErrors
+-> :::ERROR::: blocks render as error-message-box
+-> :::RESPONSE_DIVIDER::: becomes markdown horizontal rule
+-> MemoizedMarkdown
+-> splitIntoBlocks when streaming
+-> MemoizedBlock for settled blocks and streaming-block for active tail
+```
 
-Tool output is rendered with intelligent fallbacks:
+### Tool output priority
+File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutput`)
 
-1. **Diff Detection** (Lines: renderToolOutput.tsx:52) — Unified diff or Index format
-2. **Create-only Diff** (Lines: 59) — All additions, no removals → syntax-highlighted code
-3. **ANSI Colors** (Lines: 87) — Terminal escape codes → HTML with ansiToHtml
-4. **Shell JSON** (Lines: 84) — Extract `{stdout,stderr}` from JSON wrapper
-5. **File Read** (Lines: 107) — Syntax highlight, auto-strip line numbers if >80%
-6. **JSON** (Lines: 147) — Pretty-print and highlight
-7. **Fallback** (Line: 158) — Plain `<pre>` text
+1. Unified diff output with create-only syntax highlighting when `filePath` is present.
+2. ANSI terminal output with terminal-control cleanup.
+3. Shell JSON objects containing `stdout` or `stderr`.
+4. Structured `web_fetch_result` JSON.
+5. Structured `ux_grep_search_result` JSON.
+6. File-read syntax highlighting by extension from `filePath` with optional displayed line numbers.
+7. Generic JSON pretty print.
+8. Plain `<pre>` output.
 
 ---
 
 ## Component Reference
 
+### Backend
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Stream normalization | `backend/services/acpUpdateHandler.js` | `handleUpdate`, `providerModule.normalizeUpdate`, `providerModule.normalizeTool`, `providerModule.extractToolOutput`, `providerModule.extractFilePath`, `resolveToolInvocation`, `applyInvocationToEvent`, `toolRegistry.dispatch`, `toolCallState.upsert` | Normalizes ACP updates and emits stream/socket events consumed by the frontend timeline. |
+| Permission backend | `backend/services/permissionManager.js` | `PermissionManager.handleRequest`, `PermissionManager.respond`, `pendingPermissions`, socket event `permission_request`, socket event `respond_permission` | Emits permission requests and writes selected ACP permission outcomes back to the daemon transport. |
+| Stream controller | `backend/services/streamController.js` | `drainingSessions`, `statsCaptures`, `onChunk`, `waitForDrain`, `reset` | Supports update draining and silent stats capture paths used before UI stream emission. |
+
+### Frontend Stores and Hooks
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket wiring | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `wrappedOnStreamToken`, `patchShellRunToolStep`, `shellRunSnapshotPatch`, `subAgentSystemHandler`, socket events `thought`, `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes socket events into stream, shell-run, sub-agent, notification, and session stores. |
+| Stream engine | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`, `shellRunPatch`, `isShellDescriptionTitle` | Owns stream queues, adaptive typewriter mutation, event merge logic, and active assistant message mapping. |
+| Shell run state | `frontend/src/store/useShellRunStore.ts` | `ShellRunSnapshot`, `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`, `trimShellTranscript`, `pruneShellRuns` | Stores live shell transcripts and shell-run metadata by `runId`. |
+| Permission response | `frontend/src/store/useChatStore.ts` | `handleRespondPermission`, socket event `respond_permission`, socket event `save_snapshot` | Updates permission timeline responses and emits ACP permission selections. |
+| Session state | `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId`, `setSessions`, `fetchStats` | Holds `ChatSession.messages` and active-session state used by message rendering. |
+| Sub-agent state | `frontend/src/store/useSubAgentStore.ts` | `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent` | Stores sub-agent cards, sub-agent tool steps, and sub-agent permission state for `SubAgentPanel`. |
+
 ### Frontend Components
-
-| Component | File | Lines | Purpose |
+| Area | File | Anchors | Purpose |
 |---|---|---|---|
-| **MessageList** | frontend/src/components/MessageList/MessageList.tsx | 18-92 | Main chat container; slices messages by visibleCount; renders HistoryList + load-more button |
-| **HistoryList** | frontend/src/components/HistoryList.tsx | 11-26 | memo-wrapped; maps Message[] to ChatMessage components |
-| **ChatMessage** | frontend/src/components/ChatMessage.tsx | 89-183 | Routes to UserMessage or AssistantMessage; manages collapse state + manuallyToggled Set; defines CodeBlock for syntax highlighting |
-| **UserMessage** | frontend/src/components/UserMessage.tsx | 11-40 | Renders user content + attachments (images, files); uses ReactMarkdown with custom components |
-| **AssistantMessage** | frontend/src/components/AssistantMessage.tsx | 50-216 | Renders assistant messages with unified timeline; maps TimelineStep to ToolStep/PermissionStep/MemoizedMarkdown; handles copy all, fork, error rendering |
-| **ToolStep** | frontend/src/components/ToolStep.tsx | 83-143 | Renders tool execution step; uses `canonicalName` for UI behavior (e.g., `SubAgentPanel`); detectsFilePath for canvas hoist button; renders renderToolOutput; shows ToolSubAgentPanel if ux_invoke_subagents |
-| **PermissionStep** | frontend/src/components/PermissionStep.tsx | 12-47 | Renders permission request with option buttons; disables after response |
-| **MemoizedMarkdown** | frontend/src/components/MemoizedMarkdown.tsx | 87-123 | Parses content with mdast; splits into settled + active blocks; memoizes settled, streams active |
-| **MemoizedBlock** | frontend/src/components/MemoizedMarkdown.tsx | 16-23 | React.memo wrapper; never re-renders if content unchanged |
-| **renderToolOutput** | frontend/src/components/renderToolOutput.tsx | 49-161 | Priority renderer for tool output (diff > ANSI > JSON > file > plain) |
-| **CodeBlock** | frontend/src/components/ChatMessage.tsx | 44-87 | Syntax highlighting for code in markdown; Copy button + Canvas button (if canvas open) |
-| **ShellToolTerminal** | frontend/src/components/ShellToolTerminal.tsx | — | Interactive shell xterm renderer; auto-focuses active session terminals; sanitized ANSI-colored read-only transcript |
+| Message list | `frontend/src/components/MessageList/MessageList.tsx` | `MessageList`, `visibleCount`, `HistoryList` | Selects active session messages, supports lazy visible-count expansion, and renders the chat scroll area. |
+| Message iteration | `frontend/src/components/HistoryList.tsx` | `HistoryList`, `React.memo`, `ChatMessage` | Memoized mapping from `Message[]` to `ChatMessage` components. |
+| Message router | `frontend/src/components/ChatMessage.tsx` | `ChatMessage`, `CodeBlock`, `copyToClipboard`, `localCollapsed`, `manuallyToggled`, `markdownComponents` | Routes message roles, computes collapse defaults, renders code-block copy/canvas controls, and passes markdown overrides. |
+| Assistant renderer | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `renderContentWithErrors`, `handleCopyAll`, `handleFork` | Renders timeline steps, provider branding, copy, fork, archive, hook-running, elapsed-turn, and fallback content states. |
+| Markdown renderer | `frontend/src/components/MemoizedMarkdown.tsx` | `MemoizedMarkdown`, `splitIntoBlocks`, `MemoizedBlock` | Parses markdown to mdast, memoizes settled streaming blocks, and renders active markdown tails. |
+| Tool renderer | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `ShellToolTerminal`, `SubAgentPanel`, `renderToolOutput` | Renders tool headers, collapse content, canvas hoist buttons, shell terminals, sub-agent panels, and formatted output. |
+| Permission renderer | `frontend/src/components/PermissionStep.tsx` | `PermissionStep`, `onRespond`, `PermissionTimelineStep` | Renders permission options and disables buttons when a response is recorded. |
+| Shell terminal | `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal`, `fallbackRunFromEvent`, `getReadOnlyTerminalHtml`, `getTranscriptWritePlan`, `emitResize`, `stopRun` | Renders live xterm sessions, read-only terminal output, stdin, paste, resize, and kill controls. |
+| Output formatting | `frontend/src/components/renderToolOutput.tsx` | `renderToolOutput`, `tryExtractShellOutput`, `tryParseJsonObject`, `isWebFetchResult`, `isGrepSearchResult`, `renderHighlightedMatch`, `getLangFromPath` | Converts raw tool output into diff, ANSI, structured, syntax-highlighted, JSON, or plain output. |
+| Sub-agent panel | `frontend/src/components/SubAgentPanel.tsx` | `SubAgentPanel`, `invocationId` | Displays only sub-agents associated with the invoking tool step. |
+| Styling | `frontend/src/components/ChatMessage.css` | `.unified-timeline`, `.timeline-step`, `.response-divider`, `.system-event`, `.tool-output-container`, `.permission-step`, `.shell-tool-terminal` | Defines message bubble, timeline, divider, tool, permission, and terminal presentation. |
 
-### Frontend Stores & Hooks
-
-| Store / Hook | File | Lines | Purpose |
+### Types and Contracts
+| Area | File | Anchors | Purpose |
 |---|---|---|---|
-| **useStreamStore** | frontend/src/store/useStreamStore.ts | 38-403 | Manages streamQueues, processBuffer, adaptive typewriter, turn finalization |
-| **ensureAssistantMessage** | frontend/src/store/useStreamStore.ts | 47-71 | Lazily creates placeholder assistant message for new ACP session |
-| **onStreamToken** | frontend/src/store/useStreamStore.ts | 95-121 | Enqueues token with RESPONSE_DIVIDER injection logic |
-| **onStreamThought** | frontend/src/store/useStreamStore.ts | 73-88 | Enqueues thought item; sets isTyping flag |
-| **onStreamEvent** | frontend/src/store/useStreamStore.ts | 123-141 | Enqueues tool/permission event; sets isAwaitingPermission if permission_request |
-| **onStreamDone** | frontend/src/store/useStreamStore.ts | 143-192 | Finalizes turn; polls queue drain with 50ms interval, 10s timeout; saves snapshot |
-| **processBuffer** | frontend/src/store/useStreamStore.ts | 199-402 | Three-phase drain: Phase 1 (events), Phase 2 (thoughts), Phase 3 (tokens); reschedules at 32ms |
-| **useElapsed** | frontend/src/utils/timer.ts | 12-25 | Hook: live timer during streaming, frozen after turn ends |
-| **formatDuration** | frontend/src/utils/timer.ts | 3-10 | Format milliseconds as "XXms", "XXs", "XXm YYs" |
+| Stream types | `frontend/src/types.ts` | `StreamTokenData`, `StreamEventData`, `StreamDoneData`, `StatsPushData` | Socket payload contracts for stream listeners. |
+| Timeline types | `frontend/src/types.ts` | `SystemEvent`, `PermissionOption`, `PermissionRequest`, `TimelineStep`, `Message`, `ChatSession` | Rendering and persistence data shapes used by the timeline. |
 
 ---
 
 ## Gotchas & Important Notes
 
-1. **tool_start Held If Thoughts Precede It**
-   - **What:** Phase 1 stops if `tool_start` event is encountered and thoughts are still queued (Lines: useStreamStore.ts:242-243).
-   - **Why:** Without this, Phase 2 drains thoughts after tool_start collapses the thought step, splitting thought text mid-word.
-   - **How to avoid:** Write Phase 1 logic as shown; don't process tool_start immediately if thoughts are in queue.
+1. `tool_start` waits behind queued thoughts when thoughts come first.
+   - What goes wrong: thoughts split into multiple blocks or appear after a tool card.
+   - Why it happens: a tool start collapses the active thought step before Phase 2 can append remaining thought text.
+   - How to avoid it: keep the `tool_start` defer branch in `processBuffer` when `eventScanIdx > 0`.
 
-2. **RESPONSE_DIVIDER Injection Requires Even Backtick Count**
-   - **What:** If backtick count in existing content is odd, don't inject `:::RESPONSE_DIVIDER:::` (Lines: 105-106).
-   - **Why:** Injecting inside an open code fence breaks the fence syntax.
-   - **How to avoid:** Always check backtick parity before injecting divider.
+2. Queue keys are ACP session IDs.
+   - What goes wrong: background sessions, pop-outs, or sub-agents receive another session's text or tool steps.
+   - Why it happens: UI session IDs and ACP session IDs are both present in frontend state.
+   - How to avoid it: use `StreamTokenData.sessionId`, `StreamEventData.sessionId`, and `ChatSession.acpSessionId` for stream queue ownership.
 
-3. **Shell Output with $ Prefix Is Never Overwritten**
-   - **What:** If tool output starts with `$ ` (live shell streaming), later `tool_update` payloads don't replace it (Line: 286).
-   - **Why:** Live shell output is accumulated in real-time; final updates shouldn't truncate it.
-   - **How to avoid:** Don't assume tool_update always has the final output; check for `$ ` prefix.
+3. Divider injection depends on rendered content and backtick parity.
+   - What goes wrong: `:::RESPONSE_DIVIDER:::` can split an active code block or fail to separate prose after tools.
+   - Why it happens: divider insertion uses `displayedContentByMsg[activeMsgId]`, not the raw queue.
+   - How to avoid it: preserve the existing backtick-count check in `onStreamToken`.
 
-4. **_fallbackOutput Only Set on First tool_update**
-   - **What:** Cached on the first `tool_update` with output, not on subsequent updates (Lines: 296-297).
-   - **Why:** For JSONL rehydration; avoids redundant caching.
-   - **How to avoid:** Don't rely on _fallbackOutput after tool completion; it's a best-effort snapshot.
+4. Shell-run tool output is terminal-owned when `shellRunId` exists.
+   - What goes wrong: `tool_end` output replaces the live terminal transcript or duplicates final text.
+   - Why it happens: shell transcript data flows through `useShellRunStore`, not generic `SystemEvent.output` merges.
+   - How to avoid it: keep the `existingStep.event.shellRunId ? existingStep.event.output : output` merge rule.
 
-5. **MemoizedBlock Never Re-renders on Same Content**
-   - **What:** React.memo comparison uses content equality; no re-render if content string is identical (Lines: MemoizedMarkdown.tsx:22).
-   - **Why:** Prevents re-parsing settled markdown blocks.
-   - **How to avoid:** Never mutate settled block content in-place; always create a new string.
+5. Tool titles have source precedence.
+   - What goes wrong: raw tool IDs replace descriptive titles, or shell description titles are lost.
+   - Why it happens: provider updates can arrive with shorter, longer, or less useful titles at different phases.
+   - How to avoid it: preserve `titleSource` rules for `mcp_handler`, `tool_handler`, shell description titles, detailed titles, and file-path suffixing.
 
-6. **visibleCount Slice Truncates Old Messages**
-   - **What:** MessageList renders only `messages.slice(-visibleCount)` (Lines: MessageList.tsx:32). Old messages are hidden until "Load previous" is clicked.
-   - **Why:** Improves render performance for long conversations.
-   - **How to avoid:** Ensure test setup loads all messages if needed; call `incrementVisibleCount(10)` to load more.
+6. `_fallbackOutput` is a reload fallback field.
+   - What goes wrong: rehydrated tool steps lose streamed progress output when a final event omits output.
+   - Why it happens: some tools emit progress in `tool_update` and a status-only `tool_end`.
+   - How to avoid it: keep caching the first `tool_update` output when `_fallbackOutput` is empty.
 
-7. **isStreaming Flag Controls MemoizedMarkdown Mode**
-   - **What:** `MemoizedMarkdown` checks `isStreaming` to determine whether to split blocks or render as single doc (Line: 89).
-   - **Why:** While streaming, split into settled+active; after done, render full content for correctness.
-   - **How to avoid:** Always pass correct isStreaming value; don't forget to set `isStreaming: false` after turn ends.
+7. `Message.content` and timeline text must update together.
+   - What goes wrong: copy-all, fork-from-message, fallback rendering, and snapshot persistence diverge from visible text.
+   - Why it happens: `AssistantMessage` uses timeline text for rendering and `message.content` for copy/fork/fallback paths.
+   - How to avoid it: update both `message.content` and latest `TimelineStep.text.content` in the token phase.
 
-8. **manuallyToggled Set Resets on Component Unmount**
-   - **What:** The Set is declared at function scope in ChatMessage; unmounting the component loses the Set (Lines: ChatMessage.tsx:91).
-   - **Why:** Collapse state is per-render, not persisted to DB.
-   - **How to avoid:** Page reload clears all manual toggle overrides; this is by design (don't expect persistence).
+8. Manual collapse overrides are component-local.
+   - What goes wrong: a user-expanded tool collapses during streaming updates.
+   - Why it happens: stream changes recompute defaults from `timeline` and `isStreaming`.
+   - How to avoid it: keep `manuallyToggled` checks before applying automatic collapse updates in `ChatMessage`.
 
-9. **onStreamDone Polls Queue with 50ms Interval, 10s Timeout**
-   - **What:** Finalization checks if queue is empty every 50ms; if not empty after 10s, force finalize (Lines: onStreamDone:153-191).
-   - **Why:** Prevents hanging if processBuffer stalls.
-   - **How to avoid:** Keep processBuffer executing reliably; don't create bottlenecks that would trigger the timeout.
+9. Permission steps need the ACP session ID on response.
+   - What goes wrong: the selected option is recorded in the UI but the daemon does not receive the permission response.
+   - Why it happens: `handleRespondPermission` filters sessions by `acpSessionId` and emits `respond_permission` with `sessionId`.
+   - How to avoid it: pass `acpSessionId` from `AssistantMessage` to `handleRespondPermission`.
 
-10. **processBuffer is Self-Rescheduling setTimeout, Not setInterval**
-    - **What:** At end of each drain, `setTimeout(..., 32)` is called (Line: 401), not setInterval (Lines: 401).
-    - **Why:** Self-rescheduling allows dynamic timing and graceful termination when queue is empty.
-    - **How to avoid:** Check that queue drain completes; if stuck, the timeout loop will still tick but do nothing.
+10. Sub-agent panels filter by invocation ID.
+    - What goes wrong: a tool step displays agents from another invocation.
+    - Why it happens: `SubAgentPanel` filters by `invocationId`, and `useChatManager` stamps that field onto the in-progress tool step.
+    - How to avoid it: keep `sub_agent_started` invocation stamping and pass `step.event.invocationId` from `ToolStep`.
 
 ---
 
 ## Unit Tests
 
-### Backend Tests
-- N/A (streaming is pure frontend logic)
+### Backend stream and permission contracts
+- `backend/test/acpUpdateHandler.test.js`
+  - `handles agent_thought_chunk`
+  - `handles tool_call start`
+  - `prepares shell run metadata for ux_invoke_shell tool starts`
+  - `preserves a shell description title after provider normalization on updates`
+  - `updates shell title when provider exposes description after tool start`
+  - `handles tool_call_update with Json output`
+  - `falls back to standard ACP content for tool output`
+  - `restores tool title from cache if missing in update`
+  - `assigns lastSubAgentParentAcpId for sub-agent spawning tools`
+  - `handles diff fallback in tool_call_update`
+  - `skips path resolution for paths with ellipses`
+- `backend/test/permissionManager.test.js`
+  - `should track requests and emit to correct session room`
+  - `should correlate approval and send correct JSON-RPC result`
+  - `should correlate rejection and send cancelled outcome`
+  - `should support out-of-order responses across sessions`
+- `backend/test/streamController.test.js`
+  - `should stay in draining state as long as chunks arrive`
+  - `should support multiple concurrent draining sessions with independent timers`
+  - `should isolate stats capture buffers between sessions`
 
-### Frontend Tests
+### Stream store and socket wiring
+- `frontend/src/test/useStreamStore.test.ts`
+  - `ensureAssistantMessage creates a placeholder message`
+  - `onStreamToken queues text and triggers typewriter`
+  - `onStreamToken injects RESPONSE_DIVIDER after tool processing`
+  - `processBuffer drains queue into session messages with adaptive speed`
+  - `processBuffer flushes large buffers immediately`
+  - `onStreamEvent handles tool_start and collapses previous steps`
+  - `hydrates queued shell tool_start from an existing shell snapshot`
+  - `prefers MCP handler titles over longer raw provider titles`
+  - `preserves Shell V2 terminal output on tool_end by shellRunId`
+  - `preserves Shell V2 description title over later command titles`
+  - `processBuffer removes Thinking placeholder when real thoughts or tokens arrive`
+  - `onStreamDone marks message as finished and saves snapshot`
+- `frontend/src/test/typewriter-adaptive.test.ts`
+  - `should increase speed when buffer is large`
+  - `should drip thoughts at adaptive speed`
+- `frontend/src/test/streamConcurrency.test.ts`
+  - `tokens for two sessions are queued independently and in order`
+  - `processBuffer writes tokens only to the correct session messages`
+  - `activeMsgIdByAcp maps each ACP session to the correct message placeholder`
+  - `tool events for session A do not create timeline entries in session B`
+  - `concurrent tool events for different sessions are tracked independently`
+- `frontend/src/test/useChatManager.test.ts`
+  - `handles "permission_request" for sub-agent`
+  - `handles Shell V2 socket events by explicit shellRunId`
+  - `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`
+  - `creates lazy sub-agent session with provider on first token`
+  - `creates lazy sub-agent session with provider on first system_event`
+  - `routes system_event tool_start/tool_end to sub-agent store`
+  - `handles "token_done" event`
+- `frontend/src/test/useChatStore.test.ts`
+  - `updates permission step and emits to socket`
+- `frontend/src/test/useChatStoreExtended.test.ts`
+  - `updates specific permission step and emits save_snapshot`
 
-| File | Lines | Key Tests |
-|---|---|---|
-| **ChatMessage.test.tsx** | 669 | Routes to UserMessage/AssistantMessage; CodeBlock renders; collapse state logic; canvas button visibility |
-| **AssistantMessage.test.tsx** | 229 | Timeline rendering; copy all button; fork button; error message boxes; timer display |
-| **AssistantMessageCollapse.test.tsx** | — | Collapse state during streaming; last-3 rule; manual toggle persistence |
-| **AssistantMessageExtended.test.tsx** | — | Permission steps; tool step rendering; tool status indicators |
-| **UserMessage.test.tsx** | — | Attachment rendering (images, files); markdown content |
-| **MessageList.test.tsx** | — | Slice by visibleCount; load-more button; empty state |
-| **useStreamStore.test.ts** | 196 | ensureAssistantMessage; onStreamToken; onStreamEvent; processBuffer draining; collapse logic |
+### Message, markdown, permission, and tool rendering
+- `frontend/src/test/ChatMessage.test.tsx`
+  - `renders assistant message correctly with interleaved timeline`
+  - `collapses tool calls and thought bubbles when streaming is finished`
+  - `respects explicit thought collapse state from the streaming timeline`
+  - `keeps only the last 3 tool calls and last 3 thought bubbles expanded while streaming`
+  - `renders response dividers`
+  - `respects manual toggle during timeline updates while streaming`
+  - `respects manual toggle after streaming stops`
+- `frontend/src/test/AssistantMessage.test.tsx`
+  - `renders text timeline step content`
+  - `renders tool step with title`
+  - `renders thought timeline step with Thinking Process header`
+  - `renders response divider from ::: marker`
+  - `renders fallback content when no timeline text steps`
+  - `renders permission step in timeline`
+  - `does not render fork button for sub-agent sessions`
+- `frontend/src/test/AssistantMessageExtended.test.tsx`
+  - `renders correctly with multiple timeline steps`
+  - `handles copy button click`
+  - `handles fork button click`
+  - `renders permission step and handles response`
+  - `shows error messages with special box`
+  - `hides fork button for sub-agents`
+- `frontend/src/test/AssistantMessageCollapse.test.tsx`
+  - `toggles thought step collapse when clicking header`
+  - `renders collapsed thought step without content`
+- `frontend/src/test/PermissionStep.test.tsx`
+  - `calls onRespond with (requestId, optionId, toolCallId) on click`
+  - `passes undefined as toolCallId when toolCall is absent`
+  - `all buttons are disabled once step.response is set`
+  - `shows the selected option in a confirmation message after response`
+- `frontend/src/test/MemoizedMarkdown.test.tsx`
+  - `renders markdown content`
+  - `memoizes completed blocks during streaming`
+  - `renders full content when not streaming`
+  - `when isStreaming=true with multiple blocks, only the last block has streaming-block class`
+
+### Tool output, shell terminal, and sub-agent rendering
+- `frontend/src/test/ToolStep.test.tsx`
+  - `uses the AcpUI UX icon for ux tools`
+  - `shows output when expanded and output exists`
+  - `auto-scrolls live shell output to the bottom when output changes`
+  - `shows canvas button when filePath exists`
+  - `passes invocationId to SubAgentPanel for ux_invoke_subagents`
+  - `uses canonicalName to render SubAgentPanel when provider toolName is generic`
+  - `passes invocationId to SubAgentPanel for ux_invoke_counsel`
+  - `renders ShellToolTerminal for Shell V2 tool steps`
+  - `returns undefined for shell commands`
+  - `returns undefined for non-file AcpUI UX tools even when a file path is present`
+  - `canvas hoist button calls onOpenInCanvas with extracted path`
+- `frontend/src/test/renderToolOutput.test.tsx`
+  - `renders simple text output`
+  - `renders JSON output`
+  - `handles empty or null output`
+  - `renders structured web fetch output`
+  - `renders structured grep search output`
+- `frontend/src/test/renderToolOutput-ansi.test.tsx`
+  - `renders ANSI colored output as HTML with color spans`
+  - `strips terminal noise (cursor, window title) but keeps colors`
+  - `does not use ANSI path for shell JSON output`
+- `frontend/src/test/ShellToolTerminal.test.tsx`
+  - `replays transcript into xterm without spawning a terminal`
+  - `paces xterm writes until the previous write callback completes`
+  - `splits large transcript writes into bounded xterm chunks`
+  - `renders completed runs as read-only text without creating xterm`
+  - `prefers colored stored transcript over plain final output after exit`
+  - `sends input only while running`
+  - `sends clipboard paste through shell_run_input`
+  - `emits resize from fitted xterm dimensions`
+  - `sends stop command and disables stop after exit`
+- `frontend/src/test/SubAgentPanel.test.tsx`
+  - `renders nothing when invocationId is undefined`
+  - `renders nothing when invocationId does not match any agent`
+  - `renders only agents matching the invocationId`
+  - `renders tool steps`
+  - `renders permission buttons`
+- `frontend/src/test/MessageList.test.tsx`
+  - `renders messages via HistoryList when available`
+  - `shows load more button when hasMoreMessages is true`
+  - `renders empty state with provider-specific branding message`
+- `frontend/src/test/ChronologicalStream.test.tsx`
+  - `should stream thoughts, tools, and response in one vertical timeline with smart collapsing`
 
 ---
 
 ## How to Use This Guide
 
-### For Implementing Features
+### For implementing/extending this feature
+1. Start with `frontend/src/types.ts` and confirm the `TimelineStep`, `SystemEvent`, and `StreamEventData` fields needed by the change.
+2. Update backend normalization in `backend/services/acpUpdateHandler.js` only if the socket payload contract needs additional normalized fields.
+3. Update queue and merge behavior in `frontend/src/store/useStreamStore.ts` before changing rendering components.
+4. Keep socket event routing in `frontend/src/hooks/useChatManager.ts` aligned with stream, shell-run, sub-agent, and permission store ownership.
+5. Update `ChatMessage` collapse defaults only when the step-level collapse contract changes.
+6. Update `AssistantMessage`, `ToolStep`, `PermissionStep`, `MemoizedMarkdown`, or `renderToolOutput` based on the step type or output shape being rendered.
+7. Add or update tests at the store layer first, then component tests, then backend event-contract tests when socket payloads change.
 
-1. **Understand the data contracts** — Read Message, TimelineStep, SystemEvent shapes in Section 3.
-2. **Trace a flow** — Follow one of the four flows (token, tool, thought, permission) to understand the end-to-end path.
-3. **Reference exact line numbers** — Use the Component Reference table to jump to code.
-4. **Study the gotchas** — Before implementing collapse logic, output rendering, or streaming updates, review the gotchas.
-5. **Write tests** — Add test cases to the files listed above; verify your feature integrates with the existing pipeline.
-
-### For Debugging Issues
-
-1. **Check the logs** — Look for `[DB]`, `[FS]`, `[TERM]` entries in the backend log.
-2. **Inspect the store** — Use React DevTools to inspect `useStreamStore` and `useSessionLifecycleStore` state in real-time.
-3. **Trace the queue** — Add logging to `processBuffer` to see what's in the queue and how it's drained.
-4. **Verify collapse state** — Ensure `manuallyToggled` Set is being managed correctly.
-5. **Check rendering** — Use React DevTools Profiler to verify MemoizedMarkdown splitting and memoization behavior.
-6. **Browser console** — Watch for markdown parsing errors from mdast; check ReactMarkdown component errors.
+### For debugging issues with this feature
+1. Capture the socket payload and confirm `sessionId`, event name, `type`, `id`, `shellRunId`, and `invocationId`.
+2. Inspect `useStreamStore.streamQueues[sessionId]` and `activeMsgIdByAcp[sessionId]`.
+3. Check the active assistant message in `useSessionLifecycleStore.sessions[].messages[]` and inspect its `timeline`.
+4. For missing or incorrect tool display, inspect `SystemEvent.title`, `titleSource`, `toolName`, `canonicalName`, `filePath`, `shellRunId`, and `toolCategory`.
+5. For shell output issues, inspect `useShellRunStore.runs[runId]` and the `patchShellRunToolStep` path in `useChatManager`.
+6. For sub-agent panel issues, inspect `useSubAgentStore.agents[].invocationId` and the invoking tool step's `event.invocationId`.
+7. For markdown rendering issues, isolate `MemoizedMarkdown.splitIntoBlocks` and compare streaming versus completed rendering.
+8. For permission issues, trace `permission_request` through `PermissionStep.onRespond` and `useChatStore.handleRespondPermission`.
+9. Reproduce with multi-session tests when the bug involves inactive sessions, background streams, or sub-agents.
 
 ---
 
 ## Summary
 
-The message bubble UI and typewriter system work together to create smooth, live-streaming chat:
-
-- **Typewriter decouples arrival from render** — Socket events are queued and drained at adaptive speed (32ms ticks, speed scaling with buffer depth).
-- **Three-phase processing** — Events are immediate, thoughts and tokens drain with adaptive typewriter effect.
-- **Unified timeline** — Messages contain TimelineSteps (thoughts, tools, text, permissions) that render as discrete, collapsible bubbles.
-- **Smart output rendering** — Tool output uses priority-based formatting (diff > ANSI > JSON > file > plain).
-- **Memoized markdown** — Settled blocks never re-render; only the active (streaming) tail updates per tick.
-- **Collapse management** — Streaming shows last 3 tools/thoughts; completed hides all unless manually toggled.
-- **Tool context preservation** — File paths, status, output, and timestamps enable canvas integration.
-- **Critical contracts** — Message shape, TimelineStep union, SystemEvent, and adaptive algorithm are invariant.
-
-With this doc, an agent can implement streaming optimizations, add new timeline step types, enhance output rendering, or debug streaming/rendering issues with confidence.
+- Backend ACP updates become normalized `token`, `thought`, `system_event`, `stats_push`, and `permission_request` socket events.
+- `useChatManager` routes socket events into stream, shell-run, sub-agent, permission, and session stores.
+- `useStreamStore` owns per-ACP-session queues and drains them in event, thought, and token phases.
+- `TimelineStep` is the rendering contract for assistant thoughts, tools, text, and permissions.
+- Tool updates merge by `SystemEvent.id` and preserve sticky display, identity, file, shell, and sub-agent metadata.
+- Shell-run transcripts are keyed by `shellRunId` in `useShellRunStore` and rendered by `ShellToolTerminal`.
+- `ChatMessage` owns collapse defaults and manual toggles; `AssistantMessage` owns timeline step dispatch.
+- `MemoizedMarkdown` memoizes settled streaming blocks; `renderToolOutput` chooses specialized output renderers before generic output paths.
+- Tests cover backend event contracts, stream queue behavior, multi-session isolation, collapse logic, markdown rendering, tool formatting, shell terminals, permissions, and sub-agent panels.

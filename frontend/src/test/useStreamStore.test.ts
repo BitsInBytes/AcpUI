@@ -175,6 +175,74 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(tool.event.title).toBe('Detailed: file.ts');
   });
 
+  it('prefers MCP handler titles over longer raw provider titles', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 't1',
+        title: 'AcpUI/ux_grep_search: Find all project matches',
+        toolName: 'ux_grep_search',
+        isAcpUxTool: true
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_update',
+        id: 't1',
+        title: 'Search: Project matches',
+        titleSource: 'mcp_handler',
+        canonicalName: 'ux_grep_search'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_update',
+        id: 't1',
+        title: 'AcpUI/ux_grep_search: Later provider title',
+        titleSource: 'provider',
+        canonicalName: 'ux_grep_search'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const tool = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline![0] as any;
+    expect(tool.event.title).toBe('Search: Project matches');
+    expect(tool.event.titleSource).toBe('mcp_handler');
+    expect(tool.event.isAcpUxTool).toBe(true);
+  });
+
+  it('prefers detailed AcpUI provider titles over raw tool headers', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 't1',
+        title: 'AcpUI/ux_grep_search: Find hooks',
+        toolName: 'ux_grep_search',
+        isAcpUxTool: true
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_update',
+        id: 't1',
+        title: 'Search: Find hooks',
+        titleSource: 'provider',
+        canonicalName: 'ux_grep_search'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const tool = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline![0] as any;
+    expect(tool.event.title).toBe('Search: Find hooks');
+  });
+
   it('onStreamEvent handles tool_update and caches fallback output', () => {
     act(() => {
       useStreamStore.getState().ensureAssistantMessage('a1');

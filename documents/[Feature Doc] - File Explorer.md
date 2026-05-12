@@ -1,97 +1,286 @@
 # File Explorer
 
-A full-screen modal file browser accessible from the ChatHeader. Provides tree-based directory navigation, code editing via Monaco editor, markdown preview, and file persistence via socket-driven I/O with backend safePath validation.
+A full-screen file browser modal that opens from `ChatHeader`, lists provider-scoped files through Socket.IO, renders files in Monaco or markdown preview mode, and writes edits back through backend path validation.
 
-**Why this matters:** The File Explorer is the primary way users browse and edit project files within AcpUI without leaving the chat interface. Understanding its architecture is critical for extending file operations, debugging rendering issues, or implementing provider-specific path handling.
-
----
+This guide matters because File Explorer combines UI state, provider selection, filesystem access, and save semantics. Most mistakes in this area come from stale assumptions about socket payload shapes, provider root resolution, or when frontend dirty state is cleared.
 
 ## Overview
 
 ### What It Does
 
-- **Tree-based directory navigation** — Display files and folders in an expandable tree; lazy-load child directories on expansion
-- **Monaco editor integration** — Open files in a syntax-highlighted code editor with 15+ language support
-- **Markdown preview mode** — Toggle markdown files between preview (rendered) and edit (Monaco) modes
-- **Auto-save with debounce** — Automatically save file changes to disk after 1500ms of inactivity; manual save button for immediate persistence
-- **Dirty state tracking** — Visual indicator (●) for unsaved changes; prevents accidental data loss
-- **Cross-provider support** — Read/write files scoped to provider-specific root directories; safePath prevents directory traversal attacks
+- Opens from the `ChatHeader` file button and is mounted once by `App`.
+- Resolves a provider scope from `useUIStore.expandedProviderId`, `useSystemStore.activeProviderId`, or `useSystemStore.defaultProviderId`.
+- Loads the provider root label with `explorer_root` and root entries with `explorer_list`.
+- Renders an expandable tree using `TreeItem`, `expanded`, and `loaded` node state.
+- Opens file contents with `explorer_read`, then renders markdown files in `ReactMarkdown` preview mode or other files in `@monaco-editor/react`.
+- Saves edits through `explorer_write` by manual Save button or a 1500 ms editor debounce.
 
 ### Why This Matters
 
-- **Security-critical:** Backend safePath validation is the gatekeeper preventing directory traversal (e.g., `../../etc/passwd`)
-- **Performance-critical:** Lazy-loading of large directory trees prevents frontend blocking; debounced auto-save prevents excessive socket emissions
-- **UX-critical:** Dirty state tracking and the 1500ms debounce create a smooth, responsive editing experience without overwhelming the socket layer
+- Backend path validation is the filesystem boundary for provider-scoped browsing and writes.
+- Frontend save behavior clears dirty state differently for manual saves and debounced saves.
+- Directory loading is intentionally lazy to avoid fetching entire provider homes.
+- The backend returns callback payloads, not streamed events, so missing callbacks produce silent UI stalls.
+- Current tests cover root/list/read/write handlers and main render/open/preview flows; save timing is verified from source.
 
 ### Architectural Role
 
-- **Frontend:** React component (`FileExplorer.tsx`) with Zustand state (`useUIStore`)
-- **Backend:** 4 socket handlers (`explorer_root`, `explorer_list`, `explorer_read`, `explorer_write`) in `fileExplorerHandlers.js`
-- **Provider-aware:** All operations scoped to provider-specific root directory via `provider.config.paths.home`
+- Frontend modal: `frontend/src/components/FileExplorer.tsx` (Component: `FileExplorer`, helper component: `TreeItem`).
+- Frontend state: `frontend/src/store/useUIStore.ts` (State: `isFileExplorerOpen`, action: `setFileExplorerOpen`) and `frontend/src/store/useSystemStore.ts` (State: `socket`, `activeProviderId`, `defaultProviderId`).
+- Backend socket handlers: `backend/sockets/fileExplorerHandlers.js` (Export: `registerFileExplorerHandlers`, functions: `getRoot`, `safePath`).
+- Socket registration: `backend/sockets/index.js` (Function: `registerSocketHandlers`, call: `registerFileExplorerHandlers(io, socket)`).
+- Persistence: direct filesystem reads and writes through Node `fs`; no database tables are used.
 
----
+## How It Works - End-to-End Flow
 
-## How It Works — End-to-End Flow
+1. User opens the modal from the chat header.
 
-### Step 1: ChatHeader Button Click Opens Modal
-**File:** `frontend/src/components/ChatHeader/ChatHeader.tsx` (Lines 50-55)
+   File: `frontend/src/components/ChatHeader/ChatHeader.tsx` (Component: `ChatHeader`, button title: `File Explorer`)
 
-User clicks the folder icon in the ChatHeader. The button invokes `setFileExplorerOpen(true)` on the Zustand store:
+   ```tsx
+   <button
+     onClick={() => useUIStore.getState().setFileExplorerOpen(true)}
+     className="icon-button"
+     title="File Explorer"
+   >
+     <FolderOpen size={18} />
+   </button>
+   ```
 
-```typescript
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 50-55)
-<button
-  onClick={() => useUIStore.getState().setFileExplorerOpen(true)}
-  className="icon-button"
-  title="File Explorer"
->
-  <FolderOpen size={18} />
-</button>
+   The button is rendered only when the URL query does not include `popout`. The action flips `useUIStore.isFileExplorerOpen` to `true`.
+
+2. `App` keeps `FileExplorer` mounted at the application level.
+
+   File: `frontend/src/App.tsx` (Component: `App`, child component: `FileExplorer`)
+
+   ```tsx
+   <SessionSettingsModal />
+   <SystemSettingsModal />
+   <NotesModal />
+   <FileExplorer />
+   ```
+
+   `FileExplorer` returns `null` while `isFileExplorerOpen` is false, so the modal state is controlled entirely through the UI store.
+
+3. `FileExplorer` resolves socket and provider scope.
+
+   File: `frontend/src/components/FileExplorer.tsx` (Component: `FileExplorer`, state selectors: `socket`, `expandedProviderId`, `activeProviderId`, `defaultProviderId`)
+
+   ```tsx
+   const socket = useSystemStore(state => state.socket);
+   const expandedProviderId = useUIStore(state => state.expandedProviderId);
+   const systemProviderId = useSystemStore(state => state.activeProviderId || state.defaultProviderId);
+   const providerId = expandedProviderId || systemProviderId;
+   ```
+
+   The expanded provider from the sidebar wins over the active/default provider. Socket requests include `providerId` only when one is available.
+
+4. Opening the modal resets local file state and fetches root metadata.
+
+   File: `frontend/src/components/FileExplorer.tsx` (Hook: root-load `useEffect`, socket event: `explorer_root`)
+
+   ```tsx
+   setTree([]);
+   setExpanded(new Set());
+   setOpenFile(null);
+   setPreviewMode(false);
+
+   if (providerId) socket.emit('explorer_root', { providerId }, handleRoot);
+   else socket.emit('explorer_root', handleRoot);
+   ```
+
+   The root callback updates `rootLabel`. The same effect then calls `loadDir('')` to populate the first tree level.
+
+5. Backend registration attaches explorer socket handlers to each connection.
+
+   File: `backend/sockets/index.js` (Function: `registerSocketHandlers`, registration: `registerFileExplorerHandlers`)
+
+   ```js
+   registerSystemSettingsHandlers(io, socket);
+   registerFolderHandlers(io, socket);
+   registerFileExplorerHandlers(io, socket);
+   registerGitHandlers(io, socket);
+   ```
+
+   File Explorer uses Socket.IO callbacks for all responses. It does not expose HTTP routes.
+
+6. `explorer_root` resolves the provider home directory.
+
+   File: `backend/sockets/fileExplorerHandlers.js` (Function: `getRoot`, socket event: `explorer_root`)
+
+   ```js
+   function getRoot(providerId = null) {
+     const provider = getProvider(providerId);
+     return provider.config.paths?.home || '';
+   }
+
+   socket.on('explorer_root', (payload, callback) => {
+     const cb = typeof payload === 'function' ? payload : callback;
+     const providerId = typeof payload === 'object' && payload !== null ? payload.providerId || null : null;
+     cb?.({ root: getRoot(providerId) });
+   });
+   ```
+
+   `explorer_root` accepts either `{ providerId }` plus callback or a callback as the first argument. The returned root string is used as a label in the modal header.
+
+7. `explorer_list` validates and lists a directory.
+
+   File: `backend/sockets/fileExplorerHandlers.js` (Socket event: `explorer_list`, functions: `safePath`, `fs.readdirSync`)
+
+   ```js
+   const fullPath = safePath(payload.dirPath || '', payload.providerId || null);
+   const entries = fs.readdirSync(fullPath, { withFileTypes: true });
+   const items = entries
+     .filter(e => !e.name.startsWith('.'))
+     .map(e => ({ name: e.name, isDirectory: e.isDirectory() }))
+     .sort((a, b) => {
+       if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+       return a.name.localeCompare(b.name);
+     });
+   callback?.({ items, path: payload.dirPath || '' });
+   ```
+
+   Dotfiles are omitted. Directories sort before files, and entries of the same type sort alphabetically.
+
+8. `TreeItem` expands directories lazily.
+
+   File: `frontend/src/components/FileExplorer.tsx` (Component: `TreeItem`, handler: `toggleDir`, helper: `updateTreeNode`)
+
+   ```tsx
+   if (!node.loaded) {
+     loadDir(node.path, (items) => {
+       const children = items.map(e => ({
+         name: e.name,
+         path: `${node.path}/${e.name}`,
+         isDirectory: e.isDirectory,
+         children: e.isDirectory ? [] : undefined
+       }));
+       updateNode(node.path, { children, loaded: true });
+     });
+   }
+   setExpanded(prev => new Set(prev).add(key));
+   ```
+
+   The `loaded` flag prevents re-fetching a directory after it has received children.
+
+9. Clicking a file reads content and selects the renderer.
+
+   File: `frontend/src/components/FileExplorer.tsx` (Handler: `openFileHandler`, socket event: `explorer_read`)
+
+   ```tsx
+   socket?.emit('explorer_read', { ...(providerId ? { providerId } : {}), filePath }, (res: { content?: string }) => {
+     const content = res.content || '';
+     setOpenFile({ path: filePath, content, original: content });
+     setPreviewMode(filePath.endsWith('.md'));
+   });
+   ```
+
+   File: `backend/sockets/fileExplorerHandlers.js` (Socket event: `explorer_read`)
+
+   ```js
+   const fullPath = safePath(payload.filePath, payload.providerId || null);
+   const content = fs.readFileSync(fullPath, 'utf8');
+   callback?.({ content, filePath: payload.filePath });
+   ```
+
+   Markdown files open in preview mode. Other files render in Monaco with a language from `getLanguage`.
+
+10. Editing and saving writes through `explorer_write`.
+
+    File: `frontend/src/components/FileExplorer.tsx` (Handlers: `handleSave`, `handleChange`, socket event: `explorer_write`)
+
+    ```tsx
+    socket.emit('explorer_write', { ...(providerId ? { providerId } : {}), filePath: openFile.path, content: openFile.content }, () => {
+      setOpenFile(prev => prev ? { ...prev, original: prev.content } : null);
+      setSaving(false);
+    });
+    ```
+
+    ```tsx
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      if (!socket || !openFile) return;
+      socket.emit('explorer_write', { ...(providerId ? { providerId } : {}), filePath: openFile.path, content });
+      setOpenFile(prev => prev ? { ...prev, original: content } : null);
+    }, 1500);
+    ```
+
+    File: `backend/sockets/fileExplorerHandlers.js` (Socket event: `explorer_write`)
+
+    ```js
+    const fullPath = safePath(filePath, payload.providerId || null);
+    fs.writeFileSync(fullPath, content, 'utf8');
+    callback?.({ success: true });
+    ```
+
+    Manual save waits for the backend callback before clearing dirty state. Debounced save emits without a callback and clears dirty state immediately after emitting.
+
+## Architecture Diagram
+
+```mermaid
+graph TB
+  subgraph Frontend[Frontend]
+    Header[ChatHeader button: setFileExplorerOpen]
+    Store[useUIStore: isFileExplorerOpen, expandedProviderId]
+    System[useSystemStore: socket, active/default provider]
+    Explorer[FileExplorer component]
+    Tree[TreeItem + expanded Set + loaded nodes]
+    Renderer[Monaco Editor or ReactMarkdown preview]
+  end
+
+  subgraph SocketIO[Socket.IO callbacks]
+    Root[explorer_root]
+    List[explorer_list]
+    Read[explorer_read]
+    Write[explorer_write]
+  end
+
+  subgraph Backend[Backend]
+    Register[registerSocketHandlers]
+    Handlers[registerFileExplorerHandlers]
+    RootFn[getRoot]
+    Safe[safePath]
+    Fs[fs.readdirSync/readFileSync/writeFileSync]
+  end
+
+  subgraph Provider[Provider config]
+    Home[config.paths.home]
+  end
+
+  subgraph Disk[Filesystem]
+    Files[Provider home tree]
+  end
+
+  Header --> Store
+  Store --> Explorer
+  System --> Explorer
+  Explorer --> Root
+  Explorer --> List
+  Explorer --> Read
+  Explorer --> Write
+  Register --> Handlers
+  Root --> Handlers
+  List --> Handlers
+  Read --> Handlers
+  Write --> Handlers
+  Handlers --> RootFn
+  RootFn --> Home
+  Handlers --> Safe
+  Safe --> RootFn
+  Safe --> Fs
+  Fs --> Files
+  Fs --> Explorer
+  Explorer --> Tree
+  Explorer --> Renderer
 ```
 
----
+## Critical Contract
 
-### 2. State Initialization & Root Load
-**File:** `frontend/src/components/FileExplorer.tsx` (Function: `FileExplorer`, Lines 16-35; Lines 41-55)
+The critical contract is: every filesystem operation that receives a user-controlled path must call `safePath(requestedPath, providerId)` before touching `fs`.
 
-When opened, the component resolves the provider scope and fetches the root directory label from the backend:
+File: `backend/sockets/fileExplorerHandlers.js` (Function: `safePath`, dependency: `getRoot`)
 
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 16-35)
-const expandedProviderId = useUIStore(state => state.expandedProviderId);
-const systemProviderId = useSystemStore(state => state.activeProviderId || state.defaultProviderId);
-const providerId = expandedProviderId || systemProviderId;
-// ...
-```
-
-```typescript
-// FILE: frontend/src/components/FileExplorer.tsx (Lines 41-55)
-useEffect(() => {
-  if (!isOpen || !socket) return;
-  // ...
-  if (providerId) socket.emit('explorer_root', { providerId }, handleRoot);
-  else socket.emit('explorer_root', handleRoot);
-  // ...
-}, [isOpen, socket, providerId, loadDir]);
-```
-
----
-
-### 3. Backend Root & Path Safety
-**File:** `backend/sockets/fileExplorerHandlers.js` (Function: `getRoot`, Lines 60-64; Function: `safePath`, Lines 11-16)
-
-The backend resolves the root path based on the provider's `home` path and enforces path traversal protection:
-
-```javascript
-// FILE: backend/sockets/fileExplorerHandlers.js (Lines 60-64)
-function getRoot(providerId = null) {
-  const provider = getProvider(providerId);
-  return provider.config.paths?.home || '';
-}
-```
-
-```javascript
-// FILE: backend/sockets/fileExplorerHandlers.js (Lines 11-16)
+```js
 function safePath(requestedPath, providerId = null) {
   const root = getRoot(providerId);
   const resolved = path.resolve(root, requestedPath);
@@ -100,500 +289,275 @@ function safePath(requestedPath, providerId = null) {
 }
 ```
 
----
+Contract details:
 
-### 4. Directory Traversal & Lazy Loading
-**File:** `frontend/src/components/FileExplorer.tsx` (Function: `toggleDir`, Lines 57-73)
+- `requestedPath` is a relative path from the provider root in frontend calls.
+- `providerId` selects the provider passed to `getProvider(providerId)`.
+- `getRoot(providerId)` returns `provider.config.paths?.home || ''`.
+- `explorer_list`, `explorer_read`, and `explorer_write` call `safePath` before reading or writing.
+- `explorer_root` returns the root label and does not perform file I/O.
+- Backend errors return callback payloads such as `{ error: err.message }` or `{ items: [], error: err.message }` and log `[EXPLORER ERR]` through `writeLog`.
 
-Folders are loaded lazily when expanded to minimize initial data transfer.
+Socket callback shapes:
 
----
-
-### 5. File Persistence & Auto-Save
-**File:** `frontend/src/components/FileExplorer.tsx` (Function: `handleChange`, Lines 96-105)
-
-The component includes a debounce timer that auto-saves file changes to the backend after 1.5 seconds of inactivity.
-
----
-
-## Architecture Diagram
-
-```mermaid
-graph TB
-    subgraph Frontend["Frontend (React + Zustand)"]
-        CH["ChatHeader<br/>(line 50)"]
-        FE["FileExplorer<br/>(lines 14-253)"]
-        Store["useUIStore<br/>isFileExplorerOpen"]
-        Tree["Tree State<br/>expanded: Set"]
-        Edit["Monaco Editor<br/>+ Markdown Preview"]
-    end
-    
-    subgraph Network["Socket.IO"]
-        EE["explorer_root<br/>explorer_list<br/>explorer_read<br/>explorer_write"]
-    end
-    
-    subgraph Backend["Backend (Node.js)"]
-        Handler["fileExplorerHandlers.js<br/>(lines 6-64)"]
-        Safe["safePath()<br/>getRoot()"]
-        FS["fs module<br/>readFile / writeFile"]
-    end
-    
-    subgraph FS_Layer["Filesystem"]
-        Files["Provider Home<br/>Directory Tree"]
-    end
-    
-    CH -->|click| Store
-    Store -->|isOpen| FE
-    FE -->|emit| EE
-    EE -->|listener| Handler
-    Handler -->|validate| Safe
-    Safe -->|read/write| FS
-    FS -->|I/O| Files
-    FS -->|content| FE
-    FE -->|render| Edit
+```ts
+type ExplorerRootResponse = { root: string };
+type ExplorerListResponse = { items: { name: string; isDirectory: boolean }[]; path?: string; error?: string };
+type ExplorerReadResponse = { content?: string; filePath?: string; error?: string };
+type ExplorerWriteResponse = { success?: true; error?: string };
 ```
 
-**Data Flow:**
-1. ChatHeader button → Store update → FileExplorer renders
-2. FileExplorer → Socket.IO → Backend handlers
-3. Backend validates paths via safePath → Filesystem I/O
-4. Filesystem → Socket.IO → Frontend state → Monaco/Markdown rendering
+What breaks when the contract is bypassed:
 
----
+- `../` path segments can escape provider-scoped storage.
+- Missing `providerId` can route through the default provider context rather than the intended provider.
+- A missing `paths.home` returns an empty root string, which removes provider-specific boundary checks from the prefix comparison.
+- Frontend code that assumes successful callbacks can clear dirty state while the backend reports a write error.
 
-## The Critical Contract: Socket Event Shapes & Path Validation
+## Configuration/Data Flow
 
-### Socket Event Interface
+### Provider Configuration
 
-All explorer socket events follow a **payload-first, callback-second** pattern:
+Provider configs expose the File Explorer root through `paths.home`.
 
-```typescript
-// REQUEST from frontend
-socket.emit('explorer_event_name', 
-  { 
-    filePath?: string;           // Relative path from provider root
-    dirPath?: string;            // Relative directory path from provider root
-    content?: string;            // File content (for write operations)
-    providerId?: string | null;  // Optional provider identifier
-  },
-  (response) => {
-    // Backend responds via callback
-    // { items?, content?, root?, success?, path?, error?: string }
-  }
-);
-```
-
-### Path Validation Contract (Critical Security)
-
-**Every file operation must validate the requested path via `safePath()`:**
-
-```javascript
-// FILE: backend/sockets/fileExplorerHandlers.js (Lines 11-16)
-function safePath(requestedPath, providerId = null) {
-  const root = getRoot(providerId);
-  const resolved = path.resolve(root, requestedPath);
-  
-  // CRITICAL: If resolved path does NOT start with root, throw
-  if (!resolved.startsWith(root)) {
-    throw new Error('Path traversal blocked');
-  }
-  return resolved;
-}
-```
-
-**What breaks if ignored:**
-- ❌ `../../etc/passwd` would escape the provider root and read system files
-- ❌ Symlinks could point outside the root directory
-- ❌ Multi-provider isolation would be compromised (one provider could read another's files)
-
-**How the contract is enforced:**
-- Every `explorer_list`, `explorer_read`, `explorer_write` calls `safePath()` before any I/O
-- `path.resolve()` normalizes `..` and symlinks, ensuring consistent validation across Windows/Linux/macOS
-- Root isolation is per-provider: each provider has its own `paths.home` config
-
----
-
-## Configuration / Provider Support
-
-### Provider Config Requirements
-
-A provider must define a root home directory in its `provider.json` or deployment config:
+Files: `providers/*/user.json.example` (Config key: `paths.home`)
 
 ```json
 {
-  "config": {
-    "paths": {
-      "home": "/absolute/path/to/provider/home"
-    }
+  "paths": {
+    "home": "/absolute/path/to/provider/home"
   }
 }
 ```
 
-**How the backend resolves this:**
-```javascript
-// FILE: backend/sockets/fileExplorerHandlers.js (Lines 6-9)
-function getRoot(providerId = null) {
-  const provider = getProvider(providerId);
-  return provider?.config?.paths?.home || '';
-}
+The backend reads this value through `getProvider(providerId)` in `getRoot`. Providers with environment-variable expansion or default home resolution must make sure the loaded provider config contains the resolved home path before File Explorer requests run.
+
+### Provider Selection Flow
+
+```text
+useUIStore.expandedProviderId
+  -> useSystemStore.activeProviderId
+  -> useSystemStore.defaultProviderId
+  -> omitted providerId field
+  -> backend getProvider(null) behavior
 ```
 
-If a provider does not define `paths.home`, the root defaults to an empty string (which resolves to the current working directory).
+The frontend omits `providerId` from socket payloads when no provider is available. The backend treats missing provider IDs as `null`.
 
-### Provider Scoping
+### Directory Data Flow
 
-All file operations are scoped to the provider's root via `safePath()`:
+```text
+FileExplorer root-load effect
+  -> socket.emit('explorer_root', { providerId }, callback)
+  -> backend getRoot(providerId)
+  -> callback({ root })
+  -> setRootLabel(root)
 
-- ✅ Provider A can only read/write files under `/provider-a/home`
-- ✅ Provider B can only read/write files under `/provider-b/home`
-- ✅ Cross-provider file access is impossible (safePath validates provider identity)
-
-### Optional: Provider-Specific Root Resolution
-
-If a provider needs dynamic root resolution (e.g., based on workspace context), it should:
-
-1. Update `provider.config.paths.home` dynamically
-2. Ensure `getProvider(providerId).config.paths.home` always returns the correct root
-3. All subsequent `explorer_*` calls will use the new root automatically
-
----
-
-## Data Flow / Rendering Pipeline
-
-### Request → Backend Processing → Frontend Rendering
-
-**Example: User clicks a file to open it**
-
-```
-User clicks "app.js"
-    ↓
-openFileHandler('src/app.js') invoked (line 81)
-    ↓
-socket.emit('explorer_read', {
-  filePath: 'src/app.js',
-  providerId: 'my-provider'
-})
-    ↓ [SOCKET.IO TRANSMISSION]
-    ↓
-Backend receives (fileExplorerHandlers.js line 37)
-    ↓
-safePath('src/app.js', 'my-provider') validates path (line 39)
-    ↓
-fs.readFileSync() returns content
-    ↓
-callback({ content: "...", filePath: "src/app.js" })
-    ↓ [SOCKET.IO TRANSMISSION]
-    ↓
-Frontend receives callback (FileExplorer.tsx line 82)
-    ↓
-setOpenFile({ path: 'src/app.js', content: "...", original: "..." })
-    ↓
-Component re-renders (line 135)
-    ↓
-Monaco editor displays content with JavaScript syntax highlighting
+FileExplorer loadDir('')
+  -> socket.emit('explorer_list', { providerId, dirPath: '' }, callback)
+  -> backend safePath('', providerId)
+  -> fs.readdirSync(fullPath, { withFileTypes: true })
+  -> filter dotfiles, sort directories first, map to { name, isDirectory }
+  -> callback({ items, path })
+  -> setTree([...TreeNode])
 ```
 
-### Auto-Save Debounce Pipeline
+### File Rendering Flow
 
-```
-User types "const x = 5;" 
-    ↓ (1st keystroke, 0ms)
-handleChange() called (line 97)
-    ↓
-Clear previous 1500ms timer (line 100)
-    ↓
-Set NEW 1500ms timer (line 102)
-    ↓ (2nd keystroke, 200ms)
-handleChange() called again
-    ↓
-Clear 1500ms timer (reset)
-    ↓
-Set NEW 1500ms timer (now expires at 200ms + 1500ms = 1700ms)
-    ↓ (3rd keystroke, 400ms)
-[repeat clear/set cycle]
-    ↓ (no typing for 1500ms after last keystroke)
-Timer expires at 1700ms
-    ↓
-socket.emit('explorer_write', { filePath, content, providerId })
-    ↓
-Backend writes file via fs.writeFileSync() (line 53)
-    ↓
-Frontend receives callback, updates original (line 87)
-    ↓
-isDirty becomes false, ● indicator disappears
+```text
+TreeItem file click
+  -> openFileHandler(filePath)
+  -> socket.emit('explorer_read', { providerId, filePath }, callback)
+  -> backend safePath(filePath, providerId)
+  -> fs.readFileSync(fullPath, 'utf8')
+  -> callback({ content, filePath })
+  -> setOpenFile({ path, content, original: content })
+  -> setPreviewMode(filePath.endsWith('.md'))
+  -> render ReactMarkdown with remarkGfm or Monaco Editor
 ```
 
----
+File: `frontend/src/components/FileExplorer.tsx` (Function: `getLanguage`, constant: `EXT_LANG`)
+
+```ts
+const EXT_LANG: Record<string, string> = {
+  ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
+  json: 'json', md: 'markdown', css: 'css', html: 'html', yml: 'yaml', yaml: 'yaml',
+  py: 'python', sh: 'shell', bash: 'shell', cs: 'csharp', xml: 'xml', sql: 'sql',
+};
+```
+
+### Save Flow
+
+```text
+Monaco onChange
+  -> handleChange(content)
+  -> update openFile.content
+  -> clear saveTimer when present
+  -> set saveTimer for 1500 ms
+  -> emit explorer_write without callback
+  -> set openFile.original to emitted content
+
+Save button
+  -> handleSave()
+  -> setSaving(true)
+  -> emit explorer_write with callback
+  -> callback sets openFile.original to current content
+  -> callback sets saving(false)
+```
+
+The Save button is disabled when `isDirty` is false or `saving` is true. `isDirty` is derived from `openFile.content !== openFile.original`.
 
 ## Component Reference
 
-### Frontend Files
+### Frontend
 
-| File | Key Functions/Exports | Lines | Purpose |
-|------|----------------------|-------|---------|
-| `frontend/src/components/FileExplorer.tsx` | `FileExplorer` (component) | 14–198 | Main modal component; tree rendering, editor, markdown preview |
-| | `TreeItem` (sub-component) | 200–232 | Recursive tree node renderer |
-| | `getLanguage()` | 243 | Maps file extension to Monaco language mode |
-| | `updateTreeNode()` | 245–253 | Recursive tree node update utility |
-| `frontend/src/components/ChatHeader/ChatHeader.tsx` | File explorer button | 47–55 | Opens FileExplorer modal via `setFileExplorerOpen(true)` |
-| `frontend/src/store/useUIStore.ts` | `isFileExplorerOpen` state | 15, 53 | Boolean flag for modal visibility |
-| | `setFileExplorerOpen()` | 35, 84 | Setter for modal visibility |
-| `frontend/src/test/FileExplorer.test.tsx` | Test suite | Full file | 9 test cases (render, open, save, close behavior) |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| App mount | `frontend/src/App.tsx` | Component: `App`, child: `FileExplorer` | Mounts the modal once at the application root. |
+| Header control | `frontend/src/components/ChatHeader/ChatHeader.tsx` | Component: `ChatHeader`, button title: `File Explorer`, action: `setFileExplorerOpen(true)` | Opens the modal outside popout mode. |
+| Modal | `frontend/src/components/FileExplorer.tsx` | Component: `FileExplorer`; handlers: `loadDir`, `toggleDir`, `openFileHandler`, `handleSave`, `handleChange`; helpers: `getLanguage`, `updateTreeNode` | Owns tree state, provider-scoped socket calls, editor state, preview mode, and save behavior. |
+| Tree row | `frontend/src/components/FileExplorer.tsx` | Component: `TreeItem` | Recursively renders directories and files, expands folders, and opens files. |
+| UI state | `frontend/src/store/useUIStore.ts` | State: `isFileExplorerOpen`, `expandedProviderId`; action: `setFileExplorerOpen` | Stores modal visibility and sidebar-selected provider scope. |
+| System state | `frontend/src/store/useSystemStore.ts` | State: `socket`, `activeProviderId`, `defaultProviderId`; action: `setProviders` | Supplies the Socket.IO client and provider IDs used by the modal. |
+| Styling | `frontend/src/components/FileExplorer.css` | Selectors: `.file-explorer-overlay`, `.file-explorer-modal`, `.fe-tree`, `.fe-editor`, `.fe-md-preview`, `.fe-save-btn` | Defines modal layout, tree rows, editor panel, markdown preview, dirty marker, and save controls. |
 
-### Backend Files
+### Backend
 
-| File | Key Functions | Lines | Purpose |
-|------|------------------|-------|---------|
-| `backend/sockets/fileExplorerHandlers.js` | `getRoot()` | 6–9 | Resolve provider home directory |
-| | `safePath()` | 11–16 | Validate path to prevent traversal attacks |
-| | `explorer_root` handler | 60–64 | Return provider's root directory |
-| | `explorer_list` handler | 19–35 | List directory contents, filter dotfiles, sort |
-| | `explorer_read` handler | 37–46 | Read file content |
-| | `explorer_write` handler | 48–58 | Write file content |
-| `backend/sockets/index.js` | Socket registration | 104 | Registers fileExplorerHandlers on connection |
-| `backend/test/fileExplorerHandlers.test.js` | Test suite | Full file | 9 test cases (path security, I/O, error handling) |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket registration | `backend/sockets/index.js` | Function: `registerSocketHandlers`, call: `registerFileExplorerHandlers(io, socket)` | Registers explorer handlers for each connected Socket.IO client. |
+| Explorer handlers | `backend/sockets/fileExplorerHandlers.js` | Export: `registerFileExplorerHandlers`; socket events: `explorer_root`, `explorer_list`, `explorer_read`, `explorer_write` | Handles root, directory listing, file reads, and file writes. |
+| Root resolution | `backend/sockets/fileExplorerHandlers.js` | Function: `getRoot`; config key: `provider.config.paths.home` | Converts provider ID to the explorer root directory. |
+| Path validation | `backend/sockets/fileExplorerHandlers.js` | Function: `safePath`; APIs: `path.resolve`, `String.startsWith` | Blocks paths whose resolved absolute path does not start with the provider root string. |
+| Logging | `backend/services/logger.js` | Function: `writeLog`; log prefix: `[EXPLORER ERR]` | Records list/read/write failures. |
 
-### Zustand Store
+### Tests
 
-| Store | State / Method | Lines | Type | Purpose |
-|-------|----------------|-------|------|---------|
-| `useUIStore.ts` | `isFileExplorerOpen` | 15 | `boolean` | Modal visibility state |
-| | `setFileExplorerOpen()` | 35 | `(isOpen: boolean) => void` | Toggle modal |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Frontend tests | `frontend/src/test/FileExplorer.test.tsx` | Suite: `FileExplorer`; mocked socket events: `explorer_root`, `explorer_list`, `explorer_read`, `explorer_write` | Verifies render, root load, file open, markdown preview, directory expansion, and overlay close. |
+| Backend tests | `backend/test/fileExplorerHandlers.test.js` | Suite: `File Explorer Handlers`; mocked modules: `fs`, `providerLoader`, `logger` | Verifies root resolution, sorted listing, dotfile filtering, reads, writes, traversal blocking, and error callbacks. |
 
 ### Database
 
-No database tables used by File Explorer. All state is ephemeral (in-memory tree, local editor state).
+No database tables are used. File Explorer state is frontend-local, and file persistence is direct filesystem I/O.
 
----
+## Gotchas
 
-## Gotchas & Important Notes
+1. `paths.home` is required for provider isolation.
 
-### 1. **Lazy-Load Guard: Check `node.loaded` Before Emitting explorer_list**
-**What breaks:** If you re-emit `explorer_list` for an already-expanded folder, you'll fetch and re-render the entire directory again, wasting bandwidth and causing unnecessary tree re-renders.
+   `getRoot` falls back to an empty string. With an empty root, `safePath` still resolves paths, but the prefix check is not a provider-specific boundary. Keep provider `paths.home` populated for every provider that exposes File Explorer.
 
-**Why it happens:** Without the `loaded` flag, every toggle (expand/collapse/expand) re-fetches the directory.
+2. `safePath` uses a string prefix check.
 
-**How to avoid it:** Always check `node.loaded` before calling `loadDir()` in `toggleDir()` (lines 65–70):
-```typescript
-if (node && !node.loaded) {
-  loadDir(nodePath);
-  node.loaded = true;
-}
-```
+   The guard is `resolved.startsWith(root)`. Any change to root formatting, relative root values, drive-letter casing, or trailing separators must be tested against `blocks path traversal` in `backend/test/fileExplorerHandlers.test.js` and against sibling-prefix paths.
 
----
+3. `explorer_root` accepts two call shapes.
 
-### 2. **Backward-Compatible explorer_root Handler Pattern**
-**What breaks:** The backend's `explorer_root` handler (lines 60–64) accepts **two different payload patterns**:
-- Modern: `{ providerId: 'my-provider' }` (payload object)
-- Legacy: callback as first argument (for older clients)
+   `FileExplorer` emits `{ providerId }` plus callback when a provider ID exists, and emits callback as the first argument when no provider ID exists. The backend handler selects the callback with `typeof payload === 'function' ? payload : callback`.
 
-If you refactor this handler to reject the callback-style pattern, old clients will hang.
+4. Dotfiles are filtered on the backend.
 
-**How to avoid it:** Keep the conditional check:
-```javascript
-socket.on('explorer_root', function (payload, callback) {
-  // Handles both { providerId } and callback-as-first-arg
-});
-```
+   `explorer_list` filters entries whose names start with `.`. Hidden provider files such as `.env`, `.gitignore`, or provider metadata files do not appear in the tree unless the backend filter changes.
 
----
+5. Directory expansion depends on `loaded` state.
 
-### 3. **Auto-Save Debounce Requires clearTimeout**
-**What breaks:** If you forget to clear the previous timer before setting a new one, multiple timers run in parallel, causing duplicate `explorer_write` calls.
+   `toggleDir` fetches children only when `node.loaded` is falsy. If tree updates drop the `loaded` flag, expanded folders re-fetch from the backend.
 
-**Why it happens:** Each keystroke sets a new timer without canceling the old one.
+6. Frontend read/list callbacks tolerate errors by defaulting to empty values.
 
-**How to avoid it:** Always clear the previous timer (line 100):
-```typescript
-if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
-autoSaveTimerRef.current = setTimeout(() => { /* ... */ }, 1500);
-```
+   `loadDir` passes `res.items || []`, and `openFileHandler` uses `res.content || ''`. Backend errors are available in callback payloads and logs, but the modal does not render an error state.
 
----
+7. Debounced save does not wait for backend acknowledgement.
 
-### 4. **Hidden Files Starting with `.` Are Filtered by Backend**
-**What breaks:** Users may expect to see `.gitignore`, `.env`, etc., but the backend filters all dotfiles (fileExplorerHandlers.js line 24).
+   `handleChange` emits `explorer_write` without a callback and sets `original` to the emitted content. This clears dirty state even when the backend write fails after emission.
 
-**Why it happens:** Dotfiles are typically system/config files; filtering them by default improves UX.
+8. Manual save does not inspect callback payloads.
 
-**How to avoid it:** If you need to expose dotfiles, modify the filter on line 24:
-```javascript
-const entries = fs.readdirSync(fullPath) // Remove .filter(name => !name.startsWith('.'))
-```
+   `handleSave` clears dirty state and `saving` in the callback regardless of `{ success: true }` or `{ error }`. UI error handling must be added before treating write failures as visible user feedback.
 
----
+9. Markdown preview unmounts Monaco.
 
-### 5. **Markdown Files Default to Preview Mode**
-**What breaks:** Users expecting a text editor may be confused by markdown rendering.
+   Markdown files open with `previewMode` set to true, so editing requires toggling the preview button to the edit state. The preview renderer is `ReactMarkdown` with `remarkGfm`.
 
-**Why it happens:** Markdown preview is more user-friendly for reading `.md` files; toggle button available for editing.
+10. Pending save timers are component-local.
 
-**How to avoid it:** Check the `previewMode` state (line 89):
-```typescript
-setPreviewMode(isMarkdown(filePath));  // True for .md files
-```
-
-Users can manually toggle back to edit mode via the "Edit/Preview" button (line 179).
-
----
-
-### 6. **Dirty Detection Requires Both `content` and `original` Fields**
-**What breaks:** If you only store `content`, dirty detection becomes impossible (isDirty = true always).
-
-**Why it happens:** You need a reference point (`original`) to compare against current edits.
-
-**How to avoid it:** Always update both fields on save (line 87):
-```typescript
-setOpenFile(prev => prev ? { ...prev, original: newContent } : null);
-```
-
----
-
-### 7. **providerId Is Optional on All Socket Events**
-**What breaks:** If a frontend doesn't pass `providerId`, the backend defaults to `null` (which resolves to the default provider).
-
-**Why it happens:** For backward compatibility, `explorer_list`, `explorer_read`, `explorer_write` all have `providerId = null` defaults (fileExplorerHandlers.js lines 20, 38, 49).
-
-**How to avoid it:** Always pass `providerId` when multi-provider support is needed:
-```typescript
-socket.emit('explorer_read', { filePath, providerId: systemStore.activeProviderId })
-```
-
----
-
-### 8. **File Explorer Is Hidden in Popout Mode**
-**What breaks:** If you expect the File Explorer button to always be visible, you'll be surprised in popout windows.
-
-**Why it happens:** Popout windows are minimal chat-only windows; file explorer is disabled (ChatHeader.tsx line 47: `{!isPopout && ...}`).
-
-**How to avoid it:** Check `isPopout` state before rendering file explorer controls.
-
----
-
-### 9. **safePath Uses path.resolve() Which Is OS-Specific**
-**What breaks:** Path validation may behave differently on Windows vs Linux due to differences in `path.resolve()`.
-
-**Why it happens:** Windows uses `\`, Linux uses `/`; `path.resolve()` handles this, but symlink resolution is OS-specific.
-
-**How to avoid it:** Test path validation on both Windows and Linux. Use `path.join()` for building paths, not string concatenation.
-
----
-
-### 10. **Auto-Save Does Not Confirm Success Before Clearing original**
-**What breaks:** If the backend write fails silently, `original` is still updated, and the user thinks the file was saved.
-
-**Why it happens:** The callback checks `response.error`, but if the network drops, the callback never fires and the timer just clears.
-
-**How to avoid it:** Add a timeout wrapper to `explorer_write` callback, or show a toast notification on success/failure:
-```typescript
-setTimeout(() => {
-  if (!callbackFired) logger.warn('explorer_write timeout');
-}, 5000);
-```
-
----
+    `saveTimer` is a ref inside `FileExplorer`. Changes to file switching or modal close behavior should clear pending timers explicitly when that behavior needs to cancel debounced writes.
 
 ## Unit Tests
 
-### Backend Tests
+### Backend
 
-**File:** `backend/test/fileExplorerHandlers.test.js`
+File: `backend/test/fileExplorerHandlers.test.js` (Suite: `File Explorer Handlers`)
 
-| Test Name | What It Tests | Line Range |
-|-----------|-------------|-----------|
-| `explorer_root` | Returns the provider's home directory path | Lines 10–20 |
-| `explorer_root error handling` | Handles missing paths.home gracefully | Lines 22–30 |
-| `explorer_list` | Returns sorted directory entries, filters dotfiles | Lines 32–50 |
-| `explorer_list sorting` | Directories listed first, then files, both alphabetically | Lines 52–70 |
-| `explorer_read` | Reads and returns file content | Lines 72–85 |
-| `explorer_write` | Saves file content to disk | Lines 87–100 |
-| `Path traversal security` | Blocks `../../etc/passwd` attempts | Lines 102–115 |
-| `Error handling (list)` | Gracefully handles directory read errors | Lines 117–130 |
-| `Error handling (write)` | Gracefully handles write errors (permissions, disk full, etc.) | Lines 132–145 |
+- `explorer_root returns paths.home`: verifies `explorer_root` returns the provider home path from `paths.home`.
+- `explorer_root returns empty string if paths.home missing`: verifies the empty-string fallback.
+- `explorer_list returns sorted entries without dotfiles`: verifies dotfile filtering and directory-first ordering.
+- `explorer_read returns file content`: verifies file content callback shape.
+- `explorer_write saves file`: verifies `fs.writeFileSync` is called and `{ success: true }` is returned.
+- `blocks path traversal`: verifies traversal attempts return an error containing `traversal`.
+- `handles list errors gracefully`: verifies list failures return `{ items: [], error }`.
+- `explorer_list sorts items of same type alphabetically`: verifies same-type alphabetical sorting.
+- `explorer_write handles errors gracefully`: verifies write failures return `{ error }`.
 
-**Run backend tests:**
+Run targeted backend verification:
+
 ```bash
-cd backend && npx vitest run fileExplorerHandlers.test.js
+npx vitest run test/fileExplorerHandlers.test.js
 ```
 
-### Frontend Tests
+### Frontend
 
-**File:** `frontend/src/test/FileExplorer.test.tsx`
+File: `frontend/src/test/FileExplorer.test.tsx` (Suite: `FileExplorer`)
 
-| Test Name | What It Tests | Line Range |
-|-----------|-------------|-----------|
-| `Renders when isFileExplorerOpen is true` | Modal visibility state | Lines 10–20 |
-| `Does not render when isFileExplorerOpen is false` | Modal hidden state | Lines 22–30 |
-| `Shows root directory path and initial contents` | Root label and tree rendering | Lines 32–50 |
-| `Displays files and folders in tree view` | Tree node rendering | Lines 52–70 |
-| `Shows empty state when no file is open` | Empty editor state | Lines 72–80 |
-| `Emits explorer_read and displays content on file click` | File opening flow | Lines 82–100 |
-| `Renders markdown files in preview mode by default` | Markdown preview | Lines 102–115 |
-| `Toggles between preview and edit mode for .md files` | Markdown toggle | Lines 117–130 |
-| `Emits explorer_list on folder expansion for lazy loading` | Directory lazy-loading | Lines 132–150 |
-| `Closes on overlay click or close button` | Modal close behavior | Lines 152–165 |
+- `renders when open`: verifies root label renders when `isFileExplorerOpen` is true.
+- `does not render when closed`: verifies null render when `isFileExplorerOpen` is false.
+- `loads and displays root directory`: verifies mocked directory entries render.
+- `shows empty state when no file selected`: verifies the empty editor message.
+- `opens a file on click`: verifies `explorer_read` payload includes `providerId` and `filePath`, and the editor header shows the file path.
+- `opens MD file with preview mode`: verifies markdown files render preview content by default.
+- `toggles between preview and edit for MD files`: verifies the preview toggle hides rendered markdown when switching to edit mode.
+- `expands directory on click`: verifies `explorer_list` payload includes `providerId` and directory path.
+- `closes on overlay click`: verifies overlay click sets `isFileExplorerOpen` to false.
 
-**Run frontend tests:**
+Run targeted frontend verification:
+
 ```bash
-cd frontend && npx vitest run FileExplorer.test.tsx
+npx vitest run src/test/FileExplorer.test.tsx
 ```
 
----
+Frontend test coverage note: the current suite does not directly assert `handleSave` callback behavior or the 1500 ms `handleChange` debounce. Those behaviors are anchored in `frontend/src/components/FileExplorer.tsx` and should be covered when save UX changes.
 
 ## How to Use This Guide
 
-### For Implementing or Extending File Explorer Features
+### For Implementing or Extending This Feature
 
-1. **Read the End-to-End Flow** (Section: "How It Works") to understand the complete data pipeline
-2. **Check the Critical Contract** (Section: "The Critical Contract") to understand path validation and socket shapes
-3. **Review Gotchas** (Section: "Gotchas") to avoid common pitfalls
-4. **Reference exact line numbers** in the Component Reference to find code quickly
-5. **Check existing tests** to understand expected behavior before implementing
+1. Start with `frontend/src/components/FileExplorer.tsx` and identify whether the change touches `loadDir`, `toggleDir`, `openFileHandler`, `handleSave`, or `handleChange`.
+2. For new filesystem operations, add a Socket.IO event in `backend/sockets/fileExplorerHandlers.js` inside `registerFileExplorerHandlers` and call `safePath` before any `fs` access.
+3. Keep provider scope in the frontend payload by following the existing `{ ...(providerId ? { providerId } : {}), ... }` pattern.
+4. Return callback payloads with explicit success or error fields, matching the existing `explorer_*` response style.
+5. Update `backend/test/fileExplorerHandlers.test.js` with success, error, and path traversal cases for any new backend operation.
+6. Update `frontend/src/test/FileExplorer.test.tsx` for visible UI behavior, socket payloads, and callback-driven state changes.
+7. Keep this document anchored to file paths, functions, components, socket events, config keys, and test names.
 
-**Checklist for adding a new file operation (e.g., `explorer_delete`):**
-- [ ] Add socket handler in `fileExplorerHandlers.js` with `safePath()` validation
-- [ ] Define request/response shapes in handler (follow `explorer_read` pattern)
-- [ ] Emit from frontend with `providerId` parameter
-- [ ] Add backend error logging via `writeLog()`
-- [ ] Add frontend callback to update UI state (setOpenFile, setTree, etc.)
-- [ ] Update both backend and frontend tests
-- [ ] Verify path traversal protection with tests (e.g., `../../etc/passwd`)
-- [ ] Update this Feature Doc with new handler details
+### For Debugging Issues with This Feature
 
-### For Debugging Issues with File Explorer
-
-1. **Check browser console** for socket emission errors (DevTools → Network → WS)
-2. **Check server logs** (`LOG_FILE_PATH` in `.env`) for `[EXPLORER ERR]` messages
-3. **Verify safePath validation** didn't block a legitimate path (logs include attempted path)
-4. **Check providerId parameter** — if missing, will use default provider root
-5. **Test path normalization** — does `../` resolve correctly on your OS?
-6. **Verify provider config** — does `provider.config.paths.home` exist and point to a real directory?
-
-**Debugging checklist:**
-- [ ] Can you see `explorer_root` socket event in DevTools?
-- [ ] Does the backend respond with a valid root path?
-- [ ] Can you navigate the tree and see files?
-- [ ] Does `explorer_read` emit when you click a file?
-- [ ] Does the file content display correctly in Monaco?
-- [ ] Can you edit and see the 1500ms debounce in action?
-- [ ] Is dirty state (●) showing/hiding correctly?
-- [ ] Can you save (manual or auto-save) without errors?
-
----
+1. Check `useUIStore.isFileExplorerOpen` and `setFileExplorerOpen` if the modal does not appear.
+2. Check `useSystemStore.socket`, `activeProviderId`, `defaultProviderId`, and `useUIStore.expandedProviderId` if payloads miss provider scope.
+3. Check Socket.IO callback traffic for `explorer_root`, `explorer_list`, `explorer_read`, and `explorer_write` if the UI stalls.
+4. Check `[EXPLORER ERR]` logs from `backend/sockets/fileExplorerHandlers.js` when list/read/write callbacks return errors.
+5. Check `provider.config.paths.home` through `getRoot` when the root label is empty or paths resolve outside the expected provider directory.
+6. Check `safePath` behavior with the exact `dirPath` or `filePath` payload when traversal errors appear.
+7. Check `openFile.content`, `openFile.original`, `saving`, and `saveTimer` when dirty state or saves behave unexpectedly.
+8. Check `previewMode` and `filePath.endsWith('.md')` when markdown renders instead of Monaco.
 
 ## Summary
 
-The **File Explorer** is a full-screen modal file browser for browsing and editing provider-scoped project files within AcpUI. Its architecture is built on four core socket events (`explorer_root`, `explorer_list`, `explorer_read`, `explorer_write`) secured by **path traversal validation via safePath()**.
-
-**Key architectural patterns:**
-- **Tree lazy-loading:** Directories load only on first expansion (performance optimization)
-- **Debounced auto-save:** 1500ms delay prevents excessive socket emissions during rapid typing
-- **Dirty state tracking:** Tracks original vs current content to prevent accidental data loss
-- **Provider scoping:** All file operations isolated to provider-specific root directories
-- **Path validation:** Every file operation validates via `safePath()`, preventing escape attempts like `../../etc/passwd`
-
-**Critical contract:** All paths must be validated by `safePath(providerId)` before any I/O; failure to validate is a security vulnerability.
-
-**Why agents should care:** File Explorer is provider-agnostic and extensible. Understanding its socket patterns and path validation contract allows you to add new file operations (delete, rename, create), debug file I/O issues, or implement provider-specific extensions without re-reading the entire codebase.
-
+- File Explorer is a Socket.IO-backed modal for browsing and editing provider-scoped files.
+- `ChatHeader` opens the modal through `useUIStore.setFileExplorerOpen(true)`, and `App` mounts `FileExplorer` once.
+- `FileExplorer` derives provider scope from `expandedProviderId`, `activeProviderId`, and `defaultProviderId`.
+- Backend behavior lives in `registerFileExplorerHandlers` with `explorer_root`, `explorer_list`, `explorer_read`, and `explorer_write`.
+- The critical contract is that `explorer_list`, `explorer_read`, and `explorer_write` call `safePath` before filesystem access.
+- Directory listings filter dotfiles, sort directories first, and lazy-load child nodes through `TreeItem` expansion.
+- Markdown files use `ReactMarkdown` preview by default; other edit views use Monaco with `getLanguage` extension mapping.
+- Manual save waits for a callback; debounced save emits after 1500 ms and clears dirty state without waiting for backend acknowledgement.

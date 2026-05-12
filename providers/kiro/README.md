@@ -94,10 +94,16 @@ There is no explicit "disallow" field. Instead, tools are blocked by omitting th
 
 ### 4. Referencing AcpUI Tools
 
-AcpUI injects an MCP server named `AcpUI` with three tools:
+AcpUI injects an MCP server named `AcpUI` with core UX tools and optional IO/Search tools controlled by `configuration/mcp.json`.
+
+Core tools:
 - `ux_invoke_shell` — Execute shell commands
 - `ux_invoke_subagents` — Spawn parallel AI agents
 - `ux_invoke_counsel` — Multi-perspective analysis
+
+Optional tools:
+- `tools.io.enabled=true` advertises `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, and `ux_web_fetch`
+- `tools.googleSearch.enabled=true` advertises `ux_google_web_search`
 
 To use these in a Kiro agent, reference them with the `@AcpUI/` prefix:
 

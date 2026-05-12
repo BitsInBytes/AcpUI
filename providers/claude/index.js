@@ -3,7 +3,13 @@ import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { getProvider } from '../../backend/services/providerLoader.js';
-import { collectInputObjects, mergeInputObjects } from '../../backend/services/tools/toolInputUtils.js';
+import { acpUiToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
+import {
+  appendToolTitleDetail,
+  inputFromToolUpdate,
+  prettyToolTitle,
+  toolTitleDetailFromInput
+} from '../../backend/services/tools/providerToolNormalization.js';
 import { matchToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
 import { getLatestClaudeQuota, startClaudeQuotaProxy } from './quotaProxy.js';
 
@@ -329,6 +335,7 @@ export function extractDiffFromToolCall(update, Diff) {
  */
 export function normalizeTool(event, update) {
   const { config } = getProvider();
+  const input = inputFromToolUpdate(update);
   
   let toolName = update?.kind || update?._meta?.claudeCode?.toolName || '';
 
@@ -363,39 +370,27 @@ export function normalizeTool(event, update) {
     
     // If the title is missing or just the MCP prefix name, make it human-readable
     if (!title || patternMatch) {
-      const UX_TOOL_TITLES = { ux_invoke_shell: 'Invoke Shell', ux_invoke_subagents: 'Invoke Subagents', ux_invoke_counsel: 'Invoke Counsel' };
-      title = UX_TOOL_TITLES[toolName] || toolName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      title = prettyToolTitle(toolName);
     }
   }
 
-  // Attempt to extract arguments to append to the title for better visibility
-  let argsStr = '';
-  let argsObj = update?.rawInput || update?.arguments || update?.params;
-  if (typeof argsObj === 'string') {
-    // Attempt regex extraction from streaming JSON string
-    const pathMatch = argsObj.match(/"(?:file_)?path"\s*:\s*"([^"]+)"/);
-    if (pathMatch && pathMatch[1]) {
-      argsStr = path.basename(pathMatch[1]);
-    } else {
-      try {
-        argsObj = JSON.parse(argsObj);
-      } catch {
-        argsObj = null;
-      }
-    }
-  }
-  
-  if (argsObj && typeof argsObj === 'object') {
-    if (argsObj.file_path) argsStr = path.basename(argsObj.file_path);
-    else if (argsObj.path) argsStr = path.basename(argsObj.path);
-    else if (argsObj.pattern) argsStr = argsObj.pattern;
+  const normalizedAcpUiTitle = acpUiToolTitle(toolName, input, { filePath: event.filePath });
+  if (normalizedAcpUiTitle) {
+    title = normalizedAcpUiTitle;
   }
 
-  // Ensure filePath or argsStr is visible in the title
-  if (argsStr && title && !title.toLowerCase().includes(argsStr.toLowerCase())) {
-    title += `: ${argsStr}`;
-  } else if (event.filePath && title && !title.toLowerCase().includes(path.basename(event.filePath).toLowerCase())) {
-    title += `: ${path.basename(event.filePath)}`;
+  // Ensure filePath or argument detail is visible in generic provider titles.
+  let argsStr = toolTitleDetailFromInput(input, { filePath: event.filePath });
+  const rawArgs = update?.rawInput || update?.arguments || update?.params;
+  if (!argsStr && typeof rawArgs === 'string') {
+    const pathMatch = rawArgs.match(/"(?:file_)?path"\s*:\s*"([^"]+)"/);
+    const patternMatch = rawArgs.match(/"pattern"\s*:\s*"([^"]+)"/);
+    if (pathMatch?.[1]) argsStr = path.basename(pathMatch[1]);
+    else if (patternMatch?.[1]) argsStr = patternMatch[1];
+  }
+
+  if (!normalizedAcpUiTitle && argsStr) {
+    title = appendToolTitleDetail(title, argsStr);
   }
 
   return { ...event, toolName, title };
@@ -404,13 +399,8 @@ export function normalizeTool(event, update) {
 export function extractToolInvocation(update = {}, context = {}) {
   const event = context.event || {};
   const { config } = getProvider();
-  const input = mergeInputObjects(collectInputObjects(
-    update.rawInput,
-    update.arguments,
-    update.params,
-    update.input,
-    update.toolCall?.arguments
-  ));
+  const normalized = normalizeTool({ ...event }, update);
+  const input = inputFromToolUpdate(update);
 
   // Match the raw MCP tool id against the pattern to resolve canonical identity.
   // Prefer raw update fields (which always carry the original daemon tool id) over the
@@ -426,7 +416,7 @@ export function extractToolInvocation(update = {}, context = {}) {
   // event.toolName was set by normalizeTool() in acpUpdateHandler before this call,
   // but it may also still carry the raw MCP id when the title didn't match the pattern.
   // Falling back to event.toolName handles provider-builtin tools that have no pattern.
-  const canonicalName = patternMatch?.toolName || event.toolName || '';
+  const canonicalName = patternMatch?.toolName || normalized.toolName || event.toolName || '';
 
   return {
     toolCallId: update.toolCallId || event.id,
@@ -437,9 +427,9 @@ export function extractToolInvocation(update = {}, context = {}) {
     mcpToolName: patternMatch?.toolName,
     input,
     // Use the already-normalised title from the event (set by normalizeTool in acpUpdateHandler).
-    title: event.title || update.title || '',
-    filePath: event.filePath,
-    category: categorizeToolCall({ ...event, toolName: canonicalName }) || {}
+    title: normalized.title || event.title || update.title || '',
+    filePath: normalized.filePath || event.filePath,
+    category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
   };
 }
 

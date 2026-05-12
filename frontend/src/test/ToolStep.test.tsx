@@ -46,6 +46,22 @@ describe('ToolStep', () => {
     expect(screen.getByText('Running read_file: src/app.ts')).toBeInTheDocument();
   });
 
+  it('uses the AcpUI UX icon for ux tools', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({ isAcpUxTool: true, canonicalName: 'ux_read_file', title: 'Read File: app.ts' });
+    render(<ToolStep {...props} />);
+
+    expect(screen.getByLabelText('AcpUI UX tool')).toBeInTheDocument();
+    expect(screen.queryByLabelText('System tool')).not.toBeInTheDocument();
+  });
+
+  it('keeps the system icon for non-ux tools', () => {
+    render(<ToolStep {...defaultProps()} />);
+
+    expect(screen.getByLabelText('System tool')).toBeInTheDocument();
+    expect(screen.queryByLabelText('AcpUI UX tool')).not.toBeInTheDocument();
+  });
+
   it('shows pulse indicator when status is in_progress', () => {
     const props = defaultProps();
     props.step.event = makeEvent({ status: 'in_progress' });
@@ -215,6 +231,19 @@ describe('ToolStep - getFilePathFromEvent extraction', () => {
   it('returns undefined for shell commands', () => {
     const props = defaultProps();
     props.step.event = makeEvent({ title: 'Running shell: ls -la' });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();
+  });
+
+  it('returns undefined for non-file AcpUI UX tools even when a file path is present', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({
+      isAcpUxTool: true,
+      isFileOperation: false,
+      canonicalName: 'ux_web_fetch',
+      filePath: '/src/app.ts',
+      title: 'Fetch: https://example.test'
+    });
     const { container } = render(<ToolStep {...props} />);
     expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();
   });

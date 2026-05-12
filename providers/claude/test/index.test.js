@@ -507,6 +507,22 @@ describe('Claude Provider', () => {
       expect(normalized.title).toBe('Read File');
     });
 
+    it('normalizes optional AcpUI MCP tool titles without server prefixes', () => {
+      const normalize = (toolName, args) => claude.normalizeTool(
+        { title: `mcp__AcpUI__${toolName}` },
+        { rawInput: args }
+      );
+
+      expect(normalize('ux_read_file', { file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts' }).title).toBe('Read File: hello.ts');
+      expect(normalize('ux_write_file', { file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts' }).title).toBe('Write File: hello.ts');
+      expect(normalize('ux_replace', { file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts' }).title).toBe('Replace In File: hello.ts');
+      expect(normalize('ux_list_directory', { dir_path: 'D:/Git/AcpUI/.devFiles' }).title).toBe('List Directory: D:/Git/AcpUI/.devFiles');
+      expect(normalize('ux_glob', { description: 'Find feature docs', pattern: '*.md' }).title).toBe('Glob: Find feature docs');
+      expect(normalize('ux_grep_search', { description: 'Find TODOs', pattern: 'TODO' }).title).toBe('Search: Find TODOs');
+      expect(normalize('ux_web_fetch', { url: 'https://example.test/docs' }).title).toBe('Fetch: https://example.test/docs');
+      expect(normalize('ux_google_web_search', { query: 'latest docs' }).title).toBe('Web Search: latest docs');
+    });
+
     it('extracts canonical MCP invocation metadata', () => {
       const invocation = claude.extractToolInvocation(
         {

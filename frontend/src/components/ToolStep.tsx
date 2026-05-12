@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { ChevronDown, ChevronRight, Settings, Layout } from 'lucide-react';
+import { ChevronDown, ChevronRight, Settings, Layout, PlugZap } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { SystemEvent } from '../types';
 import { renderToolOutput } from './renderToolOutput';
@@ -18,6 +18,7 @@ interface ToolStepProps {
 const getFilePathFromEvent = (event: SystemEvent): string | undefined => {
   const toolIdentity = event.canonicalName || event.toolName;
   // UI-owned tools — checked here before asking the provider
+  if (event.isAcpUxTool && !event.isFileOperation) return undefined;
   if (toolIdentity === 'ux_invoke_shell') return undefined;
   if (toolIdentity === 'ux_invoke_subagents') return undefined;
 
@@ -25,6 +26,7 @@ const getFilePathFromEvent = (event: SystemEvent): string | undefined => {
   if (event.isShellCommand) return undefined;
   if (event.toolCategory === 'glob') return undefined;
   if (event.toolCategory === 'file_read') return event.filePath;
+  if (event.toolCategory === 'file_write') return event.filePath;
   if (event.toolCategory === 'file_edit') return event.filePath;
 
   const titleLower = (event.title || '').toLowerCase();
@@ -75,6 +77,7 @@ const getFilePathFromEvent = (event: SystemEvent): string | undefined => {
 const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpenInCanvas, markdownComponents }) => {
   const filePath = getFilePathFromEvent(step.event);
   const toolIdentity = step.event.canonicalName || step.event.toolName;
+  const isAcpUxTool = step.event.isAcpUxTool === true;
   const elapsed = useElapsed(step.event.startTime, step.event.endTime);
   const outputContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -85,11 +88,19 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
   }, [isCollapsed, step.event.output, step.event.status, step.event.shellRunId]);
 
   return (
-    <div className={`system-event ${step.event.status}`}>
+    <div className={`system-event ${step.event.status}${isAcpUxTool ? ' acp-ux-tool-event' : ''}`}>
       <div className="timeline-step-header-wrapper">
         <button className="timeline-step-header" onClick={onToggle}>
           {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-          <Settings size={14} className="step-icon" />
+          {isAcpUxTool ? (
+            <span className="step-icon-label" aria-label="AcpUI UX tool" title="AcpUI UX tool">
+              <PlugZap size={14} className="step-icon acp-ux-tool-icon" aria-hidden="true" />
+            </span>
+          ) : (
+            <span className="step-icon-label" aria-label="System tool" title="System tool">
+              <Settings size={14} className="step-icon" aria-hidden="true" />
+            </span>
+          )}
           <span className="event-title">{step.event.title}</span>
           {step.event.status === 'in_progress' && <span className="event-pulse">...</span>}
           {elapsed && <span className="tool-timer">{elapsed}</span>}

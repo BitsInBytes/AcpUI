@@ -43,7 +43,7 @@ npm run build
 
 ## Where To Find Detailed Technical Docs
 
-Feature docs are now the source of truth for implementation detail and exact line references:
+Feature docs are now the source of truth for implementation detail and stable file/function/event anchors:
 
 - [Feature Doc - Frontend Architecture](../documents/%5BFeature%20Doc%5D%20-%20Frontend%20Architecture.md)
 - [Feature Doc - Message Bubble UI & Typewriter System](../documents/%5BFeature%20Doc%5D%20-%20Message%20Bubble%20UI%20%26%20Typewriter%20System.md)

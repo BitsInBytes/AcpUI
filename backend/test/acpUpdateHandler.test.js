@@ -32,7 +32,7 @@ vi.mock('../database.js', () => ({
   saveConfigOptions: vi.fn().mockResolvedValue({})
 }));
 vi.mock('../services/providerLoader.js', () => ({
-  getProvider: () => ({ config: { paths: {}, protocolPrefix: 'test/' } }),
+  getProvider: () => ({ config: { paths: {}, protocolPrefix: 'test/', mcpName: 'AcpUI' } }),
   getProviderModule: vi.fn().mockResolvedValue(mockProviderModule),
   getProviderModuleSync: () => mockProviderModule
 }));
@@ -181,6 +181,7 @@ describe('acpUpdateHandler', () => {
       });
       expect(client.io.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
         type: 'tool_start',
+        isAcpUxTool: true,
         shellRunId: 'shell-run-test',
         shellInteractive: true,
         shellState: 'pending',
@@ -230,6 +231,7 @@ describe('acpUpdateHandler', () => {
       const lastEmit = systemEvents.at(-1)[1];
       expect(lastEmit).toEqual(expect.objectContaining({
         type: 'tool_end',
+        isAcpUxTool: true,
         title: 'Invoke Shell: Run test suite'
       }));
   });
@@ -270,6 +272,7 @@ describe('acpUpdateHandler', () => {
       const lastEmit = systemEvents.at(-1)[1];
       expect(lastEmit).toEqual(expect.objectContaining({
         type: 'tool_update',
+        isAcpUxTool: true,
         title: 'Invoke Shell: Inspect logs'
       }));
   });

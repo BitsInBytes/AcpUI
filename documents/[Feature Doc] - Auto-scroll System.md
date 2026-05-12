@@ -1,8 +1,6 @@
-# Feature Doc — Auto-scroll System
+# Auto-scroll System
 
-The auto-scroll system keeps the active chat viewport pinned to the newest content while still letting users intentionally pause scrolling and resume on demand.
-
-This area is easy to break because it coordinates React refs, Zustand state, wheel/scroll events, stream-driven re-renders, and `ResizeObserver` timing.
+The auto-scroll system keeps the chat viewport pinned to the newest content while preserving explicit user control over reading position. It is easy to break because it coordinates React refs, Zustand state, wheel and scroll events, streaming store ticks, `requestAnimationFrame`, and `ResizeObserver` callbacks across the main app and pop-out window.
 
 ---
 
@@ -10,195 +8,327 @@ This area is easy to break because it coordinates React refs, Zustand state, whe
 
 ### What It Does
 
-- Maintains chat stickiness to bottom when auto-scroll is active.
-- Persists the global auto-scroll preference in `localStorage` via `useUIStore`.
-- Distinguishes between user intent to pause stickiness and normal passive scrolling.
-- Exposes a forced "Back to Bottom" recovery path.
-- Keeps scrolling stable during high-frequency streaming updates and late layout changes.
-- Re-applies bottom pinning on session switches for predictable navigation.
+- Pins the chat container to the bottom while live stickiness is enabled.
+- Stores the global auto-scroll toggle in `useUIStore.isAutoScrollDisabled` and persists it to `localStorage`.
+- Keeps per-view live stickiness separate from the persisted auto-scroll toggle.
+- Forces recovery to the newest content through `scrollToBottom(true)`.
+- Schedules bottom snaps with `requestAnimationFrame` so layout and scroll position settle in the same frame.
+- Uses `ResizeObserver` to catch content growth that happens after React commits.
+- Integrates the same hook contract in `App` and `PopOutApp`.
 
 ### Why This Matters
 
-- Streaming output is only readable if the viewport tracks new tokens/events correctly.
-- Incorrect stickiness creates "message below prompt" visual regressions.
-- A single scrolling bug impacts every major workflow (chat, tools, plans, sub-agents).
-- This hook is shared by both main app and pop-out chat windows.
-- Performance depends on scheduling bottom snaps at the right frame phase.
+- Streaming output remains readable only when the viewport tracks new content predictably.
+- Scroll bugs usually cross component boundaries: hook state, store state, DOM measurements, and stream timing all interact.
+- The main chat surface and pop-out chat surface share the same scroll behavior.
+- The back-to-bottom affordance depends on user intent and the persisted toggle, not only on raw scroll position.
+- Message pagination changes `visibleCount`, which is part of the hook's bottom-snap trigger set.
 
-Architectural role: frontend-only cross-cutting behavior (hook + store + UI surfaces).
+Architectural role: frontend-only cross-cutting behavior spanning `useScroll`, `useUIStore`, `MessageList`, `ChatInput`, `useChatManager`, and `useStreamStore`.
 
 ---
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-1. `useUIStore` owns persisted global preference (`isAutoScrollDisabled`).
+1. `useUIStore` owns the persisted auto-scroll preference.
 
 ```typescript
-// FILE: frontend/src/store/useUIStore.ts (Lines 63, 92-95)
-isAutoScrollDisabled: localStorage.getItem('isAutoScrollDisabled') === 'true', // LINE 63
-toggleAutoScroll: () => set((state) => {                                        // LINE 92
-  const newValue = !state.isAutoScrollDisabled;                                  // LINE 93
-  localStorage.setItem('isAutoScrollDisabled', newValue.toString());             // LINE 94
-  return { isAutoScrollDisabled: newValue };                                     // LINE 95
+// FILE: frontend/src/store/useUIStore.ts (store field: `isAutoScrollDisabled`, action: `toggleAutoScroll`)
+isAutoScrollDisabled: localStorage.getItem('isAutoScrollDisabled') === 'true',
+
+toggleAutoScroll: () => set((state) => {
+  const newValue = !state.isAutoScrollDisabled;
+  localStorage.setItem('isAutoScrollDisabled', newValue.toString());
+  return { isAutoScrollDisabled: newValue };
 }),
 ```
 
-2. `App` and `PopOutApp` both instantiate `useScroll` and pass its handlers into `MessageList`.
+The store field means "non-forced automatic scrolling is disabled." The value is global across chat surfaces because it lives in Zustand and `localStorage`.
+
+2. `App` creates the main chat scroll controller.
 
 ```tsx
-// FILE: frontend/src/App.tsx (Lines 75-81, 220-225)
-const { scrollRef, showScrollButton, scrollToBottom, handleScroll, handleWheel } =  // LINE 75
-  useScroll(activeSessionId, activeSession?.messages, visibleCount);                  // LINE 81
+// FILE: frontend/src/App.tsx (component: `App`, hook: `useScroll`)
+const {
+  scrollRef,
+  showScrollButton,
+  scrollToBottom,
+  handleScroll,
+  handleWheel
+} = useScroll(activeSessionId, activeSession?.messages, visibleCount);
 
+useChatManager(
+  scrollToBottom,
+  (filePath) => handleFileEdited(socket, filePath),
+  (filePath) => handleOpenFileInCanvas(socket, activeSessionId, filePath)
+);
+```
+
+`App` passes the hook's `scrollToBottom` into `useChatManager`, so stream draining and chat viewport pinning share the same gate logic.
+
+3. `App` wires the hook into `MessageList`.
+
+```tsx
+// FILE: frontend/src/App.tsx (component: `App`, component: `MessageList`)
 <MessageList
   scrollRef={scrollRef as React.RefObject<HTMLDivElement>}
   handleScroll={handleScroll}
   handleWheel={handleWheel}
   showScrollButton={showScrollButton}
-  handleBackToBottom={() => scrollToBottom(true)}                                     // LINE 225
+  handleBackToBottom={() => scrollToBottom(true)}
 />
 ```
 
+The back-to-bottom button always uses the forced recovery path.
+
+4. `PopOutApp` uses the same hook contract.
+
 ```tsx
-// FILE: frontend/src/PopOutApp.tsx (Lines 40-42, 111-117)
-const { scrollRef, showScrollButton, scrollToBottom, handleScroll, handleWheel } = useScroll( // LINE 40
-  activeSessionId, activeSession?.messages, visibleCount                                     // LINE 41
+// FILE: frontend/src/PopOutApp.tsx (component: `PopOutApp`, hook: `useScroll`)
+const { scrollRef, showScrollButton, scrollToBottom, handleScroll, handleWheel } = useScroll(
+  activeSessionId, activeSession?.messages, visibleCount
 );
-<MessageList ... handleBackToBottom={() => scrollToBottom(true)} />                           // LINE 116
+
+useChatManager(
+  scrollToBottom,
+  (filePath) => handleFileEdited(socket, filePath),
+  (filePath) => handleOpenFileInCanvas(socket, activeSessionId, filePath)
+);
 ```
 
-3. `useScroll` initializes dual state: persisted global toggle + live in-session stickiness.
+The pop-out window has its own `useScroll` instance but consumes the same persisted `useUIStore.isAutoScrollDisabled` value.
 
-```typescript
-// FILE: frontend/src/hooks/useScroll.ts (Lines 6-11)
-const [isAutoScrollEnabled, setIsAutoScrollEnabled] = useState(true);   // LINE 6
-const isAutoScrollEnabledRef = useRef(true);                             // LINE 7
-const isAutoScrollDisabled = useUIStore(state => state.isAutoScrollDisabled); // LINE 8
-const isAutoScrollDisabledRef = useRef(isAutoScrollDisabled);            // LINE 9
-const toggleAutoScrollStore = useUIStore(state => state.toggleAutoScroll); // LINE 10
-const [showScrollButton, setShowScrollButton] = useState(false);         // LINE 11
-```
-
-4. `scrollToBottom` enforces the main contract: no non-forced scroll when globally disabled, and frame-aligned bottom snap.
-
-```typescript
-// FILE: frontend/src/hooks/useScroll.ts (Lines 26-47)
-if (isAutoScrollDisabled && !force) return;                              // LINE 30
-if (force || isAutoScrollEnabledRef.current) {                           // LINE 32
-  if (force) {
-    isAutoScrollEnabledRef.current = true;                               // LINE 34
-    setIsAutoScrollEnabled(true);                                        // LINE 35
-    setShowScrollButton(false);                                          // LINE 36
-  }
-  if (pendingScrollFrame.current !== null) cancelAnimationFrame(pendingScrollFrame.current); // LINE 41-43
-  pendingScrollFrame.current = requestAnimationFrame(() => {             // LINE 44
-    pendingScrollFrame.current = null;                                   // LINE 45
-    snapToBottom();                                                      // LINE 46
-  });
-}
-```
-
-5. Toggling from disabled to enabled immediately forces bottom alignment.
-
-```typescript
-// FILE: frontend/src/hooks/useScroll.ts (Lines 51-59)
-const toggleAutoScroll = useCallback(() => {
-  const wasDisabled = isAutoScrollDisabled;      // LINE 52
-  toggleAutoScrollStore();                       // LINE 53
-  if (wasDisabled) scrollToBottom(true);         // LINE 56-57
-}, [isAutoScrollDisabled, toggleAutoScrollStore, scrollToBottom]);
-```
-
-6. User wheel-up pauses stickiness for the current session view; wheel-down does not auto-resume it.
-
-```typescript
-// FILE: frontend/src/hooks/useScroll.ts (Lines 83-89)
-if (e.deltaY < 0 && isAutoScrollEnabledRef.current) {  // LINE 84
-  isAutoScrollEnabledRef.current = false;              // LINE 85
-  setIsAutoScrollEnabled(false);                       // LINE 86
-  if (isAutoScrollDisabled) setShowScrollButton(true); // LINE 87
-}
-```
-
-7. Scroll events compute "at bottom" and gate button visibility.
-
-```typescript
-// FILE: frontend/src/hooks/useScroll.ts (Lines 65-77)
-const isAtBottom = el.scrollHeight - el.scrollTop <= el.clientHeight + 50; // LINE 65
-const isScrollingUp = el.scrollTop < lastScrollTop.current;                 // LINE 66
-if (isAtBottom) setShowScrollButton(false);                                 // LINE 73-74
-else if (isScrollingUp) {
-  if (isAutoScrollDisabled) setShowScrollButton(true);                      // LINE 76
-}
-```
-
-8. `ResizeObserver` pins to bottom on post-layout growth when auto-scroll is active.
-
-```typescript
-// FILE: frontend/src/hooks/useScroll.ts (Lines 102-110, 118-127)
-const ro = new ResizeObserver(() => {                    // LINE 104
-  if (isAutoScrollDisabledRef.current) return;           // LINE 105
-  if (!isAutoScrollEnabledRef.current) return;           // LINE 106
-  const node = scrollRef.current;
-  if (!node) return;
-  node.scrollTop = node.scrollHeight;                    // LINE 109
-});
-...
-const content = el.firstElementChild;                    // LINE 123
-if (!content) return;
-ro.observe(content);                                     // LINE 125
-```
-
-9. Session switch and message growth trigger explicit bottom snaps through dedicated effects.
-
-```typescript
-// FILE: frontend/src/hooks/useScroll.ts (Lines 135-146)
-useEffect(() => {
-  if (activeSessionId) scrollToBottom(true);             // LINE 137
-}, [activeSessionId, scrollToBottom]);
-
-useEffect(() => {
-  if (activeSessionId) scrollToBottom(false);            // LINE 143
-}, [activeSessionMessages, visibleCount, scrollToBottom]); // LINE 146
-```
-
-10. Streaming pipeline calls `scrollToBottom` every process tick (non-forced), so behavior still obeys toggle/ref state.
-
-```typescript
-// FILE: frontend/src/store/useStreamStore.ts (Lines 199-200, 400-401)
-processBuffer: (scrollToBottom, onFileEdited, onOpenFileInCanvas) => { // LINE 199
-  ...
-  scrollToBottom();                                                     // LINE 400
-  set({ typewriterInterval: setTimeout(() => get().processBuffer(scrollToBottom, onFileEdited, onOpenFileInCanvas), 32) as unknown as number }); // LINE 401
-}
-```
-
-11. The footer Auto-scroll pill is the primary user-facing toggle.
+5. `MessageList` attaches the DOM ref and user event handlers.
 
 ```tsx
-// FILE: frontend/src/components/ChatInput/ChatInput.tsx (Lines 296-302)
+// FILE: frontend/src/components/MessageList/MessageList.tsx (component: `MessageList`)
+<main
+  className="chat-container"
+  ref={scrollRef}
+  onScroll={handleScroll}
+  onWheel={handleWheel}
+>
+  <div className="chat-content">
+    <HistoryList messages={slicedMessages} acpSessionId={activeSession.acpSessionId} providerId={activeSession.provider} />
+    <div className="scroll-spacer" />
+  </div>
+</main>
+```
+
+The observed content target is the chat container's `firstElementChild`, which is the `.chat-content` wrapper.
+
+6. `useScroll` initializes live stickiness, store bridging, and DOM timing refs.
+
+```typescript
+// FILE: frontend/src/hooks/useScroll.ts (hook: `useScroll`)
+const scrollRef = useRef<HTMLDivElement>(null);
+const [isAutoScrollEnabled, setIsAutoScrollEnabled] = useState(true);
+const isAutoScrollEnabledRef = useRef(true);
+const isAutoScrollDisabled = useUIStore(state => state.isAutoScrollDisabled);
+const isAutoScrollDisabledRef = useRef(isAutoScrollDisabled);
+const toggleAutoScrollStore = useUIStore(state => state.toggleAutoScroll);
+const [showScrollButton, setShowScrollButton] = useState(false);
+const pendingScrollFrame = useRef<number | null>(null);
+const resizeObserverRef = useRef<ResizeObserver | null>(null);
+```
+
+`isAutoScrollEnabled` is per-hook live stickiness. `isAutoScrollDisabled` is the persisted global preference.
+
+7. `scrollToBottom` enforces forced and non-forced behavior.
+
+```typescript
+// FILE: frontend/src/hooks/useScroll.ts (function: `scrollToBottom`)
+const scrollToBottom = useCallback((force = false) => {
+  const el = scrollRef.current;
+  if (!el) return;
+
+  if (isAutoScrollDisabled && !force) return;
+
+  if (force || isAutoScrollEnabledRef.current) {
+    if (force) {
+      isAutoScrollEnabledRef.current = true;
+      setIsAutoScrollEnabled(true);
+      setShowScrollButton(false);
+    }
+    if (pendingScrollFrame.current !== null) {
+      cancelAnimationFrame(pendingScrollFrame.current);
+    }
+    pendingScrollFrame.current = requestAnimationFrame(() => {
+      pendingScrollFrame.current = null;
+      snapToBottom();
+    });
+  }
+}, [isAutoScrollDisabled, snapToBottom]);
+```
+
+Non-forced calls respect `isAutoScrollDisabled` and live stickiness. Forced calls reset live stickiness, hide the button, and schedule a bottom snap.
+
+8. The ChatInput auto-scroll pill toggles the persisted preference.
+
+```tsx
+// FILE: frontend/src/components/ChatInput/ChatInput.tsx (component: `ChatInput`, control: Auto-scroll pill)
 <button
-  className={`chatinput-pill ${!isAutoScrollDisabled ? 'active' : ''}`} // LINE 296
-  onClick={toggleAutoScroll}                                              // LINE 297
-  title={isAutoScrollDisabled ? "Enable Auto-scroll" : "Disable auto-scroll"} // LINE 298
+  className={`chatinput-pill ${!isAutoScrollDisabled ? 'active' : ''}`}
+  onClick={toggleAutoScroll}
+  title={isAutoScrollDisabled ? "Enable Auto-scroll" : "Disable auto-scroll"}
 >
   <ArrowDownToLine size={12} />
-  Auto-scroll                                                             // LINE 301
+  Auto-scroll
 </button>
 ```
 
-12. The back-to-bottom button is rendered by `MessageList` and only appears when `showScrollButton` is true.
+The pill is active when non-forced auto-scroll calls are allowed.
+
+9. Re-enabling auto-scroll forces immediate recovery.
+
+```typescript
+// FILE: frontend/src/hooks/useScroll.ts (function: `toggleAutoScroll`)
+const toggleAutoScroll = useCallback(() => {
+  const wasDisabled = isAutoScrollDisabled;
+  toggleAutoScrollStore();
+
+  if (wasDisabled) {
+    scrollToBottom(true);
+  }
+}, [isAutoScrollDisabled, toggleAutoScrollStore, scrollToBottom]);
+```
+
+The store toggle flips first. If the user is enabling auto-scroll, `scrollToBottom(true)` restores the bottom position immediately.
+
+10. Wheel and scroll events update live stickiness.
+
+```typescript
+// FILE: frontend/src/hooks/useScroll.ts (handlers: `handleWheel`, `handleScroll`)
+const handleWheel = (e: React.WheelEvent) => {
+  if (e.deltaY < 0 && isAutoScrollEnabledRef.current) {
+    isAutoScrollEnabledRef.current = false;
+    setIsAutoScrollEnabled(false);
+    if (isAutoScrollDisabled) setShowScrollButton(true);
+  }
+};
+
+const handleScroll = useCallback(() => {
+  const el = scrollRef.current;
+  if (!el) return;
+
+  const isAtBottom = el.scrollHeight - el.scrollTop <= el.clientHeight + 50;
+  const isScrollingUp = el.scrollTop < lastScrollTop.current;
+
+  if (isAutoScrollEnabledRef.current !== isAtBottom) {
+    isAutoScrollEnabledRef.current = isAtBottom;
+    setIsAutoScrollEnabled(isAtBottom);
+  }
+
+  if (isAtBottom) {
+    setShowScrollButton(false);
+  } else if (isScrollingUp) {
+    if (isAutoScrollDisabled) setShowScrollButton(true);
+  }
+
+  lastScrollTop.current = el.scrollTop;
+}, []);
+```
+
+Wheel-up pauses live stickiness. Scrolling to the bottom restores live stickiness through `handleScroll` because `isAtBottom` becomes true.
+
+11. `ResizeObserver` pins late-growing content while auto-scroll is active.
+
+```typescript
+// FILE: frontend/src/hooks/useScroll.ts (effects: `ResizeObserver` setup and active-session observation)
+useEffect(() => {
+  if (typeof ResizeObserver === 'undefined') return;
+  const ro = new ResizeObserver(() => {
+    if (isAutoScrollDisabledRef.current) return;
+    if (!isAutoScrollEnabledRef.current) return;
+    const node = scrollRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  });
+  resizeObserverRef.current = ro;
+  return () => {
+    ro.disconnect();
+    resizeObserverRef.current = null;
+  };
+}, []);
+
+useEffect(() => {
+  const ro = resizeObserverRef.current;
+  if (!ro) return;
+  const el = scrollRef.current;
+  if (!el) return;
+  const content = el.firstElementChild;
+  if (!content) return;
+  ro.observe(content);
+  return () => ro.disconnect();
+}, [activeSessionId]);
+```
+
+The observer instance is created once and the observed target is swapped on active session changes.
+
+12. Session changes and message pagination trigger bottom snaps.
+
+```typescript
+// FILE: frontend/src/hooks/useScroll.ts (effects: active session, message growth, visible count)
+useEffect(() => {
+  if (activeSessionId) {
+    scrollToBottom(true);
+  }
+}, [activeSessionId, scrollToBottom]);
+
+useEffect(() => {
+  if (activeSessionId) {
+    scrollToBottom(false);
+  }
+}, [activeSessionMessages, visibleCount, scrollToBottom]);
+```
+
+Session changes force recovery. Message growth and `visibleCount` changes use the normal gate.
+
+13. Streaming calls the same non-forced scroll path.
+
+```typescript
+// FILE: frontend/src/hooks/useChatManager.ts (hook: `useChatManager`, effect: Typewriter Loop)
+useEffect(() => {
+  if (hasQueues && !typewriterInterval) {
+    processBuffer(scrollToBottom, onFileEdited, onOpenFileInCanvas);
+  }
+}, [hasQueues, typewriterInterval, processBuffer, scrollToBottom, onFileEdited, onOpenFileInCanvas]);
+```
+
+```typescript
+// FILE: frontend/src/store/useStreamStore.ts (action: `processBuffer`)
+scrollToBottom();
+set({
+  typewriterInterval: setTimeout(
+    () => get().processBuffer(scrollToBottom, onFileEdited, onOpenFileInCanvas),
+    32
+  ) as unknown as number
+});
+```
+
+The typewriter loop invokes `scrollToBottom()` without forcing, so user-disabled auto-scroll and paused live stickiness are honored during streaming.
+
+14. `MessageList` renders the recovery button from hook state.
 
 ```tsx
-// FILE: frontend/src/components/MessageList/MessageList.tsx (Lines 71-79)
-{showScrollButton && (
-  <div className="back-to-bottom-container">
-    <motion.button
-      onClick={handleBackToBottom}     // LINE 78
-      className="back-to-bottom-btn"
-      title="Scroll to bottom"
-    >
+// FILE: frontend/src/components/MessageList/MessageList.tsx (prop: `showScrollButton`, handler: `handleBackToBottom`)
+<AnimatePresence>
+  {showScrollButton && (
+    <div className="back-to-bottom-container">
+      <motion.button
+        onClick={handleBackToBottom}
+        className="back-to-bottom-btn"
+        title="Scroll to bottom"
+      >
+        <ChevronDown size={16} />
+        <span>Back to Bottom</span>
+      </motion.button>
+    </div>
+  )}
+</AnimatePresence>
 ```
+
+`showScrollButton` is controlled only by `useScroll`; `MessageList` renders it without recomputing scroll state.
 
 ---
 
@@ -206,40 +336,67 @@ processBuffer: (scrollToBottom, onFileEdited, onOpenFileInCanvas) => { // LINE 1
 
 ```mermaid
 flowchart LR
-  U[User Scroll / Wheel / Click] --> MS[MessageList]
-  MS --> HS[useScroll]
-  HS --> UIS[useUIStore]
-  HS --> DOM[chat-container DOM]
-  STREAM[useStreamStore.processBuffer] -->|scrollToBottom()| HS
-  CHATINPUT[ChatInput Auto-scroll Pill] -->|toggleAutoScroll| UIS
-  OBS[ResizeObserver callback] --> HS
-  HS --> BTN[Back to Bottom Visible]
-  BTN -->|click| HS
+  subgraph Store[Zustand]
+    UIS[useUIStore\nisAutoScrollDisabled\ntoggleAutoScroll]
+    SS[useStreamStore\nprocessBuffer]
+  end
+
+  subgraph Shells[Chat Surfaces]
+    APP[App]
+    POP[PopOutApp]
+  end
+
+  APP --> US[useScroll]
+  POP --> US
+  APP --> UCM[useChatManager]
+  POP --> UCM
+  UCM -->|processBuffer(scrollToBottom)| SS
+  SS -->|scrollToBottom()| US
+
+  CI[ChatInput Auto-scroll Pill] -->|toggleAutoScroll| UIS
+  UIS --> US
+
+  ML[MessageList] -->|onWheel/onScroll| US
+  ML -->|Back to Bottom| US
+  US -->|scrollRef| DOM[.chat-container]
+  US -->|observe firstElementChild| RO[ResizeObserver]
+  RO --> DOM
 ```
 
-Main chat auto-scroll is store-backed, hook-driven, and DOM-timed (wheel/scroll + resize + stream updates).
+The hook is the only component that mutates the chat container scroll position. Stores and components either provide state, render controls, or call the hook contract.
 
 ---
 
 ## The Critical Contract / Key Concept
 
-The auto-scroll system depends on two distinct states with different semantics:
+### Contract: Persisted Preference vs Live Stickiness
 
 ```typescript
-// FILE: frontend/src/hooks/useScroll.ts (Lines 6-11, 148-154)
-isAutoScrollEnabled: boolean;      // per-view stickiness (user scrolled up/down)
-isManualScrollDisabled: boolean;   // persisted global toggle (from useUIStore.isAutoScrollDisabled)
-toggleAutoScroll: () => void;      // flips persisted global toggle
+// FILE: frontend/src/hooks/useScroll.ts (hook return contract)
+return {
+  scrollRef,
+  isAutoScrollEnabled,
+  setIsAutoScrollEnabled,
+  isAutoScrollEnabledRef,
+  isManualScrollDisabled: isAutoScrollDisabled,
+  toggleAutoScroll,
+  showScrollButton,
+  scrollToBottom,
+  handleScroll,
+  handleWheel
+};
 ```
 
-Contract rules:
+Rules:
 
-1. `isAutoScrollDisabled === true` must block non-forced `scrollToBottom` calls.
-2. `scrollToBottom(true)` is always allowed and resets stickiness/button state.
-3. Wheel-up disables live stickiness (`isAutoScrollEnabledRef.current = false`) but does not flip persisted preference.
-4. Back-to-bottom and re-enable flows must re-establish stickiness immediately.
+1. `useUIStore.isAutoScrollDisabled === true` blocks non-forced `scrollToBottom()` and `ResizeObserver` pinning.
+2. `isAutoScrollEnabledRef.current === false` blocks non-forced `scrollToBottom()` and `ResizeObserver` pinning even when the global toggle is enabled.
+3. `scrollToBottom(true)` bypasses the persisted toggle, restores live stickiness, hides the recovery button, and schedules a bottom snap.
+4. `handleScroll` treats the viewport as bottom-pinned when `scrollHeight - scrollTop <= clientHeight + 50`.
+5. `handleWheel` only pauses live stickiness on upward wheel motion.
+6. Stream-driven scrolling must call `scrollToBottom()` without `force` so user intent remains authoritative.
 
-If these semantics are mixed up, users get unpredictable behavior (jumping viewport, hidden button, or stuck non-scrolling state).
+If the two states are mixed, chat can jump while the user is reading, ignore streaming output while the user expects pinning, or leave stale recovery UI visible.
 
 ---
 
@@ -248,44 +405,69 @@ If these semantics are mixed up, users get unpredictable behavior (jumping viewp
 This feature is provider-agnostic.
 
 - No provider settings are required.
-- The only persisted setting is the frontend localStorage key `isAutoScrollDisabled`.
-- Auto-scroll logic reacts to generic message growth and stream ticks, regardless of provider.
+- The persisted browser key is `isAutoScrollDisabled`.
+- Provider identity, model selection, tool type, and socket provider fields do not affect the scroll gate.
+- Message growth, stream ticks, and session changes drive auto-scroll through generic frontend state.
 
 ---
 
 ## Data Flow / Rendering Pipeline
 
-Raw interaction:
+### User Disables Auto-scroll
 
 ```text
-User wheels up while viewing output
+ChatInput Auto-scroll pill
+  -> useUIStore.toggleAutoScroll()
+  -> localStorage['isAutoScrollDisabled'] = 'true'
+  -> useScroll sees isAutoScrollDisabled === true
+  -> non-forced scrollToBottom() returns before scheduling a frame
 ```
 
-Hook state transitions:
-
-```typescript
-isAutoScrollEnabledRef.current: true -> false
-isAutoScrollEnabled: true -> false
-showScrollButton: false -> true (only if isAutoScrollDisabled is true)
-```
-
-Streaming update path:
+### User Re-enables Auto-scroll
 
 ```text
-socket token/event -> useStreamStore.processBuffer() -> scrollToBottom() -> useScroll gate
+ChatInput Auto-scroll pill
+  -> useScroll.toggleAutoScroll()
+  -> useUIStore.toggleAutoScroll()
+  -> scrollToBottom(true)
+  -> isAutoScrollEnabledRef.current = true
+  -> showScrollButton = false
+  -> requestAnimationFrame(snapToBottom)
 ```
 
-Gate behavior:
-
-```typescript
-if (isAutoScrollDisabled && !force) return;
-if (force || isAutoScrollEnabledRef.current) snapToBottom();
-```
-
-Resume path:
+### User Scrolls Up During Streaming
 
 ```text
-Back to Bottom click OR re-enable toggle -> scrollToBottom(true) -> pinned bottom + button hidden
+MessageList onWheel(deltaY < 0)
+  -> useScroll.handleWheel()
+  -> isAutoScrollEnabledRef.current = false
+  -> isAutoScrollEnabled = false
+  -> stream tick calls scrollToBottom()
+  -> call exits because live stickiness is false
+```
+
+### Streaming Token Drain
+
+```text
+backend token/thought/system_event
+  -> useChatManager socket listener
+  -> useStreamStore queue
+  -> useChatManager Typewriter Loop
+  -> useStreamStore.processBuffer(scrollToBottom)
+  -> timeline mutation
+  -> scrollToBottom()
+  -> useScroll gate
+  -> requestAnimationFrame(snapToBottom) when allowed
+```
+
+### Late Layout Growth
+
+```text
+React commit or syntax-highlighted/code/tool content grows .chat-content
+  -> ResizeObserver callback
+  -> require isAutoScrollDisabledRef.current === false
+  -> require isAutoScrollEnabledRef.current === true
+  -> scrollRef.current.scrollTop = scrollRef.current.scrollHeight
 ```
 
 ---
@@ -294,104 +476,152 @@ Back to Bottom click OR re-enable toggle -> scrollToBottom(true) -> pinned botto
 
 ### Frontend Runtime
 
-| File | Key Functions / Symbols | Exact Lines | Purpose |
-|---|---|---:|---|
-| `frontend/src/hooks/useScroll.ts` | `useScroll`, `scrollToBottom`, `handleScroll`, `handleWheel`, `toggleAutoScroll`, ResizeObserver effects | 4-160 | Core auto-scroll logic and DOM coordination |
-| `frontend/src/store/useUIStore.ts` | `isAutoScrollDisabled`, `toggleAutoScroll` | 63, 92-95 | Persisted toggle source of truth |
-| `frontend/src/store/useStreamStore.ts` | `processBuffer(scrollToBottom, ...)`, `scrollToBottom()` invocation | 199-200, 400-401 | Streaming-driven scroll triggers |
-| `frontend/src/App.tsx` | `useScroll(...)`, `MessageList` wiring | 75-81, 220-225 | Main-app integration |
-| `frontend/src/PopOutApp.tsx` | `useScroll(...)`, `MessageList` wiring | 40-42, 111-117 | Pop-out integration |
-| `frontend/src/components/MessageList/MessageList.tsx` | `onScroll`, `onWheel`, back-to-bottom button | 40-41, 71-79 | User event source + recovery button |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | Auto-scroll pill toggle UI | 50-51, 296-302 | Primary user toggle surface |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Hook | `frontend/src/hooks/useScroll.ts` | `useScroll`, `snapToBottom`, `scrollToBottom`, `toggleAutoScroll`, `handleScroll`, `handleWheel`, `ResizeObserver` effects | Core scroll state, DOM ref, frame scheduling, and observer coordination |
+| UI store | `frontend/src/store/useUIStore.ts` | `isAutoScrollDisabled`, `toggleAutoScroll`, `visibleCount`, `incrementVisibleCount`, `resetVisibleCount` | Persisted auto-scroll toggle and message pagination state |
+| Main app | `frontend/src/App.tsx` | `App`, `useScroll`, `useChatManager`, `MessageList`, `resetVisibleCount` | Main chat integration and active-session reset path |
+| Pop-out app | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `useScroll`, `useChatManager`, `MessageList`, `claimSession`, `watch_session` | Detached-window integration for the same scroll hook contract |
+| Message list | `frontend/src/components/MessageList/MessageList.tsx` | `MessageList`, `scrollRef`, `handleScroll`, `handleWheel`, `showScrollButton`, `handleBackToBottom`, `.chat-content` | Scroll container, user event source, pagination UI, and recovery button |
+| Chat input | `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput`, Auto-scroll pill, `isAutoScrollDisabled`, `toggleAutoScroll` | User-facing persisted auto-scroll toggle |
+| Chat manager | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, Typewriter Loop effect, `processBuffer(scrollToBottom, ...)` | Starts stream draining with the hook's non-forced scroll function |
+| Stream store | `frontend/src/store/useStreamStore.ts` | `processBuffer`, `typewriterInterval`, `scrollToBottom()` call | Mutates timeline during stream ticks and invokes non-forced scroll |
 
-### Adjacent (Separate Scope)
+### Adjacent Behavior
 
-| File | Key Functions / Symbols | Exact Lines | Purpose |
-|---|---|---:|---|
-| `frontend/src/components/ToolStep.tsx` | local output container auto-scroll effect | 88-92 | Tool-output pane auto-scroll; independent from chat auto-scroll toggle |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Tool output panes | `frontend/src/components/ToolStep.tsx` | local output container scroll effect, `ShellToolTerminal`, `SubAgentPanel` | Inner tool-pane scrolling, separate from the chat container auto-scroll gate |
+| Message rendering | `frontend/src/components/HistoryList.tsx`, `frontend/src/components/ChatMessage.tsx`, `frontend/src/components/AssistantMessage.tsx` | `HistoryList`, `ChatMessage`, `AssistantMessage` | Content rendered inside `.chat-content`; content growth can trigger the observer |
 
 ---
 
 ## Gotchas & Important Notes
 
-1. Two states, two meanings.
-   - `isAutoScrollDisabled` (global preference) is not the same as `isAutoScrollEnabled` (live stickiness).
+1. Two states have different meanings.
+   - `useUIStore.isAutoScrollDisabled` is persisted and global; `isAutoScrollEnabled` is live stickiness for a hook instance.
 
-2. Back-to-bottom visibility is intentionally gated.
-   - `showScrollButton` only flips on upward movement when global auto-scroll is disabled.
+2. Forced scrolling bypasses the persisted toggle.
+   - `scrollToBottom(true)` runs on session changes and back-to-bottom recovery so the user can always reach the newest content.
 
-3. Session switch always forces a bottom snap.
-   - This is deliberate (`scrollToBottom(true)` on active session change), even if the global toggle is disabled.
+3. Stream scrolling must remain non-forced.
+   - `useStreamStore.processBuffer` calls `scrollToBottom()` without arguments so disabled auto-scroll and paused stickiness are respected.
 
-4. `ResizeObserver` is optional by environment.
-   - Hook must operate safely when `ResizeObserver` is unavailable.
+4. The back-to-bottom button is intentionally gated.
+   - `showScrollButton` is set during upward movement only when `isAutoScrollDisabled` is true. The hook still pauses live stickiness when the global toggle is enabled.
 
-5. Observer target is `firstElementChild`.
-   - Missing/changed DOM structure can silently disable growth pinning.
+5. Scrolling down does not directly resume stickiness.
+   - `handleWheel` ignores positive `deltaY`; live stickiness resumes when `handleScroll` observes the viewport at the bottom or a forced path runs.
 
-6. `requestAnimationFrame` cancellation is required.
-   - Without canceling pending frames, rapid updates can queue stale snaps.
+6. `requestAnimationFrame` cancellation matters.
+   - Rapid stream ticks replace the pending frame before scheduling another bottom snap, preventing stale frame callbacks from stacking.
 
-7. Wheel-down does not auto-resume stickiness.
-   - Resume occurs through forced bottom actions, not by downward wheel events.
+7. `ResizeObserver` is optional.
+   - The hook checks `typeof ResizeObserver === 'undefined'` and still works through explicit `scrollToBottom` calls in test and browser environments without observer support.
 
-8. Tool output auto-scroll is separate.
-   - `ToolStep` scrolls its own inner container and is not governed by chat auto-scroll toggle.
+8. The observer target depends on `MessageList` structure.
+   - `useScroll` observes `scrollRef.current.firstElementChild`; `MessageList` must keep `.chat-content` as the first child of `.chat-container` for late-growth pinning.
+
+9. Session changes disconnect observer targets.
+   - The active-session observer effect calls `ro.disconnect()` in cleanup, then observes the next `firstElementChild` when the session changes.
+
+10. App shell tests mock the scroll hook.
+   - `App.test.tsx` and `PopOutApp.test.tsx` exercise shell behavior with mocked `useScroll`, so direct scroll behavior belongs in `useScroll.test.ts` and stream scrolling belongs in stream-store tests.
 
 ---
 
 ## Unit Tests
 
-Frontend:
+### Frontend Hook Tests
 
 - `frontend/src/test/useScroll.test.ts`
-  - Initializes enabled by default
-  - Honors store-loaded disabled state
-  - Toggles through store action
-  - Session switch behavior when disabled
-  - Wheel/scroll state transitions
-  - ResizeObserver behavior (observe, disconnect, growth snapping, disabled guards)
+  - `should initialize with auto-scroll enabled by default`
+  - `should load initial state from UI store`
+  - `should toggle auto-scroll via UI store action`
+  - `should scroll to bottom when session changes even if manually disabled`
+  - `should disable stickiness when scrolling up`
+  - `scrollToBottom scrolls the ref element`
+  - `handleScroll updates showScrollButton when not at bottom`
+  - `handleWheel does not change state when scrolling down`
+  - `creates the ResizeObserver exactly once on mount`
+  - `calls observe(firstElementChild) when a session is active`
+  - `disconnects old observation and re-observes new content when session changes`
+  - `scrolls to bottom when observer callback fires and auto-scroll is enabled`
+  - `does not scroll when isAutoScrollEnabled ref is false (user scrolled up)`
+  - `does not scroll when isAutoScrollDisabled store flag is true`
+  - `disconnects the observer on unmount`
+  - `skips observer setup gracefully when ResizeObserver is undefined`
+
+### Store and Component Tests
 
 - `frontend/src/test/useUIStore.test.ts`
-  - `toggleAutoScroll` writes `isAutoScrollDisabled` and localStorage.
+  - `toggleAutoScroll updates state and localStorage`
+  - `incrementVisibleCount and resetVisibleCount manage pagination`
 
 - `frontend/src/test/MessageList.test.tsx`
-  - Back-to-bottom button visibility and click dispatch.
+  - `shows scroll to bottom button when showScrollButton is true`
+  - `calls handleBackToBottom when scroll button is clicked`
+  - `shows load more button when hasMoreMessages is true`
+  - `increments visible count when load more is clicked`
 
-Integration surfaces:
+### Stream and Shell Surface Tests
 
-- `frontend/src/App.tsx` wiring tested in `frontend/src/test/App.test.tsx` (mocked `useScroll` interface usage).
-- `frontend/src/PopOutApp.tsx` wiring tested in `frontend/src/test/PopOutApp.test.tsx` (mocked `useScroll` interface usage).
+- `frontend/src/test/useStreamStore.test.ts`
+  - `processBuffer drains queue into session messages with adaptive speed`
+  - This test verifies that `processBuffer` invokes the provided `scrollToBottom` callback during token draining.
+
+- `frontend/src/test/typewriter-adaptive.test.ts`
+  - Covers adaptive `processBuffer` behavior with explicit `scrollToBottom` mocks.
+
+- `frontend/src/test/useChatManager.test.ts`
+  - Registers socket listeners and starts stream processing through `useChatManager`; this file does not own hook-level scroll assertions.
+
+### App Surface Tests
+
+- `frontend/src/test/App.test.tsx`
+  - `renders Sidebar and ChatInput`
+  - `switches between sessions and emits watch events`
+  - Uses mocked `useScroll` and mocked `MessageList`, so it verifies app shell behavior rather than DOM scroll behavior.
+
+- `frontend/src/test/PopOutApp.test.tsx`
+  - `renders loading state initially`
+  - `renders ChatHeader and ChatInput when ready`
+  - `hydrates session and emits watch_session when ready`
+  - Uses mocked `useScroll` and mocked `MessageList`, so it verifies pop-out shell behavior rather than DOM scroll behavior.
 
 ---
 
 ## How to Use This Guide
 
-### For implementing/extending auto-scroll behavior
+### For implementing/extending this feature
 
-1. Start in `useScroll.ts` and preserve the force vs non-force contract.
-2. Keep persisted preference changes in `useUIStore` only.
-3. If adding triggers (new layout or stream paths), call `scrollToBottom(false)` unless explicit user recovery is intended.
-4. Update `useScroll.test.ts` first when changing observer/timing behavior.
-5. Keep tool-output pane scrolling separate from chat-container logic.
+1. Start in `frontend/src/hooks/useScroll.ts` and keep the forced versus non-forced `scrollToBottom` contract intact.
+2. Keep persisted preference changes in `frontend/src/store/useUIStore.ts` through `isAutoScrollDisabled` and `toggleAutoScroll`.
+3. Add new automatic stream or layout triggers through `scrollToBottom()` without `force`.
+4. Use `scrollToBottom(true)` only for explicit recovery paths such as session changes, back-to-bottom clicks, or re-enabling auto-scroll.
+5. Keep `MessageList`'s `.chat-content` wrapper as the first child of `.chat-container` if the observer should continue catching late content growth.
+6. Update `frontend/src/test/useScroll.test.ts` for hook timing, observer, and user gesture behavior.
+7. Update `frontend/src/test/useStreamStore.test.ts` or `frontend/src/test/typewriter-adaptive.test.ts` when stream draining changes when or how the scroll callback is invoked.
 
-### For debugging auto-scroll issues
+### For debugging issues with this feature
 
-1. Check store state: `useUIStore.getState().isAutoScrollDisabled`.
-2. Confirm `useScroll` refs: `isAutoScrollEnabledRef.current`, `scrollRef.current`.
-3. Verify `MessageList` passes `onScroll`, `onWheel`, and back-to-bottom handlers.
-4. Reproduce with and without `ResizeObserver` support.
-5. Trace stream path: `processBuffer` -> `scrollToBottom` -> gate condition.
+1. Check `useUIStore.getState().isAutoScrollDisabled` to confirm the persisted gate.
+2. Inspect `useScroll` live refs: `isAutoScrollEnabledRef.current`, `isAutoScrollDisabledRef.current`, and `scrollRef.current`.
+3. Confirm `MessageList` receives `scrollRef`, `handleScroll`, `handleWheel`, `showScrollButton`, and `handleBackToBottom` from `App` or `PopOutApp`.
+4. Confirm the scroll container has `.chat-content` as `firstElementChild` when debugging `ResizeObserver` behavior.
+5. Trace stream scrolling from `useChatManager` Typewriter Loop to `useStreamStore.processBuffer` to the hook's `scrollToBottom()` gate.
+6. Reproduce with `ResizeObserver` available and unavailable if the issue involves code blocks, tool output, or late-rendered content.
+7. Use `frontend/src/test/useScroll.test.ts` for hook regressions and `frontend/src/test/MessageList.test.tsx` for recovery-button rendering regressions.
 
 ---
 
 ## Summary
 
-- Auto-scroll is a shared hook system, not a single component behavior.
-- It combines persisted preference, transient stickiness, DOM event handling, and frame-timed snapping.
-- `scrollToBottom(true)` is the explicit recovery path.
-- Streaming and layout growth both feed into the same gate logic.
-- Session switches intentionally force bottom alignment.
-- Back-to-bottom visibility is tied to specific user-intent conditions.
-- Tool-step local output scrolling is adjacent but independent.
-- The critical contract is preserving the dual-state semantics without mixing them.
+- Auto-scroll is hook-driven behavior shared by the main chat and pop-out chat surfaces.
+- `useUIStore.isAutoScrollDisabled` is the persisted global preference; `isAutoScrollEnabled` is per-view live stickiness.
+- `scrollToBottom(true)` is the explicit recovery path and bypasses the persisted toggle.
+- Stream-driven scrolling calls `scrollToBottom()` without forcing so user intent is preserved.
+- `requestAnimationFrame` coordinates explicit bottom snaps with browser layout timing.
+- `ResizeObserver` catches late content growth while auto-scroll is allowed and live stickiness is active.
+- `MessageList` owns the DOM container and recovery button rendering, but `useScroll` owns the scroll state.
+- The critical contract is preserving the separation between persisted preference, live stickiness, and forced recovery.

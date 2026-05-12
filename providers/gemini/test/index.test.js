@@ -322,6 +322,149 @@ describe('Gemini Provider', () => {
       expect(result.title).toBe('Invoke Shell: Deep desc');
     });
 
+    it('normalizes optional AcpUI MCP tool titles without server prefixes', () => {
+      const normalize = (toolName, args) => gemini.normalizeTool(
+        { id: `mcp_AcpUI_${toolName}-1`, title: `mcp_AcpUI_${toolName}` },
+        { toolCallId: `mcp_AcpUI_${toolName}-1`, arguments: args }
+      );
+
+      expect(normalize('ux_read_file', { file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts' }).title).toBe('Read File: hello.ts');
+      expect(normalize('ux_write_file', { file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts' }).title).toBe('Write File: hello.ts');
+      expect(normalize('ux_replace', { file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts' }).title).toBe('Replace In File: hello.ts');
+      expect(normalize('ux_list_directory', { dir_path: 'D:/Git/AcpUI/.devFiles' }).title).toBe('List Directory: D:/Git/AcpUI/.devFiles');
+      expect(normalize('ux_glob', { description: 'Find feature docs', pattern: '*.md' }).title).toBe('Glob: Find feature docs');
+      expect(normalize('ux_grep_search', { description: 'Find TODOs', pattern: 'TODO' }).title).toBe('Search: Find TODOs');
+      expect(normalize('ux_web_fetch', { url: 'https://example.test/docs' }).title).toBe('Fetch: https://example.test/docs');
+      expect(normalize('ux_google_web_search', { query: 'latest docs' }).title).toBe('Web Search: latest docs');
+    });
+
+    it('normalizes AcpUI MCP titles from nested Gemini function call args', () => {
+      const event = {
+        id: 'mcp_AcpUI_ux_grep_search-1',
+        title: 'mcp_AcpUI_ux_grep_search'
+      };
+      const update = {
+        toolCallId: 'mcp_AcpUI_ux_grep_search-1',
+        rawInput: {
+          functionCall: {
+            name: 'mcp_AcpUI_ux_grep_search',
+            args: {
+              description: 'Find hooks',
+              pattern: 'use[A-Z]'
+            }
+          }
+        }
+      };
+
+      expect(gemini.normalizeTool(event, update).title).toBe('Search: Find hooks');
+      expect(gemini.extractToolInvocation(update, { event }).title).toBe('Search: Find hooks');
+    });
+
+    it('normalizes AcpUI MCP titles from Gemini top-level args', () => {
+      const event = {
+        id: 'mcp_AcpUI_ux_web_fetch-1',
+        title: 'Web fetch (AcpUI MCP Server)'
+      };
+      const update = {
+        toolCallId: 'mcp_AcpUI_ux_web_fetch-1',
+        name: 'mcp_AcpUI_ux_web_fetch',
+        displayName: 'ux_web_fetch (AcpUI MCP Server)',
+        args: { url: 'https://example.test/docs' }
+      };
+
+      expect(gemini.normalizeTool(event, update).title).toBe('Fetch: https://example.test/docs');
+      expect(gemini.extractToolInvocation(update, { event }).title).toBe('Fetch: https://example.test/docs');
+    });
+
+    it('normalizes AcpUI MCP titles from Gemini JSON description arguments', () => {
+      const event = {
+        id: 'mcp_AcpUI_ux_replace-1',
+        title: 'Replace (AcpUI MCP Server)'
+      };
+      const update = {
+        toolCallId: 'mcp_AcpUI_ux_replace-1',
+        displayName: 'ux_replace (AcpUI MCP Server)',
+        description: '{"file_path":"D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts","old_string":"Hello","new_string":"Hi"}'
+      };
+
+      expect(gemini.normalizeTool(event, update).title).toBe('Replace In File: hello.ts');
+      expect(gemini.extractToolInvocation(update, { event }).title).toBe('Replace In File: hello.ts');
+    });
+
+    it('extracts detailed AcpUI MCP titles from nested Gemini file args', () => {
+      const invocation = gemini.extractToolInvocation(
+        {
+          toolCallId: 'mcp_AcpUI_ux_read_file-1',
+          rawInput: {
+            functionCall: {
+              name: 'mcp_AcpUI_ux_read_file',
+              args: {
+                file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts'
+              }
+            }
+          }
+        },
+        { event: { id: 'mcp_AcpUI_ux_read_file-1', title: 'mcp_AcpUI_ux_read_file' } }
+      );
+
+      expect(invocation).toEqual(expect.objectContaining({
+        canonicalName: 'ux_read_file',
+        title: 'Read File: hello.ts',
+        input: expect.objectContaining({
+          file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts'
+        })
+      }));
+    });
+
+    it('resolves AcpUI MCP names from Gemini functionCall metadata when the call id is generic', () => {
+      const event = {
+        id: 'gemini-tool-1',
+        title: 'Grep search (AcpUI MCP Server)'
+      };
+      const update = {
+        kind: 'search',
+        toolCallId: 'gemini-tool-1',
+        rawInput: {
+          functionCall: {
+            name: 'mcp_AcpUI_ux_grep_search',
+            args: {
+              description: 'Find hooks',
+              pattern: 'use[A-Z]'
+            }
+          }
+        }
+      };
+
+      const normalized = gemini.normalizeTool(event, update);
+      expect(normalized.toolName).toBe('ux_grep_search');
+      expect(normalized.title).toBe('Search: Find hooks');
+      expect(gemini.extractToolInvocation(update, { event }).title).toBe('Search: Find hooks');
+    });
+
+    it('resolves AcpUI MCP names from Gemini MCP server titles', () => {
+      const event = {
+        id: 'gemini-tool-2',
+        title: 'Read file (AcpUI MCP Server)'
+      };
+      const update = {
+        kind: 'read',
+        toolCallId: 'gemini-tool-2',
+        rawInput: {
+          functionCall: {
+            args: {
+              file_path: 'D:/Git/AcpUI/.devFiles/TEST_MCP/hello.ts'
+            }
+          }
+        }
+      };
+
+      const invocation = gemini.extractToolInvocation(update, { event });
+      expect(invocation).toEqual(expect.objectContaining({
+        canonicalName: 'ux_read_file',
+        title: 'Read File: hello.ts'
+      }));
+    });
+
     it('extracts canonical AcpUI MCP invocation metadata', () => {
       const invocation = gemini.extractToolInvocation(
         {

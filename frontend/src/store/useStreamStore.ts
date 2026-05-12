@@ -286,18 +286,45 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                     const mergedFilePath = filePath || existingStep.event.filePath;
 
                     // Selection logic:
-                    // 1. Prefer the most detailed title (usually contains the most detail)
-                    // 2. Prefer titles that already contain a colon (indicating filename/args)
+                    // 1. Prefer authoritative handler titles.
+                    // 2. Prefer titles with concrete details over raw provider tool IDs.
                     let bestTitle = incomingTitle || existingStep.event.title;
                     const existingTitle = existingStep.event.title || '';
+                    const incomingTitleSource = action.data.titleSource;
+                    const existingTitleSource = existingStep.event.titleSource;
+                    let bestTitleSource = incomingTitle ? incomingTitleSource : existingTitleSource;
+                    const incomingHasDetail = Boolean(incomingTitle?.includes(':'));
+                    const existingHasDetail = existingTitle.includes(':');
+                    const looksLikeRawToolTitle = (value?: string) => /(^|[\s/])(?:mcp_[A-Za-z0-9]+_|ux_)[a-z0-9_]+/i.test(value || '');
+                    const existingLooksRaw = looksLikeRawToolTitle(existingTitle);
 
-                    if (
+                    if (incomingTitle && incomingTitleSource === 'mcp_handler') {
+                      bestTitle = incomingTitle;
+                      bestTitleSource = incomingTitleSource;
+                    } else if (existingTitle && existingTitleSource === 'mcp_handler') {
+                      bestTitle = existingTitle;
+                      bestTitleSource = existingTitleSource;
+                    } else if (incomingTitle && incomingTitleSource === 'tool_handler' && existingTitleSource !== 'mcp_handler') {
+                      bestTitle = incomingTitle;
+                      bestTitleSource = incomingTitleSource;
+                    } else if (existingTitle && existingTitleSource === 'tool_handler' && incomingTitleSource !== 'mcp_handler') {
+                      bestTitle = existingTitle;
+                      bestTitleSource = existingTitleSource;
+                    } else if (
                       (existingStep.event.canonicalName || existingStep.event.toolName) === 'ux_invoke_shell' &&
                       isShellDescriptionTitle(existingTitle)
                     ) {
                       bestTitle = existingTitle;
-                    } else if (existingTitle.length > (bestTitle || '').length || (existingTitle.includes(':') && !bestTitle?.includes(':'))) {
+                      bestTitleSource = existingTitleSource;
+                    } else if (incomingTitle && incomingHasDetail && (!existingHasDetail || existingLooksRaw)) {
+                      bestTitle = incomingTitle;
+                      bestTitleSource = incomingTitleSource;
+                    } else if (existingTitle && existingHasDetail && !incomingHasDetail) {
                       bestTitle = existingTitle;
+                      bestTitleSource = existingTitleSource;
+                    } else if (existingTitle.length > (bestTitle || '').length && !existingLooksRaw) {
+                      bestTitle = existingTitle;
+                      bestTitleSource = existingTitleSource;
                     }
 
                     // 3. Fallback: If we have a file path but still no detail in the title, force append it
@@ -316,11 +343,15 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                         output: (existingStep.event.shellRunId ? existingStep.event.output : output) || existingStep.event.output,
                         filePath: mergedFilePath,
                         title: bestTitle,
+                        titleSource: bestTitleSource || action.data.titleSource || existingStep.event.titleSource,
                         toolName: action.data.toolName || existingStep.event.toolName,
                         canonicalName: action.data.canonicalName || existingStep.event.canonicalName,
                         mcpServer: action.data.mcpServer || existingStep.event.mcpServer,
                         mcpToolName: action.data.mcpToolName || existingStep.event.mcpToolName,
+                        isAcpUxTool: action.data.isAcpUxTool ?? existingStep.event.isAcpUxTool,
                         toolCategory: action.data.toolCategory || existingStep.event.toolCategory,
+                        isShellCommand: action.data.isShellCommand ?? existingStep.event.isShellCommand,
+                        isFileOperation: action.data.isFileOperation ?? existingStep.event.isFileOperation,
                         endTime: status === 'completed' ? Date.now() : existingStep.event.endTime
                       },
                       isCollapsed: false

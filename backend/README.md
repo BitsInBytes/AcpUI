@@ -44,15 +44,21 @@ The backend reads from repository-level configuration and environment files:
 - `configuration/workspaces.json`
 - `configuration/commands.json`
 - `configuration/counsel.json`
+- `configuration/mcp.json`
 - `.env`
 
 `ux_invoke_shell` uses the backend `ShellRunManager` and session-scoped `shell_run_*` socket events for interactive terminal execution. Concurrent shell calls are supported; each command receives a separate `shellRunId`, PTY, and terminal stream. On Windows, PowerShell startup terminal-control noise is sanitized before transcript streaming so the injected command prompt stays aligned with command output.
 
+MCP tools are controlled by `configuration/mcp.json`, or the JSON file referenced by `MCP_CONFIG`. Core tools are enabled by default. Optional tools are disabled by default; the IO group advertises `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, and `ux_web_fetch`, and the Google search group advertises `ux_google_web_search`. `ux_google_web_search` requires `googleSearch.apiKey` in the MCP config before it is advertised.
+
 ## Where To Find Detailed Technical Docs
 
-Feature docs are now the source of truth for implementation detail and exact line references:
+Feature docs are now the source of truth for implementation detail and stable file/function/event anchors:
 
 - [Feature Doc - Backend Architecture](../documents/%5BFeature%20Doc%5D%20-%20Backend%20Architecture.md)
 - [Feature Doc - Provider System](../documents/%5BFeature%20Doc%5D%20-%20Provider%20System.md)
 - [Feature Doc - JSONL Rehydration & Session Persistence](../documents/%5BFeature%20Doc%5D%20-%20JSONL%20Rehydration%20%26%20Session%20Persistence.md)
 - [Feature Doc - MCP Server System](../documents/%5BFeature%20Doc%5D%20-%20MCP%20Server.md)
+- [Feature Doc - IO MCP Tools](../documents/%5BFeature%20Doc%5D%20-%20IO%20MCP%20Tools.md)
+- [Feature Doc - Google Search MCP Tool](../documents/%5BFeature%20Doc%5D%20-%20Google%20Search%20MCP%20Tool.md)
+- [Feature Doc - MCP Feature Flag System](../documents/%5BFeature%20Doc%5D%20-%20MCP%20Feature%20Flag%20System.md)

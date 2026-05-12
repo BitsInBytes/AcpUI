@@ -1,887 +1,556 @@
-# Feature Doc — Provider Status Panel
+# Feature Doc - Provider Status Panel
 
-**The ProviderStatusPanel is a real-time status display that renders provider metrics (quota, spend, health indicators) emitted by AI provider daemons. It has two surfaces: a compact summary card shown at the bottom of each provider stack in the sidebar, and a full-screen details modal for exploring all metrics. The system includes a sophisticated backend caching mechanism that stores the latest status per provider and replays it to any new browser client on connection, ensuring no status is lost even if the provider goes offline mid-session.**
+The Provider Status Panel renders provider-supplied metrics in the sidebar and a details modal. It matters because the payload crosses provider adapters, backend extension routing, an in-memory reconnect cache, frontend extension routing, Zustand state, and React rendering; a mismatch at any boundary makes the panel disappear silently.
 
-This doc covers the complete data flow: how providers emit status, how the backend caches and broadcasts it, how the frontend routes and stores it, and how components render both summary and detail views. It does NOT cover sidebar hierarchy (see Sidebar Rendering doc for that) or provider-specific implementations (separate provider docs handle those).
-
----
+This guide covers the generic status pipeline and payload contract. Provider-specific status collection belongs in provider-specific feature docs.
 
 ## Overview
 
 ### What It Does
 
-The ProviderStatusPanel system:
-
-- **Receives status from providers**: Providers emit `provider_extension` events with a `provider/status` payload containing metrics like quota usage, spend amount, rate limits, and health status
-- **Caches on the backend**: `providerStatusMemory.js` stores the latest status per provider in memory. New client connections immediately replay the cached status instead of waiting for the provider to emit again
-- **Routes through the frontend**: Socket events pass through `useSocket.ts` → `extensionRouter.ts` → `useSystemStore` → components
-- **Renders two views**: Compact summary (in sidebar) shows 1-2 key metrics; details modal shows all sections with progress bars, tones, and detail labels
-- **Updates in real-time**: When a provider emits a new status, the panel updates instantly without page refresh
-- **Multi-provider aware**: Each provider has its own status. The panel renders one card per provider that has emitted status
+- Accepts provider extension payloads whose method resolves to `provider/status` or `provider_status` after removing the provider `protocolPrefix`.
+- Caches the latest valid status extension per `providerId` in `backend/services/providerStatusMemory.js`.
+- Replays cached status extensions to each browser socket during `backend/sockets/index.js` connection hydration.
+- Routes `provider_extension` socket events through `frontend/src/hooks/useSocket.ts` and `frontend/src/utils/extensionRouter.ts`.
+- Stores status by provider in `useSystemStore.providerStatusByProviderId` and keeps `useSystemStore.providerStatus` aligned with the active provider.
+- Renders provider-scoped sidebar panels through `frontend/src/components/Sidebar.tsx` and `frontend/src/components/ProviderStatusPanel.tsx`.
 
 ### Why This Matters
 
-- **No status loss**: The backend cache ensures status survives provider reconnections and browser refreshes
-- **Responsive feedback**: Users see quota/rate limits without leaving the chat interface
-- **Low-latency rendering**: Cached status is replayed on connect, so status appears before the user opens a chat
-- **Provider decoupling**: Status structure is generic (sections, items, tones) — any provider can emit any metrics they have
+- Status is provider-owned data, but the UI contract is generic and provider-agnostic.
+- The backend cache lets reconnecting browser clients see the latest status without waiting for another provider emission.
+- The frontend routes status by provider id, so multi-provider sidebars can show each provider's own status card.
+- The payload shape is intentionally UI-ready: the panel renders sections, items, progress values, tones, and details without provider-specific branching.
 
----
+Architectural role: backend extension cache and Socket.IO emission, frontend extension routing, Zustand system state, sidebar rendering.
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### 1. Provider Emits Status (ACP Daemon)
-**File:** (Provider-specific — each provider daemon implements its own status emission)
+1. Provider code gets an extension emitter.
 
-The ACP provider daemon sends a `provider_extension` notification:
+File: `backend/services/acpClient.js` (Method: `start`, callback: `emitProviderExtension`)
 
-```json
-{
-  "method": "my-protocol://provider/status",
-  "params": {
-    "status": {
-      "title": "Provider API",
-      "subtitle": "Usage this month",
-      "updatedAt": "2026-05-01T14:32:00Z",
-      "sections": [
-        {
-          "id": "tokens",
-          "title": "Token Usage",
-          "items": [
-            { "id": "prompt", "label": "Prompt Tokens", "value": "1.2M / 10M", "progress": { "value": 0.12 } },
-            { "id": "completion", "label": "Completion Tokens", "value": "456K / 5M", "progress": { "value": 0.091 } }
-          ]
-        }
-      ],
-      "summary": {
-        "title": "Usage",
-        "items": [
-          { "id": "total", "label": "Total Spend", "value": "$45.32" }
-        ]
-      }
-    }
-  }
+During ACP process startup, the backend passes an emitter callback into the provider module. Provider code can call this callback when it derives status from its own runtime, sidecar process, proxy, poller, or daemon-specific source.
+
+```javascript
+// FILE: backend/services/acpClient.js (Method: start)
+childEnv = await this.providerModule.prepareAcpEnvironment(childEnv, {
+  providerConfig: config,
+  io: this.io,
+  writeLog,
+  emitProviderExtension: (method, params) =>
+    this.handleProviderExtension({ providerId, method, params })
+}) || childEnv;
+```
+
+2. ACP daemon extension messages use provider-prefix routing.
+
+File: `backend/services/acpClient.js` (Method: `handleAcpMessage`, Branch: provider `protocolPrefix`)
+
+Provider extensions that arrive from the ACP daemon are accepted only when the method starts with the active provider's configured `protocolPrefix`. The provider interceptor runs before this branch, so provider modules can normalize raw daemon messages into prefixed extension messages.
+
+```javascript
+// FILE: backend/services/acpClient.js (Method: handleAcpMessage)
+const processedPayload = this.providerModule.intercept(payload);
+if (!processedPayload) return;
+
+if (processedPayload.method &&
+    getProvider(this.getProviderId()).config.protocolPrefix &&
+    processedPayload.method.startsWith(getProvider(this.getProviderId()).config.protocolPrefix)) {
+  this.handleProviderExtension(processedPayload);
 }
 ```
 
----
+3. Backend handles every provider extension through one method.
 
-### 2. Backend Receives Extension Event
-**File:** `backend/services/acpClient.js` (Lines 225-252)
+File: `backend/services/acpClient.js` (Method: `handleProviderExtension`)
 
-The `handleAcpMessage()` method routes all ACP notifications:
-
-```javascript
-// FILE: backend/services/acpClient.js (Lines 225-252)
-handleAcpMessage(message) {
-  if (message.method === 'provider_extension') {
-    const payload = message.params;  // Contains { status: {...} }
-    this.handleProviderExtension(payload);
-  }
-}
-```
-
----
-
-### 3. Backend Caches Status
-**File:** `backend/services/acpClient.js` (Lines 284-355)
-
-The `handleProviderExtension()` method processes the status:
+`handleProviderExtension` handles side effects shared by provider extensions, including model state updates, config option updates, provider-status cache insertion, and Socket.IO broadcast. `rememberProviderStatusExtension` is called for each extension, and the cache function filters out non-status payloads.
 
 ```javascript
-// FILE: backend/services/acpClient.js (Lines 284-355)
-handleProviderExtension(payload) {
-  // ... other extension types ...
-  
-  // Line 336: Cache the status for replay on new connections
-  rememberProviderStatusExtension(payload, this.providerId);
-  
-  // Lines 338-342: Broadcast to all connected clients
+// FILE: backend/services/acpClient.js (Method: handleProviderExtension)
+if (this.io) {
+  rememberProviderStatusExtension(payload, providerId);
+  const params = payload.params || {};
   this.io.emit('provider_extension', {
-    providerId: this.providerId,
-    method: payload.method,
-    params: { ...payload.params, providerId: this.providerId }
-  });
-}
-```
-
----
-
-### 4. Backend Cache Storage
-**File:** `backend/services/providerStatusMemory.js` (Lines 1-58)
-
-The cache is a simple in-memory Map:
-
-```javascript
-// FILE: backend/services/providerStatusMemory.js (Lines 1-5)
-const latestProviderStatusExtensions = new Map();  // By providerId
-let latestProviderStatusExtension = null;           // Global latest (for active provider)
-
-export function rememberProviderStatusExtension(payload, providerId) {
-  // Lines 4-29: Store by providerId, update global
-  latestProviderStatusExtensions.set(providerId, {
     providerId,
     method: payload.method,
-    params: payload.params
+    params: { ...params, providerId }
   });
-  latestProviderStatusExtension = { providerId, ...payload };
 }
 ```
 
-**Critical:** The cache is keyed by `providerId`, not global. Each provider's latest status is stored separately.
+4. Backend cache validates and normalizes status payloads.
 
----
+File: `backend/services/providerStatusMemory.js` (Function: `rememberProviderStatusExtension`)
 
-### 5. On-Connect Hydration
-**File:** `backend/sockets/index.js` (Lines 84-94)
-
-When a new client connects, the backend immediately replays all cached statuses:
+The cache only accepts extensions with a string `method`, object `params`, object `params.status`, and array `params.status.sections`. It resolves `providerId`, writes that id into the extension, params, and status object, stores the latest global extension, and stores per-provider entries when a provider id exists.
 
 ```javascript
-// FILE: backend/sockets/index.js (Lines 84-94)
-io.on('connection', (socket) => {
-  // ... other events ...
-  
-  // Hydrate client with cached provider statuses
-  const providerStatusExtensions = getLatestProviderStatusExtensions();
-  for (const ext of providerStatusExtensions) {
-    socket.emit('provider_extension', ext);
-  }
-});
-```
+// FILE: backend/services/providerStatusMemory.js (Function: rememberProviderStatusExtension)
+const status = extension.params.status;
+if (!status || typeof status !== 'object' || !Array.isArray(status.sections)) return;
 
-No delay, no wait for provider to emit again — the new client gets status instantly.
+const resolvedProviderId = providerId || extension.providerId ||
+  extension.params.providerId || status.providerId || null;
 
----
-
-### 6. Frontend Receives Socket Event
-**File:** `frontend/src/hooks/useSocket.ts` (Lines 87-103)
-
-The frontend socket listener receives the `provider_extension` event:
-
-```typescript
-// FILE: frontend/src/hooks/useSocket.ts (Lines 87-103)
-socket.on('provider_extension', (data) => {
-  const providerId = data.providerId || extractProviderId(data);
-  const result = routeExtension(data.method, /* ... params ... */);
-  
-  if (result.type === 'provider_status') {
-    // Line 103: Store status in Zustand
-    useSystemStore.getState().setProviderStatus(result.status, providerId);
-  }
-});
-```
-
-The event is routed through `extensionRouter` to be typed and validated.
-
----
-
-### 7. Extension Routing & Type Guard
-**File:** `frontend/src/utils/extensionRouter.ts` (Lines 40-70)
-
-The pure router function matches provider/status and validates the shape:
-
-```typescript
-// FILE: frontend/src/utils/extensionRouter.ts (Lines 40-70)
-export function routeExtension(method: string, payload: any) {
-  // Lines 40-42: Match provider/status
-  if (method === 'provider/status' || method === 'provider_status') {
-    if (isProviderStatus(payload.status)) {
-      return { type: 'provider_status', status: payload.status };
+const normalizedExtension = cloneJson({
+  ...extension,
+  ...(resolvedProviderId ? { providerId: resolvedProviderId } : {}),
+  params: {
+    ...extension.params,
+    ...(resolvedProviderId ? { providerId: resolvedProviderId } : {}),
+    status: {
+      ...status,
+      ...(resolvedProviderId ? { providerId: resolvedProviderId } : {})
     }
   }
-  // ... other routes ...
+});
+```
+
+5. Socket connection hydration replays cached statuses.
+
+File: `backend/sockets/index.js` (Function: `registerSocketHandlers`, Socket event: `connection`)
+
+During socket hydration, the backend emits provider catalog and branding first, then replays cached status extensions. It emits every provider-scoped cached status returned by `getLatestProviderStatusExtensions()`. The default-provider fallback uses `getLatestProviderStatusExtension(defaultProviderId)` when the per-provider list is empty.
+
+```javascript
+// FILE: backend/sockets/index.js (Function: registerSocketHandlers, Event: connection)
+const providerStatusExtensions = getLatestProviderStatusExtensions();
+if (providerStatusExtensions.length > 0) {
+  for (const providerStatusExtension of providerStatusExtensions) {
+    socket.emit('provider_extension', providerStatusExtension);
+  }
+} else {
+  const providerStatusExtension = getLatestProviderStatusExtension(defaultProviderId);
+  if (providerStatusExtension) {
+    socket.emit('provider_extension', providerStatusExtension);
+  }
+}
+```
+
+6. Frontend extracts provider identity and protocol prefix.
+
+File: `frontend/src/hooks/useSocket.ts` (Function: `getOrCreateSocket`, Socket event: `provider_extension`)
+
+The socket listener resolves the provider id from the top-level event, `params.providerId`, or `params.status.providerId`. It then reads provider branding to find the expected `protocolPrefix` before calling the pure router.
+
+```typescript
+// FILE: frontend/src/hooks/useSocket.ts (Function: getOrCreateSocket, Event: provider_extension)
+const p = data.params || {};
+const providerId = (data as { providerId?: string }).providerId ||
+  p.providerId || p.status?.providerId;
+const providerBranding = useSystemStore.getState().getBranding(providerId);
+const ext = providerBranding?.protocolPrefix || '_provider/';
+const result = routeExtension(data.method, p, ext, [], useSystemStore.getState().customCommands);
+```
+
+7. Frontend router accepts only status method suffixes and valid shapes.
+
+File: `frontend/src/utils/extensionRouter.ts` (Function: `routeExtension`, Helper: `isProviderStatus`)
+
+`routeExtension` first verifies the method starts with the expected protocol prefix. It then slices the prefix and accepts `provider/status` and `provider_status` only when `params.status.sections` is an array.
+
+```typescript
+// FILE: frontend/src/utils/extensionRouter.ts (Function: routeExtension, Helper: isProviderStatus)
+if ((type === 'provider/status' || type === 'provider_status') && isProviderStatus(params.status)) {
+  return { type: 'provider_status', status: params.status };
 }
 
-// Lines 66-70: Type guard
 function isProviderStatus(value: unknown): value is ProviderStatus {
   if (!value || typeof value !== 'object') return false;
   const status = value as Partial<ProviderStatus>;
-  return Array.isArray(status.sections);  // REQUIRED field
+  return Array.isArray(status.sections);
 }
 ```
 
-**Critical:** `sections` must be an array. If missing, `isProviderStatus()` returns false and nothing renders.
+8. System store writes status by provider id.
 
----
+File: `frontend/src/store/useSystemStore.ts` (Action: `setProviderStatus`)
 
-### 8. Store Status Update
-**File:** `frontend/src/store/useSystemStore.ts` (Lines 160-172)
-
-The `setProviderStatus` action stores status by provider:
+The store resolves the status owner, writes keyed status into `providerStatusByProviderId`, deletes keyed status when the status is null, and updates the singular `providerStatus` only for the active provider path.
 
 ```typescript
-// FILE: frontend/src/store/useSystemStore.ts (Lines 160-172)
-setProviderStatus: (status, providerId) => set(state => {
-  const resolvedProviderId = providerId || status?.providerId || state.activeProviderId || state.defaultProviderId;
-  if (!resolvedProviderId) return { providerStatus: status };
-  
-  const providerStatusByProviderId = { ...state.providerStatusByProviderId };
-  if (status) {
-    providerStatusByProviderId[resolvedProviderId] = { ...status, providerId: resolvedProviderId };
-  } else {
-    delete providerStatusByProviderId[resolvedProviderId];
-  }
-  
-  // Update both keyed + active provider's singular
-  const isActiveProvider = !providerId || resolvedProviderId === state.activeProviderId;
-  return {
-    providerStatusByProviderId,
-    providerStatus: isActiveProvider ? status : state.providerStatus
-  };
-}),
+// FILE: frontend/src/store/useSystemStore.ts (Action: setProviderStatus)
+const resolvedProviderId = providerId || status?.providerId || state.activeProviderId || state.defaultProviderId;
+if (!resolvedProviderId) return { providerStatus: status };
+
+const providerStatusByProviderId = { ...state.providerStatusByProviderId };
+if (status) providerStatusByProviderId[resolvedProviderId] = { ...status, providerId: resolvedProviderId };
+else delete providerStatusByProviderId[resolvedProviderId];
 ```
 
-**Multi-provider scoping:** Status is stored in `providerStatusByProviderId[id]`. The singular `providerStatus` is updated only if this is the active provider.
+9. Sidebar scopes a panel to each provider stack.
 
----
+File: `frontend/src/components/Sidebar.tsx` (Component: `Sidebar`, Render anchor: `ProviderStatusPanel providerId={p.providerId}`)
 
-### 9. Component Renders Compact Summary
-**File:** `frontend/src/components/ProviderStatusPanel.tsx` (Lines 7-70)
+The sidebar renders a `ProviderStatusPanel` inside each expanded provider stack. The `providerId` prop makes the panel read only that provider's keyed status instead of rendering every cached provider status.
 
-The component reads from store and renders summary:
-
-```typescript
-// FILE: frontend/src/components/ProviderStatusPanel.tsx (Lines 7-23)
-function ProviderStatusPanels({ providerId }) {
-  const statusByProvider = useSystemStore(s => s.providerStatusByProviderId);
-  
-  // Filter providers with status
-  const providersWithStatus = Object.values(statusByProvider).filter(
-    s => s && s.sections?.some(sec => sec.items?.length > 0)
-  );
-  
-  return (
-    <div className="provider-status-container">
-      {providersWithStatus.map(status => (
-        <ProviderStatusPanelSingle key={status.providerId} status={status} />
-      ))}
-    </div>
-  );
-}
-
-// Lines 25-70: Single provider panel
-function ProviderStatusPanelSingle({ status }) {
-  const [isDetailsOpen, setIsDetailsOpen] = useState(false);
-  const summaryItems = getSummaryItems(status);  // Line 140-144
-  
-  return (
-    <div className="provider-status-panel">
-      <div className="provider-status-header">{status.title}</div>
-      <div className="provider-status-summary">
-        {summaryItems.map(item => (
-          <ProviderStatusRow key={item.id} item={item} compact={true} />
-        ))}
-      </div>
-      <button onClick={() => setIsDetailsOpen(true)}>Details ↓</button>
-      {isDetailsOpen && (
-        <ProviderStatusModal status={status} onClose={() => setIsDetailsOpen(false)} />
-      )}
-    </div>
-  );
-}
+```tsx
+// FILE: frontend/src/components/Sidebar.tsx (Component: Sidebar)
+<div className="provider-stack-sessions">
+  {/* folders and sessions */}
+</div>
+<ProviderStatusPanel providerId={p.providerId} />
 ```
 
-The `getSummaryItems()` helper (Lines 140-144) extracts display items:
+10. ProviderStatusPanel renders summary rows and modal details.
 
-```typescript
-const summaryItems = status.summary?.items || status.sections[0]?.items?.slice(0, 2) || [];
+File: `frontend/src/components/ProviderStatusPanel.tsx` (Components: `ProviderStatusPanels`, `ProviderStatusPanelSingle`, `ProviderStatusModal`, `ProviderStatusRow`)
+
+`ProviderStatusPanels` reads `providerStatusByProviderId`. Without a `providerId`, it filters to statuses that have at least one item-bearing section. With a `providerId`, it selects that provider's status and leaves the item check to `ProviderStatusPanelSingle`. The single panel uses `getSummaryItems`, opens `ProviderStatusModal` through local `isDetailsOpen`, and renders rows with `ProviderStatusRow`.
+
+```tsx
+// FILE: frontend/src/components/ProviderStatusPanel.tsx (Component: ProviderStatusPanels)
+const statuses = providerId
+  ? [statusByProvider[providerId]].filter(Boolean)
+  : Object.values(statusByProvider).filter(s => s && s.sections?.some(section => section.items?.length > 0));
+
+// FILE: frontend/src/components/ProviderStatusPanel.tsx (Function: getSummaryItems)
+if (status.summary?.items?.length) return status.summary.items;
+const firstSectionItems = status.sections.find(section => section.items?.length > 0)?.items || [];
+return firstSectionItems.slice(0, 2);
 ```
-
-If status has an explicit `summary`, use it. Else use first 2 items from the first section.
-
----
-
-### 10. User Opens Details Modal
-**File:** `frontend/src/components/ProviderStatusPanel.tsx` (Lines 72-138)
-
-When the user clicks "Details", the modal shows all sections:
-
-```typescript
-// FILE: frontend/src/components/ProviderStatusPanel.tsx (Lines 72-105)
-function ProviderStatusModal({ status, onClose }) {
-  return (
-    <div className="provider-status-modal-overlay" onClick={onClose}>
-      <div className="provider-status-modal">
-        <h2>{status.title}</h2>
-        {status.sections.map(section => (
-          <section key={section.id}>
-            <h3>{section.title}</h3>
-            {section.items.map(item => (
-              <ProviderStatusRow key={item.id} item={item} compact={false} />
-            ))}
-          </section>
-        ))}
-        <div className="provider-status-modal-footer">
-          {status.updatedAt && <span>Updated: {formatUpdatedAt(status.updatedAt)}</span>}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Lines 107-138: Row renderer
-function ProviderStatusRow({ item, compact }) {
-  const progressValue = clampProgress(item.progress?.value ?? 1);  // Line 146-149
-  const toneClass = `tone-${item.tone ?? 'neutral'}`;
-  
-  return (
-    <div className={`status-row ${toneClass}`}>
-      <span className="status-label">{item.label}</span>
-      <span className="status-value">{item.value}</span>
-      {item.progress && (
-        <div className="progress-bar">
-          <div style={{ width: `${progressValue * 100}%` }} />
-        </div>
-      )}
-      {!compact && item.detail && (
-        <span className="status-detail">{item.detail}</span>
-      )}
-    </div>
-  );
-}
-```
-
-Tone-based CSS classes (`.tone-success`, `.tone-warning`, etc.) are applied to color the row. Progress bars are filled based on `clampProgress()` (0-1).
-
----
 
 ## Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         AI Provider Daemon                              │
-│                                                                         │
-│  Emits: { method: 'protocol://provider/status', params: { status } }  │
-└────────────────┬────────────────────────────────────────────────────────┘
-                 │ JSON-RPC notification (stdin)
-┌────────────────▼────────────────────────────────────────────────────────┐
-│                         Backend (Node.js)                               │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ acpClient.js (Lines 227-344)                                    │   │
-│  │ ├─ handleAcpMessage() → handleProviderExtension()              │   │
-│  │ ├─ Line 336: rememberProviderStatusExtension()                 │   │
-│  │ └─ Line 338-342: io.emit('provider_extension')                 │   │
-│  └────────────────┬──────────────────────────────────────────────┘   │
-│                   │                                                     │
-│  ┌────────────────▼──────────────────────────────────────────────┐   │
-│  │ providerStatusMemory.js (Cache)                               │   │
-│  │ ├─ Map<providerId, { method, params }>                        │   │
-│  │ ├─ rememberProviderStatusExtension() — stores by providerId   │   │
-│  │ └─ getLatestProviderStatusExtensions() — returns all cached   │   │
-│  └────────────────┬──────────────────────────────────────────────┘   │
-│                   │                                                     │
-│  ┌────────────────▼──────────────────────────────────────────────┐   │
-│  │ sockets/index.js (On-Connect Hydration, Lines 84-94)          │   │
-│  │ └─ For each cached status, emit to new socket client          │   │
-│  └────────────────┬──────────────────────────────────────────────┘   │
-└────────────────────┼──────────────────────────────────────────────────┘
-                     │ Socket.IO: provider_extension event
-┌────────────────────▼──────────────────────────────────────────────────┐
-│                         Frontend (React)                               │
-│                                                                        │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │ useSocket.ts (Lines 87-103)                                  │    │
-│  │ └─ socket.on('provider_extension') → routeExtension()        │    │
-│  └──────────────────────┬─────────────────────────────────────┘     │
-│                         │                                             │
-│  ┌──────────────────────▼─────────────────────────────────────┐     │
-│  │ extensionRouter.ts (Lines 40-70)                            │     │
-│  │ ├─ Match provider/status or provider_status                 │     │
-│  │ ├─ isProviderStatus() type guard (Lines 66-70)              │     │
-│  │ └─ Return { type: 'provider_status', status }               │     │
-│  └──────────────────────┬─────────────────────────────────────┘     │
-│                         │                                             │
-│  ┌──────────────────────▼─────────────────────────────────────┐     │
-│  │ useSystemStore.setProviderStatus() (Lines 160-172)          │     │
-│  │ └─ Store in providerStatusByProviderId[providerId]          │     │
-│  └──────────────────────┬─────────────────────────────────────┘     │
-│                         │                                             │
-│  ┌──────────────────────▼─────────────────────────────────────┐     │
-│  │ ProviderStatusPanel.tsx                                     │     │
-│  │ ├─ Read providerStatusByProviderId from store               │     │
-│  │ ├─ ProviderStatusPanels (wrapper)                           │     │
-│  │ │   └─ ProviderStatusPanelSingle × N                        │     │
-│  │ │       ├─ Compact summary view + Details button            │     │
-│  │ │       └─ ProviderStatusModal (on click)                   │     │
-│  │ │           ├─ All sections + items                         │     │
-│  │ │           └─ ProviderStatusRow × N                        │     │
-│  │ └─ CSS: tone-based coloring + progress bars                 │     │
-│  └──────────────────────────────────────────────────────────────┘    │
-│                                                                        │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │ ProviderStatusPanel.css (354 lines)                          │    │
-│  │ ├─ .tone-success/warning/danger/info (Lines 152-166)         │    │
-│  │ ├─ Progress bar fill (Lines 138-166)                         │    │
-│  │ ├─ Modal overlay + positioning (Lines 225-235)               │    │
-│  │ └─ @keyframes providerStatusEnter (Lines 344-353)            │    │
-│  └──────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  Provider[Provider adapter or ACP daemon] -->|emitProviderExtension or prefixed ACP method| AcpClient[AcpClient.handleProviderExtension]
+  AcpClient -->|shape-filtered cache write| Memory[providerStatusMemory]
+  AcpClient -->|Socket.IO provider_extension| SocketLive[Connected browser sockets]
+  Memory -->|getLatestProviderStatusExtensions| SocketConnect[sockets/index connection hydration]
+  SocketConnect -->|Socket.IO provider_extension| SocketLive
+
+  SocketLive --> UseSocket[useSocket provider_extension listener]
+  UseSocket --> Router[extensionRouter.routeExtension]
+  Router -->|provider_status result| SystemStore[useSystemStore.setProviderStatus]
+  SystemStore --> Sidebar[Sidebar provider stack]
+  Sidebar --> Panel[ProviderStatusPanel]
+  Panel --> Compact[Compact sidebar summary]
+  Panel --> Modal[ProviderStatusModal details]
 ```
 
-**Data Flow:**
-1. Backend: Provider emits → cache in memory → broadcast to sockets
-2. On-connect: Cache replayed immediately to new browser clients
-3. Frontend: Socket event → route → type guard → store → components → render
+## Critical Contract
 
----
+The provider status contract has two layers: transport extension shape and UI status shape.
 
-## The Critical Contract: ProviderStatus Shape
-
-Every status emitted by a provider must conform to this type (Lines 101-136 in `frontend/src/types.ts`):
+### Transport Extension Shape
 
 ```typescript
-type ProviderStatusTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
+// Socket event: provider_extension
+interface ProviderStatusExtension {
+  providerId?: string;
+  method: string; // `${protocolPrefix}provider/status` or `${protocolPrefix}provider_status`
+  params: {
+    providerId?: string;
+    status: ProviderStatus;
+  };
+}
+```
 
-interface ProviderStatusProgress {
-  value: number;          // REQUIRED: 0-1 float (NOT 0-100)
-  label?: string;         // Optional label shown in progress bar
+Rules:
+
+- `method` must start with the provider branding `protocolPrefix` available through `useSystemStore.getBranding(providerId)`.
+- The method suffix after `protocolPrefix` must be `provider/status` or `provider_status` for frontend rendering.
+- A stable provider id should be present at the top level, in `params.providerId`, or in `params.status.providerId`.
+- Backend cache insertion requires `params.status.sections` to be an array.
+
+### UI Status Shape
+
+File: `frontend/src/types.ts` (Types: `ProviderStatusTone`, `ProviderStatusProgress`, `ProviderStatusItem`, `ProviderStatusSection`, `ProviderStatusSummary`, `ProviderStatus`)
+
+```typescript
+export type ProviderStatusTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
+
+export interface ProviderStatusProgress {
+  value: number;
+  label?: string;
 }
 
-interface ProviderStatusItem {
-  id: string;             // Unique ID within section
-  label: string;          // Display label: "Prompt Tokens"
-  value: string;          // Display value: "1.2M / 10M"
-  detail?: string;        // Detail label shown only in expanded view
+export interface ProviderStatusItem {
+  id: string;
+  label: string;
+  value?: string;
+  detail?: string;
   tone?: ProviderStatusTone;
   progress?: ProviderStatusProgress;
 }
 
-interface ProviderStatusSection {
-  id: string;             // Unique ID within status
-  title: string;          // Section heading: "Token Usage"
-  items: ProviderStatusItem[];   // REQUIRED: must have items
+export interface ProviderStatusSection {
+  id: string;
+  title?: string;
+  items: ProviderStatusItem[];
 }
 
-interface ProviderStatusSummary {
-  title: string;          // Summary heading
-  items: ProviderStatusItem[];   // 1-2 items shown in compact view
+export interface ProviderStatusSummary {
+  title?: string;
+  items: ProviderStatusItem[];
 }
 
-interface ProviderStatus {
-  providerId?: string;    // Inferred from route; can be explicit
-  title?: string;         // e.g., "Provider API"
-  subtitle?: string;      // "Usage this month"
-  updatedAt?: string;     // ISO 8601 timestamp
+export interface ProviderStatus {
+  providerId?: string;
+  title?: string;
+  subtitle?: string;
+  updatedAt?: string;
   summary?: ProviderStatusSummary;
-  sections: ProviderStatusSection[];   // REQUIRED: type guard checks this
+  sections: ProviderStatusSection[];
 }
 ```
 
-### Breaking the Contract
+If this contract breaks:
 
-1. **Missing `sections`** → `isProviderStatus()` returns false → component never renders
-2. **`progress.value` > 1 or < 0** → `clampProgress()` squashes to [0, 1] but backend should send correct values
-3. **`tone` not in enum** → CSS class `.tone-${tone}` is invalid → row is unstyled
-4. **Empty `items` in a section** → Section still renders, just with empty content
-5. **No `summary`** → Fallback to first section's first 2 items (automatic)
+- Missing `sections` prevents backend cache insertion and frontend route acceptance.
+- Missing item-bearing sections makes `ProviderStatusPanelSingle` render null.
+- Wrong `protocolPrefix` makes `routeExtension` return null.
+- Missing provider id can attach the status to the active/default provider instead of the provider that emitted it.
+- Progress values outside normalized `0..1` are clamped by `clampProgress`, so the UI hides the data error.
+- Tone values outside the union produce CSS classes without matching status styling.
 
----
+## Configuration/Data Flow
 
-## Data Flow Example: Provider Emitting Quota Status
+### Provider Configuration
 
-### 1. Provider Emits
+File: `backend/sockets/index.js` (Function: `buildBrandingPayload`)
+
+`buildBrandingPayload` includes `protocolPrefix` in each `branding` socket payload. `useSocket` reads that prefix through `useSystemStore.getBranding(providerId)` before routing provider extensions.
+
+```javascript
+// FILE: backend/sockets/index.js (Function: buildBrandingPayload)
+return {
+  providerId,
+  ...providerConfig.branding,
+  title: providerConfig.title,
+  models: providerConfig.models,
+  defaultModel: providerConfig.models?.default,
+  protocolPrefix: providerConfig.protocolPrefix,
+  supportsAgentSwitching: providerConfig.supportsAgentSwitching ?? false
+};
+```
+
+A provider must emit status using its configured `protocolPrefix` plus `provider/status` or `provider_status`.
+
+### Data Flow Pipeline
+
+```text
+Provider-owned status source
+  -> provider extension method `${protocolPrefix}provider/status`
+  -> AcpClient.handleProviderExtension
+  -> providerStatusMemory.rememberProviderStatusExtension
+  -> Socket.IO `provider_extension`
+  -> useSocket `provider_extension` listener
+  -> extensionRouter.routeExtension
+  -> useSystemStore.setProviderStatus
+  -> Sidebar provider stack
+  -> ProviderStatusPanel compact card
+  -> ProviderStatusModal details view
+```
+
+### Example Payload
 
 ```json
 {
-  "method": "my-protocol://provider/status",
+  "providerId": "provider-id",
+  "method": "_provider/provider/status",
   "params": {
+    "providerId": "provider-id",
     "status": {
-      "providerId": "my-provider",
+      "providerId": "provider-id",
       "title": "Provider API",
-      "subtitle": "Usage this billing period",
-      "updatedAt": "2026-05-01T14:32:15Z",
+      "subtitle": "Usage window",
+      "updatedAt": "2026-05-12T14:32:15Z",
+      "summary": {
+        "title": "Summary",
+        "items": [
+          {
+            "id": "usage-summary",
+            "label": "Usage",
+            "value": "42%",
+            "detail": "Resets at 2:32 PM",
+            "tone": "info",
+            "progress": { "value": 0.42, "label": "Usage progress" }
+          }
+        ]
+      },
       "sections": [
         {
-          "id": "tokens",
-          "title": "Token Usage",
+          "id": "usage",
+          "title": "Usage",
           "items": [
             {
-              "id": "input",
-              "label": "Input Tokens",
-              "value": "2.5M / 10M",
-              "detail": "Prompt tokens processed",
-              "tone": "success",
-              "progress": { "value": 0.25 }
-            },
-            {
-              "id": "output",
-              "label": "Output Tokens",
-              "value": "500K / 5M",
-              "detail": "Completion tokens generated",
-              "tone": "success",
-              "progress": { "value": 0.1 }
-            }
-          ]
-        },
-        {
-          "id": "rate",
-          "title": "Rate Limits",
-          "items": [
-            {
-              "id": "rpm",
-              "label": "Requests Per Minute",
-              "value": "45 / 300",
+              "id": "usage-window",
+              "label": "Usage Window",
+              "value": "42%",
+              "detail": "Provider-specific reset text",
               "tone": "info",
-              "progress": { "value": 0.15 }
+              "progress": { "value": 0.42 }
             }
           ]
         }
-      ],
-      "summary": {
-        "title": "At a Glance",
-        "items": [
-          {
-            "id": "summary-tokens",
-            "label": "Total Usage",
-            "value": "3M / 15M tokens",
-            "tone": "success",
-            "progress": { "value": 0.2 }
-          }
-        ]
-      }
+      ]
     }
   }
 }
 ```
 
-### 2. Compact Summary Renders (in Sidebar)
-
-```
-╔════════════════════════════╗
-║  Provider API             ║
-║  Usage this billing peri…  ║
-╟────────────────────────────╢
-║ Total Usage: 3M / 15M tokens │
-║ ████░░░░░░░░░░░░░░ 20%    ║
-╟────────────────────────────╢
-║ Details ↓    Updated: 2:32 PM ║
-╚════════════════════════════╝
-```
-
-Only the summary item is shown (1 item). Progress bar filled to 20%. Tone: green (success).
-
-### 3. Details Modal Renders (on click)
-
-```
-╔════════════════════════════════════════╗
-║  Provider API                          ║
-║  Usage this billing period        [✕] ║
-╟────────────────────────────────────────╢
-║                                        ║
-║  Token Usage                           ║
-║  ├─ Input Tokens: 2.5M / 10M           ║
-║  │  ████░░░░░░░░░░░░░░ 25%             ║
-║  │  (Prompt tokens processed)           ║
-║  └─ Output Tokens: 500K / 5M           ║
-║     ██░░░░░░░░░░░░░░░░░ 10%            ║
-║     (Completion tokens generated)       ║
-║                                        ║
-║  Rate Limits                           ║
-║  └─ Requests Per Minute: 45 / 300      ║
-║     ███░░░░░░░░░░░░░░░░░░░░░ 15%       ║
-║                                        ║
-╟────────────────────────────────────────╢
-║ Updated: 2:32 PM                       ║
-╚════════════════════════════════════════╝
-```
-
-All sections shown. Detail labels visible. All progress bars with tone-based colors.
-
----
-
 ## Component Reference
 
-### Frontend Components
+### Backend
 
-| Component | File | Lines | Props | State | Purpose |
-|-----------|------|-------|-------|-------|---------|
-| **ProviderStatusPanels** | `ProviderStatusPanel.tsx` | 7-23 | `providerId?` | None | Root wrapper; reads `providerStatusByProviderId` from store; filters and renders one `ProviderStatusPanelSingle` per provider with status |
-| **ProviderStatusPanelSingle** | `ProviderStatusPanel.tsx` | 25-70 | `status: ProviderStatus` | `isDetailsOpen` | Single provider panel; renders compact summary + Details button; opens modal on click |
-| **ProviderStatusModal** | `ProviderStatusPanel.tsx` | 72-105 | `status: ProviderStatus`, `onClose: () => void` | None | Full-screen details overlay; renders all sections with all items |
-| **ProviderStatusRow** | `ProviderStatusPanel.tsx` | 107-138 | `item: ProviderStatusItem`, `compact: boolean` | None | Single status item row; compact hides detail label; progress bar uses tone-based color |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| ACP client | `backend/services/acpClient.js` | `start`, `emitProviderExtension`, `handleAcpMessage`, `handleProviderExtension` | Receives provider emissions, routes prefixed ACP extension methods, broadcasts `provider_extension` |
+| Status cache | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtension`, `getLatestProviderStatusExtensions`, `clearProviderStatusExtension`, `cloneJson` | Validates, normalizes, clones, stores, and clears latest status extensions |
+| Socket hydration | `backend/sockets/index.js` | `registerSocketHandlers`, `connection`, `getLatestProviderStatusExtensions`, `getLatestProviderStatusExtension`, `provider_extension` | Replays cached statuses during browser socket connection |
+| Branding payload | `backend/sockets/index.js` | `buildBrandingPayload`, `protocolPrefix` | Sends provider protocol prefix to frontend routing state |
 
-### Store Actions
+### Frontend
 
-| Store | Field/Action | Lines | Purpose |
-|-------|-------------|-------|---------|
-| `useSystemStore` | `providerStatusByProviderId: Record<string, ProviderStatus>` | 27, 89 | Stores status by providerId key |
-| `useSystemStore` | `setProviderStatus(status, providerId)` | 160-172 | Updates store; resolves providerId; updates singular `providerStatus` if active provider |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket listener | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `provider_extension`, `getBranding`, `routeExtension`, `setProviderStatus` | Resolves provider id/prefix and dispatches typed status results to the store |
+| Extension router | `frontend/src/utils/extensionRouter.ts` | `routeExtension`, `isProviderStatus`, `ExtensionResult` | Accepts status suffixes and validates `sections` array |
+| System store | `frontend/src/store/useSystemStore.ts` | `providerStatus`, `providerStatusByProviderId`, `setProviderStatus`, `getBranding` | Stores keyed provider status and active-provider status |
+| Sidebar mount | `frontend/src/components/Sidebar.tsx` | `Sidebar`, `ProviderStatusPanel providerId={p.providerId}` | Places provider-scoped status panel in each expanded provider stack |
+| Status UI | `frontend/src/components/ProviderStatusPanel.tsx` | `ProviderStatusPanels`, `ProviderStatusPanelSingle`, `ProviderStatusModal`, `ProviderStatusRow`, `getSummaryItems`, `clampProgress`, `formatUpdatedAt` | Renders compact summary and modal details |
+| Status CSS | `frontend/src/components/ProviderStatusPanel.css` | `.provider-status-panel`, `.provider-status-row`, `.tone-success`, `.tone-warning`, `.tone-danger`, `.tone-info`, `.provider-status-modal` | Styles rows, progress bars, tones, and modal layout |
+| Types | `frontend/src/types.ts` | `ProviderStatusTone`, `ProviderStatusProgress`, `ProviderStatusItem`, `ProviderStatusSection`, `ProviderStatusSummary`, `ProviderStatus`, `ProviderExtensionData` | Defines transport and render payload shapes |
 
-### Utilities & Helpers
+### Tests
 
-| Helper | File | Lines | Purpose |
-|--------|------|-------|---------|
-| `getSummaryItems()` | `ProviderStatusPanel.tsx` | 140-144 | Returns summary items if available; else first 2 from first section |
-| `clampProgress()` | `ProviderStatusPanel.tsx` | 146-149 | Clamps value to [0, 1] range |
-| `formatUpdatedAt()` | `ProviderStatusPanel.tsx` | 151-155 | Converts ISO timestamp to local time string |
-| `isProviderStatus()` | `extensionRouter.ts` | 66-70 | Type guard: validates `sections` is array |
-| `routeExtension()` | `extensionRouter.ts` | 17-64 | Pure router: matches method → returns typed action |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Backend cache | `backend/test/providerStatusMemory.test.js` | `providerStatusMemory` suite | Validates cache acceptance, rejection, cloning, and provider isolation |
+| Socket hydration | `backend/test/sockets-index.test.js` | `emits cached provider status on connection` | Verifies cached status replay on browser connection |
+| Backend extension broadcast | `backend/test/acpClient-routing.test.js` | `routes all handleProviderExtension paths` | Verifies `handleProviderExtension` emits `provider_extension` |
+| Frontend router | `frontend/src/test/extensionRouter.test.ts` | `routes generic provider status`, `routes generic provider_status alias`, `ignores malformed provider status payloads` | Verifies method suffixes and shape guard |
+| Frontend store | `frontend/src/test/useSystemStore.test.ts`, `frontend/src/test/useSystemStoreExtended.test.ts`, `frontend/src/test/useSystemStoreDeep.test.ts` | `setProviderStatus manages active status vs background status`, `setProviderStatus manages per-provider status`, `setProviderStatus handles missing resolvedProviderId`, `setProviderStatus correctly identifies active provider updates` | Verifies keyed and active status state |
+| Socket dispatch | `frontend/src/test/useSocket.test.ts` | `handles "provider_status" extension` | Verifies socket listener calls `setProviderStatus` with provider id |
+| Component rendering | `frontend/src/test/ProviderStatusPanel.test.tsx` | `ProviderStatusPanel` suite | Verifies null render, compact summary, modal details, fallback summary, detail text, and progress clamping |
 
-### Backend Services
+## Gotchas
 
-| Service | File | Lines | Purpose |
-|---------|------|-------|---------|
-| `rememberProviderStatusExtension()` | `providerStatusMemory.js` | 4-29 | Cache status in Map by providerId |
-| `getLatestProviderStatusExtensions()` | `providerStatusMemory.js` | 39-41 | Return all cached statuses for on-connect replay |
-| `handleProviderExtension()` | `acpClient.js` | 284-355 | Route provider extensions; cache status; broadcast to sockets |
+1. Method prefix and suffix both matter.
 
-### CSS
+Backend caching is shape-based, but frontend rendering requires `method.startsWith(protocolPrefix)` and a suffix of `provider/status` or `provider_status`. A valid status shape with the wrong method does not reach the store.
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `ProviderStatusPanel.css` | 1-354 | Panel styling, progress bars, tone colors (success/warning/danger/info), modal overlay, animations |
+2. `sections` is the gate at both backend and frontend boundaries.
 
-### Type Definitions
+`rememberProviderStatusExtension` and `isProviderStatus` both require `status.sections` to be an array. An empty array passes routing, but the component needs at least one item-bearing section to render visible content.
 
-| Type | File | Lines | Purpose |
-|------|------|-------|---------|
-| `ProviderStatus` | `frontend/src/types.ts` | 129-136 | Root status type with sections, summary, metadata |
-| `ProviderStatusSection` | `frontend/src/types.ts` | 118-122 | Section with id, title, items |
-| `ProviderStatusItem` | `frontend/src/types.ts` | 109-116 | Item with label, value, detail, tone, progress |
-| `ProviderStatusProgress` | `frontend/src/types.ts` | 103-107 | Progress with value 0-1, optional label |
-| `ProviderStatusTone` | `frontend/src/types.ts` | 101 | Enum: neutral, info, success, warning, danger |
+3. Provider id resolution has fallbacks.
 
----
+The backend and frontend resolve provider id from explicit arguments, top-level event fields, params, status, active provider, and default provider. Include a stable `providerId` in the emitted extension and in `status` to avoid attaching a background provider status to the active provider.
 
-## Backend Cache Mechanism
+4. Cached values are cloned.
 
-### Cache Storage
+`providerStatusMemory` stores and returns JSON clones. Mutating the result of `getLatestProviderStatusExtension` or `getLatestProviderStatusExtensions` does not mutate cache memory.
 
-**File:** `backend/services/providerStatusMemory.js` (Lines 1-2)
+5. Cache lifetime is process memory.
 
-```javascript
-const latestProviderStatusExtensions = new Map();  // By providerId
-let latestProviderStatusExtension = null;           // Global latest
-```
+The cache is not persisted to SQLite. It survives browser refresh and socket reconnect while the backend process is alive; providers should emit status again after backend startup.
 
-The Map keyed by `providerId` ensures each provider's latest status is available independently.
+6. Compact view can show detail text.
 
-### Storing Status
+`ProviderStatusRow` renders `item.detail` in both compact and modal rows. Keep summary item detail short enough for the sidebar.
 
-**File:** `backend/services/providerStatusMemory.js` (Lines 4-29)
+7. Summary is optional, but first-section fallback is narrow.
 
-When `handleProviderExtension()` receives a status (Line 336 in `acpClient.js`):
+`getSummaryItems` uses `status.summary.items` when present. Without summary items, it uses the first item-bearing section and slices the first two items.
 
-```javascript
-rememberProviderStatusExtension(payload, providerId) {
-  latestProviderStatusExtensions.set(providerId, {
-    providerId,
-    method: payload.method,
-    params: payload.params
-  });
-  latestProviderStatusExtension = { providerId, ...payload };
-}
-```
+8. Progress values are normalized floats.
 
-Both the keyed cache and global latest are updated (global for fallback/logging).
+`ProviderStatusProgress.value` is a `0..1` number. `clampProgress` clamps invalid ranges and treats non-finite values as zero, so tests may pass while provider math is wrong.
 
-### Retrieving Cached Status
+9. Tone values are CSS contracts.
 
-**File:** `backend/services/providerStatusMemory.js` (Lines 39-41)
+Only `neutral`, `info`, `success`, `warning`, and `danger` have type support. CSS styles progress fill/value colors for the non-neutral tones defined in `ProviderStatusPanel.css`.
 
-```javascript
-export function getLatestProviderStatusExtensions() {
-  return Array.from(latestProviderStatusExtensions.values());
-}
-```
+10. Modal rendering filters empty sections.
 
-Returns all cached statuses as an array.
-
-### On-Connect Replay
-
-**File:** `backend/sockets/index.js` (Lines 84-94)
-
-When a new client connects:
-
-```javascript
-const providerStatusExtensions = getLatestProviderStatusExtensions();
-for (const ext of providerStatusExtensions) {
-  socket.emit('provider_extension', ext);
-}
-```
-
-All cached statuses are emitted to the new socket immediately, before any user interaction.
-
----
-
-## Gotchas & Important Notes
-
-### 1. Type Guard Requires sections Array
-**What breaks:** Provider emits status without `sections` field → component never renders.
-
-**Why:** The `isProviderStatus()` type guard (Lines 66-70) requires `Array.isArray(status.sections)`. If missing, routing fails.
-
-**How to verify:** Check that your status payload has a non-empty `sections` array:
-```javascript
-status: {
-  sections: [{ id: "...", title: "...", items: [...] }]
-}
-```
-
----
-
-### 2. Progress Values Must Be 0-1, Not 0-100
-**What breaks:** Progress bar shows as 99% when you meant 0.99.
-
-**Why:** The `clampProgress()` function (Lines 146-149) treats values as 0-1 floats. A value of 50 is clamped to 1.0 (100%).
-
-**How to fix:** Divide by 100 before sending:
-```javascript
-progress: { value: usedTokens / maxTokens }  // 0-1
-progress: { value: 0.5 }                     // 50%
-```
-
----
-
-### 3. Cache Is In-Memory, Not Persisted
-**What breaks:** Status disappears if backend restarts.
-
-**Why:** The cache is a JavaScript Map in memory. No database persistence.
-
-**How to handle:** This is intentional — backend crashes should clear stale status. Providers will re-emit on reconnect. For critical status, providers should emit frequently or on-demand.
-
----
-
-### 4. Tone Values Must Match CSS Classes
-**What breaks:** Row renders unstyled if tone is "critical" but CSS only has "danger".
-
-**Why:** The CSS class `.tone-${tone}` is constructed dynamically (Line 113). Invalid tones produce invalid class names.
-
-**How to verify:** Only use: `neutral`, `info`, `success`, `warning`, `danger`.
-
----
-
-### 5. Only One Status Per Provider
-**What breaks:** Multiple statuses from the same provider; last one wins.
-
-**Why:** Cache is keyed by `providerId` (Line 4 in `providerStatusMemory.js`). New status overwrites the old one.
-
-**How to handle:** If you need multiple status views per provider, emit a single status with multiple sections.
-
----
-
-### 6. Summary Is Optional but Compact View Needs Items
-**What breaks:** `ProviderStatusPanelSingle` renders with no items shown.
-
-**Why:** If `summary` is missing, fallback to first section's first 2 items (Line 140-144). If the section is empty or missing, no items render.
-
-**How to fix:** Either include `summary` with items, or ensure the first section has at least 1 item.
-
----
-
-### 7. Empty Sections Still Render
-**What breaks:** Section appears with no items; looks broken.
-
-**Why:** The modal renders all sections regardless of item count.
-
-**How to prevent:** Only include sections with items. The type definition allows `items: []`, but rendering an empty section is poor UX.
-
----
-
-### 8. Active Provider Distinction in setProviderStatus
-**What breaks:** Status updates for a background provider don't update the singular `providerStatus` field.
-
-**Why:** Lines 167-170 in `useSystemStore.ts` only update `providerStatus` if the provider is active or if providerId wasn't explicitly passed.
-
-**How to understand:** This is intentional — the singular field tracks the active provider's status for global UI. The keyed field tracks all providers.
-
----
-
-### 9. Modal Close Button Requires onClose Handler
-**What breaks:** Modal doesn't close when user clicks the X button.
-
-**Why:** `ProviderStatusModal` prop `onClose` is called on click, but parent must handle it.
-
-**How to verify:** `ProviderStatusPanelSingle` passes `onClose={() => setIsDetailsOpen(false)}` to modal (Line 67).
-
----
-
-### 10. formatUpdatedAt Assumes ISO 8601
-**What breaks:** Timestamp renders as "Invalid Date".
-
-**Why:** The helper (Lines 151-155) uses `new Date(isoString)` and `.toLocaleString()`. Non-ISO strings fail.
-
-**How to fix:** Provider should emit ISO 8601 format: `"2026-05-01T14:32:15Z"`.
-
----
+`ProviderStatusModal` renders only sections where `section.items?.length > 0`. If diagnostic text is important, put it in an item `detail` field, not in an empty section.
 
 ## Unit Tests
 
-### Test File
+### Backend Tests
 
-| File | Lines | Test Coverage |
-|------|-------|--------------|
-| `frontend/src/test/ProviderStatusPanel.test.tsx` | 135 | Null render, compact+modal workflow, fallback summary, detail text, progress clamping |
+- `backend/test/providerStatusMemory.test.js`
+  - `remembers the latest provider status extension`
+  - `ignores extensions that are not provider status payloads`
+  - `returns a copy so callers cannot mutate cached memory`
+  - `keeps provider status memory isolated by provider id`
 
-### Key Test Cases
+- `backend/test/sockets-index.test.js`
+  - `emits cached provider status on connection`
 
-1. **No status renders null** (Lines 15-18): Verify component returns null when `providerStatusByProviderId` is empty
-2. **Compact summary + modal details** (Lines 20-63): Full workflow — renders compact view, clicks Details, modal appears with all sections
-3. **Fallback to first 2 items** (Lines 65-86): When `summary` is missing, summary rows use first section's first 2 items
-4. **Detail text renders in expanded** (Lines 88-108): When `compact={false}`, detail label is shown
-5. **Progress clamping** (Lines 110-133): Values -1 and 2 are clamped to 0% and 100%
+- `backend/test/acpClient-routing.test.js`
+  - `routes all handleProviderExtension paths`
 
-### Run Tests
+- `backend/test/acpClient-deep.test.js`
+  - `handles handleProviderExtension without metadata`
+  - `handles handleProviderExtension without io`
 
-```bash
-cd frontend
-npx vitest run ProviderStatusPanel.test.tsx
-npx vitest run --coverage                           # Coverage report
+### Frontend Tests
+
+- `frontend/src/test/extensionRouter.test.ts`
+  - `routes generic provider status`
+  - `routes generic provider_status alias`
+  - `ignores malformed provider status payloads`
+
+- `frontend/src/test/useSocket.test.ts`
+  - `handles "provider_status" extension`
+
+- `frontend/src/test/useSystemStore.test.ts`
+  - `setProviderStatus manages active status vs background status`
+
+- `frontend/src/test/useSystemStoreExtended.test.ts`
+  - `setProviderStatus manages per-provider status`
+
+- `frontend/src/test/useSystemStoreDeep.test.ts`
+  - `setProviderStatus handles missing resolvedProviderId`
+  - `setProviderStatus correctly identifies active provider updates`
+
+- `frontend/src/test/ProviderStatusPanel.test.tsx`
+  - `renders nothing when no provider status is available`
+  - `renders compact summary rows and opens full details in a modal`
+  - `falls back to the first two section items when no summary is provided`
+  - `renders compact summary detail text below progress rows`
+  - `clamps progress bars to the normalized 0 to 1 range`
+
+### Focused Commands
+
+```powershell
+cd backend; npx vitest run providerStatusMemory.test.js sockets-index.test.js acpClient-routing.test.js acpClient-deep.test.js
+cd frontend; npx vitest run ProviderStatusPanel.test.tsx extensionRouter.test.ts useSocket.test.ts useSystemStore.test.ts useSystemStoreExtended.test.ts useSystemStoreDeep.test.ts
 ```
-
----
 
 ## How to Use This Guide
 
-### For Implementing Provider Status Emission
+### For implementing/extending this feature
 
-1. **Understand the contract:** Read "The Critical Contract" section — your status must have `sections: ProviderStatusItem[]`
-2. **Shape your data:**
-   - Decide what metrics to expose (token usage, rate limits, health, etc.)
-   - Group into sections (e.g., "Token Usage", "Rate Limits")
-   - Each item should have `label`, `value`, optional `detail`, optional `progress`
-3. **Emit on demand or on-change:**
-   - Send via ACP `provider_extension` notification with method `provider/status` or `protocol://provider/status`
-   - Backend will cache it and replay to all clients
-4. **Test with the mock:** Create a test provider that emits known payloads, verify rendering
+1. Start with the payload contract in `frontend/src/types.ts` and build a UI-ready `ProviderStatus` object.
+2. Emit `params.status` through `emitProviderExtension` or a prefixed ACP extension method using `${protocolPrefix}provider/status`.
+3. Verify `backend/services/providerStatusMemory.js` accepts the payload by checking `sections` and `providerId` normalization.
+4. Verify `frontend/src/utils/extensionRouter.ts` accepts the method and status shape.
+5. Add or adjust focused tests in `providerStatusMemory.test.js`, `extensionRouter.test.ts`, `useSystemStore*.test.ts`, and `ProviderStatusPanel.test.tsx`.
 
-### For Debugging Status Not Appearing
+### For debugging issues with this feature
 
-1. **Check backend logs:** Look for `io.emit('provider_extension')` on line 338 of `acpClient.js`
-2. **Check frontend console:** Open DevTools Network tab, look for `provider_extension` socket messages
-3. **Check type guard:** Verify `isProviderStatus()` is not rejecting your payload — add `sections: []` if missing
-4. **Check cache:** Debug backend to confirm `rememberProviderStatusExtension()` was called
-5. **Check on-connect:** Manually refresh browser; status should appear instantly from cache (not wait for provider)
-
-### For Extending with New Metrics
-
-1. **Add new section:** Include a new object in `sections: []` with `id`, `title`, `items`
-2. **Add new item:** Include in items array with `id`, `label`, `value`, and optional `progress`, `tone`, `detail`
-3. **Use tones:** Assign `tone: 'success'` for healthy, `tone: 'warning'` for degraded, `tone: 'danger'` for critical
-4. **Test in modal:** Verify the Details modal shows all sections and items with correct colors and progress bars
-
----
+1. Confirm the backend emits a `provider_extension` event from `AcpClient.handleProviderExtension`.
+2. Confirm `rememberProviderStatusExtension` accepts the payload and `getLatestProviderStatusExtensions` returns it.
+3. Refresh the browser and confirm socket connection hydration replays the cached extension from `registerSocketHandlers`.
+4. Confirm `useSocket` resolves the same provider id and branding `protocolPrefix` used by the extension method.
+5. Confirm `routeExtension` returns `{ type: 'provider_status', status }`.
+6. Inspect `useSystemStore.providerStatusByProviderId[providerId]` and the sidebar `ProviderStatusPanel providerId` prop.
+7. Check `ProviderStatusPanelSingle` item-bearing section filtering and `getSummaryItems` fallback behavior.
 
 ## Summary
 
-The ProviderStatusPanel system is a **real-time, cached, multi-provider status display** that:
-
-1. **Receives status from providers** via ACP `provider_extension` events
-2. **Caches on the backend** in a Map keyed by providerId; replays to new clients on connect
-3. **Routes on the frontend** through `extensionRouter` with type guard validation
-4. **Stores per-provider** in `useSystemStore.providerStatusByProviderId`
-5. **Renders two views**: Compact summary (sidebar) and full details modal
-6. **Uses tone-based styling** for visual feedback (success → green, warning → yellow, danger → red)
-7. **Supports flexible metrics** via generic ProviderStatus type (sections, items, progress)
-
-**The critical contract is the `ProviderStatus` type shape**: Must have `sections` array (for type guard), progress values must be 0-1 (not 0-100), tone must be one of the enum values.
-
-Agents should be able to:
-- ✅ Emit status from a provider daemon
-- ✅ Debug why status doesn't appear (type guard, cache, routing)
-- ✅ Understand on-connect hydration (cached status replayed immediately)
-- ✅ Add new metrics/sections without modifying code (data-driven)
-- ✅ Customize tone colors and styling via CSS
-- ✅ Understand the singular `providerStatus` vs keyed `providerStatusByProviderId` distinction
+- Provider status is delivered as a provider extension with a prefixed `provider/status` or `provider_status` method.
+- `AcpClient.handleProviderExtension` broadcasts every provider extension and lets `providerStatusMemory` cache only valid status payloads.
+- `providerStatusMemory` validates `params.status.sections`, normalizes provider id into the cached extension, and returns clones.
+- `registerSocketHandlers` replays cached status extensions during socket connection hydration.
+- `useSocket` resolves provider id and protocol prefix before calling `routeExtension`.
+- `routeExtension` is the frontend gate for method suffix and `sections` shape.
+- `useSystemStore.setProviderStatus` maintains both keyed provider status and active-provider status.
+- `ProviderStatusPanel` renders provider-scoped compact summaries and modal details from `ProviderStatus` without provider-specific UI branches.

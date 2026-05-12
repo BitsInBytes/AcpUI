@@ -1,5 +1,8 @@
-import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import EventEmitter from 'events';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 const mockHandlers = {};
 const { mockResolveMcpProxy } = vi.hoisted(() => ({
@@ -19,6 +22,34 @@ vi.mock('../services/providerLoader.js', () => ({
 vi.mock('../services/logger.js', () => ({ writeLog: vi.fn() }));
 
 import createMcpApiRoutes from '../routes/mcpApi.js';
+import { resetMcpConfigForTests } from '../services/mcpConfig.js';
+
+const BASE_MCP_CONFIG = {
+  tools: {
+    invokeShell: true,
+    subagents: true,
+    counsel: true,
+    io: false,
+    googleSearch: false
+  }
+};
+
+function useMcpConfig(overrides = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acpui-mcp-config-'));
+  const configPath = path.join(dir, 'mcp.json');
+  const config = {
+    ...BASE_MCP_CONFIG,
+    ...overrides,
+    tools: {
+      ...BASE_MCP_CONFIG.tools,
+      ...(overrides.tools || {})
+    }
+  };
+  fs.writeFileSync(configPath, JSON.stringify(config), 'utf8');
+  vi.stubEnv('MCP_CONFIG', configPath);
+  resetMcpConfigForTests();
+  return configPath;
+}
 
 describe('MCP API Routes', () => {
   const io = { emit: vi.fn(), fetchSockets: vi.fn().mockResolvedValue([]) };
@@ -26,8 +57,14 @@ describe('MCP API Routes', () => {
 
   beforeEach(() => {
     for (const key of Object.keys(mockHandlers)) delete mockHandlers[key];
+    useMcpConfig();
     mockResolveMcpProxy.mockReset();
     mockResolveMcpProxy.mockReturnValue(null);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetMcpConfigForTests();
   });
 
   function getRoute(router, method, path) {
@@ -65,8 +102,45 @@ describe('MCP API Routes', () => {
       tools: expect.arrayContaining([
         expect.objectContaining({ name: 'ux_invoke_shell', inputSchema: expect.objectContaining({ type: 'object' }) }),
         expect.objectContaining({ name: 'ux_invoke_subagents', inputSchema: expect.objectContaining({ type: 'object' }) }),
+        expect.objectContaining({ name: 'ux_invoke_counsel', inputSchema: expect.objectContaining({ type: 'object' }) }),
       ])
     }));
+  });
+
+  it('GET /tools includes default-on core tools when flags are blank', () => {
+    useMcpConfig();
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'get', '/tools');
+    const res = { json: vi.fn() };
+    route.route.stack[0].handle({}, res, vi.fn());
+
+    const names = res.json.mock.calls[0][0].tools.map(tool => tool.name);
+    expect(names).toEqual(expect.arrayContaining([
+      'ux_invoke_shell',
+      'ux_invoke_subagents',
+      'ux_invoke_counsel'
+    ]));
+  });
+
+  it('GET /tools hides disabled core tools', () => {
+    useMcpConfig({
+      tools: {
+        invokeShell: false,
+        subagents: false,
+        counsel: false,
+        io: false,
+        googleSearch: false
+      }
+    });
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'get', '/tools');
+    const res = { json: vi.fn() };
+    route.route.stack[0].handle({}, res, vi.fn());
+
+    const names = res.json.mock.calls[0][0].tools.map(tool => tool.name);
+    expect(names).not.toContain('ux_invoke_shell');
+    expect(names).not.toContain('ux_invoke_subagents');
+    expect(names).not.toContain('ux_invoke_counsel');
   });
 
   it('GET /tools describes ux_invoke_shell as an interactive terminal-backed shell replacement', () => {
@@ -95,6 +169,77 @@ describe('MCP API Routes', () => {
       'acpui/concurrentInvocationsSupported': true
     }));
     expect(shellTool.description).not.toContain('only use non-interactive commands');
+  });
+
+  it('GET /tools hides optional IO and Google tools by default', () => {
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'get', '/tools');
+    const res = { json: vi.fn() };
+    route.route.stack[0].handle({}, res, vi.fn());
+
+    const names = res.json.mock.calls[0][0].tools.map(tool => tool.name);
+    expect(names).not.toContain('ux_read_file');
+    expect(names).not.toContain('ux_web_fetch');
+    expect(names).not.toContain('ux_google_web_search');
+    expect(names).not.toContain('read_file');
+    expect(names).not.toContain('web_fetch');
+    expect(names).not.toContain('google_web_search');
+  });
+
+  it('GET /tools advertises IO tools when MCP config enables them', () => {
+    useMcpConfig({ tools: { io: true } });
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'get', '/tools');
+    const res = { json: vi.fn() };
+    route.route.stack[0].handle({}, res, vi.fn());
+
+    const tools = res.json.mock.calls[0][0].tools;
+    const names = tools.map(tool => tool.name);
+    expect(names).toEqual(expect.arrayContaining([
+      'ux_read_file',
+      'ux_write_file',
+      'ux_replace',
+      'ux_list_directory',
+      'ux_glob',
+      'ux_grep_search',
+      'ux_web_fetch'
+    ]));
+    for (const oldName of ['read_file', 'write_file', 'replace', 'list_directory', 'glob', 'grep_search', 'web_fetch']) {
+      expect(names).not.toContain(oldName);
+    }
+
+    const globTool = tools.find(tool => tool.name === 'ux_glob');
+    const grepTool = tools.find(tool => tool.name === 'ux_grep_search');
+    expect(globTool.inputSchema.properties.description.description).toContain('tool header');
+    expect(grepTool.inputSchema.properties.description.description).toContain('tool header');
+  });
+
+  it('GET /tools advertises Google search only when MCP config enables it', () => {
+    useMcpConfig({ tools: { googleSearch: true }, googleSearch: { apiKey: 'configured-key' } });
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'get', '/tools');
+    const res = { json: vi.fn() };
+    route.route.stack[0].handle({}, res, vi.fn());
+
+    const searchTool = res.json.mock.calls[0][0].tools.find(tool => tool.name === 'ux_google_web_search');
+    expect(searchTool).toEqual(expect.objectContaining({
+      name: 'ux_google_web_search',
+      inputSchema: expect.objectContaining({
+        required: ['query']
+      })
+    }));
+    expect(searchTool.inputSchema.properties.api_key).toBeUndefined();
+  });
+
+  it('GET /tools does not advertise Google search when enabled without an MCP config API key', () => {
+    useMcpConfig({ tools: { googleSearch: true }, googleSearch: { apiKey: '' } });
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'get', '/tools');
+    const res = { json: vi.fn() };
+    route.route.stack[0].handle({}, res, vi.fn());
+
+    const names = res.json.mock.calls[0][0].tools.map(tool => tool.name);
+    expect(names).not.toContain('ux_google_web_search');
   });
 
   it('POST /tool-call returns 404 for unknown tool', async () => {

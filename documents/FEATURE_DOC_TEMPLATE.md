@@ -1,44 +1,80 @@
 # Feature Documentation Template & Guidelines
 
-**This document describes how to create AcpUI Feature Docs — AI agent programming guides that bootstrap agents to instantly understand and work on specific features without exploring the codebase.**
+**This document describes how to create AcpUI Feature Docs: AI agent programming guides that bootstrap agents to understand and work on specific features without broad codebase exploration.**
 
 ---
 
 ## Purpose
 
-Feature Docs are written for **AI agents**, not humans. They serve as self-contained technical guides that allow an agent to:
-- Understand a feature completely without reading multiple files
-- Know where code is located (via Function Names and exact Line Numbers)
+Feature Docs are written for **AI agents**, not as general user documentation. They serve as self-contained technical guides that allow an agent to:
+- Understand a feature without reading unrelated files
+- Know where code is located through stable file paths, function names, component names, exported symbols, event names, config keys, and test names
 - Understand data flow and architecture
-- Know what "contracts" or "shapes" the feature depends on
-- Start implementing or debugging without context bloat
-- Reference unit tests immediately
+- Know what contracts or shapes the feature depends on
+- Start implementing or debugging with minimal context bloat
+- Find unit tests immediately
 
-A good Feature Doc means an agent can load it and within seconds have a complete mental model of the system.
+A good Feature Doc lets an agent load it and quickly build a working mental model of the system.
 
 ---
 
 ## Critical Principle: Document Present State Only
 
-**Feature Docs are LIVING DOCUMENTS that describe the system AS IT EXISTS TODAY. They are NOT historical records.**
+**Feature Docs are living documents that describe the system as it exists today. They are not historical records.**
 
 This means:
-- **Never mention older implementations** — Don't say "The system used to X, but now does Y." Only describe how it works NOW.
-- **Never use past tense** — Say "Sessions are stored in project directories" not "Sessions were stored flat, but are now stored in project directories."
-- **Never compare to previous architectures** — If the system changed, document the current architecture only. Delete old descriptions.
-- **Update line numbers and code snippets regularly** — When code shifts due to additions/removals, update the docs immediately so they stay current.
-- **If a section describes an obsolete pattern**, replace it entirely with the current pattern. Don't keep both for "historical context."
+- **Never mention older implementations** - do not say "The system used to X, but now does Y." Only describe how it works now.
+- **Never use past-tense implementation history** - say "Sessions are stored in project directories" not "Sessions were stored flat, but are now stored in project directories."
+- **Never compare to previous architectures** - if the system changes, document the current architecture only.
+- **Update named anchors and code snippets when code changes** - function names, component names, event names, config keys, and snippets must stay accurate.
+- **Replace obsolete sections entirely** - do not keep outdated patterns for context.
 
-**Why**: Agents rely on Feature Docs as the source of truth for how the system works TODAY. Mixing old and new information creates ambiguity. A confused agent will either waste time on outdated code or implement changes that break the current system.
+**Why**: Agents rely on Feature Docs as the source of truth for how the system works today. Mixing old and new information creates ambiguity.
 
-**Example of what to AVOID:**
+**Example of what to avoid:**
 ```markdown
-❌ Previously, context state was stored in memory. Now we persist it to disk at <location>.
+Previously, context state was stored in memory. Now we persist it to disk at <location>.
 ```
 
-**Example of what to DO:**
+**Example of what to do:**
 ```markdown
-✅ Context usage state is persisted to disk at <location> and loaded on startup.
+Context usage state is persisted to disk at <location> and loaded on startup.
+```
+
+---
+
+## Critical Principle: Stable Anchors, Not Line Numbers
+
+Feature Docs use references that survive normal refactors:
+- File paths relative to the repository root
+- Function, method, class, component, hook, store action, and exported symbol names
+- Socket event names, API routes, config keys, database tables, and protocol fields
+- Short code snippets with enough surrounding context to search for the logic
+- Test file paths and specific test names
+
+Do **not** use line numbers in Feature Docs. Line numbers drift during normal edits and create maintenance work without adding much value. When refreshing an existing Feature Doc, remove line-number anchors from the sections you update.
+
+Preferred reference format:
+```markdown
+File: `backend/services/sessionManager.js` (Function: `getMcpServers`)
+File: `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`, Handler: `handleSubmit`)
+File: `backend/sockets/sessionHandlers.js` (Socket event: `fork_session`)
+```
+
+Preferred code snippet header:
+```javascript
+// FILE: backend/services/sessionManager.js (Function: getMcpServers)
+export function getMcpServers(providerId) {
+  const name = getProvider(providerId).config.mcpName;
+  if (!name) return [];
+  // ...only include the critical branch or contract shape...
+}
+```
+
+If a relevant block has no stable function or symbol, name the nearest searchable anchor:
+```markdown
+File: `backend/server.js` (Startup block: `registerPromptHandlers(io, client)`)
+File: `frontend/src/store/useStreamStore.ts` (Store action: `enqueueEvent`, Search token: `processBuffer`)
 ```
 
 ---
@@ -46,15 +82,15 @@ This means:
 ## File Naming Convention
 
 ```
-[Feature Doc] - <feature name>.md
+[Feature Doc] - <Feature Name>.md
 ```
 
 Examples:
 - `[Feature Doc] - ux_invoke_shell.md`
-- `[Feature Doc] - session forking.md`
+- `[Feature Doc] - Session Forking.md`
 - `[Feature Doc] - Backend Architecture.md`
 
-**Note:** Use hyphens in the filename, not underscores or spaces.
+Use the feature name that matches the BOOTSTRAP index so agents can find the document predictably.
 
 ---
 
@@ -62,87 +98,92 @@ Examples:
 
 Every Feature Doc must include these sections in this order:
 
-### 1. **Title & Overview (Start)**
-- Feature name as H1 heading
+### 1. Title & Overview
+- Feature name as an H1 heading
 - 1-2 sentence description of what the feature does
-- Statement of why it matters or common sources of confusion
+- Statement of why it matters or what commonly confuses agents
 
-### 2. **Overview Section**
-- **What It Does** — Bullet list of 4-6 concrete actions the feature performs
-- **Why This Matters** — 3-5 bullet points on importance/impact
-- Brief mention of architectural role (backend, frontend, दोनों, provider-specific?)
+### 2. Overview
+- **What It Does** - 4-6 concrete actions the feature performs
+- **Why This Matters** - 3-5 bullets on importance and impact
+- Brief architectural role: backend, frontend, both, provider-specific, MCP tool, persistence, etc.
 
-### 3. **How It Works — End-to-End Flow** (The Core)
-- Numbered steps (usually 8-12) that trace the complete data flow
+### 3. How It Works - End-to-End Flow
+- Numbered steps, usually 8-12, tracing the complete data flow
 - Each step should:
   - Have a clear title
-  - Reference the exact file with **Function/Method name** and **Line numbers**: `File: path/to/file.js (Function: methodName, Lines 10-20)`
-  - Include **key code snippets** (not full functions, just the critical lines)
+  - Reference exact file paths plus stable anchors such as function, component, event, route, config key, or store action names
+  - Include key code snippets, not full functions
   - Explain what happens and why
   - Connect to the next step
 
-**Critical:** Narrate the actual execution path. An agent should be able to follow this flow with a debugger and understand every event. Using function names alongside line numbers ensures resilience to code shifts.
+**Critical:** Narrate the actual execution path. An agent should be able to follow this flow with debugger breakpoints or repository search and understand every event.
 
-### 4. **Architecture Diagram**
+### 4. Architecture Diagram
 - Mermaid or ASCII diagram showing:
-  - Major components (backend, frontend, provider, etc.)
-  - Data flow between them (solid arrows for normal flow, dashed for async/events)
-  - How events/data are passed (Socket.IO, function calls, etc.)
-- Must be readable at a glance
-- Mermaid is preferred for complex flows; ASCII for simple ones
+  - Major components: backend, frontend, provider, database, MCP layer, etc.
+  - Data flow between them
+  - How events and data are passed: Socket.IO, function calls, JSON-RPC, filesystem, SQLite, HTTP, etc.
+- Mermaid is preferred for complex flows; ASCII is acceptable for simple flows.
 
-### 5. **The Critical Contract / Key Concept** (Most Important)
-- What is the "contract" or "shape" that this feature depends on?
-- If a component fails to follow this contract, what breaks?
-- This section should make it crystal clear what could trip up a new implementation
+### 5. The Critical Contract / Key Concept
+- State the core contract or data shape the feature depends on
+- Explain what breaks if a component fails to follow it
+- Make implementation hazards explicit
 
 Examples:
-- For tools: **Tool System V2** integration via `toolRegistry`, `toolCallState`, and `toolInvocationResolver`.
-- For sessions: The shape of the JSONL structure
-- For permissions: The request/response format and what "selected" vs "cancelled" means
+- For tools: Tool System V2 integration through `toolRegistry`, `toolCallState`, and `toolInvocationResolver`
+- For sessions: JSONL structure and persistence ownership
+- For permissions: request/response format and how approval state maps to UI behavior
 
-### 6. **Configuration / Provider-Specific Behavior** (If Applicable)
-- What does a provider need to do to support this feature?
-- What configuration files/functions are involved?
-- **Be generic** — don't show specific provider implementations, show the pattern
-- Use language like "A provider must...", "if a provider sends X...", "look for..."
-- Show example patterns, not actual provider code
-- Explain placeholder values like `{mcpName}` vs real values
+### 6. Configuration / Provider-Specific Behavior (If Applicable)
+- What a provider or config file must do to support this feature
+- Which configuration files, provider hooks, runtime fields, or feature flags are involved
+- Keep generic docs generic: say "A provider must..." rather than naming a specific provider
+- Show patterns and placeholder values, not provider-specific implementations
 
-### 7. **Data Flow / Rendering Pipeline** (If Applicable)
-- Show the transformation of data as it moves through the system
-- Include raw examples (what daemon sends) → normalized (what backend processes) → rendered (what UI shows)
-- Use code blocks showing the data at each stage
+### 7. Data Flow / Rendering Pipeline (If Applicable)
+- Show how data transforms as it moves through the system
+- Include raw examples, normalized backend shapes, store shapes, and rendered UI expectations
+- Use focused code blocks for the data at each stage
 
-### 8. **Component Reference**
+### 8. Component Reference
 - Table(s) listing all files involved, with:
   - File path
-  - Key functions/methods (names with line anchors: `methodName (Line: X)`)
+  - Stable anchors: functions, components, hooks, classes, events, routes, store actions, exports, config keys, or tables
   - One-line purpose
-- Separate tables for backend, frontend, database, provider (if applicable)
+- Separate tables for backend, frontend, database, provider, tests, and configuration when useful
 
-### 9. **Gotchas & Important Notes**
-- List 5-10 "gotchas" — things that commonly break or confuse
+Suggested table:
+```markdown
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Backend | `backend/services/sessionManager.js` | `getMcpServers`, `loadSession` | Resolves provider MCP config and session state |
+```
+
+### 9. Gotchas & Important Notes
+- List 5-10 gotchas
 - Each should be numbered and have a clear title
 - Include:
   - What goes wrong
   - Why it happens
   - How to avoid it or detect it
 
-### 10. **Unit Tests**
+### 10. Unit Tests
 - List test files and their locations
-- Group by backend/frontend/integration
-- Include specific test names if they're particularly relevant
+- Group by backend, frontend, integration, or provider when useful
+- Include specific test names for important edge cases
+- Mention test helpers or mocks that agents should understand before editing tests
 
-### 11. **How to Use This Guide**
+### 11. How to Use This Guide
 - Subsection: "For implementing/extending this feature"
 - Subsection: "For debugging issues with this feature"
-- Provide a checklist or step-by-step guidance
+- Provide a checklist or step-by-step guidance using file/function anchors
 
-### 12. **Summary**
+### 12. Summary
 - Recap the feature in 5-8 points
 - Reiterate the critical contract
-- One sentence on why agents should care
+- State why agents should care when changing this area
 
 ---
 
@@ -150,38 +191,39 @@ Examples:
 
 ### Code Snippets
 
-✅ **DO:**
-- Show key lines only (not full function bodies)
-- **Always include function names and line numbers** in headers
-- Format as: `// FILE: path/to/file.js (Function: name, Lines X-Y)`
-- Provide context (1-2 lines before/after) so the snippet is understandable
+Do:
+- Show key logic only, not full files or full functions
+- Include file paths and stable anchors in snippet headers
+- Provide enough surrounding context for repository search
+- Include the critical branch, event payload, data shape, or state transition
 
-✅ Example:
+Example:
 ```javascript
-// FILE: backend/services/sessionManager.js (Function: getMcpServers, Lines 28-35)
+// FILE: backend/services/sessionManager.js (Function: getMcpServers)
 export function getMcpServers(providerId) {
-  const name = getProvider(providerId).config.mcpName;  // LINE 28
+  const name = getProvider(providerId).config.mcpName;
   if (!name) return [];
-  // ... rest of snippet
+  return [{ name, command: 'node', args: ['mcpServer.js'] }];
 }
 ```
 
-❌ **DON'T:**
+Do not:
 - Include entire files or huge functions
-- Show code without line numbers or function context
-- Show provider-specific implementations (e.g., "Kiro does X")
+- Use line-number anchors in headings, snippets, tables, or prose
+- Show code without file path and function/component/event context
+- Put provider-specific examples in generic docs
 
 ### Pattern-Based Referencing
 
-✅ **DO:**
-- Use the standard pattern: `File: path/to/file.js (Function: methodName, Lines X-Y)`
-- This is the **Primary Key** for AI agents to find code. Even if lines shift, the function name allows them to locate the logic via search.
+Use this pattern:
+```markdown
+File: `path/to/file.js` (Function: `functionName`)
+File: `path/to/file.tsx` (Component: `ComponentName`, Hook: `useSomething`)
+File: `path/to/file.js` (Socket event: `event_name`)
+File: `path/to/config.json` (Config key: `some.key.path`)
+```
 
-### Line Numbers
-
-✅ **DO:**
-- Always reference exact line numbers: `(Lines 45-67)`, `(Line 120)`
-- These must be verified at the time of writing to match the current codebase.
+These references are the primary keys agents use to find code quickly. If a symbol is renamed, update the Feature Doc in the same change.
 
 ---
 
@@ -189,48 +231,59 @@ export function getMcpServers(providerId) {
 
 ### Narrative Flow
 
-The **How It Works** section should read like a continuous narrative:
+The **How It Works** section should read like a continuous execution path:
 - Step 1 happens
 - Which triggers Step 2
 - Which causes Step 3
-- etc.
+- Which emits or persists Step 4
 
-An agent should be able to follow the flow with a debugger breakpoint and understand every line they encounter.
+An agent should be able to follow the flow with debugger breakpoints, repository search, and the referenced file/function anchors.
 
 ### Specificity
 
-- Be as specific as possible with line numbers, function names, and file paths.
-- "The backend emits an event" is vague; "The backend emits `token_done` via `io.emit()` in `registerPromptHandlers` (Line 127)" is useful.
+Be as specific as possible with file paths, symbol names, event names, data shapes, and config keys.
+
+Weak:
+```markdown
+The backend emits an event.
+```
+
+Useful:
+```markdown
+`registerPromptHandlers` in `backend/sockets/promptHandlers.js` emits `token_done` after the stream controller flushes assistant output.
+```
 
 ---
 
 ## Checklist Before Submitting
 
 - [ ] Title and overview explain what the feature is
-- [ ] "How It Works" section traces a complete end-to-end flow with function names and line numbers
+- [ ] "How It Works" traces a complete end-to-end flow with stable file/function/event anchors
 - [ ] Architecture diagram shows data flow clearly
-- [ ] Critical contract/shape is explicitly stated
-- [ ] Tool System V2 integration is documented for tools
-- [ ] Component reference table has function names and line anchors
+- [ ] Critical contract or data shape is explicit
+- [ ] Tool System V2 integration is documented for MCP tools
+- [ ] Component reference table uses file paths and stable anchors, not line numbers
 - [ ] 5-10 gotchas are listed with explanations
-- [ ] Unit test locations are provided
-- [ ] All file paths are relative to the project root (e.g., `backend/services/foo.js`)
+- [ ] Unit test files and important test names are listed
+- [ ] All file paths are relative to the project root
+- [ ] Generic docs avoid provider-specific examples
+- [ ] The document describes the current implementation only
 
 ---
 
-## Example Structure (Outline)
+## Example Structure
 
-```
-# Feature Doc — [Feature Name]
+```markdown
+# Feature Doc - [Feature Name]
 
 ## Overview
 - What It Does
 - Why This Matters
 
-## How It Works — End-to-End Flow
-1. [Step 1: Title, File (Function, Lines), key snippet]
-2. [Step 2: Title, File (Function, Lines), key snippet]
-... (8-12 steps)
+## How It Works - End-to-End Flow
+1. [Step 1: Title, File + Function/Component/Event, key snippet]
+2. [Step 2: Title, File + Function/Component/Event, key snippet]
+...
 
 ## Architecture Diagram
 [Mermaid or ASCII]
@@ -241,14 +294,20 @@ An agent should be able to follow the flow with a debugger breakpoint and unders
 ## Configuration / Provider Support (if applicable)
 [What a provider must do, generic patterns, example configurations]
 
+## Data Flow / Rendering Pipeline (if applicable)
+[Raw input -> normalized backend shape -> store state -> rendered UI]
+
 ## Component Reference
-[Tables: Backend Files, Frontend Files, Database, Provider (if applicable)]
+[Tables: Backend, Frontend, Database, Provider, Config, Tests as applicable]
 
 ## Gotchas & Important Notes
 [5-10 numbered gotchas with explanations]
 
 ## Unit Tests
 [Test file locations and relevant test names]
+
+## How to Use This Guide
+[Implementation and debugging checklists]
 
 ## Summary
 [Key takeaways and critical contract restatement]

@@ -1,8 +1,8 @@
 # Session Archiving
 
-A soft-delete system that moves inactive sessions into an archive while preserving complete session state and attachments. Sessions can be restored (with new UI IDs) or permanently deleted from archives. Archiving respects provider-scoped storage and cascades through forked/sub-agent session hierarchies.
+Session Archiving is the soft-delete path for chat sessions. It moves the selected session into a provider archive folder, writes generic `session.json` metadata, delegates provider file movement to provider hooks, and removes the active SQLite row.
 
-**Why this matters:** Archiving is the primary deletion path for users (soft-delete by default). Understanding its architecture is critical for implementing retention policies, debugging restore issues, handling file system errors during archiving, or extending provider-specific archiving behavior.
+This area matters because the UI has both soft-delete and permanent-delete entry points, restore creates a new UI id while retaining the archived ACP id, and archive operations combine Socket.IO, SQLite, provider files, attachments, and sidebar state.
 
 ---
 
@@ -10,745 +10,571 @@ A soft-delete system that moves inactive sessions into an archive while preservi
 
 ### What It Does
 
-- **Soft-delete sessions** — Move session to archive folder instead of immediate permanent deletion; preserves complete session state, messages, and attachments
-- **Archive directory management** — Maintain provider-scoped archive directory with one folder per archived session containing session.json metadata and attachments
-- **List archived sessions** — Enumerate archived session folders; display in Archive Modal for user selection
-- **Restore archived sessions** — Recreate archived sessions with new UI IDs; re-instantiate provider session via `restoreSessionFiles()`; merge with existing sessions (never replace)
-- **Permanent deletion** — Completely remove archived session folder and all contents from disk
-- **Cascade archiving** — When archiving a parent session, recursively archive all forked/sub-agent descendants
+- Archives a selected session through the `archive_session` socket event.
+- Writes an archive folder at `provider.config.paths.archive/<safe session name>`.
+- Persists restore metadata in `session.json` and stores provider-managed files beside it.
+- Removes fork descendants from provider storage, attachment storage, and the `sessions` table before archiving the parent.
+- Lists archive folders that contain `session.json` for the Archive Modal.
+- Restores an archive by creating a new UI session id, restoring provider files, copying attachments, and saving a fresh SQLite row.
+- Permanently removes an archive folder through the `delete_archive` socket event.
 
 ### Why This Matters
 
-- **Data safety:** Archiving prevents accidental data loss; users can recover deleted sessions from Archive Modal
-- **Disk management:** Archive directories grow large over time; permanent deletion is required for cleanup
-- **Provider integration:** Each provider implements custom `archiveSessionFiles()` and `restoreSessionFiles()` to handle provider-specific session persistence
-- **Session hierarchy:** Forked sessions must be archived together with parent; orphaned forks are problematic
-- **Performance:** Archive operations are fire-and-forget on socket layer; async file I/O doesn't block socket handler
+- The sidebar delete control uses archiving unless permanent deletion is enabled or the session is a sub-agent.
+- Archive and restore depend on provider hooks, so provider modules must implement the file contract consistently.
+- SQLite has no archive table; the filesystem folder and `session.json` are the archive source of truth.
+- Restore is merge-only in the frontend; existing in-memory sessions are preserved.
+- Descendant cleanup is explicit application logic, not a database foreign-key cascade.
 
-### Architectural Role
-
-- **Frontend:** Archive Modal component, archive buttons in Sidebar, archive state in `useSessionLifecycleStore`
-- **Backend:** 4 socket handlers in `archiveHandlers.js` coordinating file I/O, database updates, and provider module calls
-- **Provider layer:** `archiveSessionFiles()`, `restoreSessionFiles()`, `deleteSessionFiles()` methods for provider-specific session persistence
-- **Database:** SQLite tracks session relationships (forked_from, is_sub_agent) to identify descendants during archive cascade
+Architectural role: backend socket orchestration, provider filesystem hooks, SQLite session persistence, frontend sidebar/modal controls.
 
 ---
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### Step 1: User Right-Clicks Session → Removes with Archive (Default)
-**File:** `frontend/src/components/Sidebar.tsx` (Function: `handleRemoveSession`, Lines 184-210)
+### 1. Sidebar Delete Chooses Archive or Permanent Delete
 
-User right-clicks a session and selects "Delete" (or via keyboard shortcut). The Sidebar invokes:
+File: `frontend/src/components/Sidebar.tsx` (Function: `handleRemoveSession`)
 
-```typescript
-// FILE: frontend/src/components/Sidebar.tsx (Lines 184-210)
-const handleRemoveSession = (sessionId: string) => {
-  // ... determines if permanent delete or archive ...
-  if (deletePermanent || session?.isSubAgent) {
-    socket.emit('delete_session', { uiId: sessionId });
-  } else {
-    socket.emit('archive_session', { ...payload, uiId: sessionId });
-  }
-  // ... recursively removes descendants from local state ...
-};
-```
-
-**Key decision:** If `deletePermanent` setting is true OR session is a sub-agent, delete permanently; otherwise archive (soft-delete).
-
----
-
-### Step 2: Frontend Emits `archive_session` with Session UI ID
-**File:** `frontend/src/store/useSessionLifecycleStore.ts` (Lines 302–318)
-
-After user interaction, the socket emits:
+`Sidebar` owns the visible session archive action. It reads `deletePermanent` from `useSystemStore`, finds the session in `useSessionLifecycleStore`, and emits either `archive_session` or `delete_session`.
 
 ```typescript
-// FILE: frontend/src/store/useSessionLifecycleStore.ts (Line 308)
-socket.emit('archive_session', { providerId: session.provider, uiId });
-```
-
-**Payload shape:**
-```typescript
-{
-  providerId: string;  // Required - provider scope
-  uiId: string;        // Required - frontend session ID
+// FILE: frontend/src/components/Sidebar.tsx (Function: handleRemoveSession)
+const session = useSessionLifecycleStore.getState().sessions.find(s => s.id === sessionId);
+if (deletePermanent || session?.isSubAgent) {
+  socket.emit('delete_session', { uiId: sessionId });
+} else {
+  const archiveProviderId = session?.provider || activeProviderId || defaultProviderId;
+  socket.emit('archive_session', { ...(archiveProviderId ? { providerId: archiveProviderId } : {}), uiId: sessionId });
 }
 ```
 
----
+After emitting, `handleRemoveSession` recursively removes the selected session and local descendants whose `forkedFrom` points at a removed id. The active session is cleared when it is part of that removed set.
 
-### Step 3: Backend `archive_session` Handler Begins Archiving
-**File:** `backend/sockets/archiveHandlers.js` (Lines 9–65)
+### 2. Store Delete Action Supports Non-Sidebar Callers
 
-The handler receives the request and begins cascading deletion:
+File: `frontend/src/store/useSessionLifecycleStore.ts` (Action: `handleDeleteSession`)
+
+The store-level delete action is used by settings and tests. It emits `delete_session` when `forcePermanent` or `deletePermanent` is true; otherwise it emits `archive_session`. It removes only the selected UI id from local state.
+
+```typescript
+// FILE: frontend/src/store/useSessionLifecycleStore.ts (Action: handleDeleteSession)
+if (forcePermanent || useSystemStore.getState().deletePermanent) {
+  socket.emit('delete_session', { providerId: session.provider, uiId });
+} else {
+  socket.emit('archive_session', { providerId: session.provider, uiId });
+}
+```
+
+### 3. Backend Resolves the Stored Session and Provider
+
+File: `backend/sockets/archiveHandlers.js` (Function: `registerArchiveHandlers`, Socket event: `archive_session`)
+
+The backend handler reads the persisted session with `db.getSession(uiId)`. The provider id used for archiving comes from `session.provider` or the default provider resolution path; the handler signature ignores the frontend `providerId` field for this event.
 
 ```javascript
-// FILE: backend/sockets/archiveHandlers.js (Lines 9-65)
+// FILE: backend/sockets/archiveHandlers.js (Socket event: archive_session)
 socket.on('archive_session', async ({ uiId }) => {
-  try {
-    const session = db.getSession(uiId);  // LINE 11 - Fetch from DB
-    
-    // Find all descendants (forked sessions, sub-agents)
-    const allSessions = db.getAllSessions(providerId);  // LINE 20
-    const descendants = allSessions.filter(s => s.forked_from === uiId || s.parent_acp_session_id === session.acpSessionId);  // LINE 21
-    
-    // Archive each descendant first (depth-first)
-    for (const desc of descendants) {
-      providerModule.deleteSessionFiles(desc.acpSessionId);  // LINE 31 - Provider cleanup
-      db.deleteSession(desc.uiId);  // LINE 35
-    }
-    
-    // Archive the parent session
-    providerModule.archiveSessionFiles(session.acpSessionId, archivePath);  // LINE 44 - Provider-specific archiving
-    
-    // Copy attachments to archive
-    const attachRoot = getAttachmentsRoot(providerId);  // LINE 47
-    const archiveAttachPath = path.join(archivePath, safeName, 'attachments');  // LINE 48
-    if (fs.existsSync(path.join(attachRoot, uiId))) {
-      fs.cpSync(path.join(attachRoot, uiId), archiveAttachPath, { recursive: true });  // LINE 51
-    }
-    
-    // Write session.json metadata to archive
-    const sessionJson = {  // LINE 53-57
-      id: session.ui_id,
-      acpSessionId: session.acp_id,
-      name: session.name,
-      model: session.model,
-      messages: JSON.parse(session.messages_json || '[]'),
-      // ... other fields
-    };
-    fs.writeFileSync(path.join(archivePath, safeName, 'session.json'), JSON.stringify(sessionJson, null, 2));
-    
-    // Delete from database
-    db.deleteSession(uiId);  // LINE 60
-    
-    writeLog(`[ARCHIVE] Archived session ${uiId}`);
-  } catch (err) {
-    writeLog(`[ARCHIVE ERR] ${err.message}`);
-  }
+  const session = await db.getSession(uiId);
+  const providerId = session?.provider || null;
+  const provider = getProvider(providerId);
+  const archivePath = provider.config.paths.archive;
+  if (!archivePath || !session) return;
+
+  const providerModule = await getProviderModule(providerId);
+  // archive work continues here
 });
 ```
 
-**Critical steps:**
-1. Line 20–35: **Cascade delete descendants** (forked/sub-agent sessions)
-2. Line 44: **Provider-specific archiving** (moves session files to archive)
-3. Line 47–51: **Copy attachments** to archive folder
-4. Line 53–58: **Write session.json** metadata
-5. Line 60: **Delete from database**
+### 4. Backend Deletes Descendants Before Archiving Parent
 
----
+Files:
+- `backend/sockets/archiveHandlers.js` (Socket event: `archive_session`, local helper: `collectDescendants`)
+- `backend/database.js` (Functions: `getAllSessions`, `deleteSession`)
 
-### Step 4: Provider Module Implements `archiveSessionFiles()`
-**File:** `providers/{provider}/index.js` (Provider-specific)
-
-Each provider implements how its session data is archived. Example:
+The archive handler loads all sessions and recursively collects descendants by matching `forkedFrom` to the parent UI id. Each descendant is permanently removed through the same provider module used for the parent archive, its attachment directory is removed, and its SQLite row is deleted.
 
 ```javascript
-// Pseudo-code; actual implementation varies by provider
-async archiveSessionFiles(acpSessionId, archivePath) {
-  const sessionDir = path.join(this.config.paths.sessions, acpSessionId);
-  const archiveSessionDir = path.join(archivePath, safeName);
-  
-  // Move provider session files to archive
-  fs.cpSync(sessionDir, archiveSessionDir, { recursive: true });  // Copy session data
-  fs.rmSync(sessionDir, { recursive: true });  // Delete original
+// FILE: backend/sockets/archiveHandlers.js (Socket event: archive_session)
+const allSessions = await db.getAllSessions();
+const descendants = [];
+const collectDescendants = (parentId) => {
+  for (const s of allSessions) {
+    if (s.forkedFrom === parentId) {
+      descendants.push(s);
+      collectDescendants(s.id);
+    }
+  }
+};
+collectDescendants(uiId);
+
+for (const child of descendants) {
+  if (child.acpSessionId) providerModule.deleteSessionFiles(child.acpSessionId);
+  const childAttach = path.join(getAttachmentsRoot(), child.id);
+  if (fs.existsSync(childAttach)) fs.rmSync(childAttach, { recursive: true, force: true });
+  await db.deleteSession(child.id);
 }
 ```
 
-This is provider-specific; some providers store session files, others store in cloud.
+`parentAcpSessionId` is stored in the database for sub-agent relationships, but this archive cascade follows `forkedFrom` only.
 
----
+### 5. Backend Builds the Archive Folder and Delegates Provider Files
 
-### Step 5: User Clicks "Archives" Button in Sidebar
-**File:** `frontend/src/components/Sidebar.tsx` (Lines 140–151)
+Files:
+- `backend/sockets/archiveHandlers.js` (Socket event: `archive_session`)
+- `providers/<provider>/index.js` (Functions: `archiveSessionFiles`, `deleteSessionFiles`)
+- `backend/services/providerLoader.js` (Exports: `DEFAULT_MODULE`, `getProviderModule`)
 
-User clicks the "Archives" button in the sidebar utility row:
-
-```typescript
-// FILE: frontend/src/components/Sidebar.tsx (Lines 140-151)
-const handleShowArchives = () => {
-  if (!socket) return;
-  const pid = currentExpandedId;  // Current provider
-  const payload = pid ? { providerId: pid } : undefined;
-  
-  const callback = (res: { archives: string[] }) => {
-    setArchives(res.archives || []);  // List of archive folder names
-    setArchiveSearch('');
-    setShowArchives(true);  // Open modal
-  };
-  
-  socket.emit('list_archives', payload, callback);  // LINE 149
-};
-```
-
-Emits `list_archives` to fetch available archives.
-
----
-
-### Step 6: Backend `list_archives` Handler Returns Archive Folders
-**File:** `backend/sockets/archiveHandlers.js` (Lines 86–101)
+The parent archive folder name is derived from `session.name || 'Unnamed'`, replaces Windows-invalid path characters with `_`, and truncates to 80 characters. The handler creates the directory, calls `providerModule.archiveSessionFiles(session.acpSessionId, archiveDir)`, then copies and removes attachments.
 
 ```javascript
-// FILE: backend/sockets/archiveHandlers.js (Lines 86-101)
-socket.on('list_archives', (payload, callback) => {
-  try {
-    const providerId = payload?.providerId || null;  // LINE 87 - Optional provider scope
-    const archivePath = getProvider(providerId).config.paths.archive;  // LINE 88
-    
-    // List all folders containing a session.json file
-    const archives = fs.readdirSync(archivePath)  // LINE 91
-      .filter(name => {
-        const sessionJsonPath = path.join(archivePath, name, 'session.json');
-        return fs.existsSync(sessionJsonPath);  // Only list if session.json exists
-      });
-    
-    callback({ archives });  // LINE 101 - Return array of folder names
-  } catch (err) {
-    callback({ archives: [] });  // LINE 100 - Return empty on error
-  }
+// FILE: backend/sockets/archiveHandlers.js (Socket event: archive_session)
+const safeName = (session.name || 'Unnamed').replace(/[<>:"/\\|?*]/g, '_').substring(0, 80);
+const archiveDir = path.join(archivePath, safeName);
+if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true });
+
+if (session.acpSessionId) {
+  providerModule.archiveSessionFiles(session.acpSessionId, archiveDir);
+}
+
+const attachDir = path.join(getAttachmentsRoot(), uiId);
+if (fs.existsSync(attachDir)) {
+  fs.cpSync(attachDir, path.join(archiveDir, 'attachments'), { recursive: true });
+  fs.rmSync(attachDir, { recursive: true, force: true });
+}
+```
+
+Provider modules are responsible for placing provider-specific session files inside `archiveDir` and removing active provider files. The bound default module supplies no-op versions of the archive hooks so missing provider code does not crash solely due to a missing export.
+
+### 6. Backend Writes `session.json` and Deletes the Parent DB Row
+
+Files:
+- `backend/sockets/archiveHandlers.js` (Socket event: `archive_session`)
+- `backend/database.js` (Function: `deleteSession`)
+
+The generic metadata file is written after provider files and attachments are handled. Then the active SQLite row is removed.
+
+```javascript
+// FILE: backend/sockets/archiveHandlers.js (Socket event: archive_session)
+fs.writeFileSync(path.join(archiveDir, 'session.json'), JSON.stringify({
+  id: session.id,
+  acpSessionId: session.acpSessionId,
+  name: session.name,
+  model: session.model,
+  currentModelId: session.currentModelId,
+  modelOptions: session.modelOptions,
+  messages: session.messages,
+  isPinned: session.isPinned,
+  cwd: session.cwd || null,
+  configOptions: session.configOptions || []
+}, null, 2));
+
+await db.deleteSession(uiId);
+```
+
+The archive metadata does not include `provider`, `folderId`, `forkedFrom`, `forkPoint`, `isSubAgent`, `parentAcpSessionId`, `notes`, or `stats`.
+
+### 7. User Opens the Archive Modal
+
+Files:
+- `frontend/src/components/Sidebar.tsx` (Function: `handleShowArchives`)
+- `frontend/src/components/ArchiveModal.tsx` (Component: `ArchiveModal`)
+
+The sidebar utility button emits `list_archives` for the currently expanded provider. The callback stores folder names, clears archive search, and opens `ArchiveModal`.
+
+```typescript
+// FILE: frontend/src/components/Sidebar.tsx (Function: handleShowArchives)
+const pid = currentExpandedId;
+const payload = pid ? { providerId: pid } : undefined;
+const callback = (res: { archives: string[] }) => {
+  setArchives(res.archives || []);
+  setArchiveSearch('');
+  setShowArchives(true);
+};
+if (payload) socket.emit('list_archives', payload, callback);
+else socket.emit('list_archives', callback);
+```
+
+`ArchiveModal` filters archive folder names case-insensitively, restores from the row content click, and permanently deletes from the trash button.
+
+### 8. Backend Lists Archive Folders
+
+File: `backend/sockets/archiveHandlers.js` (Socket event: `list_archives`)
+
+The list handler accepts either `(callback)` or `(payload, callback)`. It resolves `payload.providerId` when present, reads the provider archive path, and returns only directories containing `session.json`.
+
+```javascript
+// FILE: backend/sockets/archiveHandlers.js (Socket event: list_archives)
+const _cb = typeof payload === 'function' ? payload : callback;
+const provider = getProvider(payload?.providerId || null);
+const archivePath = provider.config.paths.archive;
+if (!archivePath || !fs.existsSync(archivePath)) return _cb({ archives: [] });
+const dirs = fs.readdirSync(archivePath).filter(d => {
+  const full = path.join(archivePath, d);
+  return fs.statSync(full).isDirectory() && fs.existsSync(path.join(full, 'session.json'));
 });
+_cb({ archives: dirs });
 ```
 
-Returns a list of archive folder names. Only folders containing `session.json` are considered valid archives.
+Read or path errors are logged and return `{ archives: [] }`.
 
----
+### 9. User Restores an Archive
 
-### Step 7: Frontend Opens Archive Modal with Restore Options
-**File:** `frontend/src/components/ArchiveModal.tsx` (Lines 1–57)
+Files:
+- `frontend/src/components/Sidebar.tsx` (Function: `handleRestore`)
+- `backend/sockets/archiveHandlers.js` (Socket event: `restore_archive`)
 
-The modal renders with:
-- Search box to filter archives
-- List of archive folders
-- Restore button (folder name link) for each
-- Delete (trash) button for permanent removal
+The frontend emits `restore_archive` with the folder name and current provider id. On success, it closes the modal and emits `load_sessions`. The resulting sessions are merged into the current store by UI id; existing sessions are not replaced.
 
 ```typescript
-// FILE: frontend/src/components/ArchiveModal.tsx (Lines 19-53)
-{filteredArchives.map(archiveName => (
-  <div key={archiveName} className="archive-item">
-    <button className="archive-name-btn" onClick={() => onRestore(archiveName)}>
-      <Archive size={14} /> {archiveName}
-    </button>
-    {restoring === archiveName && <span className="restoring-indicator">Restoring...</span>}
-    <button className="delete-btn" onClick={() => onDelete(archiveName)}>
-      <Trash size={14} />
-    </button>
-  </div>
-))}
-```
-
----
-
-### Step 8: User Clicks Archive to Restore → Emits `restore_archive`
-**File:** `frontend/src/components/Sidebar.tsx` (Lines 153–174)
-
-```typescript
-// FILE: frontend/src/components/Sidebar.tsx (Lines 153-174)
-const handleRestore = (folderName: string) => {
-  if (!socket) return;
-  setRestoring(folderName);  // Show "Restoring..." indicator
-  
-  const pid = currentExpandedId;
-  socket.emit('restore_archive',  // LINE 157
-    { 
-      folderName, 
-      providerId: pid 
-    },
-    (res: { success?: boolean; uiId?: string; acpSessionId?: string; error?: string }) => {
-      setRestoring(null);
-      
-      if (res.success) {
-        setShowArchives(false);  // Close modal
-        
-        // Reload all sessions to merge restored session
-        socket.emit('load_sessions', (loadRes: { sessions?: ChatSession[] }) => {
-          if (loadRes.sessions) {
-            const current = useSessionLifecycleStore.getState().sessions;
-            const existingIds = new Set(current.map(s => s.id));
-            
-            // Add new sessions (never replace existing)
-            const newSessions = loadRes.sessions.filter(s => !existingIds.has(s.id));
-            if (newSessions.length) {
-              setSessions([...current, ...newSessions]);
-            }
-          }
-        });
-      } else {
-        logger.error('Restore failed:', res.error);
-      }
-    }
-  );
-};
-```
-
-**Key behavior:** On success, calls `load_sessions` to **merge** new sessions, never replacing existing ones.
-
----
-
-### Step 9: Backend `restore_archive` Handler Restores Session
-**File:** `backend/sockets/archiveHandlers.js` (Lines 103–149)
-
-```javascript
-// FILE: backend/sockets/archiveHandlers.js (Lines 103-149)
-socket.on('restore_archive', async (payload, callback) => {
-  try {
-    const { folderName, providerId } = payload;  // LINE 104
-    const archivePath = getProvider(providerId).config.paths.archive;  // LINE 105
-    const archiveFolder = path.join(archivePath, folderName);  // LINE 106
-    
-    // Read session.json metadata
-    const sessionJsonPath = path.join(archiveFolder, 'session.json');  // LINE 108
-    if (!fs.existsSync(sessionJsonPath)) {
-      return callback({ error: 'session.json not found in archive' });  // LINE 110
-    }
-    
-    const archivedSession = JSON.parse(fs.readFileSync(sessionJsonPath, 'utf-8'));  // LINE 112
-    
-    // Provider-specific restore (recreate provider session files)
-    const providerModule = await getProviderModule(providerId);  // LINE 116
-    const newAcpSessionId = await providerModule.restoreSessionFiles(  // LINE 118
-      archivedSession.acpSessionId, 
-      archiveFolder
-    );
-    
-    // Restore attachments
-    const attachmentSrcPath = path.join(archiveFolder, 'attachments');  // LINE 122
-    if (fs.existsSync(attachmentSrcPath)) {
-      const attachmentDestPath = path.join(getAttachmentsRoot(providerId), newUiId);  // LINE 125
-      fs.mkdirSync(attachmentDestPath, { recursive: true });
-      fs.cpSync(attachmentSrcPath, attachmentDestPath, { recursive: true });  // LINE 127
-    }
-    
-    // Create new database record with restored data
-    const newUiId = generateId();  // LINE 129 - New UI ID for restored session
-    const newSession = {  // LINE 130-140
-      ui_id: newUiId,
-      acp_id: newAcpSessionId,
-      name: archivedSession.name,
-      messages_json: JSON.stringify(archivedSession.messages),
-      model: archivedSession.model,
-      is_pinned: false,  // Restore always unpins
-      provider: providerId,
-      // ... other fields
-    };
-    db.saveSession(newSession);  // LINE 129 - Save to database
-    
-    // Delete archive folder
-    fs.rmSync(archiveFolder, { recursive: true });  // LINE 142
-    
-    callback({  // LINE 144 - Return new IDs to frontend
-      success: true,
-      uiId: newUiId,
-      acpSessionId: newAcpSessionId
+// FILE: frontend/src/components/Sidebar.tsx (Function: handleRestore)
+socket.emit('restore_archive', { ...(pid ? { providerId: pid } : {}), folderName }, (res) => {
+  if (res.success) {
+    setShowArchives(false);
+    socket.emit('load_sessions', (loadRes: { sessions?: ChatSession[] }) => {
+      const current = useSessionLifecycleStore.getState().sessions;
+      const existingIds = new Set(current.map(s => s.id));
+      const newSessions = (loadRes.sessions || [])
+        .filter((s: ChatSession) => !existingIds.has(s.id))
+        .map((s: ChatSession) => ({ ...s, isTyping: false, isWarmingUp: false }));
+      if (newSessions.length) setSessions([...current, ...newSessions]);
     });
-  } catch (err) {
-    callback({ error: err.message });  // LINE 147
   }
 });
 ```
 
-**Critical steps:**
-1. Line 108–112: **Read session.json** metadata
-2. Line 118: **Provider-specific restore** (recreates provider session)
-3. Line 122–127: **Restore attachments** from archive
-4. Line 129–140: **Create new DB record** with new UI ID and ACP ID
-5. Line 142: **Delete archive folder** after successful restore
+### 10. Backend Restores Files, Attachments, and DB Record
 
----
+Files:
+- `backend/sockets/archiveHandlers.js` (Socket event: `restore_archive`)
+- `backend/database.js` (Function: `saveSession`)
+- `providers/<provider>/index.js` (Function: `restoreSessionFiles`)
 
-### Step 10: Backend `delete_archive` Handler Permanently Deletes Archive
-**File:** `backend/sockets/archiveHandlers.js` (Lines 67–84)
+The backend reads `session.json`, creates `newUiId` from `Date.now().toString()`, calls the provider restore hook, copies attachments to the new UI id, writes a new SQLite session row, removes the archive folder, and returns the new UI id.
 
 ```javascript
-// FILE: backend/sockets/archiveHandlers.js (Lines 67-84)
-socket.on('delete_archive', (payload, callback) => {
-  try {
-    const { folderName, providerId = null } = payload;  // LINE 68
-    const archivePath = getProvider(providerId).config.paths.archive;  // LINE 69
-    const archiveFolder = path.join(archivePath, folderName);  // LINE 70
-    
-    // Permanently delete entire archive folder
-    fs.rmSync(archiveFolder, { recursive: true });  // LINE 72 - Irrevocable
-    
-    callback({ success: true });  // LINE 74
-  } catch (err) {
-    callback({ error: err.message });  // LINE 80
-  }
+// FILE: backend/sockets/archiveHandlers.js (Socket event: restore_archive)
+const saved = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
+const newUiId = Date.now().toString();
+const providerModule = await getProviderModule(providerId);
+
+if (saved.acpSessionId) {
+  providerModule.restoreSessionFiles(saved.acpSessionId, archiveDir);
+}
+
+const attachSrc = path.join(archiveDir, 'attachments');
+if (fs.existsSync(attachSrc)) {
+  const attachDest = path.join(getAttachmentsRoot(), newUiId);
+  fs.cpSync(attachSrc, attachDest, { recursive: true });
+}
+
+await db.saveSession({
+  id: newUiId,
+  acpSessionId: saved.acpSessionId,
+  name: saved.name || folderName,
+  model: saved.model || 'flagship',
+  currentModelId: saved.currentModelId,
+  modelOptions: saved.modelOptions,
+  messages: saved.messages || [],
+  isPinned: false,
+  cwd: saved.cwd || null,
+  configOptions: saved.configOptions || []
 });
+
+fs.rmSync(archiveDir, { recursive: true, force: true });
+callback({ success: true, uiId: newUiId, acpSessionId: saved.acpSessionId });
 ```
 
-Completely removes the archive folder and all contents (session.json, provider files, attachments).
+The restore handler ignores the return value from `restoreSessionFiles`. The database row receives a new UI id and the archived ACP session id. The save payload does not include a `provider` field, so the stored provider is `NULL` for restored sessions.
+
+### 11. User Permanently Deletes an Archive
+
+Files:
+- `frontend/src/components/Sidebar.tsx` (Function: `handleDeleteArchive`)
+- `backend/sockets/archiveHandlers.js` (Socket event: `delete_archive`)
+
+The frontend emits `delete_archive` and removes the folder name from local modal state after the callback runs. The backend resolves the provider archive path and removes the folder recursively when it exists.
+
+```javascript
+// FILE: backend/sockets/archiveHandlers.js (Socket event: delete_archive)
+const folderName = payload.folderName;
+const provider = getProvider(payload?.providerId || null);
+const archivePath = provider.config.paths.archive;
+if (!archivePath) return callback?.({ error: 'No archive path' });
+const archiveDir = path.join(archivePath, folderName);
+if (fs.existsSync(archiveDir)) {
+  fs.rmSync(archiveDir, { recursive: true, force: true });
+}
+callback?.({ success: true });
+```
 
 ---
 
 ## Architecture Diagram
 
 ```mermaid
-graph TB
-    subgraph Frontend["Frontend (React)"]
-        SB["Sidebar.tsx<br/>(delete button)"]
-        AM["ArchiveModal.tsx<br/>(list view)"]
-        Store["useSessionLifecycleStore<br/>(sessions state)"]
-    end
-    
-    subgraph Network["Socket.IO"]
-        Events["4 events:<br/>archive_session<br/>list_archives<br/>restore_archive<br/>delete_archive"]
-    end
-    
-    subgraph Backend["Backend (Node.js)"]
-        Handler["archiveHandlers.js<br/>(4 handlers)"]
-        Provider["providerModule<br/>(archiveSessionFiles, etc)"]
-        DB["SQLite DB<br/>(sessions table)"]
-    end
-    
-    subgraph Filesystem["Disk Storage"]
-        Archive["archivePath/<br/>{folderName}/<br/>session.json<br/>attachments/"]
-        ProviderFiles["Provider Session<br/>Files"]
-    end
-    
-    SB -->|emit archive_session| Events
-    SB -->|emit delete_session| Events
-    AM -->|emit restore_archive| Events
-    AM -->|emit delete_archive| Events
-    Events -->|handler| Handler
-    Handler -->|call| Provider
-    Handler -->|read/write| Archive
-    Handler -->|write| DB
-    Provider -->|manage| ProviderFiles
-    Store -->|display| SB
-    Store -->|remove/add| AM
+flowchart TB
+  subgraph Frontend[Frontend]
+    Sidebar[Sidebar.tsx\nhandleRemoveSession\nhandleShowArchives\nhandleRestore\nhandleDeleteArchive]
+    Store[useSessionLifecycleStore\nhandleDeleteSession\nsetSessions]
+    Modal[ArchiveModal.tsx\narchive list/search\nrestore/delete controls]
+  end
+
+  subgraph Socket[Socket.IO events]
+    ArchiveEvent[archive_session]
+    ListEvent[list_archives]
+    RestoreEvent[restore_archive]
+    DeleteEvent[delete_archive]
+    LoadEvent[load_sessions]
+  end
+
+  subgraph Backend[Backend]
+    ArchiveHandlers[backend/sockets/archiveHandlers.js\nregisterArchiveHandlers]
+    SessionHandlers[backend/sockets/sessionHandlers.js\nload_sessions/delete_session]
+    Database[backend/database.js\nsessions table\ngetSession/getAllSessions\nsaveSession/deleteSession]
+    ProviderLoader[backend/services/providerLoader.js\ngetProvider/getProviderModule]
+    Attachments[backend/services/attachmentVault.js\ngetAttachmentsRoot]
+  end
+
+  subgraph Provider[Provider module]
+    Hooks[archiveSessionFiles\nrestoreSessionFiles\ndeleteSessionFiles\ngetAttachmentsDir]
+  end
+
+  subgraph Disk[Filesystem]
+    ArchiveFolder[paths.archive/<safeName>\nsession.json\nattachments/\nprovider files]
+    ProviderFiles[Provider session files]
+    AttachmentFiles[Attachment directories]
+  end
+
+  Sidebar --> ArchiveEvent
+  Sidebar --> ListEvent
+  Modal --> RestoreEvent
+  Modal --> DeleteEvent
+  ArchiveEvent --> ArchiveHandlers
+  ListEvent --> ArchiveHandlers
+  RestoreEvent --> ArchiveHandlers
+  DeleteEvent --> ArchiveHandlers
+  ArchiveHandlers --> Database
+  ArchiveHandlers --> ProviderLoader
+  ProviderLoader --> Hooks
+  Hooks --> ProviderFiles
+  ArchiveHandlers --> ArchiveFolder
+  ArchiveHandlers --> Attachments
+  Attachments --> AttachmentFiles
+  RestoreEvent --> LoadEvent
+  LoadEvent --> SessionHandlers
+  SessionHandlers --> Database
+  SessionHandlers --> Store
+  Store --> Sidebar
 ```
 
 ---
 
-## The Critical Contract: Archive Metadata & Restore Guarantee
+## Critical Contract
 
-### Archive Folder Structure
+### Archive Folder Contract
 
-Each archived session creates a folder in `archivePath`:
+An archive folder is valid when it is a directory under `provider.config.paths.archive` and contains `session.json`.
 
-```
-archivePath/
-├── Session-1-Name/
-│   ├── session.json           (metadata + messages)
-│   ├── attachments/           (optional; user files)
-│   └── [provider-files]       (provider-specific session files)
-├── Session-2-Name/
-│   └── session.json
-└── ...
+```text
+<provider archive path>/
+  <safe session name>/
+    session.json
+    attachments/             optional, copied from the UI attachment directory
+    restore_meta.json         optional, written by provider hook implementations
+    *.jsonl, *.json, tasks/   optional, provider-managed session files
 ```
 
-### session.json Schema
+Folder names are display-name based. They are sanitized on archive but are not guaranteed to be globally unique.
+
+### `session.json` Contract
+
+File: `backend/sockets/archiveHandlers.js` (Socket events: `archive_session`, `restore_archive`)
 
 ```json
 {
-  "id": "ui-id-123",                    // Original UI ID
-  "acpSessionId": "acp-id-abc",         // Provider session ID
-  "name": "Session Name",               // Display name
-  "model": "provider-model-standard",    // Model used
-  "currentModelId": "provider-model-id",// Active model variant
-  "modelOptions": [],                   // Model configuration array
-  "messages": [                         // Full message history
-    { "role": "user", "content": "..." },
-    { "role": "assistant", "content": "..." }
-  ],
-  "isPinned": false,                    // Will be false on restore
-  "cwd": null,                          // Working directory
-  "configOptions": [],                  // Session config options
-  "stats": {},                          // Session stats
-  "notes": ""                           // User notes
+  "id": "original-ui-id",
+  "acpSessionId": "provider-session-id",
+  "name": "Display Name",
+  "model": "model-selection",
+  "currentModelId": "model-id-or-null",
+  "modelOptions": [],
+  "messages": [],
+  "isPinned": false,
+  "cwd": "workspace-path-or-null",
+  "configOptions": []
 }
 ```
 
-### Restore Guarantee
+Restore consumes these fields directly. Fields outside this shape are ignored unless code is added to `restore_archive` and `db.saveSession` receives them.
 
-**Critical contract:** Restore ALWAYS:
-1. Generates a **new UI ID** (line 129 of archiveHandlers.js)
-2. Calls `providerModule.restoreSessionFiles()` for **new ACP session ID** (line 118)
-3. **Never reuses original IDs** — prevents collision with other sessions
-4. **Merges with existing sessions** — never replaces (line 168 of Sidebar.tsx)
-5. **Sets isPinned to false** — restored sessions start unpinned (line 137)
+### Restore Identity Contract
 
-**What breaks if violated:**
-- ❌ Reusing original UI ID → collides with forked siblings
-- ❌ Reusing original ACP ID → provider session conflict
-- ❌ Replacing existing sessions → data loss
-- ❌ Keeping isPinned true → clutter in sidebar
+- Restore always creates a new UI id with `Date.now().toString()`.
+- Restore stores `saved.acpSessionId` as the session `acpSessionId`.
+- Restore calls `providerModule.restoreSessionFiles(saved.acpSessionId, archiveDir)` and ignores the return value.
+- Restore saves the session unpinned with `isPinned: false`.
+- Frontend restore merges sessions by UI id and does not replace existing in-memory sessions.
+- The archive folder is removed after `db.saveSession` succeeds.
+
+### Provider Hook Contract
+
+Files:
+- `backend/services/providerLoader.js` (Exports: `DEFAULT_MODULE`, `getProviderModule`, `runWithProvider`)
+- `providers/<provider>/index.js` (Functions: `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, `getAttachmentsDir`)
+
+Provider modules must expose these hooks:
+
+```javascript
+// FILE: providers/<provider>/index.js (Provider archive hook contract)
+export function archiveSessionFiles(acpId, archiveDir) {
+  // Copy provider session files into archiveDir and remove active provider files.
+}
+
+export function restoreSessionFiles(savedAcpId, archiveDir) {
+  // Copy provider files from archiveDir back to provider storage for savedAcpId.
+}
+
+export function deleteSessionFiles(acpId) {
+  // Remove active provider files for acpId.
+}
+```
+
+`archiveHandlers.js` invokes these hooks without awaiting them. Hook implementations should complete synchronously or throw synchronously for the current handler to observe failures.
 
 ---
 
-## Configuration / Provider Support
+## Configuration / Data Flow
 
-### Archive Path Resolution
+### Provider Archive Path
 
-Each provider defines its archive path in `user.json`:
+File: `providers/<provider>/user.json` (Config key: `paths.archive`)
+
+Each provider config supplies an archive path through its merged provider configuration. `getProvider(providerId).config.paths.archive` is read by all archive socket events.
 
 ```json
 {
   "paths": {
-    "home": "...",
-    "sessions": "...",
-    "archive": "/absolute/path/to/archive"  // Provider-specific
+    "archive": "absolute-or-expanded-provider-archive-path"
   }
 }
 ```
 
-**Resolution flow:**
-1. `archiveHandlers.js` line 88: `getProvider(providerId).config.paths.archive`
-2. `providerLoader.js` loads `providers/{id}/user.json`
-3. Each provider can have its own archive directory
+### Provider Resolution by Event
 
-### Provider Module Interface
+| Socket event | Provider source | Notes |
+|---|---|---|
+| `archive_session` | `db.getSession(uiId).provider` through `getProvider(providerId)` | Frontend sends `providerId`, but the handler destructures only `uiId`. |
+| `list_archives` | `payload.providerId` or default provider | Supports callback-only form. |
+| `restore_archive` | `payload.providerId` or default provider | Uses provider path for archive lookup and `getProviderModule(providerId)` for file restore. |
+| `delete_archive` | `payload.providerId` or default provider | Requires payload with `folderName`. |
+| `delete_session` | `db.getSession(uiId).provider` or default provider | Permanent delete path lives in `backend/sockets/sessionHandlers.js`. |
 
-Providers must implement three methods:
+### Database Flow
 
-```javascript
-// Providers/{provider}/index.js
-class ProviderModule {
-  // Move session files to archive
-  async archiveSessionFiles(acpSessionId, archivePath) {
-    // Provider-specific: save session state to archivePath
-    // Called by archiveHandlers.js line 44
-  }
-  
-  // Restore session files from archive
-  async restoreSessionFiles(acpSessionId, archiveFolder) {
-    // Provider-specific: recreate session, return new ACP ID
-    // Called by archiveHandlers.js line 118
-    // Returns: { acpSessionId: string } or new ID
-  }
-  
-  // Clean up provider session files (used for descendants)
-  async deleteSessionFiles(acpSessionId) {
-    // Provider-specific: permanent deletion of session files
-    // Called by archiveHandlers.js line 31
-  }
-}
-```
+File: `backend/database.js` (Table: `sessions`)
 
----
+The archive system uses these helpers:
 
-## Data Flow / Rendering Pipeline
+- `getSession(uiId)` returns full messages and metadata for `session.json`.
+- `getAllSessions(provider, options)` returns lightweight metadata for descendant scans and frontend lists.
+- `saveSession(session)` creates the restored row.
+- `deleteSession(uiId)` deletes one row by `ui_id`.
 
-### Archive Flow: Session → Archive Folder
+The `sessions` table stores relationship fields used by archive and sidebar state: `forked_from`, `fork_point`, `is_sub_agent`, `parent_acp_session_id`, plus provider and model/config fields. Archive cascade uses `forkedFrom`, which is the normalized frontend/db object field for `forked_from`.
 
-```
-User clicks delete (default: archive)
-    ↓
-socket.emit('archive_session', { providerId, uiId })
-    ↓ [Backend]
-db.getSession(uiId)  // Fetch session metadata
-    ↓
-Find descendants (forked_from === uiId)
-    ↓
-For each descendant:
-  - providerModule.deleteSessionFiles()
-  - db.deleteSession()
-    ↓
-providerModule.archiveSessionFiles(acpSessionId, archivePath)
-    ↓
-Copy attachments to archivePath/{safeName}/attachments
-    ↓
-Write session.json to archivePath/{safeName}/session.json
-    ↓
-db.deleteSession(uiId)  // Remove from DB
-    ↓
-[Frontend]
-useSessionLifecycleStore removes session from state
-```
+### Attachment Flow
 
-### Restore Flow: Archive Folder → New Session
+File: `backend/services/attachmentVault.js` (Function: `getAttachmentsRoot`)
 
-```
-User clicks archive in Archive Modal
-    ↓
-socket.emit('restore_archive', { folderName, providerId })
-    ↓ [Backend]
-Read session.json from archivePath/{folderName}/session.json
-    ↓
-providerModule.restoreSessionFiles(oldAcpId, archiveFolder)
-    ↓ Returns: newAcpSessionId
-Copy attachments from archivePath/{folderName}/attachments → attachmentsRoot/{newUiId}
-    ↓
-Generate newUiId
-    ↓
-db.saveSession({ ui_id: newUiId, acp_id: newAcpSessionId, ... })
-    ↓
-fs.rmSync(archivePath/{folderName})  // Delete archive folder
-    ↓
-Callback: { success: true, uiId: newUiId, acpSessionId: newAcpSessionId }
-    ↓
-[Frontend]
-socket.emit('load_sessions')  // Reload all sessions
-    ↓
-Filter out existing IDs, add new sessions to state
-```
+Archive copies `getAttachmentsRoot()/uiId` to `archiveDir/attachments` and removes the active attachment folder. Restore copies `archiveDir/attachments` to `getAttachmentsRoot()/newUiId`. `getAttachmentsRoot(providerId = null)` resolves through the provider module `getAttachmentsDir`, but `archiveHandlers.js` calls it without a provider argument.
 
 ---
 
 ## Component Reference
 
-### Frontend Files
+### Backend
 
-| File | Key Functions/Exports | Lines | Purpose |
-|------|----------------------|-------|---------|
-| `frontend/src/components/ArchiveModal.tsx` | `ArchiveModal` (component) | 1–57 | Modal UI for archive list, search, restore/delete buttons |
-| | `filteredArchives` logic | 14–17 | Filter by search query |
-| | Archive item render | 39–50 | Display archive folder, restore button, delete button |
-| `frontend/src/components/Sidebar.tsx` | "Archives" button | 375–384 | Trigger archive modal |
-| | `handleShowArchives()` | 140–151 | Emit `list_archives`, open modal |
-| | `handleRestore()` | 153–174 | Emit `restore_archive`, merge sessions |
-| | `handleDeleteArchive()` | 176–182 | Emit `delete_archive`, update local list |
-| | `handleRemoveSession()` | 184–210 | Check `deletePermanent` flag, emit `archive_session` or `delete_session` |
-| | Archive modal render | 450–460 | Conditionally show ArchiveModal |
-| `frontend/src/store/useSessionLifecycleStore.ts` | `handleDeleteSession()` | 302–318 | Emit `archive_session` or `delete_session` based on settings |
-| `frontend/src/test/ArchiveModal.test.tsx` | Test suite | Full file | 5 test cases (render, search, restore, delete, empty state) |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket handlers | `backend/sockets/archiveHandlers.js` | `registerArchiveHandlers`, socket events `archive_session`, `list_archives`, `restore_archive`, `delete_archive` | Main archive, list, restore, and permanent archive deletion orchestration. |
+| Permanent session delete | `backend/sockets/sessionHandlers.js` | Socket events `delete_session`, `load_sessions`; local helper `collectDescendants` | Removes active sessions permanently and reloads sessions after restore. |
+| Database | `backend/database.js` | `sessions` table, `saveSession`, `getSession`, `getAllSessions`, `deleteSession` | Persists active sessions and relationship fields. |
+| Provider loader | `backend/services/providerLoader.js` | `DEFAULT_MODULE`, `getProvider`, `getProviderModule`, `runWithProvider` | Resolves provider config and binds provider hooks to provider context. |
+| Attachments | `backend/services/attachmentVault.js` | `getAttachmentsRoot`, `getAttachmentsDir` provider hook | Resolves attachment storage roots and ensures roots exist. |
+| Cleanup helper | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | Permanent delete path delegates provider file deletion through `deleteSessionFiles`. |
 
-### Backend Files
+### Frontend
 
-| File | Key Functions | Lines | Purpose |
-|------|------------------|-------|---------|
-| `backend/sockets/archiveHandlers.js` | `registerArchiveHandlers()` | 22 | Register all 4 handlers on socket connection |
-| | `archive_session` handler | 9–65 | Cascade delete descendants, archive provider files, write session.json, delete from DB |
-| | `list_archives` handler | 86–101 | List archive folders containing session.json |
-| | `restore_archive` handler | 103–149 | Read session.json, restore provider files, copy attachments, create DB record, delete archive folder |
-| | `delete_archive` handler | 67–84 | Permanently delete archive folder |
-| | Helper: `getArchivePath()` | 13–16 | Resolve provider archive directory |
-| | Helper: `safeName()` | 17–18 | Sanitize folder names |
-| `backend/sockets/index.js` | Handler registration call | 97 | Register `archiveHandlers` on connection |
-| `backend/database.js` | `getSession(uiId)` | 240 | Fetch session by UI ID |
-| | `getAllSessions(provider)` | 169 | Fetch all sessions, used to find descendants |
-| | `saveSession(session)` | 118 | Create new session (used on restore) |
-| | `deleteSession(uiId)` | 310 | Remove session from DB |
-| | `sessions` table schema | 29–43 | Columns: `forked_from`, `is_sub_agent`, `parent_acp_session_id` (for hierarchy) |
-| `backend/test/archiveHandlers.test.js` | Test suite | Full file | 10 test cases (cascade delete, restore, attachments, errors) |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Sidebar UI | `frontend/src/components/Sidebar.tsx` | `Sidebar`, `handleRemoveSession`, `handleShowArchives`, `handleRestore`, `handleDeleteArchive`, `renderChildren` | Emits archive socket events, updates local session state, owns Archive Modal state. |
+| Archive Modal | `frontend/src/components/ArchiveModal.tsx` | `ArchiveModal`, `ArchiveModalProps`, `filtered` | Displays archive names, search input, restore action, and permanent archive delete action. |
+| Session store | `frontend/src/store/useSessionLifecycleStore.ts` | `handleDeleteSession`, `setSessions`, `activeSessionId` | Store-level archive/delete action and restore merge target. |
+| System store | `frontend/src/store/useSystemStore.ts` | `deletePermanent`, `activeProviderId`, `defaultProviderId`, `socket` | Supplies delete mode, provider selection, and socket instance. |
 
-### Zustand Store
+### Provider Hooks
 
-| Store | State / Method | Lines | Type | Purpose |
-|-------|----------------|-------|------|---------|
-| `useSessionLifecycleStore` | `sessions` | All | `ChatSession[]` | All active sessions; removed when archived |
-| | `handleDeleteSession()` | 277–293 | `(socket, uiId, forcePermanent?) => void` | Archive or permanently delete |
-| | `activeSessionId` | All | `string \| null` | Updated when active session is archived |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Provider modules | `providers/<provider>/index.js` | `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, `getAttachmentsDir`, `getSessionPaths` | Provider-owned file lifecycle for archive, restore, cleanup, and attachment roots. |
+| Provider tests | `providers/<provider>/test/index.test.js` | Tests for `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles` where present | Verifies provider file copies/removals for provider-specific session layouts. |
+
+### Tests
+
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Backend archive handlers | `backend/test/archiveHandlers.test.js` | `archiveHandlers` suite | Covers list, restore, delete, archive metadata, error handling, and recursive descendant cleanup. |
+| Provider contract | `backend/test/providerContract.test.js` | `provider contract exports` suite | Requires every provider to explicitly export archive hooks. |
+| Provider loader | `backend/test/providerLoader.test.js` | Default module expectations for `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles` | Verifies no-op defaults exist. |
+| Provider cleanup hook | `backend/test/providerHooks.test.js` | `acpCleanup.cleanupAcpSession() Discovery Hook` | Verifies cleanup uses `provider.deleteSessionFiles`. |
+| Frontend modal | `frontend/src/test/ArchiveModal.test.tsx` | `ArchiveModal` suite | Covers render, search, restore click, delete click, and empty state. |
+| Frontend sidebar | `frontend/src/test/Sidebar.test.tsx` | Archive Modal and archive/delete session tests | Covers list, restore merge, archive emit, deletePermanent behavior, and archive deletion UI. |
+| Frontend store | `frontend/src/test/useSessionLifecycleStore.test.ts`, `frontend/src/test/useSessionLifecycleStoreDeep.test.ts` | `handleDeleteSession` tests | Covers store-level archive and permanent delete emission. |
 
 ---
 
-## Gotchas & Important Notes
+## Gotchas
 
-### 1. **Cascade Delete: Descendants Deleted BEFORE Parent, Not Restored**
-**What breaks:** If you archive a parent session without removing descendants, the descendants become orphaned in the database with a dangling `forked_from` reference.
+### 1. Restore Creates a New UI Id but Reuses the Archived ACP Id
 
-**Why it happens:** The cascade delete is intentional—children shouldn't exist without a parent (lines 20–35). But on restore, descendants are NOT re-created (they're deleted, not archived).
+The restore handler creates `newUiId` with `Date.now().toString()` and stores `saved.acpSessionId` in the restored row. `restoreSessionFiles` return values are ignored. Provider hooks should restore files for the saved ACP id unless the backend restore contract is changed together with tests.
 
-**How to avoid it:** Understand the asymmetry:
-- **Archive:** Cascades down (parent + all descendants deleted together)
-- **Restore:** Only restores the parent (no descendant re-creation)
+### 2. Restored Rows Do Not Persist Provider Id
 
-If you restore a parent, you must manually re-fork if needed.
+`restore_archive` calls `db.saveSession` without `provider`. The restored row has `provider` set to `NULL` in SQLite. Sidebar grouping treats missing provider as the active/default provider path in `Sidebar`, but backend provider-specific session loading should be checked when changing restore behavior.
 
----
+### 3. Descendant Cascade Follows `forkedFrom` Only
 
-### 2. **New IDs on Restore: UI ID and ACP ID Both Change**
-**What breaks:** If you assume restored session has the same ID as the archived session, you'll have ID mismatches.
+Archive cascade recursively matches `s.forkedFrom === parentId`. It does not traverse `parentAcpSessionId`. Sub-agent or fork records that need cascade cleanup must have the UI relationship represented through `forkedFrom`.
 
-**Why it happens:** Intentional by design—new UI ID (line 129) and new ACP ID from `providerModule.restoreSessionFiles()` (line 118) prevent ID collisions.
+### 4. Descendants Are Permanently Deleted During Parent Archive
 
-**How to avoid it:**
-```typescript
-// ❌ Wrong
-const restoredSession = archives[folderName];  // Doesn't have new IDs yet
+Descendant sessions are removed through `deleteSessionFiles`, attachment removal, and `db.deleteSession`. They are not written as separate archive folders. Restoring the parent restores only the parent session metadata and provider files found in that archive folder.
 
-// ✅ Correct
-const { uiId: newUiId, acpSessionId: newAcpId } = callback;  // Use returned IDs
-```
+### 5. Archive Folder Names Are Display Names
 
----
+The archive directory is based on sanitized session name, truncated to 80 characters. Two sessions with the same sanitized name target the same directory. Detect collisions in `backend/sockets/archiveHandlers.js` before adding batch archive or retention features.
 
-### 3. **Restore Never Replaces; Only Merges (Merge Strategy)**
-**What breaks:** If a session with the same name exists, both are restored with different IDs (duplicates in sidebar).
+### 6. Restore and Delete Use Unsanitized Folder Names
 
-**Why it happens:** Intentional—safer to avoid overwrites (line 168 of Sidebar.tsx filters by existing IDs, only adds new ones).
+Archive creation sanitizes `safeName`, but `restore_archive` and `delete_archive` join `payload.folderName` directly under the archive path. Archive names come from `list_archives` in the normal UI flow. Any new external restore/delete entry point should validate folder names.
 
-**How to avoid it:** Expect duplicates if restoring a session with conflicting name. Users must manually delete duplicates.
+### 7. Archive Handler Calls Attachment Root Without Provider Id
 
----
+`archiveHandlers.js` calls `getAttachmentsRoot()` with no provider argument for archive and restore attachment copies. `getAttachmentsRoot` can resolve provider-specific roots, but the archive handler relies on the ambient/default provider path for these calls.
 
-### 4. **Attachments Copied During Archive & Restore; Not Linked**
-**What breaks:** If attachments directory is on a slow network mount, archiving hangs while copying.
+### 8. Provider Hooks Are Invoked Synchronously
 
-**Why it happens:** `fs.cpSync()` (line 51, line 127) is synchronous and waits for full copy.
+`archiveSessionFiles`, `restoreSessionFiles`, and `deleteSessionFiles` are called without `await` in the archive handler. Current hook implementations are synchronous filesystem operations. Async hooks can finish outside the handler error path.
 
-**How to avoid it:** For large attachment directories, consider async copy or symlinks (but test with each provider).
+### 9. Missing Archive Paths Return Empty or Error Depending on Event
 
----
+`list_archives` returns `{ archives: [] }` when the archive path is missing or unreadable. `restore_archive` returns `{ error: 'No ARCHIVE_PATH configured' }`. `delete_archive` returns `{ error: 'No archive path' }` when no path is configured.
 
-### 5. **session.json Is Written Once on Archive; Read Once on Restore**
-**What breaks:** If session.json is corrupted on disk, restore silently fails with "session.json not found" (line 110).
+### 10. Sidebar and Store Delete Paths Have Different Local Cascade Behavior
 
-**Why it happens:** No validation on write (line 53–58); no checksum verification on read.
-
-**How to avoid it:** Add JSON validation on write:
-```javascript
-const sessionJson = { /* ... */ };
-JSON.stringify(sessionJson);  // Validate serializable
-fs.writeFileSync(...);
-```
-
----
-
-### 6. **Permanent Deletion flag `deletePermanent` Is Global, Not Per-Session**
-**What breaks:** If you want some sessions deleted permanently and others archived, the global flag affects all.
-
-**Why it happens:** `deletePermanent` is a system-wide setting in System Settings Modal; no per-session override (line 185 of Sidebar.tsx).
-
-**How to avoid it:** Check the flag before deletion:
-```typescript
-const deletePermanent = useSystemStore.getState().deletePermanent;
-if (deletePermanent) { /* delete */ } else { /* archive */ }
-```
-
----
-
-### 7. **Sub-Agents Are Always Deleted Permanently, Never Archived**
-**What breaks:** If you archive a sub-agent, it's permanently deleted instead (line 186).
-
-**Why it happens:** Sub-agents are ephemeral; permanent deletion is the default (line 186: `if (deletePermanent || isSubAgent)`).
-
-**How to avoid it:** Don't expect to restore sub-agents from archive. They're cleaned up immediately on parent cancellation.
-
----
-
-### 8. **Archive Path Must Exist or Handler Silently Returns Empty**
-**What breaks:** If `archivePath` directory doesn't exist, `list_archives` returns `[]` instead of erroring (line 100).
-
-**Why it happens:** `fs.readdirSync()` throws ENOENT if path doesn't exist; caught and returned as empty (line 100).
-
-**How to avoid it:** Ensure archive directory exists on provider initialization, or create it on first use.
-
----
-
-### 9. **Provider Module `restoreSessionFiles()` Must Return New ACP ID**
-**What breaks:** If provider returns undefined/null for new ACP ID, restore fails silently with "cannot read acpSessionId of undefined."
-
-**Why it happens:** Line 118 assigns the return value directly without null checks.
-
-**How to avoid it:** Ensure provider module returns an object with `acpSessionId` property:
-```javascript
-return { acpSessionId: newId };  // ✅ Correct
-```
-
----
-
-### 10. **Archive Folder Names Sanitized But Not Validated on Restore**
-**What breaks:** If user manually renames archive folder to contain `../`, restore path traversal might occur.
-
-**Why it happens:** No path validation on restore (line 106 assumes `folderName` is safe).
-
-**How to avoid it:** Validate `folderName` on restore:
-```javascript
-const safeFolderName = path.basename(folderName);  // Strip parent paths
-```
+`Sidebar.handleRemoveSession` recursively removes descendants from local state. `useSessionLifecycleStore.handleDeleteSession` removes only the selected session locally. Use the sidebar path as the reference for visible tree deletion behavior.
 
 ---
 
@@ -756,95 +582,92 @@ const safeFolderName = path.basename(folderName);  // Strip parent paths
 
 ### Backend Tests
 
-**File:** `backend/test/archiveHandlers.test.js`
+Run from `backend`:
 
-| Test Name | What It Tests | Coverage |
-|-----------|-------------|----------|
-| `list_archives returns folder names that contain session.json` | Listing valid archives | Happy path |
-| `list_archives returns empty archives when archive path does not exist` | Error handling for missing directory | Edge case |
-| `list_archives returns empty archives on error` | Error handling (readdir failure) | Error handling |
-| `restore_archive copies files via provider and creates DB record` | Full restore flow | Happy path |
-| `restore_archive returns error when session.json not found in archive` | Validation of archive contents | Error handling |
-| `restore_archive returns error when restore throws` | Provider exception handling | Error handling |
-| `delete_archive removes folder` | Permanent deletion | Happy path |
-| `delete_archive returns error when rmSync throws` | Deletion error handling | Error handling |
-| `archive_session archives via provider and saves session.json` | Full archive flow | Happy path |
-| `archive_session recursively deletes descendant sessions before archiving parent` | Cascade delete | Edge case |
+```bash
+npx vitest run test/archiveHandlers.test.js test/providerContract.test.js test/providerLoader.test.js test/providerHooks.test.js
+```
 
-**Run:** `cd backend && npx vitest run archiveHandlers.test.js`
+Key tests:
+
+| File | Test name | Contract |
+|---|---|---|
+| `backend/test/archiveHandlers.test.js` | `returns folder names that contain session.json` | `list_archives` filters valid archive folders. |
+| `backend/test/archiveHandlers.test.js` | `returns empty archives when archive path does not exist` | Missing archive path lists as empty. |
+| `backend/test/archiveHandlers.test.js` | `returns empty archives on error` | Listing errors do not throw through callback. |
+| `backend/test/archiveHandlers.test.js` | `copies files via provider and creates DB record` | Restore calls `restoreSessionFiles`, saves DB row, and returns success. |
+| `backend/test/archiveHandlers.test.js` | `returns error when session.json not found in archive` | Restore requires `session.json`. |
+| `backend/test/archiveHandlers.test.js` | `returns error when restore throws` | Restore read/provider failures return callback errors. |
+| `backend/test/archiveHandlers.test.js` | `removes folder` | `delete_archive` removes archive folders recursively. |
+| `backend/test/archiveHandlers.test.js` | `returns error when rmSync throws` | Permanent archive deletion surfaces filesystem errors. |
+| `backend/test/archiveHandlers.test.js` | `archives via provider and saves session.json` | Archive creates folder, calls provider hook, writes metadata, deletes DB row. |
+| `backend/test/archiveHandlers.test.js` | `recursively deletes descendant sessions before archiving parent` | Descendant provider files and DB rows are removed. |
+| `backend/test/archiveHandlers.test.js` | `logs error when getSession throws` | Archive handler logs DB read errors. |
+| `backend/test/archiveHandlers.test.js` | `does not call deleteSession for descendants when there are none` | Parent archive does not delete unrelated sessions. |
+| `backend/test/providerContract.test.js` | `every provider explicitly exports every contract function` | Provider modules expose archive hooks. |
+| `backend/test/providerLoader.test.js` | default module expectations for archive hooks | Missing hooks fall back to no-op functions. |
+| `backend/test/providerHooks.test.js` | `should use provider.deleteSessionFiles` | Permanent cleanup delegates to provider hook. |
 
 ### Frontend Tests
 
-**File:** `frontend/src/test/ArchiveModal.test.tsx`
+Run from `frontend`:
 
-| Test Name | What It Tests |
-|-----------|-------------|
-| `renders list of archive names` | Modal display |
-| `filters archives by search` | Search functionality |
-| `calls onRestore when clicking an archive` | Restore callback |
-| `calls onDelete when clicking delete button` | Delete callback |
-| `shows empty message when no archives match` | Empty state UI |
+```bash
+npx vitest run src/test/ArchiveModal.test.tsx src/test/Sidebar.test.tsx src/test/useSessionLifecycleStore.test.ts src/test/useSessionLifecycleStoreDeep.test.ts
+```
 
-**Run:** `cd frontend && npx vitest run ArchiveModal.test.tsx`
+Key tests:
+
+| File | Test name | Contract |
+|---|---|---|
+| `frontend/src/test/ArchiveModal.test.tsx` | `renders list of archive names` | Modal renders archive folder names. |
+| `frontend/src/test/ArchiveModal.test.tsx` | `filters archives by search` | Search filters archive names. |
+| `frontend/src/test/ArchiveModal.test.tsx` | `calls onRestore when clicking an archive` | Row click restores the archive. |
+| `frontend/src/test/ArchiveModal.test.tsx` | `calls onDelete when clicking delete button` | Trash button calls delete without restore. |
+| `frontend/src/test/ArchiveModal.test.tsx` | `shows empty message when no archives match` | Empty state renders. |
+| `frontend/src/test/Sidebar.test.tsx` | `archive button opens archive modal` | Sidebar emits `list_archives` and opens modal. |
+| `frontend/src/test/Sidebar.test.tsx` | `restoring archive preserves existing sessions and only adds new ones` | Restore merge keeps existing sessions intact. |
+| `frontend/src/test/Sidebar.test.tsx` | `clicking archive item calls restore_archive socket emit` | Restore emits folder and provider payload. |
+| `frontend/src/test/Sidebar.test.tsx` | `archive session removes it from the list` | Sidebar archive emits `archive_session` and updates local state. |
+| `frontend/src/test/Sidebar.test.tsx` | `emits archive_session when deletePermanent is false` | Delete mode selects soft-delete. |
+| `frontend/src/test/Sidebar.test.tsx` | `emits delete_session when deletePermanent is true` | Delete mode selects permanent delete. |
+| `frontend/src/test/useSessionLifecycleStore.test.ts` | `handleDeleteSession removes session and emits archive_session by default` | Store delete action archives by default. |
+| `frontend/src/test/useSessionLifecycleStoreDeep.test.ts` | `handleDeleteSession emits archive_session when permanent is false` | Store action archive branch. |
+| `frontend/src/test/useSessionLifecycleStoreDeep.test.ts` | `handleDeleteSession emits delete_session when permanent is true` | Store action permanent branch. |
 
 ---
 
 ## How to Use This Guide
 
-### For Implementing Archive Features
+### For implementing or extending this feature
 
-1. **Understand the cascade model:** Archiving a session cascades to descendants (forked/sub-agent sessions)
-2. **Follow the restore pattern:** New IDs, merge-only (never replace), set isPinned to false
-3. **Implement provider methods:** `archiveSessionFiles()`, `restoreSessionFiles()`, `deleteSessionFiles()`
-4. **Handle attachments:** Copy during archive (line 51), restore during restore (line 127)
-5. **Write session.json:** Include full message history and metadata (lines 53–58)
-6. **Test cascade logic:** Verify descendants are removed when parent archived
+1. Start at `backend/sockets/archiveHandlers.js` and identify which socket event changes.
+2. Check the `session.json` contract before adding restore fields; update both archive write and restore save code together.
+3. Confirm whether the change affects provider files; if yes, update `archiveSessionFiles`, `restoreSessionFiles`, or `deleteSessionFiles` in provider modules.
+4. If descendants are involved, verify the `forkedFrom` tree in `db.getAllSessions` output and the local `Sidebar.handleRemoveSession` removal loop.
+5. If attachments are involved, inspect `getAttachmentsRoot` and provider `getAttachmentsDir` behavior.
+6. Update or add backend tests in `backend/test/archiveHandlers.test.js` for socket behavior.
+7. Update frontend tests in `ArchiveModal.test.tsx`, `Sidebar.test.tsx`, or store tests for UI/store behavior.
 
-**Checklist for new archive feature:**
-- [ ] Socket handler registered in `archiveHandlers.js`
-- [ ] Provider module methods implemented (`archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`)
-- [ ] Database cascade logic tested (descendants removed)
-- [ ] Attachments copied correctly during archive and restore
-- [ ] session.json metadata includes all required fields
-- [ ] New IDs generated on restore (no ID reuse)
-- [ ] Tests cover happy path and error cases
-- [ ] Feature Doc updated with new behavior
+### For debugging archive issues
 
-### For Debugging Archive Issues
-
-1. **Check archive folder exists** — `provider.config.paths.archive` points to a real directory
-2. **Verify session.json content** — Use `fs.readFileSync()` to inspect metadata
-3. **Check descendant tracking** — Database `forked_from` and `parent_acp_session_id` columns correct
-4. **Trace provider method calls** — Ensure `archiveSessionFiles()` called and successful
-5. **Check attachments** — Are files copied to archive folder?
-6. **Test restore merge** — Does `load_sessions` properly filter existing IDs?
-7. **Verify new IDs** — Are UI ID and ACP ID different after restore?
-
-**Debugging checklist:**
-- [ ] Socket event emitted with correct payload?
-- [ ] Backend handler triggered (check logs)?
-- [ ] Provider `archiveSessionFiles()` called successfully?
-- [ ] session.json written with complete metadata?
-- [ ] Database record deleted?
-- [ ] Attachments copied to archive folder?
-- [ ] Archive folder listed by `list_archives`?
-- [ ] Restore generates new IDs?
-- [ ] Restored session merged (not replaced)?
-- [ ] Archive folder deleted after successful restore?
+1. Verify the socket event and payload: `archive_session`, `list_archives`, `restore_archive`, or `delete_archive`.
+2. For archive failures, inspect `db.getSession(uiId)`, `session.provider`, `provider.config.paths.archive`, and `providerModule.archiveSessionFiles`.
+3. For missing archive rows, inspect the archive folder and confirm `session.json` exists directly under the folder.
+4. For restore failures, inspect `session.json`, `providerModule.restoreSessionFiles(saved.acpSessionId, archiveDir)`, attachment copy paths, and `db.saveSession` input.
+5. For missing descendants, inspect `forkedFrom` values from `db.getAllSessions()` and the sidebar `renderChildren` relationship.
+6. For provider file mismatches, inspect `getSessionPaths`, `archiveSessionFiles`, `restoreSessionFiles`, and provider-specific `restore_meta.json` handling.
+7. For restored sessions appearing under the wrong provider, inspect the restored DB row provider value and `Sidebar` provider grouping fallback.
 
 ---
 
 ## Summary
 
-The **Session Archiving** system is a soft-delete mechanism that preserves complete session state in archive folders while maintaining provider isolation and session hierarchy. Its architecture pivots on four socket handlers and a cascade delete strategy that removes descendants before archiving parents.
-
-**Key patterns:**
-- **Cascade archiving:** Children removed when parent archived (asymmetric restore)
-- **Merge-only restore:** New sessions added, never replacing (safety-first)
-- **Provider integration:** Each provider implements `archiveSessionFiles()`, `restoreSessionFiles()`, `deleteSessionFiles()`
-- **Metadata preservation:** session.json stores complete session state, messages, and attachment references
-- **New IDs on restore:** UI ID and ACP ID generated fresh to prevent collisions
-
-**Critical contract:** Archive folders contain `session.json` metadata; restore always generates new IDs and merges with existing sessions (never replaces); descendants are deleted (not archived) when parent archived.
-
-**Why agents should care:** Archiving is the default deletion path (unless `deletePermanent` is true); understanding cascade logic, restore merge strategy, and provider module contracts allows you to extend archiving to new features (e.g., archive entire folders, batch restore), debug data loss issues, or implement custom retention policies without re-reading the entire codebase.
+- Session Archiving is a filesystem-backed soft-delete path coordinated by `backend/sockets/archiveHandlers.js`.
+- `session.json` is the generic archive metadata contract; provider hooks own provider-specific session files.
+- Archive removes descendants by `forkedFrom` before archiving the selected parent.
+- Restore creates a new UI id, keeps the archived ACP session id, saves an unpinned DB row, and removes the archive folder.
+- Frontend restore is merge-only and preserves existing in-memory session objects.
+- Archive folder listing depends on directories that contain `session.json`.
+- Permanent archive deletion removes the archive folder from disk and does not touch active DB rows.
+- The critical contract is `session.json` plus synchronous provider archive hooks and correct UI-id/ACP-id handling.

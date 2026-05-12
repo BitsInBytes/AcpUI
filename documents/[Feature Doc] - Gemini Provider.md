@@ -1,381 +1,439 @@
-# Feature Doc — Gemini Provider
+# Gemini Provider
+
+The Gemini provider adapts AcpUI to the Gemini CLI ACP daemon. It owns Gemini-specific startup, authentication, tool identity normalization, quota/context signaling, and Gemini session-file handling so the rest of AcpUI receives provider-agnostic timeline events.
 
 ## Overview
 
-Gemini is implemented via the `@google/gemini-cli` npm package running in ACP (Agent Client Protocol) mode. This document is a **sidecar supplement** to `[Feature Doc] - Provider System.md` and assumes you understand the provider contract. It exists solely to show how Gemini specifically implements or deviates from that contract, with real code, line numbers, and Gemini-specific terminology.
+### What It Does
 
-**Load this doc alongside `[Feature Doc] - Provider System.md` when working on the Gemini provider.** This doc makes no sense in isolation.
+- Starts the Gemini CLI ACP daemon from `providers/gemini/user.json` command settings.
+- Authenticates with `gemini-api-key` when `apiKey` exists, or `oauth-personal` when the CLI's OAuth credentials are used.
+- Translates Gemini `session/update` notifications into AcpUI provider extensions, tokens, thoughts, and normalized tool events.
+- Resolves Gemini tool identity into canonical AcpUI fields through `normalizeTool`, `extractToolInvocation`, and backend tool invocation resolution.
+- Repairs missing or incomplete Gemini tool output for file reads, directory listings, search results, and structured result objects.
+- Emits Gemini provider extensions for slash commands, context usage metadata, and provider status.
+- Handles Gemini JSONL and JSON session files for clone, archive, restore, delete, and history rehydration.
 
----
+### Why This Matters
 
-## What Gemini Implements
+- Gemini emits ACP payloads with shapes that differ from the generic backend assumptions.
+- Gemini MCP tool IDs use the provider-configured `mcp_{mcpName}_{toolName}` pattern, so the provider must normalize tool names before the backend can dispatch AcpUI-owned tools.
+- Context usage comes from final prompt quota metadata, not from streaming `usage_update` notifications.
+- Quota status requires OAuth credentials and Google Cloud Code quota endpoints; API-key sessions skip that status path.
+- Session replay depends on Gemini's project-hashed session directory layout and JSONL record semantics.
 
-Gemini implements all required provider contract functions:
+### Architectural Role
 
-- **intercept()** — Caches tool arguments on `tool_call`, normalizes `available_commands_update` into slash-prefixed `commands/available` provider extensions, extracts Context Usage Percentage on `end_turn`, and actively **swallows** the native Gemini `usage_update` event to prevent wild UI percentage swings. Does NOT track prompt lifecycle (see `onPromptStarted`/`onPromptCompleted`).
-- **normalizeUpdate()** — Strips `<system-reminder>` XML tags from message chunks and trims leading/trailing whitespace.
-- **extractToolOutput()** — Multi-stage lookup for tool output. Fixes `read_file` by reading from disk directly. Reconstructs dropped structured outputs (like `list_directory`) using cached arguments.
-- **extractFilePath()** — Fallback chain to find paths in `locations` arrays, `content` arrays, and parsed JSON `arguments`.
-- **extractDiffFromToolCall()** — Extracts unified diffs or raw text from write/edit operations so they are syntax-highlighted in the UI immediately.
-- **extractToolInvocation()** — **V2 Tool Routing**: Extracts canonical identity using `toolIdPattern` (`mcp_{mcpName}_{toolName}`) and uses `findDeep` to recover `description` and `command` from nested Gemini arguments.
-- **normalizeTool()** — Maps raw ACP `kind` enums (`read`, `edit`, `search`) to UI tool categories. Synthesizes human-readable titles, extracts shell descriptions from `"Running: <desc>"` labels, and appends target paths.
-- **categorizeToolCall()** — Maps Gemini's standardized tool names to UI categories (`file_read`, `shell`, etc.).
-- **parseExtension()** — Routes Gemini's protocol extensions (e.g. `metadata` for Context % and `provider_status` for Quota %).
-- **prepareAcpEnvironment()** — Initializes background OAuth Quota fetching if enabled in `user.json`.
-- **performHandshake()** — Sends `initialize` (intentionally omitting `fs` capabilities to avoid proxy hangs) and `authenticate` (supporting both API Key and OAuth flows) in parallel.
-- **setConfigOption()** — Routes `mode` and `model` changes to their respective ACP endpoints.
-- **Session file operations** — `getSessionPaths()`, `cloneSession()`, `archiveSessionFiles()`, `restoreSessionFiles()`, `deleteSessionFiles()`. Handles Gemini's project-hashed subdirectory layout.
-- **parseSessionHistory()** — Reconstructs the Unified Timeline from Gemini's JSONL format, correctly applying `$rewindTo` truncations and extracting nested `tool_use` blocks.
-- **Context Debug Logging** — Maintains `context_debug.log` (Line 11) to track token flow, prompt starts, and quota refreshes.
-- **Smart Polling** — Controls background quota polling using `_activePromptCount` (Line 24) and `_inFlightSessions` (Line 25) to only poll when work is actually being done. Lifecycle is tracked via explicit `onPromptStarted()` / `onPromptCompleted()` hooks called by `promptHandlers.js`, NOT via `intercept()` — see Gotcha #12.
-- **onPromptStarted() / onPromptCompleted()** — Exported lifecycle hooks called by `promptHandlers.js` before and after the `session/prompt` RPC (lines 114 and 158). These are the authoritative signals for quota polling — more reliable than watching `intercept()` which also fires for `session/load` history drain traffic.
+This feature is a backend provider adapter plus provider-specific file/session logic. The frontend receives normalized Socket.IO events and `provider_extension` payloads; it does not call Gemini-specific code.
 
-### Gemini-Unique Characteristics
+## How It Works - End-to-End Flow
 
-| Aspect | Gemini | General Pattern |
-|--------|--------|-----------------|
-| **Context & Quota** | Extracted from `_meta.quota` on `end_turn`; OAuth fetched directly from Google APIs | Varies |
-| **Session Layout** | Project-scoped subdirectories `~/.gemini/tmp/<project-hash>/chats/` | Varies; may be flat |
-| **Tool ID Pattern** | `mcp_{mcpName}_{toolName}` (SINGLE underscore) | Varies by MCP registration |
-| **Tool Output Drops** | CLI aggressively summarizes or drops structured tool outputs to save tokens; Provider reconstructs them manually | Varies |
-| **History Rewinds** | Emits `$rewindTo` entries in JSONL instead of rewriting history | Varies |
-| **Handshake** | `initialize` and `authenticate` MUST be sent in parallel | Varies |
+1. **Provider identity and config load**
 
----
+   Files: `providers/gemini/provider.json`, `providers/gemini/branding.json`, `providers/gemini/user.json`, `providers/gemini/user.json.example`, `backend/services/providerLoader.js` (Functions: `getProvider`, `getProviderModule`, `bindProviderModule`).
 
-## How Gemini Starts — Handshake Flow
+   `provider.json` defines `protocolPrefix: "_gemini/"`, `mcpName: "AcpUI"`, `toolIdPattern: "mcp_{mcpName}_{toolName}"`, `supportsAgentSwitching: false`, and the Gemini `clientInfo`. `user.json` supplies local command, path, auth, quota, and model settings. The provider loader merges the config files and binds every exported provider function to provider context.
 
-### Step 1: prepareAcpEnvironment()
+2. **The ACP daemon environment is prepared**
 
-Before the Gemini CLI is spawned, `prepareAcpEnvironment()` initializes the background quota fetching system (if enabled).
+   File: `providers/gemini/index.js` (Export: `prepareAcpEnvironment`, Helpers: `resolveApiKey`, `_loadTokenState`, `_startQuotaFetching`).
 
-**File:** `providers/gemini/index.js` (Lines 610-631)
+   `prepareAcpEnvironment` stores `emitProviderExtension` and `writeLog`, initializes token-state persistence, and starts quota bootstrap only when `apiKey` is absent and `fetchQuotaStatus` is enabled. It returns the environment unchanged and intentionally keeps API-key auth out of the child process environment.
 
-```javascript
-export async function prepareAcpEnvironment(env, context = {}) {
-  logContext('PREPARE_ACP_ENVIRONMENT', { ... }); // LINE 611
-  _emitProviderExtension = context.emitProviderExtension;
-  _writeLog = context.writeLog;
+   ```javascript
+   // FILE: providers/gemini/index.js (Export: prepareAcpEnvironment)
+   _emitProviderExtension = context.emitProviderExtension;
+   _writeLog = context.writeLog;
+   const apiKey = resolveApiKey();
+   _tokenStateFile = path.join(homePath, '.gemini', 'acp_session_tokens.json');
+   if (!apiKey && config.fetchQuotaStatus) {
+     _startQuotaFetching(config.paths.home).catch(err => _writeLog?.(...));
+   }
+   return env;
+   ```
 
-  // Do NOT inject the API key as GEMINI_API_KEY into the subprocess environment.
-  // ...
-  
-  const { config } = getProvider();
-  const apiKey = resolveApiKey();
+3. **Handshake sends `initialize` and `authenticate` together**
 
-  if (!apiKey && config.fetchQuotaStatus) {
-    _startQuotaFetching(config.paths.home).catch(err =>
-      _writeLog?.(`[GEMINI QUOTA] Init failed: ${err.message}`)
-    );
-  }
+   Files: `backend/services/acpClient.js` (Methods: `start`, `performHandshake`), `providers/gemini/index.js` (Export: `performHandshake`), `providers/gemini/ACP_PROTOCOL_SAMPLES.md` (Sections: `Handshake Timing`, `initialize`, `authenticate`).
 
-  return env;
-}
+   `AcpClient.start` spawns the configured Gemini command, caches the provider module, calls `prepareAcpEnvironment`, and then calls `performHandshake`. Gemini requires `initialize` and `authenticate` to be in flight at the same time.
+
+   ```javascript
+   // FILE: providers/gemini/index.js (Export: performHandshake)
+   const initPromise = acpClient.transport.sendRequest('initialize', {
+     protocolVersion: 1,
+     clientCapabilities: { terminal: true },
+     clientInfo: config.clientInfo || { name: 'AcpUI', version: '1.0.0' }
+   });
+
+   const authPromise = apiKey
+     ? acpClient.transport.sendRequest('authenticate', {
+         methodId: 'gemini-api-key',
+         _meta: { 'api-key': apiKey }
+       })
+     : acpClient.transport.sendRequest('authenticate', { methodId: 'oauth-personal' });
+
+   await Promise.all([initPromise, authPromise]);
+   ```
+
+4. **Session creation includes Gemini session params and the AcpUI MCP proxy**
+
+   Files: `backend/sockets/sessionHandlers.js` (Socket event: `create_session`, Helper: `captureModelState`), `backend/services/sessionManager.js` (Function: `getMcpServers`), `providers/gemini/index.js` (Exports: `buildSessionParams`, `getMcpServerMeta`, `setInitialAgent`, `normalizeModelState`).
+
+   `create_session` calls `buildSessionParams(requestAgent)` and spreads the result into `session/new` or `session/load`. `getMcpServers` injects the AcpUI stdio proxy using the provider's `mcpName`. Gemini's `getMcpServerMeta` returns `undefined`, so the MCP server entry contains standard proxy fields only.
+
+   ```javascript
+   // FILE: providers/gemini/index.js (Export: buildSessionParams)
+   export function buildSessionParams(agent) {
+     if (agent) return { _meta: { agent } };
+     return undefined;
+   }
+   ```
+
+5. **Inbound daemon payloads pass through Gemini interception**
+
+   Files: `backend/services/acpClient.js` (Method: `handleAcpMessage`), `providers/gemini/index.js` (Export: `intercept`, Helper: `normalizeCommands`, Export: `emitCachedContext`).
+
+   `handleAcpMessage` calls `intercept(payload)` before routing. Gemini interception rewrites `available_commands_update` into `_gemini/commands/available`, emits cached context once a session id is observed, caches tool arguments for later tool updates, drops `usage_update`, and emits `_gemini/metadata` after final prompt results with quota token counts.
+
+   ```javascript
+   // FILE: providers/gemini/index.js (Export: intercept)
+   if (update?.sessionUpdate === 'available_commands_update') {
+     return {
+       method: `${config.protocolPrefix}commands/available`,
+       params: { sessionId, commands: normalizeCommands(update.availableCommands) }
+     };
+   }
+   if (update?.sessionUpdate === 'usage_update') return null;
+   ```
+
+6. **Streaming updates are normalized into the Unified Timeline**
+
+   Files: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`), `providers/gemini/index.js` (Exports: `normalizeUpdate`, `stripReminder`, `extractToolOutput`, `extractDiffFromToolCall`, `extractFilePath`).
+
+   `handleUpdate` delegates Gemini text cleanup to `normalizeUpdate`. It then emits `token`, `thought`, and `system_event` Socket.IO events. Gemini-specific helpers remove `<system-reminder>` blocks, extract paths from `locations`, arguments, and diff blocks, and recover output from Gemini's result shapes.
+
+7. **Tool identity becomes canonical before AcpUI tool dispatch**
+
+   Files: `providers/gemini/index.js` (Exports: `normalizeTool`, `extractToolInvocation`, `categorizeToolCall`), `backend/services/tools/providerToolNormalization.js` (Functions: `inputFromToolUpdate`, `collectToolNameCandidates`, `resolveToolNameFromCandidates`, `resolveToolNameFromAcpUiMcpTitle`), `backend/services/tools/toolIdPattern.js` (Function: `matchToolIdPattern`), `backend/services/tools/toolInvocationResolver.js` (Functions: `resolveToolInvocation`, `applyInvocationToEvent`), `backend/services/tools/acpUiToolTitles.js` (Function: `acpUiToolTitle`), `backend/services/tools/acpUxTools.js` (Constants: `ACP_UX_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`).
+
+   Gemini can expose AcpUI MCP tool identity through tool ids, titles, nested `functionCall` metadata, JSON description strings, or cached arguments. The provider resolves those candidates, derives a canonical tool name, formats the UI title, and returns a tool invocation object. The backend resolver merges provider identity with sticky tool state and MCP execution registry details, then `toolRegistry` dispatches AcpUI-owned handlers.
+
+   ```javascript
+   // FILE: providers/gemini/index.js (Export: extractToolInvocation)
+   return {
+     toolCallId: update.toolCallId || event.id,
+     kind: isMcpTool ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+     rawName,
+     canonicalName,
+     mcpServer: patternMatch?.mcpName || (isAcpUiTool ? config.mcpName : undefined),
+     mcpToolName: patternMatch?.toolName || (isAcpUiTool ? canonicalName : undefined),
+     input,
+     title: finalTitle,
+     filePath: normalizedFilePath,
+     category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
+   };
+   ```
+
+8. **Provider extensions are parsed and broadcast**
+
+   Files: `providers/gemini/index.js` (Export: `parseExtension`, Helper: `_emitStatus`), `backend/services/acpClient.js` (Method: `handleProviderExtension`), `backend/services/providerStatusMemory.js` (Functions: `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions`).
+
+   Provider extension methods under `_gemini/` are converted into structured types: `commands`, `metadata`, `provider_status`, or `unknown`. `handleProviderExtension` emits them as `provider_extension` and remembers status-like extensions so new Socket.IO clients receive current provider state.
+
+9. **Prompt lifecycle controls quota polling**
+
+   Files: `backend/sockets/promptHandlers.js` (Socket event: `prompt`), `providers/gemini/index.js` (Exports: `onPromptStarted`, `onPromptCompleted`, `stopQuotaFetching`, Helpers: `_ensureQuotaPolling`, `_fetchAndEmitQuota`, `_buildStatus`).
+
+   The backend calls `onPromptStarted(sessionId)` immediately before `session/prompt` and calls `onPromptCompleted(sessionId)` in a `finally` block. Gemini uses those hooks to start interval polling while prompts are active and stop polling when the active prompt set is empty. Final prompt results also trigger a quota refresh when `stopReason` is `end_turn` and a quota project id exists.
+
+10. **Gemini session files back clone, archive, restore, delete, and JSONL replay**
+
+    Files: `providers/gemini/index.js` (Exports: `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, `parseSessionHistory`; Helpers: `getShortId`, `findSessionDir`, `getExactSessionFile`, `extractTextFromContent`, `extractToolResultText`).
+
+    The provider searches `config.paths.sessions` for project-hashed `chats` directories containing files whose names include the first UUID segment. `parseSessionHistory` reads Gemini JSONL records, applies `$rewindTo`, skips metadata and system records, then returns AcpUI messages whose assistant entries contain timeline steps for thoughts, tools, and text.
+
+## Architecture Diagram
+
+```mermaid
+flowchart TD
+  Config[providers/gemini/provider.json + branding.json + user.json]
+  Loader[backend/services/providerLoader.js]
+  Client[backend/services/acpClient.js]
+  Gemini[Gemini CLI ACP daemon]
+  Provider[providers/gemini/index.js]
+  SessionHandlers[backend/sockets/sessionHandlers.js]
+  PromptHandlers[backend/sockets/promptHandlers.js]
+  UpdateHandler[backend/services/acpUpdateHandler.js]
+  ToolNormalizer[backend/services/tools/providerToolNormalization.js]
+  ToolResolver[backend/services/tools/toolInvocationResolver.js]
+  ToolRegistry[backend/services/tools/index.js]
+  McpServer[backend/mcp/mcpServer.js + stdio-proxy.js]
+  SessionFiles[(Gemini JSONL/JSON session files)]
+  TokenState[(Gemini context token state file)]
+  GoogleApis[(OAuth + Cloud Code quota APIs)]
+  Frontend[Socket.IO frontend]
+
+  Config --> Loader
+  Loader --> Client
+  Client --> Provider
+  Client <--> Gemini
+  SessionHandlers --> Client
+  PromptHandlers --> Client
+  SessionHandlers --> McpServer
+  Gemini --> Client
+  Client --> UpdateHandler
+  UpdateHandler --> Provider
+  Provider --> ToolNormalizer
+  UpdateHandler --> ToolResolver
+  ToolResolver --> ToolRegistry
+  McpServer --> ToolRegistry
+  Provider --> SessionFiles
+  Provider --> TokenState
+  Provider --> GoogleApis
+  Client --> Frontend
 ```
 
-### Step 2: performHandshake()
+## Critical Contract
 
-Once the subprocess is running, the provider performs the ACP handshake. 
+The Gemini provider contract has five required boundaries:
 
-**File:** `providers/gemini/index.js` (Lines 1022-1052)
+- **Handshake contract:** `performHandshake(acpClient)` must send `initialize` with `clientCapabilities: { terminal: true }` and must send `authenticate` without waiting for the initialize response.
+- **Interception contract:** `intercept(payload)` must return a routed payload object or `null`. `usage_update` returns `null`; `available_commands_update` returns a `_gemini/commands/available` extension payload.
+- **Tool identity contract:** `provider.json.toolIdPattern` and `extractToolInvocation(update, context)` must agree on the Gemini MCP id shape. For AcpUI tools, the returned `canonicalName`, `mcpServer`, `mcpToolName`, and `input` are the source data for `toolInvocationResolver` and `toolRegistry`.
+- **Quota/context contract:** `onPromptStarted`, `onPromptCompleted`, final prompt result quota fields, and `_emitProviderExtension` are the only provider-owned path for Gemini quota polling and context percentage metadata.
+- **Session-file contract:** `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, and `parseSessionHistory` must follow Gemini's project-hashed directory layout and first-UUID-segment filename lookup.
 
-```javascript
-export async function performHandshake(acpClient) {
-  const { config } = getProvider();
-  
-  // Do NOT claim `fs` capability to prevent Gemini CLI from routing FS calls 
-  // to AcpUI via JSON-RPC, which stalls indefinitely.
-  const initPromise = acpClient.transport.sendRequest('initialize', {
-    protocolVersion: 1,
-    clientCapabilities: { terminal: true },
-    clientInfo: config.clientInfo || { name: 'AcpUI', version: '1.0.0' }
-  });
+When any of these boundaries drift, AcpUI can show generic tool titles, lose AcpUI MCP tool output, display stale context usage, fail session replay, or route provider extensions incorrectly.
 
-  const apiKey = resolveApiKey();
+## Configuration / Data Flow
 
-  const authPromise = apiKey
-    ? acpClient.transport.sendRequest('authenticate', {
-        methodId: 'gemini-api-key',
-        _meta: { 'api-key': apiKey },
-      })
-    : acpClient.transport.sendRequest('authenticate', {
-        methodId: 'oauth-personal',
-      });
+### Provider config files
 
-  // Both must be sent in parallel. Gemini holds initialize response until authenticate arrives.
-  await Promise.all([initPromise, authPromise]);
-}
-```
+| File | Keys / Anchors | Current Role |
+|---|---|---|
+| `providers/gemini/provider.json` | `name`, `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `clientInfo`, `supportsAgentSwitching` | Static provider identity, MCP tool id format, and tool category metadata. |
+| `providers/gemini/branding.json` | `title`, `assistantName`, `busyText`, `modelLabel`, `maxImageDimension` | UI labels and image sizing used through generic branding payloads. |
+| `providers/gemini/user.json` | `command`, `args`, `fetchQuotaStatus`, `paths`, `models`, optional `apiKey` | Local runtime settings for the Gemini CLI command, paths, auth, quota, and model defaults. |
+| `providers/gemini/user.json.example` | Same schema as `user.json` with placeholder values | Safe template for local provider configuration. |
+| `configuration/mcp.json.example` | `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch`, `io`, `webFetch`, `googleSearch` | Optional AcpUI MCP tool advertisement and limits. |
 
----
+### Gemini settings integration
 
-## Tool Pipeline — V2 Routing and Output Reconstruction
+`providers/gemini/README.md` documents Gemini CLI settings for tool allow/exclude behavior. The relevant Gemini tool patterns are `mcp_AcpUI_*` and concrete names such as `mcp_AcpUI_ux_invoke_shell`. Those names match the provider's `toolIdPattern` after `{mcpName}` resolves to `AcpUI`.
 
-Gemini's tool handling uses the V2 Tool Invocation system to resolve canonical identities before combatting the CLI's aggressive output summarization.
+Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, and `ux_invoke_counsel`. Optional IO/search tools are enabled through `configuration/mcp.json` and include `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`, and `ux_google_web_search`.
 
-### 1. V2 Tool Invocation Routing
+### Authentication data flow
 
-**File:** `providers/gemini/index.js` (Lines 589–653)
+- `providers/gemini/user.json` `apiKey` present: `performHandshake` sends `authenticate` with `methodId: "gemini-api-key"` and `_meta["api-key"]` inside request params.
+- `apiKey` absent: `performHandshake` sends `authenticate` with `methodId: "oauth-personal"` and the Gemini CLI uses saved OAuth credentials.
+- `prepareAcpEnvironment` does not set `GEMINI_API_KEY` in the spawned process environment.
+- Quota fetching reads `oauth_creds.json` from `config.paths.home` and uses OAuth-only Cloud Code quota requests.
 
-Gemini implements `extractToolInvocation()` to provide authoritative metadata. It uses `toolIdPattern` (`mcp_{mcpName}_{toolName}`) to resolve the canonical tool name. Because Gemini CLI sometimes wraps tool arguments in unexpected nested keys, this function includes a `findDeep` helper to recover `description` and `command` for the backend registry.
+### Context usage data flow
 
-```javascript
-export function extractToolInvocation(update = {}, context = {}) {
-  // ... (collects input objects)
+1. Gemini returns a final prompt result with `result._meta.quota.token_count` and `result._meta.quota.model_usage`.
+2. `intercept` reads the cumulative `input_tokens` and `output_tokens` for the session.
+3. The provider stores token counts in `_accumulatedTokensBySession` and writes token state through `_saveTokenState`.
+4. The provider computes `contextUsagePercentage` using `CONTEXT_WINDOWS` or `DEFAULT_CONTEXT_WINDOW`.
+5. `_emitProviderExtension` sends `_gemini/metadata` with `sessionId` and `contextUsagePercentage`.
+6. `emitCachedContext(sessionId)` re-emits persisted context once for hot or loaded sessions.
 
-  // Deep search for description and command if Gemini CLI wraps them in unexpected keys
-  if (isAcpUiTool && (!input.description || !input.command)) {
-    const findDeep = (obj, targetKey) => {
-      if (!obj || typeof obj !== 'object') return null;
-      if (obj[targetKey]) return obj[targetKey];
-      for (const val of Object.values(obj)) {
-        const res = findDeep(val, targetKey);
-        if (res) return res;
-      }
-      return null;
-    };
-    // ...
-  }
+### Quota status data flow
 
-  return {
-    toolCallId: update.toolCallId || event.id,
-    kind: isAcpUiTool ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
-    rawName,
-    canonicalName,
-    mcpServer: patternMatch?.mcpName || (isAcpUiTool ? config.mcpName : undefined),
-    mcpToolName: patternMatch?.toolName || (isAcpUiTool ? canonicalName : undefined),
-    input,
-    title: event.title || update.title || (isAcpUiTool ? '' : normalized.title),
-    filePath: normalized.filePath || event.filePath,
-    category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
-  };
-}
-```
+1. `prepareAcpEnvironment` calls `_startQuotaFetching(config.paths.home)` when `fetchQuotaStatus` is true and `apiKey` is absent.
+2. `_readTokenFromDisk` reads `oauth_creds.json` from `config.paths.home`.
+3. `_requestLoadCodeAssist` discovers `cloudaicompanionProject`.
+4. `_fetchAndEmitQuota` calls `retrieveUserQuota`, handles 401 retry/refresh, and stores quota buckets.
+5. `_buildStatus` groups buckets into Pro, Flash, Light, and other labels.
+6. `_emitStatus` sends `_gemini/provider/status` with the provider status payload.
+7. `parseExtension` maps that method to `{ type: "provider_status", status }`.
 
-### 2. Argument Caching (intercept)
+### Tool normalization data flow
 
-**File:** `providers/gemini/index.js` (Lines 94-99)
+1. Gemini sends a `tool_call` or `tool_call_update` with `toolCallId`, `kind`, `title`, `locations`, and possible argument objects.
+2. `intercept` caches tool input by `toolCallId` and session-scoped key.
+3. `normalizeTool` resolves `toolName` from configured id patterns, MCP server titles, nested `functionCall` metadata, and `KIND_TO_TOOL_NAME`.
+4. `extractToolInvocation` returns canonical identity, input, title, file path, and category.
+5. `resolveToolInvocation` merges provider data with `toolCallState` and `mcpExecutionRegistry`.
+6. `applyInvocationToEvent` stamps `toolName`, `canonicalName`, `mcpServer`, `mcpToolName`, `isAcpUxTool`, title, category, and file path onto the emitted `system_event`.
 
-When a `tool_call` starts, its exact arguments are cached:
+### Session-file data flow
 
-```javascript
-    // Cache arguments when a tool starts so we can reconstruct dropped outputs
-    if (payload.params?.update?.sessionUpdate === 'tool_call') {
-      const update = payload.params.update;
-      if (update.toolCallId && (update.arguments || update.rawInput)) {
-        toolArgCache.set(update.toolCallId, update.arguments || update.rawInput);
-      }
-    }
-```
-
-### 2. Output Reconstruction (extractToolOutput)
-
-**File:** `providers/gemini/index.js` (Lines 248-294)
-
-When the tool completes, if the output is missing or heavily summarized (e.g. `"Found 10 matching file(s)"`), the provider uses the cached arguments to manually execute the command on the backend and return the real output to the UI.
-
-```javascript
-  // 6. Fix for Gemini list_directory returning no output
-  if (update.status === 'completed' && update.toolCallId?.startsWith('list_directory')) {
-    if (!raw || (Array.isArray(raw) && raw.length === 0)) {
-       const argsRaw = toolArgCache.get(update.toolCallId) || {};
-       const args = typeof argsRaw === 'string' ? JSON.parse(argsRaw || '{}') : argsRaw;
-       // ... extracts dirPath, resolves absolute path, runs fs.readdirSync ...
-       return files.length > 0 ? files.join('\n') : '(empty directory)';
-    }
-  }
-  
-  // 7. Fix for empty search outputs
-  if (update.status === 'completed' && (!raw || (Array.isArray(raw) && raw.length === 0))) {
-     if (update.toolCallId?.startsWith('grep_search') || update.toolCallId?.startsWith('glob')) {
-         return 'No matches found.';
-     }
-  }
-```
-
-### 3. File Read Fixing
-
-**File:** `providers/gemini/index.js` (Lines 170-202)
-
-Gemini's `read_file` often returns a summary instead of the actual file contents. The provider intercepts this and reads the file directly from disk.
-
-```javascript
-  // Fix for Gemini read_file returning only a summary string instead of file contents
-  if (update.status === 'completed' && update.toolCallId?.startsWith('read_file')) {
-    let filePath = update.locations?.[0]?.path;
-    if (filePath && fs.existsSync(filePath)) {
-        let content = fs.readFileSync(filePath, 'utf-8');
-        // ... extracts summary to find requested line ranges, slices content ...
-        return stripReminder(content);
-    }
-  }
-```
-
----
-
-## Context % and Quota Tracking
-
-Gemini provides rich metadata in every prompt response that powers the UI footer and status panel.
-
-### 1. Swallowing Native Usage Updates
-
-**File:** `providers/gemini/index.js` (Lines 83-91)
-
-The Gemini CLI emits unstable mid-stream `usage_update` events with arbitrary sizes, causing the UI context percentage to wildly inflate (e.g. 1370%). The provider **swallows these completely** and logs them to `context_debug.log`.
-
-```javascript
-      // Log usage_update events to understand the token flow
-      if (update?.sessionUpdate === 'usage_update') {
-        logContext('USAGE_UPDATE', { ... }); // LINE 84
-        return null;
-      }
-```
-
-### 2. Emitting Context %
-
-**File:** `providers/gemini/index.js` (Lines 111-155)
-
-Instead of the native event, the true context usage is calculated at `end_turn` from the `_meta.quota.token_count` field against a hardcoded context window.
-
-```javascript
-    if (payload?.result?.stopReason) {
-      // ...
-      if (payload.result?._meta?.quota && sessionId) {
-        const quota = payload.result._meta.quota;
-        // ...
-        const percent = (inputTokens / windowSize) * 100;
-        
-        if (_emitProviderExtension) {
-          _sessionContextInfo.set(sessionId, { percent, inputTokens, windowSize, model });
-          _emitProviderExtension(`${config.protocolPrefix}metadata`, {
-            sessionId,
-            contextUsagePercentage: percent
-          });
-        }
-```
-
-### 3. OAuth Quota Fetching
-
-If enabled via `fetchQuotaStatus: true` in `user.json`, the provider communicates with Google APIs to show remaining API quota in the Provider Status panel.
-
-**Files:** `providers/gemini/index.js` (Lines 1056-1375)
-
-The quota-fetching system uses **reactive 401-based token refresh** and emits status immediately on startup:
-
-1. **Startup**: `_startQuotaFetching()` (Line 1396) is called from `prepareAcpEnvironment()`. It:
-   - Discovers the user's `cloudaicompanionProject` ID via `loadCodeAssist`.
-   - Immediately emits initial status using `emitInitial: true`.
-   - Sets up a 30-second polling timer that only runs when `_activePromptCount > 0`.
-   - `_activePromptCount` is managed exclusively by `onPromptStarted()` / `onPromptCompleted()` — not by `intercept()`.
-
-2. **Client ID Derivation**: The OAuth client ID is **derived at runtime** from the `azp` field of the JWT `id_token` in `oauth_creds.json` via `_extractClientId()` (Line 1076). The **client secret** is hardcoded (Line 1074).
-
-3. **Reactive Token Refresh** (on 401): `_fetchAndEmitQuota()` (Line 1256):
-   - Attempts the quota request via `_requestQuota()` (Line 1102).
-   - **On 401**: Re-reads token from disk, retries.
-   - **On 401 again**: Calls `_refreshAndSaveToken()` (Line 1118), writes to disk, retries.
-   - Emits status to UI via `_emitStatus()` (Line 1367).
-
----
-
-## Session Files — Hashed Project Layout
-
-Gemini stores sessions in project-scoped subdirectories, similar to Claude, but deeply nested under `chats/`.
-
-### Layout
-
-```
-~/.gemini/tmp/
-├── {project-hash}/
-│   ├── chats/
-│   │   ├── session-{timestamp}-{shortId}.jsonl
-│   │   └── session-{timestamp}-{shortId}.json
-│   └── ...
-```
-
-### `getShortId` and `findSessionDir`
-
-**File:** `providers/gemini/index.js` (Lines 660-696)
-
-Gemini uses only the first 8 characters of the UUID to name files.
-
-```javascript
-function getShortId(acpId) {
-  return acpId.split('-')[0] || acpId;  // Extracts "a1b2c3d4" from "a1b2c3d4-..."
-}
-```
-
----
-
-## JSONL History parsing & `$rewindTo`
-
-**File:** `providers/gemini/index.js` (Lines 836-965)
-
-Unlike other providers, Gemini does not physically truncate the JSONL file when a user rewinds history. Instead, it appends a `$rewindTo` record. The `parseSessionHistory` function must apply these rewinds sequentially before generating the final message array.
-
----
+1. `getSessionPaths(acpId)` calls `findSessionDir(config.paths.sessions, acpId)`.
+2. `findSessionDir` searches project directories for `<project-hash>/chats` entries that include `getShortId(acpId)`.
+3. `getExactSessionFile` returns the matching `.jsonl` or `.json` file, or a fallback exact filename under the resolved directory.
+4. `parseSessionHistory` reads JSONL records, handles `$rewindTo`, ignores `$set` and system records, then emits AcpUI user/assistant messages.
+5. Assistant messages include timeline entries for `thought`, `tool`, and final text content.
 
 ## Component Reference
 
-| Lines | Function | Purpose |
-|-------|----------|---------|
-| 11–22 | logContext() | JSONL logging to `context_debug.log`. |
-| 78–181 | intercept() | Emit context %, normalize available commands, cache tool args, swallow `usage_update`. Does NOT track prompt lifecycle. |
-| 163–185 | normalizeUpdate() | Strips `<system-reminder>` XML tags. |
-| 205–302 | extractToolOutput() | Extracts from `result` / `content`, fixes `read_file` disk reads, reconstructions. |
-| 314–343 | extractFilePath() | Extracts file paths from locations, content arrays, or parsed JSON args. |
-| 355–385 | extractDiffFromToolCall() | Pulls unified diff patches from Write/Edit tools for live rendering. |
-| 413–487 | normalizeTool() | Maps `kind` enums, synthesizes titles, extracts shell descriptions from `"Running: <desc>"` labels, strips MCP prefixes. |
-| 492–513 | categorizeToolCall() | Routes AcpUI MCP tools and standard categories. |
-| 589–653 | extractToolInvocation() | **V2 Tool Routing**: Canonical identity extraction; uses `findDeep` to recover `description` and `command` from nested Gemini arguments. |
-| 592–614 | parseExtension() | Maps `{prefix}commands/available`, `{prefix}metadata`, and `{prefix}provider/status`. |
-| 610-631 | prepareAcpEnvironment() | Bootstraps background quota polling if allowed. |
-| 660–696 | findSessionDir() / getShortId() | Resolves Gemini's deep project-hash directory structure. |
-| 732–809 | cloneSession() | Truncates user turns and copies files into the same project dir. |
-| 818–841 | archiveSessionFiles() | Archives session and saves absolute directory to `restore_meta.json`. |
-| 894–1013 | parseSessionHistory() | Rebuilds timeline, applying `$rewindTo` and unpacking nested tool calls. |
-| 1022–1052 | performHandshake() | Sends parallel init + auth, explicitly excluding `fs` capability. |
-| 1076–1086 | _extractClientId() | Parses `id_token` JWT and extracts `azp` field for OAuth client ID. |
-| 1088–1096 | _readTokenFromDisk() | Reads access token from `oauth_creds.json`. |
-| 1102-1116 | _requestQuota() | Makes HTTP POST to retrieveUserQuota endpoint. |
-| 1118–1166 | _refreshAndSaveToken() | Refreshes expired token using derived client_id + hardcoded secret; saves to disk. |
-| 1320–1324 | stopQuotaFetching() | Clears polling timer and resets counters (for cleanup/shutdown). |
-| 1334–1340 | onPromptStarted() | Lifecycle hook: registers a session as active, starts quota polling. Called by `promptHandlers.js` before `session/prompt`. |
-| 1347–1353 | onPromptCompleted() | Lifecycle hook: removes a session from the active set, stops polling when count reaches zero. Called in a `finally` block in `promptHandlers.js`. |
-| 1396–1441 | _startQuotaFetching() | Bootstrap: discover project ID, emit initial status, start 30s polling timer. |
-| 1442–1481 | _fetchAndEmitQuota() | Reactive 401 fetch: read token, try request, refresh on 401, build/cache/emit status. |
-| 1483–1579 | _buildStatus() | Build provider_status extension with formatted quota buckets. |
-| 1581–1586 | _emitStatus() | Emits the latest cached status to the UI. |
+### Provider Files
 
----
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Provider logic | `providers/gemini/index.js` | `prepareAcpEnvironment`, `performHandshake`, `resolveApiKey` | Environment preparation and Gemini ACP auth. |
+| Provider logic | `providers/gemini/index.js` | `intercept`, `normalizeCommands`, `emitCachedContext` | Raw payload interception, slash command extension mapping, cached context emission. |
+| Provider logic | `providers/gemini/index.js` | `normalizeUpdate`, `stripReminder` | Text cleanup for message and thought chunks. |
+| Provider logic | `providers/gemini/index.js` | `extractToolOutput`, `extractDiffFromToolCall`, `extractFilePath` | Gemini tool output, diff, and path recovery. |
+| Provider logic | `providers/gemini/index.js` | `normalizeTool`, `extractToolInvocation`, `categorizeToolCall` | Canonical tool identity and category extraction. |
+| Provider logic | `providers/gemini/index.js` | `parseExtension`, `_emitStatus`, `_buildStatus` | Gemini provider extension parsing and provider status payload formatting. |
+| Provider logic | `providers/gemini/index.js` | `onPromptStarted`, `onPromptCompleted`, `stopQuotaFetching` | Prompt lifecycle and quota polling. |
+| Provider logic | `providers/gemini/index.js` | `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, `parseSessionHistory` | Session file lifecycle and JSONL history replay. |
+| Provider config | `providers/gemini/provider.json` | `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `clientInfo` | Static provider contract and MCP identity pattern. |
+| Provider config | `providers/gemini/branding.json` | `assistantName`, `modelLabel`, `maxImageDimension` | Gemini branding and upload sizing. |
+| Provider config | `providers/gemini/user.json`, `providers/gemini/user.json.example` | `command`, `args`, `apiKey`, `fetchQuotaStatus`, `paths`, `models` | Local runtime, auth, path, quota, and model settings. |
+| Provider docs | `providers/gemini/README.md` | `Configuring Tool Permissions`, `Runtime Flow`, `Session Files`, `Authentication & Quota Status`, `Context Usage Percentage` | Operational notes for Gemini CLI and AcpUI MCP tool configuration. |
+| Provider docs | `providers/gemini/ACP_PROTOCOL_SAMPLES.md` | `Handshake Timing`, `initialize`, `authenticate`, `session/load`, `available_commands_update`, `FS Proxy` | Captured Gemini ACP protocol behavior. |
+| Provider docs | `providers/gemini/SESSION_META_DATA.md` | `_meta.api-key`, `_meta.agent` | Gemini ACP meta-field reference. |
 
-## Gotchas & Important Notes
+### Backend Integration
 
-1. **`initialize` and `authenticate` MUST be parallel**
-   Gemini CLI holds the `initialize` request indefinitely until `authenticate` is sent. Awaiting them sequentially will cause a permanent stall.
-2. **Never claim `fs` client capability**
-   If `fs` is claimed in `initialize`, Gemini will proxy every internal file read through JSON-RPC to AcpUI. AcpUI does not have listeners for this, resulting in a permanent stall on file operations.
-3. **Session IDs are truncated**
-   Gemini uses only the first 8 characters of a session UUID (e.g. `session-timestamp-a1b2c3d4.jsonl`). A standard `.split('-').pop()` will return the wrong segment. Use `.split('-')[0]`.
-4. **Beware native `usage_update` events**
-   The CLI emits intermediate chunk usage updates that wildly misrepresent the context window. They must be swallowed in `intercept()`.
-5. **JSONL append-only history**
-   Editing history in Gemini does not delete old JSONL lines; it appends a `$rewindTo` line. Your history parser must honor rewinds to avoid rendering ghost messages.
-6. **Dropped Tool Outputs**
-   Tools like `list_directory` will often complete successfully but return an empty `content` array to save tokens. AcpUI uses `toolArgCache` and `fs.readdirSync` to bypass this manually.
-7. **API Key injection destroys OAuth**
-   Never inject `GEMINI_API_KEY` into the subprocess `process.env`. If the CLI detects this, it permanently writes it to `~/.gemini/settings.json`, destroying the user's OAuth tokens. Pass the key explicitly via `_meta` in `authenticate`.
-8. **OAuth client ID is derived from `id_token`, secret is hardcoded**
-   The OAuth `client_id` is extracted at runtime from the `azp` field of the JWT `id_token` in `oauth_creds.json` via `_extractClientId()`. This adapts automatically if the Gemini CLI changes its OAuth client. The `client_secret` is hardcoded (intentionally — Google's installed-app OAuth pattern permits this). If token refresh silently stops working, verify that `oauth_creds.json` exists and contains valid `id_token` and `refresh_token` fields.
-9. **Status emits immediately on startup with `emitInitial: true`**
-   Unlike previous versions that waited for a session to activate, quota status now emits as soon as the Provider Status panel is available, using the `emitInitial` flag. This ensures users see quota data even before starting a conversation.
-10. **Reactive 401-based token refresh (Codex pattern)**
-   Token refresh is no longer proactive (checking `expiry_date` before each request). Instead, the provider tries the request first. If it gets a 401, it re-reads the token from disk (another process may have refreshed it), retries, and only if that fails does it refresh and save new credentials. This is more efficient and aligns with Codex's approach.
-11. **Context Debug Log**
-    A `context_debug.log` file is created in the provider directory. If you experience unexpected progress bar behavior, check this log for `INTERCEPT_CALLED`, `PROMPT_START`, and `SESSION_COMPLETED` events.
-12. **Smart Polling Timer — Hook-Based Lifecycle Tracking (not intercept-based)**
-    Polling only occurs when `_activePromptCount > 0`. If no sessions are active, the polling timer is stopped to save battery and network bandwidth.
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Provider loading | `backend/services/providerLoader.js` | `getProvider`, `getProviderModule`, `bindProviderModule` | Loads Gemini config and binds exports to provider context. |
+| ACP client | `backend/services/acpClient.js` | `start`, `performHandshake`, `handleAcpMessage`, `handleProviderExtension`, `handleModelStateUpdate` | Spawns Gemini, routes payloads, handles provider extensions. |
+| Update handling | `backend/services/acpUpdateHandler.js` | `handleUpdate`, `tool_call`, `tool_call_update`, `usage_update`, `available_commands_update` branches | Converts normalized provider updates into Socket.IO events. |
+| Prompt socket | `backend/sockets/promptHandlers.js` | Socket event `prompt`, Socket event `cancel_prompt`, Socket event `respond_permission`, Socket event `set_mode` | Sends prompts, calls prompt lifecycle hooks, cancels Gemini prompts, responds to permissions. |
+| Session socket | `backend/sockets/sessionHandlers.js` | Socket event `create_session`, `fork_session`, `rehydrate_session`, `set_session_option`, `set_session_model`, Helper: `captureModelState` | Creates/loads sessions, injects provider params and MCP servers, captures model/config state. |
+| Session manager | `backend/services/sessionManager.js` | `getMcpServers`, `setSessionModel`, `setProviderConfigOption`, `reapplySavedConfigOptions`, `emitCachedContext` | Builds MCP proxy config and reapplies persisted session state. |
+| JSONL parser | `backend/services/jsonlParser.js` | `parseJsonlSession` | Calls provider `parseSessionHistory` during session rehydration. |
+| Provider status | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions` | Stores latest provider status extension for new clients. |
 
-    **The lifecycle is NOT tracked via `intercept()`.** An earlier implementation detected prompt starts by watching for `agent_message_chunk`, `user_message_chunk`, and `tool_call` events inside `intercept()`. This caused a critical bug: when Gemini CLI resumes a session via `session/load`, it replays the entire history as a stream of ACP notifications (`user_message_chunk`, `tool_call` with `status: "completed"`, `agent_message_chunk`). These are byte-for-byte identical to live traffic inside `intercept()`. Since `session/load` has no `stopReason` in its result (only `session/prompt` results have `stopReason`), the decrement logic never fired, leaving `_activePromptCount` permanently elevated and the polling timer running indefinitely — even with no chat active.
+### Tool and MCP Integration
 
-    **The fix**: `onPromptStarted(sessionId)` and `onPromptCompleted(sessionId)` are explicit exported functions called directly by `promptHandlers.js`. `promptHandlers.js` only handles real user-initiated prompts — never `session/load`. `onPromptCompleted` is called from a `finally` block, guaranteeing it fires on success, cancellation (`stopReason: "cancelled"` resolves normally), and errors alike.
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Tool normalization | `backend/services/tools/providerToolNormalization.js` | `inputFromToolUpdate`, `collectToolNameCandidates`, `resolveToolNameFromCandidates`, `resolveToolNameFromAcpUiMcpTitle` | Extracts AcpUI MCP names and inputs from Gemini-shaped raw data. |
+| Tool id pattern | `backend/services/tools/toolIdPattern.js` | `matchToolIdPattern`, `toolIdPatternToRegex`, `replaceToolIdPattern` | Matches `mcp_{mcpName}_{toolName}` against Gemini tool ids and titles. |
+| Tool identity | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider extraction with cached tool state and MCP execution details. |
+| Tool definitions | `backend/services/tools/acpUxTools.js` | `ACP_UX_TOOL_NAMES`, `ACP_UX_CORE_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`, `isAcpUxToolName` | Central AcpUI MCP tool names and category metadata. |
+| Tool titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `basenameForToolPath` | Formats visible AcpUI MCP tool titles. |
+| MCP server | `backend/mcp/mcpServer.js` | `getMcpServers`, `createToolHandlers`, `wrapToolHandlers` | Advertises and executes core/optional AcpUI MCP tools. |
+| MCP config | `backend/services/mcpConfig.js` | `getMcpConfig`, `isInvokeShellMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled` | Controls which AcpUI MCP tools Gemini can discover. |
+| MCP config example | `configuration/mcp.json.example` | `tools`, `io`, `webFetch`, `googleSearch` | Reference shape for MCP feature flags and IO/search limits. |
+
+## Gotchas
+
+1. **Handshake requests must be concurrent**
+
+   Gemini holds the `initialize` response until authentication completes. Keep `initialize` and `authenticate` in flight together in `performHandshake`.
+
+2. **Do not advertise filesystem capability**
+
+   `clientCapabilities` contains `terminal: true` only. Adding `fs` makes Gemini route file operations through `fs/read_text_file` and `fs/write_text_file` JSON-RPC requests that AcpUI does not answer in this provider path.
+
+3. **API keys stay inside `authenticate` params**
+
+   `prepareAcpEnvironment` does not set `GEMINI_API_KEY`. API-key auth is passed as `authenticate.params._meta["api-key"]`, which keeps daemon startup from rewriting OAuth-oriented Gemini settings.
+
+4. **Streaming `usage_update` is dropped**
+
+   Gemini's native streaming usage events do not drive AcpUI context usage. `intercept` returns `null` for those events and uses final prompt result quota fields instead.
+
+5. **Token-state path is computed by code, not by README prose**
+
+   `prepareAcpEnvironment` builds `_tokenStateFile` with `path.join(homePath, '.gemini', 'acp_session_tokens.json')`. Check `config.paths.home` before assuming the absolute file location.
+
+6. **AcpUI MCP ids use single underscores for Gemini**
+
+   Gemini tool ids match `mcp_AcpUI_ux_invoke_shell`, not double-underscore or slash-separated formats. Update `provider.json.toolIdPattern`, `matchToolIdPattern` expectations, and provider tests together if the daemon naming shape changes.
+
+7. **Tool input may arrive in nested Gemini fields**
+
+   `rawInput.functionCall.args`, `args`, `arguments`, `description`, and cached tool input all feed title and identity resolution. Update `normalizeTool` and `extractToolInvocation` together when adding a tool shape.
+
+8. **Generic AcpUI titles can be intentionally empty**
+
+   For generic AcpUI tool starts, `extractToolInvocation` can return an empty title so `toolInvocationResolver` can reuse cached title or MCP handler title data.
+
+9. **Session-load history does not count as prompt activity**
+
+   Gemini replay traffic can look like live chunks. Quota polling is controlled by `onPromptStarted` and `onPromptCompleted`, not by observing `intercept` traffic.
+
+10. **Session filenames use the first UUID segment**
+
+   `getShortId(acpId)` uses `acpId.split('-')[0]`. `getSessionPaths` searches project `chats` directories for filenames containing that segment.
+
+11. **Runtime config changes are limited to mode and model**
+
+   `setConfigOption` sends `session/set_mode` for `mode`, sends `session/set_model` for `model`, and returns `null` for other option ids.
+
+12. **Provider extensions are provider-level broadcasts**
+
+   `handleProviderExtension` emits `provider_extension` globally. Gemini command, metadata, and status extensions can reach all connected clients.
+
+## Unit Tests
+
+### Provider Tests
+
+File: `providers/gemini/test/index.test.js`
+
+Key test names:
+
+- `sends initialize and authenticate in parallel`
+- `normalizes available commands into slash commands`
+- `emits persisted context for a loaded session on request`
+- `extracts context % and emits metadata extension on prompt result`
+- `swallows native usage_update events`
+- `fixes read_file by reading from disk directly`
+- `reconstructs list_directory output using cached args`
+- `maps ACP kind search to grep`
+- `normalizes optional AcpUI MCP tool titles without server prefixes`
+- `normalizes AcpUI MCP titles from nested Gemini function call args`
+- `resolves AcpUI MCP names from Gemini functionCall metadata when the call id is generic`
+- `extracts canonical AcpUI MCP invocation metadata`
+- `returns empty title for generic AcpUI tool to allow fallback`
+- `routes ux_invoke_shell to shell category`
+- `getSessionPaths resolves project-hashed dirs`
+- `prepareAcpEnvironment initializes quota fetching when enabled`
+- `handles token refresh on 401 response during startup`
+- `onPromptStarted is idempotent - double-calling does not double-count`
+- `intercept() does not start quota polling from session/load drain messages`
+- `onPromptCompleted stops polling when the last active prompt ends`
+
+### Backend Contract and Tool Tests
+
+Files and important tests:
+
+- `backend/test/providerContract.test.js` - `every provider explicitly exports every contract function`
+- `backend/test/providerToolNormalization.test.js` - `builds input from Gemini-style args and JSON description fields`; `resolves AcpUI tool names from nested candidates and human MCP titles`
+- `backend/test/toolIdPattern.test.js` - `matches provider-configured Gemini ids without numeric suffixes`
+- `backend/test/toolInvocationResolver.test.js` - `uses provider extraction as canonical tool identity`; `prefers centrally recorded MCP execution details over provider generic titles`; `can claim a recent MCP execution when the provider tool id arrives later`
+- `backend/test/acpUpdateHandler.test.js` - `prepares shell run metadata for ux_invoke_shell tool starts`; `preserves a shell description title after provider normalization on updates`; `updates shell title when provider exposes description after tool start`
+- `backend/test/mcpConfig.test.js` - MCP feature flag loading and optional Google search gating
+- `backend/test/mcpServer.test.js` - MCP server advertisement and handler behavior for core and optional AcpUI tools
+
+## How to Use This Guide
+
+### For implementing or extending Gemini behavior
+
+1. Start in `providers/gemini/index.js` and choose the exported provider contract function that owns the behavior.
+2. For tool rendering or AcpUI MCP routing, update `normalizeTool`, `extractToolInvocation`, and provider tests together.
+3. For optional IO/search tool behavior, also check `backend/services/tools/acpUxTools.js`, `backend/services/tools/acpUiToolTitles.js`, and `configuration/mcp.json.example`.
+4. For raw Gemini payload routing, trace `backend/services/acpClient.js` `handleAcpMessage` into provider `intercept` and then into `backend/services/acpUpdateHandler.js` `handleUpdate`.
+5. For context usage or quota status, trace `prepareAcpEnvironment`, `intercept`, `onPromptStarted`, `onPromptCompleted`, `_fetchAndEmitQuota`, and `parseExtension`.
+6. For session persistence, trace `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, and `parseSessionHistory`.
+7. Add focused provider tests in `providers/gemini/test/index.test.js` and backend tool pipeline tests when generic resolution behavior changes.
+
+### For debugging Gemini issues
+
+1. Daemon startup or auth failure: check `providers/gemini/user.json`, `prepareAcpEnvironment`, `performHandshake`, and `providers/gemini/ACP_PROTOCOL_SAMPLES.md` handshake sections.
+2. Missing slash commands: check `intercept`, `normalizeCommands`, `_gemini/commands/available`, and `parseExtension`.
+3. Wrong AcpUI MCP tool title: check `provider.json.toolIdPattern`, `normalizeTool`, `extractToolInvocation`, `providerToolNormalization`, and `toolInvocationResolver`.
+4. Missing shell/subagent/counsel UI: check `configuration/mcp.json`, `mcpServer.createToolHandlers`, `acpUxTools`, and Gemini settings allow/exclude patterns from `providers/gemini/README.md`.
+5. Stale context percentage: check final prompt result quota metadata, `_accumulatedTokensBySession`, `_saveTokenState`, and `emitCachedContext`.
+6. Missing provider status: check `fetchQuotaStatus`, `config.paths.home`, `oauth_creds.json`, `_requestLoadCodeAssist`, `_fetchAndEmitQuota`, and `_emitStatus`.
+7. Bad session replay: check `getSessionPaths`, `findSessionDir`, `parseSessionHistory`, and Gemini JSONL records for `$rewindTo`.
+
+## Summary
+
+- Gemini provider behavior is implemented in `providers/gemini/index.js` through explicit provider contract exports.
+- Provider identity, extension prefix, MCP server name, tool id pattern, and categories come from `providers/gemini/provider.json`.
+- Handshake uses concurrent `initialize` and `authenticate` requests and advertises only terminal capability.
+- API-key auth is carried in the ACP `authenticate` request; OAuth enables optional quota status.
+- Context usage comes from final prompt quota metadata and can be re-emitted through `emitCachedContext`.
+- Gemini AcpUI MCP tool identity is normalized through `normalizeTool`, `extractToolInvocation`, `providerToolNormalization`, and `toolInvocationResolver`.
+- Optional IO/search tools are controlled by `configuration/mcp.json` and still use Gemini's `mcp_AcpUI_*` tool id shape.
+- Gemini session files are project-scoped and history replay is owned by `parseSessionHistory`.

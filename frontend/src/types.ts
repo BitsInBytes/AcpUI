@@ -77,6 +77,15 @@ export interface StreamEventData {
   status?: string;
   output?: string;
   filePath?: string;
+  toolName?: string;
+  canonicalName?: string;
+  titleSource?: 'unknown' | 'cached' | 'provider' | 'tool_handler' | 'mcp_handler' | string;
+  mcpServer?: string;
+  mcpToolName?: string;
+  isAcpUxTool?: boolean;
+  toolCategory?: string;
+  isShellCommand?: boolean;
+  isFileOperation?: boolean;
   providerId?: string;
   command?: string;
   cwd?: string;
@@ -187,8 +196,10 @@ export interface SystemEvent {
   toolCategory?: string;
   toolName?: string;
   canonicalName?: string;
+  titleSource?: 'unknown' | 'cached' | 'provider' | 'tool_handler' | 'mcp_handler' | string;
   mcpServer?: string;
   mcpToolName?: string;
+  isAcpUxTool?: boolean;
   isShellCommand?: boolean;
   isFileOperation?: boolean;
   _fallbackOutput?: string;

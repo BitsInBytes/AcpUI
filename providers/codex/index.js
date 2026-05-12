@@ -2,8 +2,14 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { getProvider } from '../../backend/services/providerLoader.js';
-import { collectInputObjects, mergeInputObjects } from '../../backend/services/tools/toolInputUtils.js';
-import { matchToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
+import { acpUiToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
+import {
+  commandFromRawInput,
+  inputFromToolUpdate,
+  mcpInvocationFromRaw,
+  resolvePatternToolName,
+  stripToolTitlePrefix
+} from '../../backend/services/tools/providerToolNormalization.js';
 
 const MODEL_OPTION_IDS = new Set(['model']);
 const REASONING_OPTION_IDS = new Set(['reasoning_effort', 'effort']);
@@ -492,13 +498,8 @@ export function extractDiffFromToolCall(update, Diff) {
 function normalizeToolName(name) {
   if (!name || typeof name !== 'string') return '';
   const { config } = getProvider();
-  const patternMatch = matchToolIdPattern(name, config);
-  if (patternMatch?.toolName) return patternMatch.toolName.trim().toLowerCase();
-
-  const normalized = name
-    .replace(/^Tool:\s*/i, '')
-    .trim()
-    .toLowerCase();
+  const patternToolName = resolvePatternToolName(name, config);
+  const normalized = (patternToolName || stripToolTitlePrefix(name)).toLowerCase();
 
   if (normalized === 'shell_command') return 'shell';
   if (normalized === 'apply_patch') return 'edit_file';
@@ -508,8 +509,8 @@ function normalizeToolName(name) {
 function toolNameFromTitle(title) {
   if (!title || typeof title !== 'string') return '';
   const { config } = getProvider();
-  const patternMatch = matchToolIdPattern(title.replace(/^Tool:\s*/i, ''), config);
-  if (patternMatch?.toolName) return normalizeToolName(patternMatch.toolName);
+  const patternToolName = resolvePatternToolName(title, config);
+  if (patternToolName) return normalizeToolName(patternToolName);
 
   const lower = title.toLowerCase();
   if (lower.includes('web search')) return 'web_search';
@@ -519,32 +520,11 @@ function toolNameFromTitle(title) {
 }
 
 function commandFromRaw(rawValue) {
-  const raw = parseMaybeJson(rawValue);
-  if (!isObject(raw)) return '';
-  const rawArgs = raw.invocation?.arguments || raw.arguments || raw.args || {};
-  const parsedArgs = parseMaybeJson(rawArgs);
-  const value = raw.command
-    || raw.cmd
-    || raw.parsed_cmd
-    || raw.parsedCmd
-    || raw.argv
-    || (isObject(parsedArgs) ? parsedArgs.command : undefined);
-  if (Array.isArray(value)) return value.join(' ');
-  if (typeof value === 'string') return value;
-  return '';
+  return commandFromRawInput(rawValue);
 }
 
 function invocationFromRaw(rawValue) {
-  const raw = parseMaybeJson(rawValue);
-  if (!isObject(raw)) return {};
-  const invocation = raw.invocation || raw;
-  const rawArgs = invocation.arguments || invocation.args || raw.arguments || raw.args || {};
-  const parsedArgs = parseMaybeJson(rawArgs);
-  return {
-    server: invocation.server,
-    tool: invocation.tool || invocation.name,
-    arguments: isObject(parsedArgs) ? parsedArgs : {}
-  };
+  return mcpInvocationFromRaw(rawValue);
 }
 
 function inferToolName(update, event) {
@@ -566,12 +546,19 @@ function inferToolName(update, event) {
   return normalizeToolName(event.toolName || update.toolCallId || '');
 }
 
+function inputFromUpdate(update = {}) {
+  const invocation = invocationFromRaw(update.rawInput);
+  return inputFromToolUpdate(update, { extraInputs: [invocation.arguments || {}] });
+}
+
 function titleForTool(toolName, event, update) {
   const filePath = event.filePath || extractFilePath(update, p => p);
   const basename = filePath ? path.basename(filePath) : '';
   const rawTitle = update.title || event.title || '';
-  const invocation = invocationFromRaw(update.rawInput);
-  const args = invocation.arguments || {};
+  const args = inputFromUpdate(update);
+  const fileArg = args.file_path || args.filePath || args.path || '';
+  const fileBasename = fileArg ? path.basename(fileArg) : basename;
+  const normalizedAcpUiTitle = acpUiToolTitle(toolName, args, { filePath: fileArg || filePath });
 
   if (toolName === 'ux_invoke_shell') {
     const command = args.command || commandFromRaw(update.rawInput);
@@ -583,9 +570,10 @@ function titleForTool(toolName, event, update) {
     const command = commandFromRaw(update.rawInput);
     return command ? `Run command: ${command}` : 'Run command';
   }
-  if (toolName === 'read_file') return basename ? `Read file: ${basename}` : 'Read file';
+  if (toolName === 'read_file') return fileBasename ? `Read file: ${fileBasename}` : 'Read file';
   if (toolName === 'edit_file') return basename ? `Edit file: ${basename}` : 'Edit file';
-  if (toolName === 'write_file') return basename ? `Write file: ${basename}` : 'Write file';
+  if (toolName === 'write_file') return fileBasename ? `Write file: ${fileBasename}` : 'Write file';
+  if (normalizedAcpUiTitle) return normalizedAcpUiTitle;
   if (toolName === 'search') return args.pattern || args.query ? `Search: ${args.pattern || args.query}` : 'Search';
   if (toolName === 'web_search') return args.query ? `Web search: ${args.query}` : 'Web search';
   if (toolName === 'fetch') return args.url ? `Fetch: ${args.url}` : 'Fetch';
@@ -610,16 +598,7 @@ export function extractToolInvocation(update = {}, context = {}) {
   const event = context.event || {};
   const normalized = normalizeTool({ ...event }, update);
   const invocation = invocationFromRaw(update.rawInput);
-  const input = {
-    ...mergeInputObjects(collectInputObjects(
-      update.rawInput,
-      update.arguments,
-      update.params,
-      update.input,
-      update.toolCall?.arguments
-    )),
-    ...(invocation.arguments || {})
-  };
+  const input = inputFromUpdate(update);
   const canonicalName = normalized.toolName || '';
   const rawName = invocation.tool || update.toolName || update.name || event.toolName || update.title || event.title || '';
 

@@ -1,6 +1,8 @@
 # Canvas System
 
-The canvas is a right-side split-screen panel that displays code artifacts and terminal tabs. It provides a unified workspace for viewing, editing, and applying file changes alongside the chat interface. Artifacts are sourced from ACP tool outputs (file writes), manual file reads, or chat code blocks.
+The Canvas system is the right-side workspace for session-scoped file artifacts, Monaco editing, markdown preview, git-aware diff viewing, and terminal tab hosting. The feature spans React/Zustand state, Socket.IO file/git handlers, and SQLite `canvas_artifacts` persistence.
+
+This area is easy to break because canvas state is keyed by UI session id while chat streaming is keyed by ACP session id, and because file artifacts can enter the canvas from code blocks, tool timeline steps, stream callbacks, git status rows, and persisted database rows.
 
 ---
 
@@ -8,437 +10,541 @@ The canvas is a right-side split-screen panel that displays code artifacts and t
 
 ### What It Does
 
-- **Artifact Management** — Stores and displays multiple code/markdown/text files as tabs, each as a `CanvasArtifact` with id, title, content, language, and optional file path.
-- **Multi-view Rendering** — Renders artifacts in three modes: code editor (Monaco), markdown preview (ReactMarkdown), or git diff (side-by-side SafeDiffEditor).
-- **File Persistence** — Saves artifacts to SQLite per session; loads them on session switch or browser reload.
-- **Git Integration** — Displays changed files (added/modified/deleted/untracked) from `git status`, allows clicking to open file and view git diff.
-- **File-to-Disk** — Writes artifact content directly to the filesystem via `canvas_apply_to_file` with direct `fs.writeFileSync` call.
-- **Session Scoping** — Canvas open/closed state is remembered per session in `canvasOpenBySession` map; terminals and artifacts are session-specific.
-- **Terminal Hosting** — Shares the tab bar with terminal tabs (handled separately; see [Feature Doc] - Terminal in Canvas.md).
-- **Auto-Plan Opening** — Automatically opens canvas when `plan.md` is created while waiting for a permission request.
+- Stores session-scoped `CanvasArtifact` entries in `useCanvasStore` and persists them with the `canvas_save` socket event.
+- Loads saved artifacts for the active UI session with `canvas_load` and `getCanvasArtifactsForSession`.
+- Reads current file contents through `canvas_read_file`, writes editor content through `canvas_apply_to_file`, and opens files in VS Code through `open_in_editor`.
+- Renders artifact content in Monaco code view, ReactMarkdown preview, or a Monaco `SafeDiffEditor` diff view.
+- Opens files from assistant code blocks, tool timeline file paths, completed tool events, and git status rows.
+- Shows workspace git status, detects whether the active artifact has changes, and loads HEAD content with `git_show_head` for side-by-side diffs.
+- Hosts session-scoped terminal tabs in the same pane and keeps the pane open while terminals exist.
 
 ### Why This Matters
 
-- **Seamless Workflow** — Developers can write code in the chat, see it update in real-time in the canvas, and apply changes without leaving the UI.
-- **Deduplication Logic** — Artifacts are merged by file path OR id to avoid duplicate tabs, but understanding the order of checks prevents unexpected behavior.
-- **Error Boundary** — Monaco crashes on rapid session switches; error boundary per session ensures the crash doesn't kill the whole app.
-- **Git-aware Editing** — Canvas integrates with the git workflow: view working tree changes, see diffs, apply to file, and track which files are watched.
-- **Persistence Across Sessions** — Artifacts are persisted to the database so they survive browser reload.
+- `CanvasArtifact.sessionId` uses the UI session id, not the ACP transport id.
+- Artifact deduplication decides whether file updates replace an existing tab or create duplicates.
+- File reads and writes touch the local filesystem directly through backend socket handlers.
+- Git diff rendering depends on correct workspace `cwd`, path joining, and HEAD lookup callbacks.
+- Monaco rendering is isolated by an `ErrorBoundary`, so reset behavior is intentional and session-scoped.
+
+### Architectural Role
+
+- Frontend: React + Zustand (`useCanvasStore`, `CanvasPane`, `App`, `PopOutApp`, `ToolStep`).
+- Backend: Socket handlers (`canvasHandlers`, `gitHandlers`, `sessionHandlers`).
+- Persistence: SQLite table `canvas_artifacts` managed by `backend/database.js`.
+- Adjacent system: Terminal tabs are stored in `useCanvasStore`, while PTY lifecycle is handled by the Terminal-in-Canvas system.
 
 ---
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### Flow A: File Written by ACP Tool
+1. Assistant code blocks can create snippet artifacts.
+   - File: `frontend/src/components/ChatMessage.tsx` (Component: `CodeBlock`, Handler: `handleOpenCanvas`)
+   - File: `frontend/src/store/useCanvasStore.ts` (Store action: `handleOpenInCanvas`)
+   - `CodeBlock` renders an `Open in Canvas` action only when `useCanvasStore.isCanvasOpen` is true. The handler creates a snippet artifact with `id`, `sessionId`, `title`, `content`, `language`, and `version`, then delegates to `handleOpenInCanvas`.
 
-1. **Tool Output Processing** — ACP daemon sends a `tool_call` or `tool_call_update` with a filePath field. This goes through acpUpdateHandler → useStreamStore.onStreamEvent (Function: `handleUpdate`, Lines: 16-283).
+```tsx
+// FILE: frontend/src/components/ChatMessage.tsx (Component: CodeBlock, Handler: handleOpenCanvas)
+handleOpenInCanvas(socket, activeSessionId, {
+  id: `canvas-${Date.now()}`,
+  sessionId: activeSessionId || '',
+  title: `${language} snippet`,
+  content: value,
+  language,
+  version: 1
+});
+```
 
-2. **processBuffer Detects Completion** — The frontend's useStreamStore.processBuffer loop (Function: `processBuffer`, Lines: 214-416) processes the tool step and checks if status === 'completed' && filePath exists.
+2. Tool timeline steps can open the current file state.
+   - File: `frontend/src/components/AssistantMessage.tsx` (Component: `AssistantMessage`, Prop: `ToolStep.onOpenInCanvas`)
+   - File: `frontend/src/components/ToolStep.tsx` (Function: `getFilePathFromEvent`, Component: `ToolStep`)
+   - File: `frontend/src/store/useCanvasStore.ts` (Store action: `handleOpenFileInCanvas`)
+   - `ToolStep` extracts file paths from `event.filePath`, provider file tool categories, supported tool-title patterns, or diff output headers. It suppresses canvas hoist for shell tools, sub-agent tools, non-file AcpUI UX tools, directory listings, glob tools, and truncated paths containing `...`.
 
-3. **onFileEdited Callback** — processBuffer calls `onFileEdited(filePath)` (Line: 312), which is wired from useChatManager → App.tsx (Lines: 84-88).
+```tsx
+// FILE: frontend/src/components/ToolStep.tsx (Function: getFilePathFromEvent)
+if (event.toolCategory === 'file_read') return event.filePath;
+if (event.toolCategory === 'file_write') return event.filePath;
+if (event.toolCategory === 'file_edit') return event.filePath;
+if (event.filePath) return event.filePath;
+```
 
-4. **handleFileEdited Triggered** — The callback invokes `handleFileEdited(socket, editedFilePath)` in useCanvasStore (Function: `handleFileEdited`, Lines: 111-140).
+3. Stream processing refreshes watched files and opens plans.
+   - File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`)
+   - File: `frontend/src/store/useStreamStore.ts` (Store action: `processBuffer`)
+   - File: `frontend/src/App.tsx` (Hook call: `useChatManager(...)`)
+   - File: `frontend/src/PopOutApp.tsx` (Hook call: `useChatManager(...)`)
+   - `App` and `PopOutApp` pass `handleFileEdited` and `handleOpenFileInCanvas` into `useChatManager`. `processBuffer` calls those callbacks when a `tool_end` or `tool_update` event has `status: 'completed'` and a `filePath`; paths ending in `plan.md` also open as artifacts.
 
-5. **File Already in Artifacts** — handleFileEdited checks if the edited file matches any watched artifact's filePath (normalized path comparison, Line 119).
+```ts
+// FILE: frontend/src/store/useStreamStore.ts (Store action: processBuffer)
+if (status === 'completed' && filePath) {
+  onFileEdited?.(filePath);
+  if (filePath.toLowerCase().endsWith('plan.md')) {
+    onOpenFileInCanvas?.(filePath);
+  }
+}
+```
 
-6. **Re-read File from Backend** — socket.emit('canvas_read_file', {filePath}) → backend canvasHandlers (Function: `registerCanvasHandlers`, Lines: 7-78) resolves the path, reads file content, infers language from extension.
+4. `handleOpenFileInCanvas` reads file content before creating an artifact.
+   - File: `frontend/src/store/useCanvasStore.ts` (Store action: `handleOpenFileInCanvas`)
+   - File: `backend/sockets/canvasHandlers.js` (Socket event: `canvas_read_file`)
+   - The frontend emits `canvas_read_file` with `{ filePath }`. The backend resolves the path, uses `fs.realpathSync` when the file exists, reads UTF-8 content, derives `language` from the extension, and returns an artifact without `sessionId`. The store then passes the artifact through `handleOpenInCanvas`, which stamps the active UI session id.
 
-7. **Artifact Updated** — The read artifact is merged into canvasArtifacts at the same artifact.id with updated content and `lastUpdated: Date.now()` (Lines: 125-138).
+```js
+// FILE: backend/sockets/canvasHandlers.js (Socket event: canvas_read_file)
+const resolvedPath = path.resolve(filePath);
+const finalPath = fs.existsSync(resolvedPath) ? fs.realpathSync(resolvedPath) : resolvedPath;
+const language = path.extname(finalPath).slice(1) || 'text';
+callback({ artifact: { id: `canvas-fs-${Date.now()}`, title, content, language, filePath: finalPath, version: 1 } });
+```
 
-8. **Glow Animation** — The 3-second glow on the tab is driven by `lastUpdated` being recent (Line: 242).
+5. `handleOpenInCanvas` deduplicates and persists artifacts.
+   - File: `frontend/src/store/useCanvasStore.ts` (Store action: `handleOpenInCanvas`)
+   - File: `backend/sockets/canvasHandlers.js` (Socket event: `canvas_save`)
+   - File: `backend/database.js` (Function: `saveCanvasArtifact`)
+   - The store copies the artifact, sets `sessionId` from the active UI session id when available, finds an existing artifact by exact `filePath` match or by `id`, and either updates the existing entry or appends a new one. It emits `canvas_save` only when both `socket` and `sessionId` are available.
 
-### Flow B: plan.md Auto-Open
+```ts
+// FILE: frontend/src/store/useCanvasStore.ts (Store action: handleOpenInCanvas)
+const existing = state.canvasArtifacts.find(a =>
+  (a.filePath && newArtifact.filePath && a.filePath === newArtifact.filePath) ||
+  (a.id === newArtifact.id)
+);
+```
 
-1. **plan.md Completion** — ACP tool writes plan.md → processBuffer detects status='completed' && filePath ends with 'plan.md'.
+6. SQLite stores artifacts by UI session id.
+   - File: `backend/database.js` (Table: `canvas_artifacts`, Functions: `saveCanvasArtifact`, `getCanvasArtifactsForSession`, `deleteCanvasArtifact`)
+   - `canvas_artifacts.session_id` references `sessions.ui_id`. `saveCanvasArtifact` upserts by artifact `id`, writes `file_path`, and refreshes `created_at` during updates. `getCanvasArtifactsForSession` returns artifacts ordered by `created_at DESC`.
 
-2. **onOpenFileInCanvas Callback** — processBuffer also calls `onOpenFileInCanvas(filePath)` (Line: frontend/src/store/useStreamStore.ts:303).
+```sql
+-- FILE: backend/database.js (Table: canvas_artifacts)
+CREATE TABLE IF NOT EXISTS canvas_artifacts (
+  id TEXT PRIMARY KEY,
+  session_id TEXT,
+  title TEXT,
+  content TEXT,
+  language TEXT,
+  version INTEGER DEFAULT 1,
+  file_path TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(session_id) REFERENCES sessions(ui_id) ON DELETE CASCADE
+)
+```
 
-3. **handleOpenFileInCanvas Invoked** — App.tsx wires this callback (Line: frontend/src/App.tsx:87); it emits 'canvas_read_file' to the backend.
+7. Active-session changes restore canvas state.
+   - File: `frontend/src/App.tsx` (Effect: active session switch)
+   - File: `frontend/src/store/useCanvasStore.ts` (State keys: `canvasOpenBySession`, `terminals`, `activeTerminalId`)
+   - `App` emits `unwatch_session` and `watch_session` for ACP sessions, saves the departing UI session's `isCanvasOpen` value in `canvasOpenBySession`, clears active artifacts, restores open state from `canvasOpenBySession`, and keeps the pane open when the new UI session has terminals.
+   - `App` also emits `canvas_load` for the active UI session and selects the first returned artifact when persisted artifacts exist.
 
-4. **Canvas Opens** — If `isAwaitingPermission` is true (permission request pending), App.tsx auto-sets `setIsCanvasOpen(true)` (Lines: frontend/src/App.tsx:145-156).
+8. Watched-file refresh updates open artifacts after writes.
+   - File: `frontend/src/store/useCanvasStore.ts` (Store action: `handleFileEdited`)
+   - File: `backend/sockets/canvasHandlers.js` (Socket event: `canvas_read_file`)
+   - `handleFileEdited` normalizes separators and lowercases paths, then matches the first watched artifact whose normalized path suffix overlaps the edited path. It rereads that file and updates the existing artifact id plus `lastUpdated` for tab glow.
 
-### Flow C: Code Block "Open in Canvas"
+```ts
+// FILE: frontend/src/store/useCanvasStore.ts (Store action: handleFileEdited)
+const watched = state.canvasArtifacts.find(a =>
+  a.filePath && (
+    normalize(a.filePath).endsWith(editedNormalized) ||
+    editedNormalized.endsWith(normalize(a.filePath))
+  )
+);
+```
 
-1. **Code Block Component** — User clicks "Open in Canvas" button in a code block message (ChatMessage.tsx Lines: ~44-70).
+9. CanvasPane renders code, markdown preview, or diff.
+   - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Component: `CanvasPane`, Function: `getMonacoLanguage`, Component: `SafeDiffEditor`)
+   - Markdown artifacts default to preview mode. Non-markdown artifacts default to Monaco code mode. The component keeps the current `viewMode` when the same artifact id receives updated content, and resets view mode only when the active artifact id changes outside a git-open flow.
+   - Diff mode renders `SafeDiffEditor` only when `gitOriginal !== null`, which prevents Monaco diff models from mounting before HEAD content returns.
 
-2. **handleOpenInCanvas Called** — Directly calls useCanvasStore.handleOpenInCanvas(socket, activeSessionId, {artifact object}) (frontend/src/components/ChatMessage.tsx:56-67).
+10. Editor apply writes content to disk.
+    - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Handler: `handleApplyToFile`)
+    - File: `backend/sockets/canvasHandlers.js` (Socket event: `canvas_apply_to_file`)
+    - `handleApplyToFile` emits `{ filePath, content }`. The backend validates that `filePath` is truthy, writes UTF-8 content with `fs.writeFileSync`, and reports success or an error through the callback. The frontend shows `Applied!` for successful writes and alerts on errors.
 
-3. **Deduplication Check** — handleOpenInCanvas checks if artifact already exists by filePath OR id (Lines: frontend/src/store/useCanvasStore.ts:75-78).
+11. Git status drives file list and diff affordances.
+    - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Handlers: `refreshGitStatus`, `handleOpenGitFile`)
+    - File: `frontend/src/utils/canvasHelpers.ts` (Functions: `isFileChanged`, `buildFullPath`)
+    - File: `backend/sockets/gitHandlers.js` (Socket events: `git_status`, `git_show_head`, `git_diff`, `git_stage`, `git_unstage`)
+    - `CanvasPane` resolves `cwd` from the active session `cwd` or the first configured workspace path. It emits `git_status`, renders changed files, and uses `buildFullPath` before opening a git row. Opening a git row reads current disk content with `canvas_read_file`, stores it in the canvas, switches to diff mode, and fills the original side with `git_show_head`.
+    - The toolbar Diff button appears when the active artifact has `filePath` and `isFileChanged` matches it against the git status list. This button also uses `git_show_head`. Backend `git_diff`, `git_stage`, and `git_unstage` are implemented socket events, but `CanvasPane` does not render stage controls and uses `git_show_head` for the Monaco side-by-side diff.
 
-4. **New Artifact or Update** — If new, adds to canvasArtifacts and emits canvas_save; if exists, updates in-place and re-emits canvas_save (Lines: frontend/src/store/useCanvasStore.ts:80-99).
+12. Terminal tabs share the canvas pane.
+    - File: `frontend/src/store/useCanvasStore.ts` (Store actions: `openTerminal`, `closeTerminal`, `setActiveTerminalId`)
+    - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Component: `Terminal`, Socket event: `terminal_kill`)
+    - `CanvasPane` filters terminal tabs by active UI session id. Closing a terminal emits `terminal_kill`, calls `clearSpawnedTerminal`, and updates `useCanvasStore`. Closing the final artifact keeps `isCanvasOpen` true when terminals remain.
 
-5. **DB Persistence** — Backend canvasHandlers.canvas_save persists the artifact to SQLite via `db.saveCanvasArtifact(artifact)` (Lines: backend/sockets/canvasHandlers.js:7-16).
-
-### Flow D: Session Switch
-
-1. **Active Session Changes** — useSessionLifecycleStore.activeSessionId changes (App.tsx Line: 103).
-
-2. **Canvas State Saved** — Previous session's canvas open state is saved to `canvasOpenBySession[prevId]` (Lines: frontend/src/App.tsx:110-114).
-
-3. **Artifacts Cleared** — canvasArtifacts and activeCanvasArtifact are reset to empty (Lines: frontend/src/App.tsx:120).
-
-4. **canvas_load Emitted** — socket.emit('canvas_load', {sessionId: activeSessionId}) → backend getCanvasArtifactsForSession (Lines: backend/database.js:341-355).
-
-5. **Artifacts Restored** — Backend returns all artifacts for the session, frontend populates canvasArtifacts (Lines: frontend/src/App.tsx:135-139).
-
-6. **Canvas State Restored** — isCanvasOpen and activeCanvasArtifact are restored from canvasOpenBySession or set to false if no artifacts (Lines: frontend/src/App.tsx:118-121).
-
-### Flow E: Git File Selection
-
-1. **Git Panel Visible** — CanvasPane fetches git_status on mount (Lines: frontend/src/components/CanvasPane/CanvasPane.tsx:143-149) and when artifacts update.
-
-2. **User Clicks Git File** — handleOpenGitFile invoked with the changed file path (Line: 157).
-
-3. **File Read & Diff Fetch** — Emits canvas_read_file to get modified content; emits git_show_head to get HEAD version (Lines: 158-175).
-
-4. **Diff View Activated** — Sets viewMode='diff', gitOriginal populated, SafeDiffEditor mounts showing side-by-side comparison (Lines: 339-346).
+13. Open in VS Code delegates to the backend.
+    - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Button: `Open in VS Code`)
+    - File: `backend/sockets/sessionHandlers.js` (Socket event: `open_in_editor`)
+    - The frontend emits `open_in_editor` with the artifact `filePath`; the backend runs `code "<filePath>"` and logs failures through `writeLog`.
 
 ---
 
 ## Architecture Diagram
 
 ```mermaid
-graph TB
-  subgraph "Chat Interface"
-    ChatInput["ChatInput<br/>(Terminal button)"]
-    AssistantMsg["AssistantMessage<br/>(Code blocks)"]
-  end
+flowchart TB
+  CodeBlock[ChatMessage CodeBlock] -->|handleOpenInCanvas| Store[useCanvasStore]
+  Assistant[AssistantMessage] --> ToolStep[ToolStep getFilePathFromEvent]
+  ToolStep -->|handleOpenFileInCanvas| Store
+  Stream[useStreamStore processBuffer] -->|onFileEdited / onOpenFileInCanvas| Store
+  App[App session effect] -->|canvas_load| CanvasSocket[canvasHandlers]
 
-  subgraph "Frontend Stores & Components"
-    CanvasStore["useCanvasStore<br/>(artifact state, terminals)"]
-    StreamStore["useStreamStore<br/>(processBuffer + callbacks)"]
-    CanvasPane["CanvasPane.tsx<br/>(Monaco, Markdown, SafeDiffEditor)"]
-    Terminal["Terminal.tsx<br/>(xterm + PTY)"]
-  end
+  Store -->|canvas_save| CanvasSocket
+  Store -->|canvas_delete| CanvasSocket
+  Store -->|canvas_read_file| CanvasSocket
+  CanvasSocket --> DB[(SQLite canvas_artifacts)]
+  CanvasSocket --> FS[(Filesystem)]
 
-  subgraph "Backend Socket Handlers"
-    CanvasHandlers["canvasHandlers.js<br/>(canvas_save, canvas_load, etc)"]
-    TerminalHandlers["terminalHandlers.js<br/>(terminal_spawn, etc)"]
-  end
-
-  subgraph "Backend Services"
-    Database["database.js<br/>(canvas_artifacts table)"]
-    FileSystem["fs module<br/>(writeFileSync, readFileSync)"]
-  end
-
-  subgraph "Stream Pipeline"
-    OnFileEdited["onFileEdited(path)"]
-    OnOpenFileInCanvas["onOpenFileInCanvas(path)"]
-  end
-
-  ChatInput -->|openTerminal| CanvasStore
-  AssistantMsg -->|handleOpenInCanvas| CanvasStore
-  StreamStore -->|onFileEdited<br/>onOpenFileInCanvas| OnFileEdited
-  OnFileEdited -->|handleFileEdited| CanvasStore
-  OnOpenFileInCanvas -->|handleOpenFileInCanvas| CanvasStore
-  CanvasStore -->|canvas_save<br/>canvas_load<br/>canvas_delete| CanvasHandlers
-  CanvasHandlers -->|saveCanvasArtifact<br/>getCanvasArtifactsForSession| Database
-  CanvasPane -->|canvas_read_file<br/>canvas_apply_to_file<br/>git_status| CanvasHandlers
-  CanvasHandlers -->|readFileSync<br/>writeFileSync| FileSystem
-  CanvasPane -->|render artifacts| CanvasStore
-  CanvasPane -->|Terminal tabs| Terminal
-  Terminal -->|terminal_spawn<br/>terminal_input<br/>terminal_resize| TerminalHandlers
-  TerminalHandlers -->|node-pty| FileSystem
-
-  style ChatInput fill:#e1f5ff
-  style CanvasPane fill:#f3e5f5
-  style Database fill:#e8f5e9
+  Pane[CanvasPane] -->|canvas_apply_to_file| CanvasSocket
+  Pane -->|git_status / git_show_head| GitSocket[gitHandlers]
+  GitSocket --> Git[(git CLI)]
+  Pane -->|open_in_editor| SessionSocket[sessionHandlers]
+  Pane --> Terminal[Terminal tabs]
 ```
 
 ---
 
-## The Critical Contract: CanvasArtifact
+## The Critical Contract: `CanvasArtifact` + UI Session Persistence
 
-Every canvas artifact must conform to this shape:
+File: `frontend/src/types.ts` (Interface: `CanvasArtifact`)
 
-```typescript
-interface CanvasArtifact {
-  id: string;                    // Unique identifier, often `canvas-${Date.now()}` or `canvas-fs-${Date.now()}`
-  sessionId: string;             // UI session ID (foreign key to sessions table)
-  title: string;                 // Display name in tab (e.g., "test.js" or "JavaScript snippet")
-  content: string;               // Full file/code content
-  language: string;              // Language for syntax highlighting (js, ts, python, markdown, etc.)
-  version: number;               // Version number (always 1 for now, reserved for future versioning)
-  filePath?: string;             // Optional: absolute or relative path on disk (e.g., "/home/user/src/main.js")
-  createdAt?: string;            // Optional: ISO timestamp (set by DB)
-  lastUpdated?: number;          // Optional: JavaScript timestamp (milliseconds), used to drive 3-second glow animation
+```ts
+// FILE: frontend/src/types.ts (Interface: CanvasArtifact)
+export interface CanvasArtifact {
+  id: string;
+  sessionId: string;
+  title: string;
+  content: string;
+  language: string;
+  version: number;
+  filePath?: string;
+  createdAt?: string;
+  lastUpdated?: number;
 }
 ```
 
-### Deduplication Logic
+Rules that must hold:
 
-When adding or updating an artifact:
+1. `sessionId` is the UI session id stored in `ChatSession.id` and `sessions.ui_id`; it is not the ACP session id.
+2. Artifacts returned from `canvas_read_file` do not include `sessionId`; `handleOpenInCanvas` must stamp the active UI session id before `canvas_save`.
+3. `handleOpenInCanvas` deduplicates by exact `filePath` match before `id` match, and updates keep the existing artifact id.
+4. `handleFileEdited` updates only already-watched artifacts and preserves the watched artifact id.
+5. `canvas_load` and `getCanvasArtifactsForSession` query by UI session id.
+6. Canvas close logic must keep the pane open when terminal tabs exist for the active UI session.
 
-1. **Check by filePath** — If filePath is provided and matches an existing artifact's filePath (case-insensitive, normalized), **update that artifact** (reuse its id).
-2. **Check by id** — If filePath is not provided, check if an artifact with the same id exists. If yes, **update it**.
-3. **Add New** — If neither filePath nor id match any existing artifact, **add a new entry** to canvasArtifacts.
-
-**Note:** Because deduplication is by filePath OR id (not AND), it's possible to have multiple artifacts pointing to the same file if their ids differ. This is intentional and allows comparing versions.
-
----
-
-## Data Flow: Raw → Normalized → Rendered
-
-### Stage 1: Raw ACP Output
-
-```typescript
-// From ACP daemon: tool_call with status='completed'
-{
-  type: 'tool_call',
-  id: 'tc-123',
-  name: 'write_file',
-  status: 'completed',
-  filePath: '/home/user/project/src/app.js',
-  // output omitted
-}
-```
-
-### Stage 2: Normalized by Backend
-
-```javascript
-// FILE: backend/sockets/canvasHandlers.js (Lines 52-78)
-socket.on('canvas_read_file', async ({ filePath }, callback) => {
-  const resolvedPath = path.resolve(filePath);
-  const finalPath = fs.existsSync(resolvedPath) ? fs.realpathSync(resolvedPath) : resolvedPath;
-  const content = fs.readFileSync(finalPath, 'utf8');
-  const language = path.extname(finalPath).slice(1) || 'text';  // Extract from extension
-  const title = path.basename(finalPath);
-  callback({
-    artifact: {
-      id: `canvas-fs-${Date.now()}`,
-      title,
-      content,
-      language,
-      filePath: finalPath,
-      version: 1
-    }
-  });
-});
-```
-
-### Stage 3: Stored in Frontend Store
-
-```typescript
-// FILE: frontend/src/store/useCanvasStore.ts (Lines 67-100)
-const artifact = {
-  id: 'canvas-fs-1234567890',
-  sessionId: 'sess-abc123',
-  title: 'app.js',
-  content: '// JavaScript code...',
-  language: 'javascript',
-  version: 1,
-  filePath: '/home/user/project/src/app.js',
-  lastUpdated: 1640000000000
-};
-
-// Stored in canvasArtifacts array and activeCanvasArtifact
-```
-
-### Stage 4: Rendered in CanvasPane
-
-```typescript
-// FILE: frontend/src/components/CanvasPane/CanvasPane.tsx (Lines 347-368)
-// Based on language and viewMode, choose renderer
-<Editor
-  height="100%"
-  language={getMonacoLanguage(activeArtifact.language, activeArtifact.filePath)}
-  theme="vs-dark"
-  value={content}
-  onChange={(value) => setContent(value || '')}
-/>
-```
+If this contract breaks, users see duplicated tabs, missing persisted artifacts, artifacts attached to the wrong session, stale file content, or canvas panes that close while terminals are active.
 
 ---
 
 ## Configuration / Provider-Specific Behavior
 
-The canvas system is provider-agnostic. All artifacts are stored uniformly regardless of which provider created them. Providers do not need special configuration to support canvas artifacts.
+Canvas is provider-agnostic at the UI, socket, and database layers.
 
-**However**, if a provider wants to optimize tool output handling:
+Required upstream behavior:
 
-- Ensure tool outputs include a `filePath` field if the tool writes a file (ACP standard).
-- The backend will automatically infer language from the file extension.
-- If a provider emits a custom `filePath` shape or encoding, it should be normalized in the provider's `index.js` before reaching the backend handlers.
+- Tool completion events that modify files should include `filePath` so `useStreamStore.processBuffer` can refresh watched artifacts.
+- Tool timeline events should include `toolCategory`, `filePath`, `isAcpUxTool`, `isFileOperation`, `isShellCommand`, `canonicalName`, or `toolName` when those fields are needed for `ToolStep.getFilePathFromEvent` to decide whether the canvas hoist button is appropriate.
+- Plan auto-open behavior requires a completed tool event whose `filePath` ends with `plan.md` after lowercase normalization.
+
+Runtime and host dependencies:
+
+- Git integration requires `git` to be available to the backend process and `cwd` to point at a git worktree.
+- `CanvasPane` resolves git `cwd` from `ChatSession.cwd` or `useSystemStore.workspaceCwds[0].path`.
+- `open_in_editor` requires the `code` command to be available on the backend host PATH.
+- `canvas_apply_to_file` writes directly to the provided path; it does not use the File Explorer `safePath` validation route.
+
+---
+
+## Data Flow / Rendering Pipeline
+
+### Stream File Write to Watched Artifact Refresh
+
+```text
+backend emits system_event tool_end/tool_update with status completed and filePath
+  -> useChatManager routes system_event to useStreamStore.onStreamEvent
+  -> useStreamStore.processBuffer merges filePath into the tool step
+  -> processBuffer calls onFileEdited(filePath)
+  -> useCanvasStore.handleFileEdited finds a watched artifact by fuzzy path suffix
+  -> canvas_read_file returns current disk content
+  -> useCanvasStore replaces the watched artifact content and sets lastUpdated
+  -> CanvasPane tab glows and active editor content refreshes
+```
+
+### Tool Timeline Hoist to Artifact Persistence
+
+```text
+ToolStep.getFilePathFromEvent extracts a file path
+  -> AssistantMessage passes onOpenInCanvas to handleOpenFileInCanvas
+  -> useCanvasStore emits canvas_read_file
+  -> canvasHandlers reads UTF-8 file content and returns CanvasArtifact data
+  -> handleOpenInCanvas stamps active UI session id
+  -> handleOpenInCanvas emits canvas_save
+  -> database.saveCanvasArtifact upserts canvas_artifacts row
+  -> CanvasPane selects the artifact tab
+```
+
+### Git Row to Diff View
+
+```text
+CanvasPane.refreshGitStatus emits git_status with cwd
+  -> gitHandlers returns branch and changed file list
+  -> user selects a git row
+  -> CanvasPane.handleOpenGitFile builds cwd-relative full path
+  -> canvas_read_file loads current disk content
+  -> handleOpenInCanvas stores current content as an artifact
+  -> CanvasPane emits git_show_head for original content
+  -> SafeDiffEditor renders original HEAD content against current editor content
+```
+
+### Socket and Database Shapes
+
+```ts
+// FILE: frontend/src/types.ts (Interface: CanvasReadFileResponse)
+export interface CanvasReadFileResponse {
+  artifact?: CanvasArtifact;
+  error?: string;
+}
+```
+
+```js
+// FILE: backend/database.js (Function: getCanvasArtifactsForSession)
+SELECT id, session_id as sessionId, title, content, language, version,
+       file_path as filePath, created_at as createdAt
+FROM canvas_artifacts
+WHERE session_id = ?
+ORDER BY created_at DESC
+```
 
 ---
 
 ## Component Reference
 
-### Backend Files
+### Frontend
 
-| File | Key Functions | Lines | Purpose |
-|------|---|---|---|
-| `backend/sockets/canvasHandlers.js` | registerCanvasHandlers | 6-79 | Socket event handlers for canvas operations |
-| ↳ | canvas_save | 7-16 | Persist artifact to DB |
-| ↳ | canvas_load | 18-27 | Load artifacts for a session |
-| ↳ | canvas_delete | 29-38 | Delete artifact by id |
-| ↳ | canvas_read_file | 52-78 | Read file from disk and return as artifact |
-| ↳ | canvas_apply_to_file | 40-50 | Write artifact content to disk |
-| `backend/database.js` | saveCanvasArtifact | 320-340 | INSERT OR REPLACE into canvas_artifacts table |
-| ↳ | getCanvasArtifactsForSession | 341-355 | SELECT all artifacts for a session, ordered by created_at DESC |
-| ↳ | deleteCanvasArtifact | 357-368 | DELETE artifact by id |
-| ↳ | initDb | ~74-92 | CREATE TABLE canvas_artifacts schema |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Store | `frontend/src/store/useCanvasStore.ts` | `useCanvasStore`, `openTerminal`, `closeTerminal`, `setActiveTerminalId`, `resetCanvas`, `handleOpenInCanvas`, `handleOpenFileInCanvas`, `handleFileEdited`, `handleCloseArtifact` | Core canvas, artifact, and terminal-tab state |
+| Pane | `frontend/src/components/CanvasPane/CanvasPane.tsx` | `CanvasPane`, `getMonacoLanguage`, `SafeDiffEditor`, `refreshGitStatus`, `handleOpenGitFile`, `handleApplyToFile` | Main canvas UI, Monaco editor, markdown preview, diff mode, git list, terminal tabs |
+| App Shell | `frontend/src/App.tsx` | `App`, `useChatManager(...)`, active session switch effect, `canvas_load`, plan auto-open effect, `ErrorBoundary`, `computeResizeWidth` | Main-window canvas lifecycle, persisted artifact load, resize, crash isolation |
+| Pop-out Shell | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `useChatManager(...)`, `CanvasPane`, `ErrorBoundary`, `computeResizeWidthNoSidebar` | Pop-out canvas rendering and stream-file callbacks |
+| Stream | `frontend/src/store/useStreamStore.ts` | `processBuffer`, `onStreamEvent` | Merges tool file paths, triggers file refresh, opens `plan.md` artifacts |
+| Socket Hook | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, socket event `system_event`, typewriter loop effect | Connects stream processing to canvas callbacks supplied by app shells |
+| Code Blocks | `frontend/src/components/ChatMessage.tsx` | `CodeBlock`, `handleOpenCanvas`, `markdownComponents.code` | Creates snippet artifacts from rendered markdown code blocks |
+| Tool Timeline | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `ToolStep.onOpenInCanvas` | Bridges tool-step hoist buttons to `handleOpenFileInCanvas` |
+| Tool Timeline | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `canvas-hoist-btn` | Extracts file paths from tool events and renders file-state hoist button |
+| Helpers | `frontend/src/utils/canvasHelpers.ts` | `isFileChanged`, `buildFullPath` | Git changed-file matching and cwd/path joining |
+| Types | `frontend/src/types.ts` | `CanvasArtifact`, `CanvasLoadResponse`, `CanvasReadFileResponse`, `CanvasActionResponse`, `StreamEventData.filePath`, `SystemEvent.filePath` | Cross-layer canvas and stream contracts |
 
-### Frontend Stores
+### Backend
 
-| File | Key Functions | Lines | Purpose |
-|------|---|---|---|
-| `frontend/src/store/useCanvasStore.ts` | useCanvasStore | 31-169 | Zustand store for canvas state |
-| ↳ | setIsCanvasOpen | 39 | Toggle canvas visibility |
-| ↳ | setCanvasArtifacts | 40 | Replace all artifacts |
-| ↳ | setActiveCanvasArtifact | 41 | Select active artifact |
-| ↳ | handleOpenInCanvas | 67-100 | Add/update artifact with deduplication |
-| ↳ | handleOpenFileInCanvas | 102-111 | Read file from backend and add to canvas |
-| ↳ | handleFileEdited | 113-142 | Re-read edited file and update artifact |
-| ↳ | handleCloseArtifact | 144-168 | Remove artifact and update canvas visibility |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Canvas Socket | `backend/sockets/canvasHandlers.js` | `registerCanvasHandlers`, socket events `canvas_save`, `canvas_load`, `canvas_delete`, `canvas_apply_to_file`, `canvas_read_file` | Artifact persistence callbacks and filesystem read/write |
+| Git Socket | `backend/sockets/gitHandlers.js` | `registerGitHandlers`, helper `git`, socket events `git_status`, `git_diff`, `git_stage`, `git_unstage`, `git_show_head` | Git status, diff, staging, unstaging, and HEAD content lookup |
+| Session Socket | `backend/sockets/sessionHandlers.js` | `registerSessionHandlers`, socket event `open_in_editor` | Opens current artifact path in VS Code through the backend host |
+| Database | `backend/database.js` | Table `canvas_artifacts`, functions `saveCanvasArtifact`, `getCanvasArtifactsForSession`, `deleteCanvasArtifact` | SQLite storage keyed by UI session id |
 
-### Frontend Components
+### Tests
 
-| File | Key Components/Hooks | Lines | Purpose |
-|------|---|---|---|
-| `frontend/src/components/CanvasPane/CanvasPane.tsx` | CanvasPane | 99-382 | Main canvas panel with editor, diff, preview, and git panel |
-| ↳ | SafeDiffEditor | 53-97 | Monaco diff editor (side-by-side) |
-| ↳ | getMonacoLanguage | 24-51 | Map language string to Monaco language id |
-| `frontend/src/App.tsx` | App | ~195-251 | Hosts CanvasPane in split-screen layout, handles canvas resize |
-| ↳ | ErrorBoundary | ~34-49 | Catches Monaco crashes per session |
-| `frontend/src/hooks/useChatManager.ts` | useChatManager | 23-428 | Wires onFileEdited and onOpenFileInCanvas callbacks |
-| `frontend/src/store/useStreamStore.ts` | processBuffer | 199-402 | Detects tool completions and calls onFileEdited/onOpenFileInCanvas |
-| `frontend/src/utils/canvasHelpers.ts` | isFileChanged | 6-13 | Check if file is in git changed list (normalized paths) |
-| ↳ | buildFullPath | 15-17 | Build absolute path from cwd + relative path |
-| `frontend/src/utils/resizeHelper.ts` | computeResizeWidth | 6-14 | Calculate chat pane width during drag resize (min 300px, max based on window size) |
-
-### Database
-
-| Table | Columns | Purpose |
-|---|---|---|
-| `canvas_artifacts` | id (PK), session_id (FK), title, content, language, version, file_path, created_at | Persists artifacts per session |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Frontend Store | `frontend/src/test/useCanvasStore.test.ts` | suite `useCanvasStore` | Store setters, terminal actions, artifact dedup, file read open, watched-file refresh, close/delete, reset |
+| Frontend Pane | `frontend/src/test/CanvasPane.test.tsx` | suites `CanvasPane Component`, `CanvasPane - additional coverage`, `CanvasPane - Terminal Tab`, `CanvasPane - prevArtifactIdRef behavior`, `CanvasPane - multiple terminals and tab interactions` | Rendering modes, apply/open editor actions, tab behavior, language mapping, terminal tabs, same-artifact view-mode preservation |
+| Frontend Helpers | `frontend/src/test/canvasHelpers.test.ts` | suites `isFileChanged`, `buildFullPath` | Path normalization and git file-change matching |
+| Frontend Tool Timeline | `frontend/src/test/ToolStep.test.tsx` | suite `ToolStep`, suite `ToolStep - getFilePathFromEvent extraction` | Canvas hoist button rules and file path extraction |
+| Frontend Chat | `frontend/src/test/ChatMessage.test.tsx` | tests `renders Open in Canvas button on code blocks and calls callback`, `does not render Open in Canvas button for truncated paths with ellipses`, `renders Open in Canvas button for valid full paths`, `code block shows Canvas button when canvas is open`, `code block does NOT show Canvas button when canvas is closed` | Code-block entry point and tool hoist visibility through assistant rendering |
+| Frontend App | `frontend/src/test/App.test.tsx` | tests `persists canvas open state per session`, `auto-opens canvas for plans when awaiting permission`, `handles resize handle mouse events` | Main app canvas lifecycle, plan auto-open, resize handle |
+| Frontend Stream | `frontend/src/test/useStreamStore.test.ts` | suite `useStreamStore (Pure Logic)` | Tool event merging and stream queue processing that drives file callbacks |
+| Backend Canvas | `backend/test/canvasHandlers.test.js` | suite `canvasHandlers` | Canvas socket success paths, filesystem read/write, error paths, no-callback safety |
+| Backend Git | `backend/test/gitHandlers.test.js` | suites `Git Handlers`, `Git Handlers - git_show_head` | Git status, diff, stage, unstage, HEAD lookup, new-file fallback, error handling |
+| Backend Database | `backend/test/persistence.test.js` | test `handles canvas artifacts` | End-to-end canvas artifact DB CRUD |
+| Backend Database | `backend/test/database-exhaustive.test.js` | tests `hits all canvas branches`, `hits all error paths using mock injection` | Canvas DB helper branches and DB error propagation |
 
 ---
 
 ## Gotchas & Important Notes
 
-1. **Monaco Crashes on Fast Session Switches**
-   - **What:** Rapid switching between sessions can cause Monaco Editor to throw internal errors if it's mid-render.
-   - **Why:** Monaco isn't fully unmounted between session changes; if state updates before DOM cleanup, exceptions propagate.
-   - **Fix:** ErrorBoundary wraps CanvasPane per-session key (App.tsx Line 235); any crash resets canvas state via resetCanvas() instead of crashing the app.
+1. UI session id and ACP session id are different.
+   - Canvas persistence uses `ChatSession.id` / `sessions.ui_id`. Stream queues use `ChatSession.acpSessionId`. Passing the ACP id to `canvas_load` or `canvas_save` stores artifacts under the wrong key.
 
-2. **SafeDiffEditor Requires Non-Null gitOriginal**
-   - **What:** If gitOriginal is null when SafeDiffEditor mounts, it silently fails to initialize.
-   - **Why:** The guard `gitOriginal !== null` at CanvasPane.tsx:339 prevents mounting until git_show_head callback returns.
-   - **Gotcha:** Rapid clicks on git files can cause multiple requests; the artifact id check (Line 173) prevents stale data from overwriting newer artifacts.
+2. Artifact open dedup is exact, but file refresh matching is fuzzy.
+   - `handleOpenInCanvas` compares `filePath` with strict equality. `handleFileEdited` lowercases, normalizes separators, and uses suffix overlap. Similar filenames in different folders can match the first watched suffix.
 
-3. **Session Switch Clears All Canvas State**
-   - **What:** Switching sessions resets canvasArtifacts, activeCanvasArtifact, and activeTerminalId.
-   - **Why:** Each session has its own set of artifacts; the previous session's state is saved and the new session's state is loaded from DB.
-   - **Gotcha:** Don't hold artifact references outside useCanvasStore; they're cleared on every session switch.
+3. Watched-file refresh does not emit `canvas_save`.
+   - `handleFileEdited` updates the in-memory artifact and `lastUpdated`. Reopening through `handleOpenFileInCanvas` or calling `handleOpenInCanvas` persists through `canvas_save`.
 
-4. **Deduplication by FilePath OR ID (Not Both)**
-   - **What:** Two artifacts can coexist if they differ on BOTH filePath and id.
-   - **Why:** The deduplication check is: if filePath matches, update; else if id matches, update; else add new.
-   - **Gotcha:** This allows multiple versions of the same file open simultaneously if id differs, which can be confusing.
+4. File artifacts read from disk need store stamping.
+   - `canvas_read_file` returns an artifact without `sessionId`. Persistence depends on `handleOpenInCanvas` receiving a non-null active UI session id.
 
-5. **canvas_delete is Immediate, No Confirmation**
-   - **What:** Clicking the ✕ button on a tab calls canvas_delete immediately; the artifact is removed from the store and DB without prompting.
-   - **Why:** Artifact deletion is a lightweight operation; there's no recovery mechanism in the current design.
-   - **Gotcha:** Users can't undo accidental closes. Consider adding a confirmation modal if this becomes a UX issue.
+5. Canvas writes are direct filesystem writes.
+   - `canvas_apply_to_file` calls `fs.writeFileSync(filePath, content, 'utf8')`. It does not use File Explorer `safePath` validation.
 
-6. **Language Inference from File Extension (Backend)**
-   - **What:** If a tool output doesn't provide a language, the backend infers it from file extension.
-   - **Why:** Most ACP tools don't emit a language hint; extension is the fallback.
-   - **Gotcha:** Unknown extensions default to 'text'; Monaco will treat them as plaintext. Provide explicit language hints if extension-based inference fails.
+6. Diff mode has a loading sentinel.
+   - `SafeDiffEditor` mounts only when `viewMode === 'diff'` and `gitOriginal !== null`. `git_show_head` returns an empty string for new files; empty string means render a blank original side, while `null` means HEAD content has not arrived.
 
-7. **canvasOpenBySession is In-Memory Only**
-   - **What:** The canvas open/closed state per session is stored in canvasOpenBySession (Map in store), not persisted to DB.
-   - **Why:** Canvas state is transient UI state; sessions are persisted, but their canvas visibility preference is not.
-   - **Gotcha:** On browser reload, all sessions start with canvas closed (unless they have active terminals or loaded artifacts trigger auto-open).
+7. Git cwd fallback can change the repo source.
+   - `CanvasPane` uses active session `cwd` first and then `workspaceCwds[0].path`. Missing session `cwd` can make the git panel show the first configured workspace.
 
-8. **computeResizeWidth Enforces Hard Limits**
-   - **What:** Min chat width is 300px; max is (window.innerWidth − sidebar − 400px).
-   - **Why:** Minimum ensures the editor is usable; maximum prevents the canvas from disappearing.
-   - **Gotcha:** On very narrow windows (<700px), canvas width becomes constrained. The resize handle will stop at the max width.
+8. Code-block canvas actions require an open canvas.
+   - `CodeBlock` hides its Canvas button when `isCanvasOpen` is false. ToolStep hoist buttons are independent of that code-block condition because they open files through `AssistantMessage` and `handleOpenFileInCanvas`.
 
-9. **Plan Auto-Open Only When isAwaitingPermission**
-   - **What:** plan.md auto-opens canvas only if activeSession.isAwaitingPermission is true.
-   - **Why:** Auto-opening the canvas on every plan.md creation would be noisy; limiting it to permission waits ensures relevance.
-   - **Gotcha:** If plan.md is created while NOT awaiting a permission, canvas won't auto-open. Users must click the terminal button or manually open canvas.
+9. Pop-out canvas does not issue `canvas_load` during bootstrap.
+   - `PopOutApp` wires stream callbacks and renders `CanvasPane`, but the persisted artifact load path is in `App`.
 
-10. **Artifact Deduplication Can Hide Concurrent Edits**
-    - **What:** If two tool calls write the same file path simultaneously, the second one updates the first (same artifact id).
-    - **Why:** Artifacts are merged by filePath, so concurrent writes to the same file are collapsed into one artifact.
-    - **Gotcha:** If you need to compare two versions of the same file side-by-side, manually add one as a new artifact with a different id (e.g., via the code block "Open in Canvas" button with different content).
+10. Terminal tabs keep the pane open.
+    - `closeTerminal`, `resetCanvas`, and `handleCloseArtifact` all preserve `isCanvasOpen` when terminals remain for the active session.
 
 ---
 
 ## Unit Tests
 
-### Backend Tests
+### Backend
 
-- **File:** `backend/test/canvasHandlers.test.js`
-  - `canvas_save saves artifact to DB` — Verifies that canvas_save emits success and calls db.saveCanvasArtifact (Line ~40)
-  - `canvas_load returns artifacts` — Verifies that canvas_load calls db.getCanvasArtifactsForSession and returns artifacts (Line ~51)
-  - `canvas_delete removes artifact` — Verifies that canvas_delete calls db.deleteCanvasArtifact (Line ~61)
-  - `canvas_read_file returns file content` — Verifies that canvas_read_file reads a file, infers language, and returns a CanvasArtifact (Line ~71)
-  - `canvas_apply_to_file writes content` — Verifies that canvas_apply_to_file calls fs.writeFileSync (Line ~83)
-  - Error cases: missing filePath, file not found, etc. (Lines ~92+)
+- `backend/test/canvasHandlers.test.js`
+  - `canvas_save saves artifact to DB`
+  - `canvas_load returns artifacts`
+  - `canvas_delete removes artifact`
+  - `canvas_read_file returns file content`
+  - `canvas_apply_to_file writes content`
+  - `canvas_read_file errors on missing path`
+  - `canvas_apply_to_file errors on missing filePath`
+  - `canvas_read_file uses resolvedPath when file does not exist on disk`
+  - `canvas_read_file falls back to "text" language when file has no extension`
+  - `handlers do not throw when called without a callback`
+  - `error branches do not throw when called without a callback`
 
-### Frontend Tests
+- `backend/test/gitHandlers.test.js`
+  - `git_status returns branch and files`
+  - `git_status returns empty files array when working tree is clean`
+  - `git_status maps deleted and renamed statuses`
+  - `git_diff returns staged diff`
+  - `git_diff returns unstaged diff`
+  - `git_diff shows full content for untracked files`
+  - `git_stage calls git add`
+  - `git_unstage calls git reset HEAD`
+  - `git_diff returns (no changes) when diff is empty`
+  - `git_diff handles errors`
+  - `git_unstage handles errors`
+  - `git_stage handles errors`
+  - `returns file content from HEAD`
+  - `returns empty string for new files when git command throws`
 
-- **File:** `frontend/src/test/useCanvasStore.test.ts`
-  - `handleOpenInCanvas adds new artifact or updates existing` — Verifies deduplication by id and filePath (Line ~68)
-  - `handleFileEdited updates artifact on file change` — Verifies that file edits are detected and artifact is refreshed (Line ~90+)
-  - `handleCloseArtifact removes artifact` — Verifies that closing an artifact removes it and adjusts active artifact (Line ~100+)
-  - Terminal tests: openTerminal, closeTerminal, session scoping (Line ~110+)
+- `backend/test/persistence.test.js`
+  - `handles canvas artifacts`
 
-- **File:** `frontend/src/test/CanvasPane.test.tsx`
-  - `renders placeholder when activeArtifact is null` — Empty state (Line ~26)
-  - `renders artifact title and content correctly` — Monaco editor receives artifact data (Line ~31)
-  - `calls onClose when close button is clicked` — Close button works (Line ~44)
-  - `emits canvas_apply_to_file when Apply is clicked if filePath exists` — Apply button calls socket.emit (Line ~57)
-  - Git panel tests: git_status, git_show_head (Lines ~65+)
-  - Diff view tests: SafeDiffEditor mounts with gitOriginal (Lines ~75+)
+- `backend/test/database-exhaustive.test.js`
+  - `hits all canvas branches`
+  - `hits all error paths using mock injection`
 
-- **File:** `frontend/src/test/canvasHelpers.test.ts`
-  - `isFileChanged detects file in git changed list` — Path normalization (Line ~15)
-  - `buildFullPath constructs full path` — Path joining (Line ~25)
+### Frontend
 
-- **File:** `frontend/src/test/ChatMessage.test.tsx`
-  - `code block shows Canvas button when canvas is open` — Code block "Open in Canvas" button appears and calls handleOpenInCanvas (Line ~485)
+- `frontend/src/test/useCanvasStore.test.ts`
+  - `setIsCanvasOpen updates global open state`
+  - `setActiveCanvasArtifact updates current artifact`
+  - `openTerminal adds a terminal and sets it as active`
+  - `closeTerminal handles termination and active switch`
+  - `handleOpenInCanvas adds new artifact or updates existing`
+  - `handleOpenFileInCanvas fetches from socket`
+  - `handleFileEdited updates watched artifacts`
+  - `handleCloseArtifact emits canvas_delete and updates state`
+  - `resetCanvas clears artifacts and closes canvas`
+
+- `frontend/src/test/CanvasPane.test.tsx`
+  - `renders placeholder when activeArtifact is null`
+  - `renders artifact title and content correctly`
+  - `emits canvas_apply_to_file when Apply is clicked if filePath exists`
+  - `defaults to preview mode for markdown artifacts`
+  - `switches between code and preview modes`
+  - `detects language from filePath if generic`
+  - `renders VS Code button when artifact has filePath`
+  - `VS Code button emits open_in_editor`
+  - `Apply button shows Applied state after successful apply`
+  - `Apply button shows alert on failure`
+  - `does not show Apply or VS Code buttons when no filePath`
+  - `detects markdown from filePath ending in .md`
+  - `editing content in monaco updates local state`
+  - `tab shows filePath basename when filePath is set`
+  - `does NOT reset viewMode when same artifact remounts with updated content`
+  - `renders multiple terminal tabs when multiple terminals in store for active session`
+  - `clicking a terminal tab calls setActiveTerminalId`
+  - `close button on terminal tab calls closeTerminal`
+  - `diff button not shown when no filePath on artifact`
+
+- `frontend/src/test/canvasHelpers.test.ts`
+  - `returns true when file path matches`
+  - `returns false when no match`
+  - `returns false for undefined filePath`
+  - `handles backslash/forward slash normalization`
+  - `joins and normalizes paths`
+
+- `frontend/src/test/ToolStep.test.tsx`
+  - `shows canvas button when filePath exists`
+  - `extracts path from "Running write_file: path" title`
+  - `extracts path from "Running read_file_parallel: path" title`
+  - `returns undefined for shell commands`
+  - `returns undefined for non-file AcpUI UX tools even when a file path is present`
+  - `returns undefined for list_directory commands`
+  - `returns undefined when path contains ellipsis`
+  - `extracts path from generic "Running tool_name: path" pattern`
+  - `extracts path from title that is just a filename with dot`
+  - `extracts path from output Index: line`
+  - `extracts path from output diff --- line`
+  - `does not extract from output --- old (literal "old")`
+  - `canvas hoist button calls onOpenInCanvas with extracted path`
+
+- `frontend/src/test/ChatMessage.test.tsx`
+  - `renders Open in Canvas button on code blocks and calls callback`
+  - `does not render Open in Canvas button for truncated paths with ellipses`
+  - `renders Open in Canvas button for valid full paths`
+  - `code block shows Canvas button when canvas is open`
+  - `code block does NOT show Canvas button when canvas is closed`
+
+- `frontend/src/test/App.test.tsx`
+  - `persists canvas open state per session`
+  - `auto-opens canvas for plans when awaiting permission`
+  - `handles resize handle mouse events`
+
+- `frontend/src/test/useStreamStore.test.ts`
+  - `onStreamEvent handles tool_start and collapses previous steps`
+  - `onStreamEvent merges tool titles correctly`
+  - `onStreamEvent handles tool_update and caches fallback output`
 
 ---
 
 ## How to Use This Guide
 
-### For Implementing Canvas Features
+### For implementing/extending this feature
 
-1. **Read this entire doc** to understand the artifact lifecycle and deduplication logic.
-2. **Study the data flow diagrams** to know where events come from and where they go.
-3. **Reference the component table** for exact line numbers when reading code.
-4. **Check the gotchas** before implementing your feature — they highlight common pitfalls.
-5. **Write tests** in the same test files listed above; add new test cases for your feature.
-6. **Update BOOTSTRAP.md** if you're adding a new system or significantly changing the architecture.
+1. Start with `frontend/src/types.ts` and keep the `CanvasArtifact` shape stable.
+2. Use `frontend/src/store/useCanvasStore.ts` to decide whether behavior belongs in store state, socket reads, socket writes, or terminal tab state.
+3. For file-opening behavior, trace entry points through `ChatMessage.CodeBlock`, `ToolStep.getFilePathFromEvent`, `AssistantMessage.ToolStep.onOpenInCanvas`, and `useStreamStore.processBuffer`.
+4. For session lifecycle behavior, inspect `App` active-session switching and `canvas_load` before changing artifact persistence or pane open/close behavior.
+5. For git behavior, update `CanvasPane.refreshGitStatus`, `CanvasPane.handleOpenGitFile`, `canvasHelpers.isFileChanged`, and `backend/sockets/gitHandlers.js` together.
+6. For filesystem behavior, update `backend/sockets/canvasHandlers.js` and DB helper tests when changing `canvas_read_file`, `canvas_apply_to_file`, or artifact persistence.
+7. Add or adjust tests in `useCanvasStore.test.ts`, `CanvasPane.test.tsx`, `ToolStep.test.tsx`, `canvasHandlers.test.js`, and `gitHandlers.test.js` based on the affected layer.
 
-### For Debugging Canvas Issues
+### For debugging issues with this feature
 
-1. **Check the logs** — Backend logs appear in the configured `LOG_FILE_PATH` (`.env`), frontend logs appear in browser console.
-2. **Verify database state** — Open `persistence.db` in a SQLite viewer and query `SELECT * FROM canvas_artifacts WHERE session_id = 'xxx'` to see what the backend has persisted.
-3. **Use browser DevTools** — Check the Redux/Zustand store (React DevTools) to inspect `useCanvasStore` state in real-time.
-4. **Trace socket events** — Use browser DevTools Network tab (filter for WebSocket) to see Socket.IO messages: `canvas_save`, `canvas_load`, `canvas_read_file`, etc.
-5. **Monaco errors** — If canvas content doesn't render, check browser console for Monaco initialization errors; look for the ErrorBoundary reset in the logs.
-6. **File path issues** — If canvas_read_file fails, verify the file path is absolute and the file exists; check that `fs.existsSync` passes on the backend.
+1. Confirm whether the symptom involves UI session id (`ChatSession.id`) or ACP session id (`ChatSession.acpSessionId`). Canvas persistence uses the UI id.
+2. Inspect `useCanvasStore` state: `isCanvasOpen`, `canvasOpenBySession`, `canvasArtifacts`, `activeCanvasArtifact`, `terminals`, and `activeTerminalId`.
+3. Trace socket events: `canvas_load`, `canvas_save`, `canvas_delete`, `canvas_read_file`, `canvas_apply_to_file`, `git_status`, `git_show_head`, and `open_in_editor`.
+4. Check `canvas_artifacts` rows for the active `session_id` when persisted artifacts are missing or sorted unexpectedly.
+5. If a watched file does not refresh, verify that the stream event is completed, includes `filePath`, and that `handleFileEdited` can suffix-match an already-open artifact.
+6. If a diff is blank, distinguish `gitOriginal === null` from `gitOriginal === ''`, then check the `git_show_head` callback and the artifact id guard in `handleOpenGitFile`.
+7. If git status points at the wrong repository, inspect active session `cwd` and `workspaceCwds[0].path`.
+8. If terminal tabs affect close behavior, inspect `terminals.filter(t => t.sessionId === activeSessionId)` and `activeTerminalId`.
 
 ---
 
 ## Summary
 
-The canvas system is a multi-layered artifact management system that bridges the chat UI with a split-screen code editor:
-
-- **Frontend store** (useCanvasStore) maintains in-memory artifact state and deduplication logic.
-- **Backend handlers** (canvasHandlers.js) persist artifacts to SQLite and manage file I/O.
-- **CanvasPane component** renders artifacts in three modes (code, diff, preview) and provides git integration.
-- **ErrorBoundary** isolates Monaco crashes per session to prevent full app failure.
-- **Session-scoped lifecycle** saves and restores canvas state on session switch.
-- **Critical contract** is the CanvasArtifact shape; all code must conform to it.
-- **Deduplication** by filePath OR id prevents duplicate tabs but allows intentional multi-version viewing.
-- **Gotchas** span Monaco crashes, SafeDiffEditor initialization, in-memory state, and timing issues.
-
-With this doc, an agent should be able to add features (new rendering modes, additional tool output handling), debug issues (missing artifacts, render failures), or extend the system (custom artifact types, provider-specific behavior) with confidence.
+- Canvas is a session-scoped artifact, editor, diff, and terminal workspace.
+- `CanvasArtifact.sessionId` is the UI session id and maps to SQLite `canvas_artifacts.session_id`.
+- `useCanvasStore` owns artifact deduplication, file-open actions, watched-file refresh, and terminal tab state.
+- `App` owns main-window canvas restoration, persisted artifact loading, plan auto-open, resize, and ErrorBoundary reset behavior.
+- `ToolStep`, `AssistantMessage`, `ChatMessage`, and `useStreamStore` are the primary canvas entry points from chat rendering and streaming.
+- `canvasHandlers` owns artifact CRUD plus direct filesystem read/write; `gitHandlers` owns git status, diffs, staging, unstaging, and HEAD content.
+- `CanvasPane` renders code, preview, and diff modes, and uses `git_show_head` plus current disk content for Monaco side-by-side diffs.
+- The critical contract is stable artifact shape, UI-session-keyed persistence, exact open deduplication, and careful separation between file refresh, artifact persistence, and terminal pane lifetime.

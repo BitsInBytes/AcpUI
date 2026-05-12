@@ -1,854 +1,524 @@
-# Feature Doc — Voice-to-Text System
+# Feature Doc - Voice-to-Text System
 
-Real-time speech-to-text transcription using whisper.cpp, enabling users to compose prompts via microphone input. Integrates with the Chat Input component to insert transcribed text directly into the textarea.
+Voice-to-text lets a user record microphone audio in the chat input, encode it as a local WAV blob, send it to the backend through Socket.IO, and insert the local whisper.cpp transcript into the active prompt textarea.
 
----
+Why this matters: the feature crosses browser media APIs, frontend state, Socket.IO payload limits, temporary files, a spawned whisper-server process, and optional environment configuration. Most failures happen at those boundaries.
 
 ## Overview
 
 ### What It Does
-- **Microphone input** — Captures audio from selected audio device via Web Audio API (getUserMedia)
-- **Local WAV recording** — Frontend records audio to WAV format (16kHz mono PCM) without sending to server
-- **whisper-server process** — Backend spawns `whisper-server.exe` with `ggml-small.bin` model on dedicated port (default 9877)
-- **Audio transcription** — Backend sends recorded WAV to whisper-server HTTP endpoint for real-time inference
-- **Minimal latency** — Local model inference (~1-3 sec for typical input) vs cloud API calls
-- **Device selection** — User chooses microphone via System Settings Audio tab; persisted in localStorage
-- **UI feedback** — Mic button shows recording state and processing spinner; disable prevents interaction during warming up
+- Captures microphone audio through `navigator.mediaDevices.getUserMedia()` in `frontend/src/utils/wavRecorder.ts` (Class: `WavRecorder`).
+- Buffers mono audio in the browser and encodes it as a 16 kHz, 16-bit PCM WAV `Blob`.
+- Advertises feature availability through the `voice_enabled` socket event and `useVoiceStore.isVoiceEnabled`.
+- Renders a mic control in `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`, Handler: `onMicClick`) when voice is enabled.
+- Sends the recorded `ArrayBuffer` through the `process_voice` socket event.
+- Spawns `backend/whisper/whisper-server.exe` from `backend/voiceService.js` (Function: `startSTTServer`) when `VOICE_STT_ENABLED=true`.
+- Posts the WAV file to whisper-server's `/inference` endpoint and returns `{ text }` through the socket callback.
+- Replaces the active session input with the transcript through `useInputStore.setInput()`.
 
 ### Why This Matters
-- **Hands-free input** — Users can record prompts without typing
-- **Local processing** — Audio never leaves user's machine; no cloud API dependency or costs
-- **Privacy-first** — Whisper model runs locally; recording is temporary (deleted after transcription)
-- **Keyboard-free workflow** — Natural for mobile or dictation-style interaction
-- **Accessibility** — Voice input helps users with limited keyboard accessibility
+- The browser must produce a WAV shape that whisper-server can decode.
+- `VOICE_STT_ENABLED` controls UI visibility but does not validate microphone permission, whisper binary health, or model file health.
+- The frontend holds the full recording in memory until stop, so this is a one-shot recording path, not streaming transcription.
+- The backend writes a temporary WAV file and must delete it after the HTTP request.
+- The feature is provider-independent; transcript text enters the same prompt input as typed text.
 
----
+Architectural role: frontend recording and UI state, backend Socket.IO routing, local whisper.cpp process management, and temporary file IO. It does not use provider config, provider protocol extensions, or database tables.
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### 1. Frontend Detects Voice Enabled
-**File:** `frontend/src/hooks/useSocket.ts` (socket event handler)
+### 1. Backend Loads STT Configuration and Starts whisper-server
+File: `backend/server.js` (Startup block: `startSTTServer()`)
+File: `backend/voiceService.js` (Functions: `isSTTEnabled`, `startSTTServer`; Config keys: `VOICE_STT_ENABLED`, `STT_PORT`)
+
+```javascript
+// FILE: backend/voiceService.js (Functions: isSTTEnabled, startSTTServer)
+const WHISPER_SERVER = path.join(__dirname, 'whisper', 'whisper-server.exe');
+const WHISPER_MODEL = path.join(__dirname, 'whisper', 'ggml-small.bin');
+const STT_PORT = process.env.STT_PORT || '9877';
+
+export function isSTTEnabled() {
+  return process.env.VOICE_STT_ENABLED === 'true';
+}
+
+export function startSTTServer() {
+  if (!isSTTEnabled() || serverProcess) return;
+  serverProcess = spawn(WHISPER_SERVER, [
+    '-m', WHISPER_MODEL,
+    '--port', String(STT_PORT),
+    '-t', '4'
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+}
+```
+
+`backend/server.js` calls `startSTTServer()` during backend initialization. The service checks `VOICE_STT_ENABLED`, keeps a module-level `serverProcess` guard, and launches the whisper server with the configured port, `ggml-small.bin`, and four worker threads.
+
+### 2. Backend Advertises Voice Availability
+File: `backend/sockets/index.js` (Socket event: `voice_enabled`)
+File: `backend/services/acpClient.js` (Method: `performHandshake`, Socket event: `voice_enabled`)
+File: `frontend/src/hooks/useSocket.ts` (Hook: `useSocket`, Socket event handler: `voice_enabled`)
+
+```javascript
+// FILE: backend/sockets/index.js (Socket event: voice_enabled)
+socket.emit('voice_enabled', { enabled: isSTTEnabled() });
+```
 
 ```typescript
-socket.on('voice_enabled', ({ enabled }) => {
-  useVoiceStore.setState({ isVoiceEnabled: enabled });
+// FILE: frontend/src/hooks/useSocket.ts (Socket event handler: voice_enabled)
+_socket.on('voice_enabled', (data: { enabled: boolean }) => {
+  useVoiceStore.getState().setIsVoiceEnabled(data.enabled);
 });
 ```
 
-On socket connect, backend emits `voice_enabled` event. Frontend sets `isVoiceEnabled` flag in Zustand store. If `true`, the mic button appears in ChatInput (Lines 245-254 of ChatInput.tsx).
+Each socket connection receives `voice_enabled` from `registerSocketHandlers()`. `acpClient.performHandshake()` also emits the same event after the provider handshake. The frontend stores the boolean in `useVoiceStore.isVoiceEnabled`; `ChatInput` uses that state to decide whether to render the mic button.
 
-### 2. User Clicks Mic Button to Start Recording
-**File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 165-171)
+### 3. Frontend Discovers Audio Devices
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Initial load callback: `mockFetch`)
+File: `frontend/src/hooks/useVoice.ts` (Hook: `useVoice`, Function: `fetchAudioDevices`)
+File: `frontend/src/store/useVoiceStore.ts` (Store: `useVoiceStore`, Action: `fetchAudioDevices`)
+File: `frontend/src/components/SystemSettingsModal.tsx` (Component: `SystemSettingsModal`, Tab: `audio`)
 
 ```typescript
+// FILE: frontend/src/hooks/useVoice.ts (Function: fetchAudioDevices)
+const devices = await navigator.mediaDevices.enumerateDevices();
+const audioInputs = devices
+  .filter(d => d.kind === 'audioinput')
+  .map(d => ({ id: d.deviceId, label: d.label || 'Default Microphone' }));
+
+setAvailableAudioDevices(audioInputs);
+if (audioInputs.length > 0 && !selectedAudioDevice) {
+  setSelectedAudioDevice(audioInputs[0].id);
+}
+```
+
+`useChatManager()` enumerates input devices during initial session load and writes them to `useVoiceStore.availableAudioDevices`. `SystemSettingsModal` renders the Audio tab from the same store and lets the user select a device. `useVoice.fetchAudioDevices()` also selects the first discovered device when no `selectedAudioDevice` is stored.
+
+### 4. System Settings Persists the Selected Microphone
+File: `frontend/src/store/useVoiceStore.ts` (Store: `useVoiceStore`, Action: `setSelectedAudioDevice`, localStorage key: `selectedAudioDevice`)
+File: `frontend/src/components/SystemSettingsModal.tsx` (Component: `SystemSettingsModal`, Tab: `audio`)
+
+```typescript
+// FILE: frontend/src/store/useVoiceStore.ts (Action: setSelectedAudioDevice)
+selectedAudioDevice: localStorage.getItem('selectedAudioDevice') || '',
+
+setSelectedAudioDevice: (deviceId) => {
+  localStorage.setItem('selectedAudioDevice', deviceId);
+  set({ selectedAudioDevice: deviceId });
+},
+```
+
+The selected browser device ID is global frontend state and persists in localStorage. An empty string means the recorder asks the browser for the default system audio input.
+
+### 5. ChatInput Renders and Toggles the Mic Button
+File: `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`, Handler: `onMicClick`, CSS classes: `mic-btn`, `recording`, `processing`)
+File: `frontend/src/components/ChatInput/ChatInput.css` (Selectors: `.mic-btn.recording`, `.mic-btn.processing`)
+
+```typescript
+// FILE: frontend/src/components/ChatInput/ChatInput.tsx (Handler: onMicClick)
 const onMicClick = () => {
   if (isRecording) {
-    stopRecording((text) => setInput(activeSessionId || '', text));  // LINE 167
+    stopRecording((text) => setInput(activeSessionId || '', text));
   } else {
-    startRecording();  // LINE 169
+    startRecording();
   }
 };
 ```
 
-Clicking the mic button calls `startRecording()` (from `useVoice` hook) or `stopRecording()` if already recording.
+When `isVoiceEnabled` is true, `ChatInput` renders a mic button. The button calls `startRecording()` when idle and `stopRecording()` when recording. The transcript callback writes the returned text into the input store for the active session ID. The current behavior replaces the full input value with the transcript.
 
-### 1. Audio Capture (WavRecorder)
-**File:** `frontend/src/hooks/useVoice.ts` (Function: `useVoice`, Lines 36-47; Lines 49-77)
-
-The `useVoice` hook manages the `WavRecorder` instance. It handles starting and stopping the recording, capturing the audio blob, and converting it to an `ArrayBuffer` for socket transmission.
+### 6. WavRecorder Starts Browser Audio Capture
+File: `frontend/src/hooks/useVoice.ts` (Hook: `useVoice`, Function: `startRecording`)
+File: `frontend/src/utils/wavRecorder.ts` (Class: `WavRecorder`, Method: `start`)
 
 ```typescript
-// FILE: frontend/src/hooks/useVoice.ts (Lines 36-47)
-const startRecording = useCallback(async () => {
-  // ... initializes WavRecorder and starts capture ...
-}, [selectedAudioDevice, setIsRecording]);
+// FILE: frontend/src/utils/wavRecorder.ts (Method: start)
+const constraints: MediaStreamConstraints = {
+  audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+};
+
+this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+this.source = this.audioContext.createMediaStreamSource(this.mediaStream);
+this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
 ```
 
-1. WavRecorder instance is created (singleton per session)
-2. Calls `WavRecorder.start(deviceId)` with selected audio device
-3. Sets `isRecording = true` in Zustand
-4. Records start timestamp for minimum duration check
+`useVoice.startRecording()` creates one `WavRecorder` instance per hook lifecycle and calls `WavRecorder.start(selectedAudioDevice)`. The recorder requests microphone access, creates an `AudioContext`, creates a `ScriptProcessorNode`, and buffers channel 0 samples as `Float32Array` chunks.
 
-### 4. WavRecorder Captures Audio via Web Audio API
-**File:** `frontend/src/utils/wavRecorder.ts` (Lines 10-35)
+### 7. WavRecorder Stops, Cleans Up, and Encodes WAV
+File: `frontend/src/hooks/useVoice.ts` (Hook: `useVoice`, Function: `stopRecording`)
+File: `frontend/src/utils/wavRecorder.ts` (Class: `WavRecorder`, Methods: `stop`, `createWavBlob`, `downsample`, `encodeWAV`)
 
 ```typescript
-async start(deviceId?: string): Promise<void> {
-  this.recordingBuffer = [];
-  this.recordingLength = 0;
+// FILE: frontend/src/hooks/useVoice.ts (Function: stopRecording)
+setIsRecording(false);
+const blob = await recorderRef.current.stop();
 
-  const constraints: MediaStreamConstraints = {
-    audio: deviceId ? { deviceId: { exact: deviceId } } : true,  // LINE 15
-  };
-
-  this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);  // LINE 18
-  this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();  // LINE 20
-  
-  this.source = this.audioContext.createMediaStreamSource(this.mediaStream);  // LINE 22
-  this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);  // LINE 23
-
-  this.processor.onaudioprocess = (e) => {
-    const inputData = e.inputBuffer.getChannelData(0);  // LINE 26
-    const float32Array = new Float32Array(inputData.length);
-    float32Array.set(inputData);
-    this.recordingBuffer.push(float32Array);  // LINE 29
-    this.recordingLength += float32Array.length;  // LINE 30
-  };
-
-  this.source.connect(this.processor);  // LINE 33
-  this.processor.connect(this.audioContext.destination);  // LINE 34
+const duration = Date.now() - voiceStartTimeRef.current;
+if (duration < 400) {
+  console.log('[VOICE] Recording too short, ignoring');
+  return;
 }
 ```
 
-1. Requests microphone access with optional deviceId constraint (Line 15)
-2. Creates AudioContext and connects source → processor (Lines 20-23)
-3. `onaudioprocess` callback accumulates audio chunks (Lines 25-31)
-4. Processor buffers are connected to destination for monitoring (optional)
+```typescript
+// FILE: frontend/src/utils/wavRecorder.ts (Methods: createWavBlob, downsample, encodeWAV)
+const inputSampleRate = this.audioContext?.sampleRate || 44100;
+const downsampled = this.downsample(result, inputSampleRate, this.targetSampleRate);
+const dataview = this.encodeWAV(downsampled, this.targetSampleRate);
+return new Blob([dataview.buffer as ArrayBuffer], { type: 'audio/wav' });
+```
 
-### 5. User Clicks Mic Button Again to Stop Recording
-**File:** `frontend/src/hooks/useVoice.ts` (Lines 49-77)
+`stop()` disconnects the source and processor, stops every media stream track, closes the `AudioContext`, and creates a WAV blob. `createWavBlob()` flattens buffered samples, downsamples to 16000 Hz, and writes a RIFF/WAVE header plus 16-bit signed PCM sample data. `useVoice.stopRecording()` ignores recordings shorter than 400 ms.
+
+### 8. Frontend Sends the WAV Through Socket.IO
+File: `frontend/src/hooks/useVoice.ts` (Hook: `useVoice`, Function: `stopRecording`, Socket event: `process_voice`)
+File: `backend/server.js` (Socket.IO option: `maxHttpBufferSize`)
 
 ```typescript
-const stopRecording = useCallback(async (callback: (text: string) => void) => {
-  if (!recorderRef.current) return;
-  try {
-    setIsRecording(false);  // LINE 52
-    const blob = await recorderRef.current.stop();  // LINE 53
-    
-    const duration = Date.now() - voiceStartTimeRef.current;  // LINE 55
-    if (duration < 400) {
-      console.log('[VOICE] Recording too short, ignoring');
-      return;  // LINE 58
-    }
-
-    const reader = new FileReader();  // LINE 61
-    reader.onload = () => {
-      const arrayBuffer = reader.result as ArrayBuffer;  // LINE 63
-      setIsProcessingVoice(true);  // LINE 64
-      if (socket) {
-        socket.emit('process_voice', { audioBuffer: arrayBuffer }, (res: { text: string | null }) => {  // LINE 66
-          setIsProcessingVoice(false);
-          if (res.text) callback(res.text);  // LINE 68
-        });
-      }
-    };
-    reader.readAsArrayBuffer(blob);  // LINE 72
-  } catch (e) {
-    console.error('Failed to stop recording:', e);
-    setIsProcessingVoice(false);
-  }
-}, [socket, setIsRecording, setIsProcessingVoice]);
-```
-
-1. Calls `WavRecorder.stop()` which returns Blob (Line 53)
-2. Checks minimum duration (400ms) to avoid accidental clicks (Lines 55-58)
-3. Reads blob as ArrayBuffer via FileReader (Lines 61-72)
-4. Emits `process_voice` socket event with audioBuffer (Line 66)
-5. On response, calls callback with transcribed text (Line 68)
-
-### 6. WavRecorder Converts Audio Buffers to WAV Blob
-**File:** `frontend/src/utils/wavRecorder.ts` (Lines 37-79)
-
-```typescript
-async stop(): Promise<Blob> {
-  return new Promise((resolve) => {
-    if (this.processor && this.source) {
-      this.source.disconnect();  // LINE 40
-      this.processor.disconnect();  // LINE 41
-    }
-
-    if (this.mediaStream) {
-      this.mediaStream.getTracks().forEach((track) => track.stop());  // LINE 45
-    }
-
-    if (this.audioContext && this.audioContext.state !== 'closed') {
-      this.audioContext.close().then(() => {
-        resolve(this.createWavBlob());  // LINE 50
-      });
-    } else {
-      resolve(this.createWavBlob());  // LINE 53
-    }
-  });
-}
-```
-
-1. Disconnects audio nodes (Lines 40-41)
-2. Stops media stream tracks (stops microphone) (Line 45)
-3. Closes AudioContext (Line 49)
-4. Creates WAV blob from buffered audio (Lines 50, 53)
-
-### 7. WavRecorder Downsamples and Encodes WAV
-**File:** `frontend/src/utils/wavRecorder.ts` (Lines 58-79, 81-102, 104-135)
-
-```typescript
-private createWavBlob(): Blob {
-  if (this.recordingLength === 0) {
-    return new Blob([], { type: 'audio/wav' });
-  }
-
-  const inputSampleRate = this.audioContext?.sampleRate || 44100;  // LINE 63
-  
-  // Flatten buffer
-  const result = new Float32Array(this.recordingLength);  // LINE 66
-  let offset = 0;
-  for (let i = 0; i < this.recordingBuffer.length; i++) {
-    result.set(this.recordingBuffer[i], offset);
-    offset += this.recordingBuffer[i].length;
-  }
-
-  // Downsample to 16kHz
-  const downsampled = this.downsample(result, inputSampleRate, this.targetSampleRate);  // LINE 74
-  
-  // Encode to WAV
-  const dataview = this.encodeWAV(downsampled, this.targetSampleRate);  // LINE 77
-  return new Blob([dataview.buffer as ArrayBuffer], { type: 'audio/wav' });  // LINE 78
-}
-
-private downsample(buffer: Float32Array, sampleRate: number, targetSampleRate: number): Float32Array {
-  if (sampleRate === targetSampleRate) {
-    return buffer;
-  }
-  const ratio = sampleRate / targetSampleRate;  // LINE 85
-  const newLength = Math.round(buffer.length / ratio);
-  const result = new Float32Array(newLength);
-  let offsetResult = 0;
-  let offsetBuffer = 0;
-  while (offsetResult < result.length) {
-    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-    let accum = 0, count = 0;
-    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-      accum += buffer[i];
-      count++;
-    }
-    result[offsetResult] = accum / count;  // Average-based resampling
-    offsetResult++;
-    offsetBuffer = nextOffsetBuffer;
-  }
-  return result;
-}
-
-private encodeWAV(samples: Float32Array, sampleRate: number): DataView {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);  // WAV header + PCM data
-  const view = new DataView(buffer);
-
-  // Write RIFF headers (Lines 114-126)
-  writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + samples.length * 2, true);  // File size
-  writeString(view, 8, 'WAVE');
-  writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true);  // Subchunk1Size
-  view.setUint16(20, 1, true);  // AudioFormat (PCM)
-  view.setUint16(22, 1, true);  // NumChannels (Mono)
-  view.setUint32(24, sampleRate, true);  // SampleRate (16000)
-  view.setUint32(28, sampleRate * 2, true);  // ByteRate
-  view.setUint16(32, 2, true);  // BlockAlign
-  view.setUint16(34, 16, true);  // BitsPerSample
-  writeString(view, 36, 'data');
-  view.setUint32(40, samples.length * 2, true);  // Subchunk2Size
-
-  // Write PCM samples (Lines 128-132)
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++, offset += 2) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-
-  return view;
-}
-```
-
-Process:
-1. Flattens recorded buffers into single Float32Array (Lines 66-71)
-2. Downsamples from system sample rate (44.1kHz/48kHz) to 16kHz (Line 74)
-3. Downsampling uses average-based approach (simpler than linear interpolation)
-4. Encodes downsampled audio to WAV format (Lines 104-135):
-   - RIFF/WAVE header with PCM format metadata
-   - Mono, 16-bit PCM samples at 16kHz
-   - Samples are clipped to [-1, 1] and converted to 16-bit signed integers
-
-### 8. Backend Receives process_voice Socket Event
-**File:** `backend/sockets/voiceHandlers.js` (Lines 4-9)
-
-```javascript
-socket.on('process_voice', async ({ audioBuffer, sessionId }, callback) => {
-  const text = await voice.transcribeAudio(audioBuffer, writeLog, sessionId);  // LINE 6
-  callback({ text });  // LINE 7
-});
-```
-
-Backend receives ArrayBuffer, passes to `transcribeAudio` for processing, returns result via callback.
-
-### 9. Backend Writes Audio to Disk and Calls whisper-server
-**File:** `backend/voiceService.js` (Lines 45-80)
-
-```javascript
-export async function transcribeAudio(audioBuffer, log, sessionId) {
-  if (!isSTTEnabled()) return null;  // LINE 46
-  if (!audioBuffer) { log('[VOICE] No audio buffer received.'); return null; }  // LINE 47
-
-  let filePath = null;
-  try {
-    const dir = path.join(getAttachmentsRoot(), sessionId || 'voice');  // LINE 51
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });  // LINE 52
-    filePath = path.join(dir, `stt-${Date.now()}.wav`);  // LINE 53
-    fs.writeFileSync(filePath, Buffer.from(audioBuffer));  // LINE 54
-
-    const formData = new FormData();  // LINE 56
-    formData.append('file', new Blob([fs.readFileSync(filePath)]), 'audio.wav');  // LINE 57
-    formData.append('response_format', 'text');  // LINE 58
-
-    const res = await fetch(`http://127.0.0.1:${STT_PORT}/inference`, {  // LINE 60
-      method: 'POST',
-      body: formData
+// FILE: frontend/src/hooks/useVoice.ts (Socket event: process_voice)
+const reader = new FileReader();
+reader.onload = () => {
+  const arrayBuffer = reader.result as ArrayBuffer;
+  setIsProcessingVoice(true);
+  if (socket) {
+    socket.emit('process_voice', { audioBuffer: arrayBuffer }, (res: { text: string | null }) => {
+      setIsProcessingVoice(false);
+      if (res.text) callback(res.text);
     });
-
-    if (!res.ok) throw new Error(`whisper-server returned ${res.status}`);  // LINE 65
-    const text = (await res.text()).trim();  // LINE 66
-
-    log(`[VOICE] Transcribed: "${text}"`);  // LINE 68
-    return text || null;  // LINE 69
-  } catch (err) {
-    log(`[VOICE ERR] ${err.message}`);  // LINE 71
-    return null;  // LINE 72
-  } finally {
-    if (filePath && fs.existsSync(filePath)) {
-      try {
-        fs.unlinkSync(filePath);  // LINE 76: Delete temp WAV
-      } catch { /* ignore */ }
-    }
   }
-}
+};
+reader.readAsArrayBuffer(blob);
 ```
 
-1. Checks if STT is enabled (Line 46)
-2. Writes ArrayBuffer to temp WAV file on disk (Lines 51-54)
-3. Creates FormData with file + response format (Lines 56-58)
-4. POSTs to whisper-server HTTP endpoint (Line 60)
-5. Reads response text (Line 66)
-6. Deletes temp WAV file in finally block (Line 76)
+The hook converts the WAV blob to an `ArrayBuffer` and emits `process_voice`. `ChatInput` does not pass `sessionId` through this path, so the backend uses the fallback `voice` temp directory for recordings started from the mic button. Socket.IO is configured with `maxHttpBufferSize: 100 * 1024 * 1024` in `backend/server.js`.
 
-### 10. whisper-server Processes Audio and Returns Transcript
-**File:** `backend/voiceService.js` (Lines 14-43)
+### 9. Backend Routes process_voice to the STT Service
+File: `backend/sockets/voiceHandlers.js` (Function: `registerVoiceHandlers`, Socket event: `process_voice`)
+File: `backend/voiceService.js` (Function: `transcribeAudio`)
 
 ```javascript
-export function startSTTServer() {
-  if (!isSTTEnabled() || serverProcess) return;  // LINE 25
-
-  writeLog(`[VOICE] Starting whisper-server on port ${STT_PORT}...`);  // LINE 27
-  serverProcess = spawn(WHISPER_SERVER, [
-    '-m', WHISPER_MODEL,  // ggml-small.bin (71MB model)
-    '--port', String(STT_PORT),  // Default 9877
-    '-t', '4'  // 4 threads
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });  // LINE 28-32
-
-  serverProcess.stdout.on('data', () => {});  // LINE 34
-  serverProcess.stderr.on('data', d => {
-    const msg = d.toString().trim();
-    if (msg && msg.includes('error')) writeLog(`[WHISPER] ${msg}`);
-  });
-  serverProcess.on('exit', (code) => {
-    writeLog(`[VOICE] whisper-server exited with code ${code}`);
-    serverProcess = null;
-  });
-}
-```
-
-On server startup (Lines 24-43):
-1. Spawns `whisper-server.exe` with model path and port (Lines 28-32)
-2. Passes model file `ggml-small.bin` (71MB, supports 99 languages, ~1-3s inference)
-3. Uses 4 threads for processing
-4. Keeps process alive; logs errors; handles exit
-
-whisper-server:
-- Listens on `http://127.0.0.1:9877/inference` (configurable port)
-- Accepts multipart form with audio file
-- Runs whisper inference (ggml-cpp optimized)
-- Returns plain text transcript
-
-### 11. Backend Returns Transcript via Socket Callback
-**File:** `backend/sockets/voiceHandlers.js` (Lines 5-8)
-
-```javascript
+// FILE: backend/sockets/voiceHandlers.js (Socket event: process_voice)
 socket.on('process_voice', async ({ audioBuffer, sessionId }, callback) => {
   const text = await voice.transcribeAudio(audioBuffer, writeLog, sessionId);
   callback({ text });
 });
 ```
 
-Returns text (or null if failed) via callback to frontend.
+`registerVoiceHandlers()` receives the binary payload and optional `sessionId`, calls `transcribeAudio()`, and always replies through the Socket.IO callback with `{ text }`. `text` is a string on success and `null` for disabled STT, missing audio, whisper errors, blank output, or caught exceptions.
 
-### 12. Frontend Inserts Transcribed Text into Textarea
-**File:** `frontend/src/hooks/useVoice.ts` (Line 68)
+### 10. Backend Writes a Temp WAV and Calls whisper-server
+File: `backend/voiceService.js` (Function: `transcribeAudio`, Config key: `STT_PORT`)
+File: `backend/services/attachmentVault.js` (Function: `getAttachmentsRoot`)
 
-```typescript
-if (res.text) callback(res.text);
+```javascript
+// FILE: backend/voiceService.js (Function: transcribeAudio)
+const dir = path.join(getAttachmentsRoot(), sessionId || 'voice');
+if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+filePath = path.join(dir, `stt-${Date.now()}.wav`);
+fs.writeFileSync(filePath, Buffer.from(audioBuffer));
+
+const formData = new FormData();
+formData.append('file', new Blob([fs.readFileSync(filePath)]), 'audio.wav');
+formData.append('response_format', 'text');
+
+const res = await fetch(`http://127.0.0.1:${STT_PORT}/inference`, {
+  method: 'POST',
+  body: formData
+});
 ```
 
-The callback (from stopRecording) calls `setInput(activeSessionId, text)`, which updates the textarea with the transcribed text.
+`transcribeAudio()` writes the received buffer to the attachment vault under `sessionId` or `voice`, posts a multipart form to whisper-server, trims the plain text response, and deletes the temporary WAV file in a `finally` block.
+
+### 11. Frontend Inserts the Transcript
+File: `frontend/src/hooks/useVoice.ts` (Hook: `useVoice`, Function: `stopRecording`)
+File: `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`, Handler: `onMicClick`)
+File: `frontend/src/store/useInputStore.ts` (Store action: `setInput`)
 
 ```typescript
-// From ChatInput.tsx Line 167
+// FILE: frontend/src/components/ChatInput/ChatInput.tsx (Handler: onMicClick)
 stopRecording((text) => setInput(activeSessionId || '', text));
 ```
 
-Text is inserted into Zustand useInputStore, which updates the textarea value (Lines 236-240 of ChatInput.tsx).
-
-### 13. User Reviews and Submits
-User can edit the transcribed text in the textarea and then click Send to submit the prompt (same as normal text input).
-
----
+The socket callback clears `isProcessingVoice`, and non-empty transcripts call the callback passed by `ChatInput`. The text lands in the same prompt store as typed input and follows the normal submit path when the user sends it.
 
 ## Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   Frontend: Microphone Input                 │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  User clicks Mic button                                       │
-│  ↓                                                            │
-│  startRecording():                                            │
-│  1. navigator.mediaDevices.getUserMedia(deviceId)            │
-│  2. AudioContext + ScriptProcessor (4096-sample chunks)      │
-│  3. Set isRecording = true                                   │
-│  ↓                                                            │
-│  Audio stream flows through processor onaudioprocess         │
-│  chunks accumulate in recordingBuffer[]                       │
-│  ↓                                                            │
-│  User clicks Mic button again                                │
-│  ↓                                                            │
-│  stopRecording():                                            │
-│  1. Disconnect source → processor                            │
-│  2. Stop media stream (microphone off)                        │
-│  3. Flatten buffers → downsample 44.1kHz → 16kHz             │
-│  4. Encode to WAV (PCM, mono, 16-bit)                        │
-│  5. FileReader.readAsArrayBuffer(blob)                       │
-│  6. socket.emit('process_voice', {audioBuffer})              │
-│  7. Set isProcessingVoice = true                             │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │ Socket: process_voice {audioBuffer}
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Backend: whisper-server Integration             │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  voiceHandlers.js receives process_voice                     │
-│  ↓                                                            │
-│  Call transcribeAudio(audioBuffer, sessionId)                │
-│  ↓                                                            │
-│  1. Check isSTTEnabled() (env VOICE_STT_ENABLED)             │
-│  2. Write ArrayBuffer → temp WAV file                        │
-│  3. FormData.append(file + response_format='text')           │
-│  4. fetch POST http://127.0.0.1:9877/inference               │
-│  5. Read response text                                        │
-│  6. Delete temp WAV file                                      │
-│  7. Return text (or null on error)                           │
-│  ↓                                                            │
-│  Callback({ text: '...' })                                   │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTP: POST /inference (multipart)
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│         whisper-server.exe (ggml-cpp, local process)        │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  Spawned at server startup by voiceService.startSTTServer()  │
-│  Port: 9877 (STT_PORT env var)                              │
-│  Model: ggml-small.bin (71MB, 99 languages)                 │
-│  Threads: 4 (for inference optimization)                     │
-│                                                               │
-│  Receives: multipart form with audio.wav                     │
-│  ↓                                                            │
-│  Runs whisper inference (ggml-cpp optimized)                 │
-│  ↓                                                            │
-│  Returns: plain text transcript                              │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │ Response: "Transcribed text..."
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Frontend: Insert Transcript                      │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  socket callback({ text })                                   │
-│  ↓                                                            │
-│  setIsProcessingVoice(false)                                 │
-│  callback(text)  ← from useVoice stopRecording              │
-│  ↓                                                            │
-│  setInput(activeSessionId, text)                             │
-│  ↓                                                            │
-│  Zustand: useInputStore.inputs[sessionId] = text             │
-│  ↓                                                            │
-│  Textarea updates: value={input}                             │
-│  ↓                                                            │
-│  User reviews transcribed text, edits if needed              │
-│  ↓                                                            │
-│  User clicks Send → prompt submission (normal flow)          │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  ENV[.env: VOICE_STT_ENABLED, STT_PORT] --> VS[backend/voiceService.js]
+  VS -->|startSTTServer| WSP[backend/whisper/whisper-server.exe]
+  WSP --> MODEL[backend/whisper/ggml-small.bin]
+
+  SI[backend/sockets/index.js] -->|voice_enabled| US[frontend/src/hooks/useSocket.ts]
+  ACP[backend/services/acpClient.js performHandshake] -->|voice_enabled| US
+  US --> STORE[useVoiceStore.isVoiceEnabled]
+
+  STORE --> CI[ChatInput mic button]
+  SETTINGS[SystemSettingsModal Audio tab] --> STORE
+  MANAGER[useChatManager initial load] --> STORE
+  CI -->|onMicClick| UV[useVoice startRecording/stopRecording]
+  UV --> REC[WavRecorder]
+  REC -->|getUserMedia + AudioContext| MIC[Browser microphone]
+  REC -->|16 kHz mono PCM WAV Blob| UV
+  UV -->|process_voice ArrayBuffer| VH[backend/sockets/voiceHandlers.js]
+  VH -->|transcribeAudio| VS
+  VS -->|temp WAV under attachment vault| TMP[stt timestamp WAV]
+  VS -->|multipart POST /inference| WSP
+  WSP -->|plain text| VS
+  VS -->|delete temp file; return text/null| VH
+  VH -->|callback { text }| UV
+  UV --> INPUT[useInputStore.setInput]
 ```
 
----
+## The Critical Contract: WAV Payload, Socket Callback, and Null-on-Failure
 
-## The Critical Contract: Audio Format and Transcription Response
+### WAV Format Contract
+File: `frontend/src/utils/wavRecorder.ts` (Class: `WavRecorder`, Methods: `downsample`, `encodeWAV`)
 
-### Frontend Audio Encoding
+The backend treats `audioBuffer` as a complete WAV file. The frontend must send a RIFF/WAVE payload with this shape:
 
 ```typescript
-// Input: Float32 samples from AudioContext (any sample rate)
-// Output: ArrayBuffer in WAV format with these specs:
-
-interface WAVFormat {
-  format: 'RIFF',  // Audio file format container
-  codec: 'WAVE',   // PCM audio
-  channels: 1,     // Mono
-  sampleRate: 16000,  // 16kHz (required by whisper)
-  bitDepth: 16,    // 16-bit signed PCM
-  endian: 'little',
-}
+// Contract produced by WavRecorder.encodeWAV()
+type VoiceWavPayload = {
+  container: 'RIFF/WAVE';
+  format: 'PCM';
+  channels: 1;
+  sampleRate: 16000;
+  bitsPerSample: 16;
+  endian: 'little';
+};
 ```
 
-WAV encoding (Lines 104-135, wavRecorder.ts):
-- **Header size**: 44 bytes (RIFF + WAVE + fmt + data chunks)
-- **Sample encoding**: Each sample converted from Float32 [-1, 1] to Int16 [-32768, 32767]
-- **File structure**: RIFF header → fmt chunk (metadata) → data chunk (PCM samples)
+`WavRecorder.encodeWAV()` writes `fmt ` and `data` chunks, stores mono PCM metadata, and clamps each float sample into signed 16-bit PCM. `WavRecorder.downsample()` averages source samples into the target sample rate before encoding.
 
-### Backend Transcription Request
-
-```
-POST http://127.0.0.1:9877/inference
-Content-Type: multipart/form-data
-
-file: (binary WAV data)
-response_format: "text"
-```
-
-whisper-server API:
-- Accepts multipart form with audio file
-- `response_format` can be "text" (plain text), "json", "srt", "vtt"
-- Returns transcribed text as plain text (or structured format if requested)
-
-### Error Handling Contract
+### Socket Contract
+File: `frontend/src/hooks/useVoice.ts` (Socket event: `process_voice`)
+File: `backend/sockets/voiceHandlers.js` (Socket event: `process_voice`)
 
 ```typescript
-// If STT disabled: return null
-// If audioBuffer missing: log, return null
-// If whisper-server unreachable: log, return null
-// If whisper-server errors: catch, log, return null
-// If temp WAV write fails: catch, log, return null
-// On success: return trimmed text string (or null if empty)
+// Client payload and callback shape
+socket.emit(
+  'process_voice',
+  { audioBuffer: arrayBuffer },
+  (res: { text: string | null }) => { /* update UI */ }
+);
 ```
 
----
-
-## Configuration / Provider Support
-
-Voice system requires **environment and file setup**, not provider-specific config:
-
-### 1. **Environment Variables** (`.env`)
-
-```bash
-VOICE_STT_ENABLED=true          # Enable voice input (default: false)
-STT_PORT=9877                   # whisper-server port (default: 9877)
+```javascript
+// Server callback shape
+callback({ text });
 ```
 
-### 2. **Required Files** (Manual Setup)
+The callback payload always uses the `text` field. The frontend only inserts text when the field is truthy. Empty transcripts and failed transcriptions leave the prompt input unchanged.
 
-```
-backend/whisper/
-├── whisper-server.exe          # Pre-built binary (from whisper.cpp releases)
-├── ggml-small.bin              # Model file (71MB, 99 languages)
-└── required .dll files         # As needed by whisper-server.exe
-```
+### Backend Failure Contract
+File: `backend/voiceService.js` (Function: `transcribeAudio`)
 
-**Download Links:**
-- whisper-server.exe: https://github.com/ggerganov/whisper.cpp (releases page)
-- ggml-small.bin: https://huggingface.co/ggerganov/whisper.cpp (models section)
+`transcribeAudio()` returns `null` when:
+- `VOICE_STT_ENABLED` is not exactly `true`.
+- `audioBuffer` is missing.
+- whisper-server returns a non-OK HTTP status.
+- `fetch()` throws.
+- whisper-server returns only whitespace.
+- any caught file, form, or HTTP operation throws.
 
-### 3. **No Provider-Specific Configuration**
+The function deletes `filePath` in `finally` when the temporary file exists. Callers must treat `null` as a normal transcription result, not as an exception path.
 
-Voice system is **provider-agnostic**:
-- Works with any ACP provider
-- Audio device selection is global (not per-provider)
-- Transcribed text goes directly to textarea (provider-independent)
+## Configuration / Data Flow
 
----
+### Environment and Runtime Files
 
-## Data Flow / Rendering Pipeline
+| Config or File | Anchor | Current Behavior |
+|---|---|---|
+| `VOICE_STT_ENABLED` | `backend/voiceService.js` (Function: `isSTTEnabled`) | Enables server startup and `voice_enabled` when the value is exactly `true`. |
+| `STT_PORT` | `backend/voiceService.js` (Constant: `STT_PORT`) | Controls the whisper-server port and `/inference` URL. Runtime fallback is `9877`. |
+| `.env.example` | `.env.example` (Keys: `VOICE_STT_ENABLED`, `STT_PORT`) | Example config sets `VOICE_STT_ENABLED=false` and `STT_PORT=9777`. |
+| `backend/whisper/whisper-server.exe` | `backend/voiceService.js` (Constant: `WHISPER_SERVER`) | Spawn target for local STT. |
+| `backend/whisper/ggml-small.bin` | `backend/voiceService.js` (Constant: `WHISPER_MODEL`) | Model path passed with `-m`. |
+| `backend/whisper/*.dll` | `backend/whisper/` | Runtime libraries loaded by the whisper executable. |
 
-### Microphone Permission Request
+Effective endpoint selection is:
 
-```
-User clicks Mic button
-  │
-  ▼ startRecording()
-  │
-  ├─ navigator.mediaDevices.getUserMedia({audio: {deviceId}})
-  │
-  ├─ Browser shows permission dialog:
-  │  "Allow AcpUI to use your microphone?"
-  │
-  ├─ User clicks Allow
-  │
-  └─ MediaStream granted (or exception if denied)
-     RecorderRef.current = new WavRecorder()
-     recorderRef.start(deviceId)
+```text
+process.env.STT_PORT if set
+else backend/voiceService.js fallback 9877
+
+POST http://127.0.0.1:<effective STT_PORT>/inference
 ```
 
-### Audio Buffering and Recording
+### Frontend State Flow
 
-```
-Audio flowing through Web Audio API:
-  │
-  ├─ MediaStreamAudioSourceNode (input)
-  ├─ ScriptProcessorNode (4096-sample chunks)
-  │  └─ onaudioprocess callback:
-  │     1. Extract Float32 channel[0] data
-  │     2. Copy to Float32Array
-  │     3. Push to recordingBuffer[]
-  │     4. Accumulate length
-  ├─ Connect → AudioContext.destination (monitoring only)
-  │
-  └─ Repeat until stop() called
+```text
+voice_enabled socket event
+  -> useSocket handler
+  -> useVoiceStore.setIsVoiceEnabled(enabled)
+  -> ChatInput renders or hides mic button
 ```
 
-### Audio Encoding Pipeline
-
-```
-Raw Float32 buffers[] (44.1kHz or 48kHz, mixed sample rates)
-  │
-  ▼ Flatten: merge all chunks into single Float32Array
-  │
-  ▼ Downsample: 44.1kHz/48kHz → 16kHz (via averaging)
-  │
-  ▼ Encode to WAV:
-  │  1. Create 44-byte header (RIFF/WAVE/fmt metadata)
-  │  2. For each sample:
-  │     - Clamp Float32 to [-1, 1]
-  │     - Convert to Int16: s < 0 ? s*0x8000 : s*0x7FFF
-  │     - Write 2 bytes (little-endian)
-  │  3. Append all Int16 samples to header
-  │
-  ▼ Return Blob(buffer, {type: 'audio/wav'})
-  │
-  ▼ FileReader converts Blob → ArrayBuffer
-  │
-  └─ socket.emit('process_voice', {audioBuffer})
+```text
+navigator.mediaDevices.enumerateDevices()
+  -> audioinput entries only
+  -> useVoiceStore.availableAudioDevices
+  -> SystemSettingsModal Audio tab select
+  -> useVoiceStore.setSelectedAudioDevice(deviceId)
+  -> localStorage key selectedAudioDevice
+  -> WavRecorder.start(deviceId)
 ```
 
-### Transcription Flow
+### Recording and Transcription Flow
 
-```
-Backend receives ArrayBuffer {audioBuffer}
-  │
-  ├─ Check: VOICE_STT_ENABLED env var?
-  │  No → return null
-  │
-  ├─ Check: audioBuffer exists?
-  │  No → return null
-  │
-  ├─ Write: Buffer.from(audioBuffer) → temp file {sessionId}/stt-{timestamp}.wav
-  │
-  ├─ POST: multipart form to http://127.0.0.1:9877/inference
-  │
-  ├─ whisper-server:
-  │  1. Loads model (first request may take 2-3s)
-  │  2. Runs inference (typically 1-2s for short audio)
-  │  3. Returns plain text
-  │
-  ├─ Read response: text = res.text().trim()
-  │
-  ├─ Log: '[VOICE] Transcribed: "..."'
-  │
-  ├─ Finally: Delete temp WAV file
-  │
-  └─ Return text || null
+```text
+ChatInput.onMicClick
+  -> useVoice.startRecording()
+  -> WavRecorder.start(selectedAudioDevice)
+  -> browser audio chunks in recordingBuffer
+  -> ChatInput.onMicClick while recording
+  -> useVoice.stopRecording(callback)
+  -> WavRecorder.stop()
+  -> createWavBlob() -> downsample() -> encodeWAV()
+  -> FileReader.readAsArrayBuffer(blob)
+  -> socket.emit('process_voice', { audioBuffer }, callback)
+  -> registerVoiceHandlers() -> transcribeAudio()
+  -> temp stt-<timestamp>.wav file
+  -> whisper-server /inference
+  -> callback({ text })
+  -> useInputStore.setInput(activeSessionId, text)
 ```
 
-### UI Feedback Flow
+### Provider and Persistence Behavior
 
-```
-User interaction:
-  │
-  ├─ Click Mic: setIsRecording(true) → Mic icon shows active state
-  │
-  ├─ Recording: microphone indicator (green dot or pulsing icon)
-  │
-  ├─ Release/Click Stop: stopRecording() → disable mic during processing
-  │
-  ├─ setIsProcessingVoice(true) → Mic button shows spinner (Loader2 icon)
-  │
-  ├─ Waiting for whisper-server response (typically 1-3 seconds)
-  │
-  ├─ Socket callback arrives: setIsProcessingVoice(false)
-  │
-  ├─ setInput(sessionId, transcribedText)
-  │
-  └─ Textarea updates: shows transcribed text for user review/editing
-```
-
----
+- Provider config is not involved.
+- The transcript is plain text and enters the prompt box before submission.
+- No voice-specific database table is used.
+- Temporary WAV files are stored under `getAttachmentsRoot()` and removed by `transcribeAudio()` after the request finishes.
+- ChatInput-originated recordings omit `sessionId`; direct `process_voice` callers can include `sessionId` to scope the temp directory.
 
 ## Component Reference
 
-### Frontend Components & Hooks
+### Frontend
 
-| File | Component/Function | Lines | Purpose |
-|------|-------------------|-------|---------|
-| `frontend/src/hooks/useVoice.ts` | `useVoice` | 6-91 | Voice recording lifecycle; requests device list; starts/stops recording; emits process_voice socket event |
-| `frontend/src/hooks/useVoice.ts` | `fetchAudioDevices` | 20-34 | Enumerates audio input devices via mediaDevices API |
-| `frontend/src/hooks/useVoice.ts` | `startRecording` | 36-47 | Initializes WavRecorder; calls start(deviceId); sets isRecording |
-| `frontend/src/hooks/useVoice.ts` | `stopRecording` | 49-77 | Stops WavRecorder; validates duration; reads blob as ArrayBuffer; emits socket event |
-| `frontend/src/store/useVoiceStore.ts` | `useVoiceStore` | 24-51 | Zustand store: isRecording, isProcessingVoice, availableAudioDevices, selectedAudioDevice |
-| `frontend/src/utils/wavRecorder.ts` | `WavRecorder` class | 1-137 | Web Audio API integration; captures microphone; downsamples; encodes WAV |
-| `frontend/src/utils/wavRecorder.ts` | `start()` | 10-35 | Requests getUserMedia; sets up AudioContext + ScriptProcessor |
-| `frontend/src/utils/wavRecorder.ts` | `stop()` | 37-56 | Disconnects nodes; stops tracks; creates WAV blob |
-| `frontend/src/utils/wavRecorder.ts` | `createWavBlob()` | 58-79 | Flattens buffers; downsamples; calls encodeWAV |
-| `frontend/src/utils/wavRecorder.ts` | `downsample()` | 81-102 | Resamples audio from system rate to 16kHz (averaging) |
-| `frontend/src/utils/wavRecorder.ts` | `encodeWAV()` | 104-135 | Encodes downsampled audio to WAV format (RIFF header + PCM samples) |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | Mic button | 245-255 | Calls onMicClick; shows recording/processing state |
-| `frontend/src/components/SystemSettingsModal.tsx` | Audio tab | 104-127 | Audio device selection dropdown; refresh button; device enumeration |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket hydration | `frontend/src/hooks/useSocket.ts` | `useSocket`, socket event `voice_enabled`, `setIsVoiceEnabled` | Converts backend voice availability into Zustand state. |
+| Chat bootstrap | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, initial load callback `mockFetch`, `handleInitialLoad` | Enumerates audio input devices during initial load. |
+| Voice hook | `frontend/src/hooks/useVoice.ts` | `useVoice`, `fetchAudioDevices`, `startRecording`, `stopRecording`, `recorderRef`, `voiceStartTimeRef`, `isMouseDownOnMicRef` | Owns recording lifecycle and `process_voice` emission. |
+| Voice store | `frontend/src/store/useVoiceStore.ts` | `useVoiceStore`, `setIsRecording`, `setIsProcessingVoice`, `setIsVoiceEnabled`, `setAvailableAudioDevices`, `setSelectedAudioDevice`, `fetchAudioDevices` | Stores voice UI state and selected microphone. |
+| WAV recorder | `frontend/src/utils/wavRecorder.ts` | `WavRecorder`, `start`, `stop`, `createWavBlob`, `downsample`, `encodeWAV`, `targetSampleRate` | Captures Web Audio chunks and produces the WAV payload. |
+| Prompt UI | `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput`, `onMicClick`, `isVoiceEnabled`, `isRecording`, `isProcessingVoice`, `setInput` | Renders the mic button and inserts transcripts into the prompt input. |
+| Prompt styling | `frontend/src/components/ChatInput/ChatInput.css` | `.mic-btn.recording`, `.mic-btn.processing`, `recording-glow`, `processing-glow` | Shows recording and processing visual states. |
+| Settings UI | `frontend/src/components/SystemSettingsModal.tsx` | `SystemSettingsModal`, `activeTab: 'audio'`, `fetchAudioDevices`, `setSelectedAudioDevice` | Lets the user refresh and select audio input devices. |
 
-### Backend Services & Handlers
+### Backend
 
-| File | Function | Lines | Purpose |
-|------|----------|-------|---------|
-| `backend/voiceService.js` | `isSTTEnabled()` | 20-22 | Checks VOICE_STT_ENABLED env var |
-| `backend/voiceService.js` | `startSTTServer()` | 24-43 | Spawns whisper-server.exe with model + port; logs errors; handles exit |
-| `backend/voiceService.js` | `transcribeAudio()` | 45-80 | Writes audio to temp file; POSTs to whisper-server; deletes temp file; returns text |
-| `backend/sockets/voiceHandlers.js` | `process_voice` handler | 5-8 | Receives audioBuffer; calls transcribeAudio; returns text via callback |
-| `backend/server.js` | Initialization | Line 95 | Calls startSTTServer() on app startup |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Server startup | `backend/server.js` | `startSTTServer`, Socket.IO option `maxHttpBufferSize` | Starts STT service and permits large socket payloads. |
+| Socket connection | `backend/sockets/index.js` | `registerSocketHandlers`, socket event `voice_enabled`, `registerVoiceHandlers` | Advertises voice support and registers voice handlers. |
+| Voice socket handler | `backend/sockets/voiceHandlers.js` | `registerVoiceHandlers`, socket event `process_voice` | Routes audio buffers to the STT service and replies with `{ text }`. |
+| STT service | `backend/voiceService.js` | `isSTTEnabled`, `startSTTServer`, `transcribeAudio`, `WHISPER_SERVER`, `WHISPER_MODEL`, `STT_PORT` | Manages whisper-server and transcription requests. |
+| Attachment root | `backend/services/attachmentVault.js` | `getAttachmentsRoot` | Provides the base directory for temporary WAV files. |
+| Provider handshake | `backend/services/acpClient.js` | `performHandshake`, socket event `voice_enabled` | Re-emits voice availability after provider readiness. |
 
-### Socket Events
+### Configuration and Runtime Assets
 
-| Event | Direction | Payload | Purpose |
-|-------|-----------|---------|---------|
-| `voice_enabled` | Server → Client | `{enabled: boolean}` | Notifies UI if STT is available |
-| `process_voice` | Client → Server | `{audioBuffer: ArrayBuffer, sessionId?: string}` | Requests transcription |
-| (callback) | Server → Client | `{text: string \| null}` | Returns transcribed text |
-
----
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Env example | `.env.example` | `VOICE_STT_ENABLED`, `STT_PORT` | Documents optional voice STT env keys. |
+| Whisper binary | `backend/whisper/whisper-server.exe` | Spawn target `WHISPER_SERVER` | Local whisper.cpp HTTP server executable. |
+| Whisper model | `backend/whisper/ggml-small.bin` | Model target `WHISPER_MODEL` | Local speech model passed to whisper-server. |
+| Whisper DLLs | `backend/whisper/ggml-base.dll`, `backend/whisper/ggml-cpu.dll`, `backend/whisper/ggml.dll`, `backend/whisper/whisper.dll` | Runtime library files | Support files loaded by the Windows executable. |
 
 ## Gotchas & Important Notes
 
-### 1. **whisper-server Must Be Running Before Voice is Used**
-- **Problem:** If user clicks Mic before whisper-server starts, request times out.
-- **Why:** `startSTTServer()` is called at app startup, but initialization takes ~1-2s.
-- **Mitigation:** UI disables Mic button until `voice_enabled` event arrives. Consider checking server health.
+1. **Feature enablement is env-only**
+   `isSTTEnabled()` checks only `process.env.VOICE_STT_ENABLED === 'true'`. The `voice_enabled` event can be true even if the microphone permission, whisper executable, model file, port, or DLLs are not healthy.
 
-### 2. **First Inference Request Takes 2-3 Seconds**
-- **Problem:** First voice query is slow (whisper model loading into memory).
-- **Why:** ggml-small.bin (71MB) is loaded on first inference request.
-- **Mitigation:** Model stays in memory; subsequent requests are faster (~1-2s).
+2. **Runtime port has two source values**
+   `backend/voiceService.js` falls back to `9877` when `STT_PORT` is unset. `.env.example` sets `STT_PORT=9777`. The effective port is the environment value when present; debugging should inspect the loaded `.env` value and the `[VOICE] Starting whisper-server on port ...` log.
 
-### 3. **16kHz Sample Rate is Required**
-- **Problem:** If downsampling logic breaks, audio quality degrades or fails to transcribe.
-- **Why:** whisper.cpp is optimized for 16kHz; other rates not supported.
-- **Verification:** Check audio buffer length vs sample rate; downsampling ratio (44100 / 16000 = 2.75).
+3. **ChatInput recordings do not include sessionId**
+   `useVoice.stopRecording()` emits `{ audioBuffer }`. The backend supports `{ audioBuffer, sessionId }`, but the mic button path uses the fallback temp directory `voice` under `getAttachmentsRoot()`.
 
-### 4. **Minimum Duration Check (400ms) Can Prevent Legitimate Short Recordings**
-- **Problem:** User accidentally clicks Mic twice quickly; transcription is skipped silently.
-- **Why:** 400ms check prevents noise/click captures (Lines 56-58, useVoice.ts).
-- **Tunable:** Adjust duration threshold in stopRecording if needed.
+4. **Voice transcript replaces prompt input**
+   `ChatInput.onMicClick` calls `setInput(activeSessionId || '', text)`. It does not append to existing text or preserve a cursor position.
 
-### 5. **Audio Stays in Memory During Processing**
-- **Problem:** Large audio files (5+ minutes) consume significant browser memory.
-- **Why:** Float32Array buffers accumulate; no streaming compression.
-- **Limitation:** Typical use case (10-30 sec) = ~320KB-960KB in memory. Acceptable for local browser.
+5. **Null socket can leave processing state set**
+   `useVoice.stopRecording()` sets `isProcessingVoice` to true inside `FileReader.onload`; the false transition is inside the `socket.emit` callback. If `socket` is null after the blob is read, `isProcessingVoice` remains true until another state transition changes it.
 
-### 6. **No Streaming Transcription**
-- **Problem:** User must wait for entire recording to finish before transcription starts.
-- **Why:** WAV encoding happens after recording stops; one-shot POST to whisper-server.
-- **Alternative:** Could implement streaming via chunked requests (not implemented).
+6. **Short recordings never reach the backend**
+   `useVoice.stopRecording()` returns early when duration is under 400 ms. That path sets `isRecording` false and skips FileReader, `process_voice`, and `isProcessingVoice`.
 
-### 7. **Temp WAV Files Can Accumulate If Process Crashes**
-- **Problem:** If Node.js crashes during transcribeAudio, temp WAV files aren't deleted.
-- **Why:** Finally block (Line 73-78) may not execute if process dies.
-- **Mitigation:** Periodic cleanup of `{attachmentsRoot}/voice/stt-*.wav` files.
+7. **Device labels can differ by enumeration path**
+   `useVoice.fetchAudioDevices()` and `useChatManager()` use `Default Microphone` for blank labels. `useVoiceStore.fetchAudioDevices()` uses `Unknown Microphone`. Tests cover the store fallback label.
 
-### 8. **Device Permissions Are Permanent Per Site (Browser Policy)**
-- **Problem:** Once user grants microphone access, they see no more prompts (good for UX, bad if they want to revoke).
-- **Why:** Browser caches permission decisions in IndexedDB/site data.
-- **Recovery:** User can revoke via browser settings → Privacy → Microphone.
+8. **The recorder is one-shot per stop call**
+   Audio chunks stay in browser memory until `stop()` flattens and encodes them. Long recordings increase memory usage and socket payload size; the backend accepts large socket payloads through `maxHttpBufferSize`, but the feature does not stream partial audio.
 
-### 9. **Audio Context May Fail in Private Browsing / Incognito**
-- **Problem:** Some browsers (Safari) block getUserMedia in private mode.
-- **Why:** Privacy policy: no access to hardware in private sessions.
-- **Detection:** Try/catch handles exception; isRecording stays false; user sees no feedback.
+9. **whisper-server output logging is selective**
+   `startSTTServer()` ignores stdout and writes stderr only when the message contains `error`. Port binding, model loading, and process exit debugging starts in `backend/voiceService.js` logs.
 
-### 10. **No Feedback if whisper-server Exits Unexpectedly**
-- **Problem:** If whisper-server crashes (e.g., memory pressure), user gets null result silently.
-- **Why:** `transcribeAudio` catches errors; logs to backend; returns null; UI shows empty transcript.
-- **Debugging:** Check server logs for whisper process exit code. Restart backend if needed.
-
----
+10. **Temp file cleanup depends on process continuity**
+   `transcribeAudio()` removes the temp WAV file in `finally`. A Node process exit during transcription can leave `stt-*.wav` files under the attachment vault.
 
 ## Unit Tests
 
 ### Frontend Tests
 
-| Test File | Test Names | Location | Coverage |
-|-----------|-----------|----------|----------|
-| `frontend/src/test/useVoice.test.ts` | Recording lifecycle tests | ? | startRecording, stopRecording |
-| `frontend/src/test/useVoice.test.ts` | Device enumeration tests | ? | fetchAudioDevices |
-| `frontend/src/test/useVoiceStore.test.ts` | Store state tests | ? | isRecording, isProcessingVoice, devices |
-| `frontend/src/test/wavRecorder.test.ts` | WAV encoding tests | ? | downsample, encodeWAV, createWavBlob |
-| `frontend/src/test/wavRecorder.test.ts` | Downsampling tests | ? | downsample accuracy (44.1→16kHz) |
+| File | Test Names | Coverage |
+|---|---|---|
+| `frontend/src/test/useVoice.test.ts` | `fetchAudioDevices updates store`; `startRecording calls WavRecorder.start and updates state`; `stopRecording processes voice if duration is sufficient`; `stopRecording calls WavRecorder.stop and emits process_voice` | Hook-level device discovery, recorder start, duration-gated stop, FileReader conversion, and `process_voice` emission. |
+| `frontend/src/test/useVoiceStore.test.ts` | `updates recording and processing state`; `manages available audio devices`; `updates selected audio device and persists to localStorage`; `fetchAudioDevices updates state from navigator.mediaDevices`; `setIsVoiceEnabled updates state`; `fetchAudioDevices handles errors gracefully`; `fetchAudioDevices labels unknown devices` | Zustand state transitions, persistence key `selectedAudioDevice`, device filtering, enablement state, and error handling. |
+| `frontend/src/test/wavRecorder.test.ts` | `downsamples buffer correctly`; `encodes WAV header correctly`; `stops recording and returns a blob` | Downsampling behavior, WAV header fields, and `audio/wav` blob creation. |
+| `frontend/src/test/useSocket.test.ts` | `handles "voice_enabled" event` | Socket-to-store enablement contract. |
+| `frontend/src/test/SystemSettingsModal.test.tsx` | `renders and switches tabs` | Audio tab rendering with `Audio Input` and stored microphone choices. |
+| `frontend/src/test/ChatInput.test.tsx` | `automatically focuses the textarea when enabled` and general ChatInput tests using `isVoiceEnabled: true` test setup | ChatInput renders with voice state seeded; there is no dedicated named test that clicks the mic button. |
 
 ### Backend Tests
 
-| Test File | Test Names | Location | Coverage |
-|-----------|-----------|----------|----------|
-| `backend/test/voiceService.test.js` | isSTTEnabled tests | ? | env var check |
-| `backend/test/voiceService.test.js` | transcribeAudio tests | ? | audio processing, API calls |
-| `backend/test/voiceHandlers.test.js` | process_voice handler | ? | socket event handling |
+| File | Test Names | Coverage |
+|---|---|---|
+| `backend/test/voiceService.test.js` | `returns null if no audio buffer is provided`; `returns null if STT is not enabled`; `isSTTEnabled returns true when env var is true`; `isSTTEnabled returns false when env var is not true`; `startSTTServer does nothing when STT is disabled`; `startSTTServer starts when STT is enabled`; `transcribeAudio returns result or null on error` | Feature flag, empty input, startup guard, broad transcription behavior. |
+| `backend/test/voiceService.test.js` | `transcribeAudio catches fetch error and returns null`; `transcribeAudio returns null when sessionId is undefined`; `startSTTServer registers exit handler on server process`; `exit handler body logs and clears serverProcess`; `transcribeAudio returns transcribed text on successful whisper-server response`; `transcribeAudio returns null when server response text is blank`; `transcribeAudio returns null and logs error when server returns non-ok status` | Fetch failures, fallback `voice` temp directory, process exit handler, successful text trimming, blank output, and HTTP error handling. |
+| `backend/test/voiceHandlers.test.js` | `should call transcribeAudio and return text` | `process_voice` socket handler callback shape. |
+| `backend/test/coverage-boost.test.js` | server import coverage with `startSTTServer` mocked | Confirms server startup imports without launching the real STT process in that test path. |
 
----
+### Test Commands
+
+```bash
+# Backend voice tests
+cd backend && npx vitest run test/voiceService.test.js test/voiceHandlers.test.js
+
+# Frontend voice tests
+cd frontend && npx vitest run src/test/useVoice.test.ts src/test/useVoiceStore.test.ts src/test/wavRecorder.test.ts src/test/useSocket.test.ts src/test/SystemSettingsModal.test.tsx src/test/ChatInput.test.tsx
+```
 
 ## How to Use This Guide
 
-### For Implementing / Extending This Feature
+### For Implementing or Extending This Feature
 
-1. **Understand audio capture** — Read Steps 2-7 (microphone → WAV encoding).
-2. **Understand transcription** — Read Steps 8-11 (socket → whisper-server → response).
-3. **Add custom audio processing** — Modify `wavRecorder.ts` downsample/encode logic if needed.
-4. **Add streaming transcription** — Chunk the audio buffer; POST multiple requests to whisper-server with accumulated text.
-5. **Support different models** — Change `WHISPER_MODEL` path in voiceService.js; models: tiny, base, small, medium, large.
-6. **Change sample rate** — Modify `targetSampleRate` constant in wavRecorder.ts (default 16000); verify whisper-server supports it.
-7. **Add real-time feedback** — Emit socket events during recording (e.g., audio level meter).
+1. Start at `frontend/src/components/ChatInput/ChatInput.tsx` (Handler: `onMicClick`) to understand when recording starts and where transcript text lands.
+2. Follow `frontend/src/hooks/useVoice.ts` (Functions: `startRecording`, `stopRecording`) before changing socket payloads, processing state, or duration gating.
+3. Follow `frontend/src/utils/wavRecorder.ts` (Methods: `downsample`, `encodeWAV`) before changing sample rate, channels, bit depth, or recording APIs.
+4. Follow `backend/sockets/voiceHandlers.js` (Socket event: `process_voice`) before changing the callback contract.
+5. Follow `backend/voiceService.js` (Functions: `startSTTServer`, `transcribeAudio`) before changing whisper-server startup, temp file handling, endpoint shape, or null/error behavior.
+6. Update the tests listed in the Unit Tests section when changing state keys, socket payloads, WAV format, or backend STT behavior.
 
-### For Debugging Issues with This Feature
+### For Debugging This Feature
 
-1. **Mic button doesn't appear** — Check `voice_enabled` event. Verify `VOICE_STT_ENABLED=true` in .env. Check browser console for errors.
-2. **Microphone permission denied** — User clicked "Block". Check browser settings → Privacy → Microphone. Request permission again.
-3. **Recording doesn't start** — Check `getUserMedia` error in console. Verify device ID is valid. Try default device.
-4. **No transcript returned** — Check whisper-server running: `netstat -an | find ":9877"` (Windows) or `lsof -i :9877` (Mac/Linux).
-5. **"Recording too short" message** — Recording < 400ms. Increase minimum duration in useVoice.ts Line 56 if needed.
-6. **Whisper-server crashes** — Check backend logs for exit code. Model file missing or corrupted? Restart backend.
-7. **Transcript contains gibberish** — Audio quality poor? Increase model size (ggml-medium.bin, ggml-large.bin). Try different microphone.
-8. **High latency (3+ seconds)** — First request loads model. Subsequent requests faster. Warm-up with dummy request if time-critical.
-
----
+1. If the mic button is hidden, check `backend/sockets/index.js` and `frontend/src/hooks/useSocket.ts` for the `voice_enabled` event, then check `VOICE_STT_ENABLED` in the loaded `.env`.
+2. If the mic button appears but transcription fails, check `backend/voiceService.js` logs for whisper-server startup, `/inference` fetch errors, and `[VOICE ERR]` messages.
+3. If microphone selection is wrong, check `useVoiceStore.selectedAudioDevice`, localStorage key `selectedAudioDevice`, and `SystemSettingsModal` Audio tab state.
+4. If no socket request is sent, check `useVoice.stopRecording()` duration gating and `FileReader.onload` execution.
+5. If whisper-server receives invalid audio, inspect `WavRecorder.encodeWAV()` and run `frontend/src/test/wavRecorder.test.ts`.
+6. If temporary files accumulate, inspect `transcribeAudio()` cleanup and the attachment vault directory returned by `getAttachmentsRoot()`.
+7. If the transcript appears in the wrong input state, inspect `ChatInput.onMicClick` and `useInputStore.setInput(activeSessionId || '', text)`.
 
 ## Summary
 
-The **Voice-to-Text System** enables users to record speech and have it transcribed locally via whisper.cpp, integrated seamlessly into the Chat Input component. Key points:
-
-1. **Frontend recording**: Web Audio API captures microphone → buffers → downsamples 44.1kHz to 16kHz → encodes WAV.
-2. **Socket transmission**: ArrayBuffer sent to backend via `process_voice` socket event.
-3. **Local inference**: whisper-server.exe (spawned at app startup) processes audio via HTTP POST → returns text.
-4. **Text insertion**: Transcribed text inserted into textarea for user review/editing before submission.
-5. **Device selection**: User chooses microphone from System Settings Audio tab; persisted in localStorage.
-
-**Critical Contract:** Audio must be 16kHz mono PCM WAV format. whisper-server API expects multipart form with file + `response_format=text`.
-
-**Configuration:** Requires `VOICE_STT_ENABLED=true` env var + manual setup of whisper-server.exe and ggml-small.bin in `backend/whisper/` directory.
-
-**Privacy-First:** All audio processing happens locally; no cloud API calls; temp files deleted after transcription.
-
-This feature is provider-agnostic and optional (only enabled if `VOICE_STT_ENABLED=true`). Perfect for hands-free dictation or accessibility-focused workflows.
+- Voice-to-text is an optional, provider-independent path from microphone recording to prompt text insertion.
+- Backend enablement comes from `VOICE_STT_ENABLED`; runtime endpoint selection comes from `STT_PORT` or the `9877` fallback in `backend/voiceService.js`.
+- The browser recorder must produce 16 kHz mono 16-bit PCM WAV data.
+- `process_voice` carries `{ audioBuffer }` from the frontend and replies with `{ text: string | null }`.
+- `transcribeAudio()` treats failure as `null`, logs errors, and cleans up the temp WAV file when the process remains alive.
+- The ChatInput mic path replaces the active prompt text with the transcript.
+- Tests cover the hook, store, WAV encoder, socket enablement, System Settings audio tab, STT service, and voice socket handler.

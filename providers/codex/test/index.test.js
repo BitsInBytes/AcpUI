@@ -635,6 +635,46 @@ describe('Codex Provider', () => {
       expect(codex.categorizeToolCall(event)).toEqual({ category: 'shell', isShellCommand: true });
     });
 
+    it('normalizes optional AcpUI MCP tool titles without server prefixes', () => {
+      const normalize = (tool, args) => codex.normalizeTool(
+        { type: 'tool_start', id: `t-${tool}`, title: `Tool: AcpUI/${tool}` },
+        {
+          title: `Tool: AcpUI/${tool}`,
+          rawInput: { invocation: { server: 'AcpUI', tool, arguments: args } }
+        }
+      );
+
+      expect(normalize('ux_read_file', { file_path: 'D:/repo/hello.ts' }).title).toBe('Read File: hello.ts');
+      expect(normalize('ux_replace', { file_path: 'D:/repo/hello.ts' }).title).toBe('Replace In File: hello.ts');
+      expect(normalize('ux_list_directory', { dir_path: 'D:/repo/src' }).title).toBe('List Directory: D:/repo/src');
+      expect(normalize('ux_glob', { description: 'Find source files', pattern: '**/*.ts' }).title).toBe('Glob: Find source files');
+      expect(normalize('ux_grep_search', { description: 'Find hooks', pattern: 'use[A-Z]' }).title).toBe('Search: Find hooks');
+      expect(normalize('ux_web_fetch', { url: 'https://example.test/docs' }).title).toBe('Fetch: https://example.test/docs');
+      expect(normalize('ux_google_web_search', { query: 'latest docs' }).title).toBe('Web Search: latest docs');
+    });
+
+    it('normalizes Codex titles from all standard input locations', () => {
+      const fromArguments = codex.normalizeTool(
+        { type: 'tool_start', id: 't-args', title: 'Tool: AcpUI/ux_grep_search' },
+        {
+          title: 'Tool: AcpUI/ux_grep_search',
+          rawInput: { invocation: { server: 'AcpUI', tool: 'ux_grep_search' } },
+          arguments: { description: 'Find hooks', pattern: 'use[A-Z]' }
+        }
+      );
+      const fromToolCallArguments = codex.normalizeTool(
+        { type: 'tool_start', id: 't-tool-call', title: 'Tool: AcpUI/ux_web_fetch' },
+        {
+          title: 'Tool: AcpUI/ux_web_fetch',
+          rawInput: { invocation: { server: 'AcpUI', tool: 'ux_web_fetch' } },
+          toolCall: { arguments: { url: 'https://example.test/docs' } }
+        }
+      );
+
+      expect(fromArguments.title).toBe('Search: Find hooks');
+      expect(fromToolCallArguments.title).toBe('Fetch: https://example.test/docs');
+    });
+
     it('extracts canonical tool invocation metadata from Codex MCP raw input', () => {
       const invocation = codex.extractToolInvocation(
         {

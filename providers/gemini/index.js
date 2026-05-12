@@ -2,7 +2,14 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProvider } from '../../backend/services/providerLoader.js';
-import { collectInputObjects, mergeInputObjects } from '../../backend/services/tools/toolInputUtils.js';
+import { acpUiToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
+import { ACP_UX_TOOL_NAMES, isAcpUxToolName } from '../../backend/services/tools/acpUxTools.js';
+import {
+  collectToolNameCandidates,
+  inputFromToolUpdate,
+  resolveToolNameFromAcpUiMcpTitle,
+  resolveToolNameFromCandidates
+} from '../../backend/services/tools/providerToolNormalization.js';
 import { matchToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -10,7 +17,6 @@ const __dirname = path.dirname(__filename);
 
 // Cache for arguments to reconstruct outputs that Gemini CLI drops
 const toolArgCache = new Map();
-
 // Context % and Quota % State
 let _emitProviderExtension = null;
 let _writeLog = null;
@@ -110,9 +116,9 @@ export function intercept(payload) {
         return null;
       }
 
-      if (update?.sessionUpdate === 'tool_call') {
-        if (update.toolCallId && (update.arguments || update.rawInput)) {
-          toolArgCache.set(update.toolCallId, update.arguments || update.rawInput);
+      if (update?.sessionUpdate === 'tool_call' || update?.sessionUpdate === 'tool_call_update') {
+        if (update.toolCallId) {
+          cacheToolInput(update.toolCallId, inputFromUpdate(update, { sessionId }), sessionId);
         }
       }
     }
@@ -449,6 +455,42 @@ const KIND_TO_TOOL_NAME = {
   other:   'other',
 };
 
+function toolInputCacheKey(sessionId, toolCallId) {
+  return sessionId && toolCallId ? `${sessionId}::${toolCallId}` : '';
+}
+
+function isNonEmptyInput(input) {
+  return Boolean(input && typeof input === 'object' && Object.keys(input).length > 0);
+}
+
+function cacheToolInput(toolCallId, input, sessionId) {
+  if (!toolCallId || !isNonEmptyInput(input)) return;
+  toolArgCache.set(toolCallId, input);
+  const scopedKey = toolInputCacheKey(sessionId, toolCallId);
+  if (scopedKey) toolArgCache.set(scopedKey, input);
+}
+
+function getCachedToolInput(toolCallId, sessionId) {
+  const scopedKey = toolInputCacheKey(sessionId, toolCallId);
+  if (scopedKey && toolArgCache.has(scopedKey)) return toolArgCache.get(scopedKey);
+  return sessionId ? (toolArgCache.get(toolCallId) || {}) : {};
+}
+
+function inputFromUpdate(update = {}, context = {}) {
+  const toolCallId = update.toolCallId || update.id || context.event?.id;
+  const sessionId = context.sessionId || context.event?.sessionId;
+  const directInput = inputFromToolUpdate(update, { deep: true });
+  const cachedInput = getCachedToolInput(toolCallId, sessionId);
+  const input = { ...cachedInput, ...directInput };
+
+  cacheToolInput(toolCallId, input, sessionId);
+  return input;
+}
+
+function resolveToolNameFromMcpTitle(title) {
+  return resolveToolNameFromAcpUiMcpTitle(title);
+}
+
 /**
  * Normalize a tool call event: map ACP ToolKind → toolName and clean up title.
  */
@@ -456,34 +498,64 @@ export function normalizeTool(event, update) {
   const { config } = getProvider();
   const clientName = config.clientInfo?.name || 'AcpUI';
 
-  // 1. Identify the tool name. 
-  // Priority: 
-  //   a) Specific sub-agent overrides
-  //   b) Original toolName from event
-  //   c) Extracted from Gemini title (human-readable title)
-  //   d) Extracted from Gemini toolCallId (technical ID)
+  // 1. Identify the tool name.
+  // Priority:
+  //   a) Specific AcpUI MCP function-call metadata
+  //   b) AcpUI MCP human title suffix
+  //   c) Original provider toolName
+  //   d) Extracted from Gemini toolCallId/title
   //   e) Mapped from ACP ToolKind (kind)
 
   let title = (event.title || '').replace(/\r?\n/g, ' ').trim();
+  const originalTitle = title;
   const rawId = event.id || update?.toolCallId || '';
   const kind = update?.kind || '';
+  const input = inputFromUpdate(update, { sessionId: event.sessionId, event });
 
   // Strip the MCP server suffix if present (e.g. " (AcpUI MCP Server)")
-  const suffixRegex = new RegExp(`\\s*\\(${clientName} MCP Server\\)$`, 'i');
+  const suffixRegex = new RegExp('\\s*\\(' + clientName + ' MCP Server\\)' + String.fromCharCode(36), 'i');
+  const isAcpUiMcpTitle = suffixRegex.test(originalTitle);
   title = title.replace(suffixRegex, '');
 
-  let toolName = event.toolName || '';
+  const toolNameCandidates = [
+    event.toolName,
+    update?.toolName,
+    update?.name,
+    update?.displayName,
+    rawId,
+    update?.toolCallId,
+    title,
+    originalTitle,
+    ...collectToolNameCandidates([
+      update?.rawInput,
+      update?.arguments,
+      update?.args,
+      update?.params,
+      update?.input,
+      update?.description,
+      update?.toolCall
+    ])
+  ];
+  const candidateToolName = resolveToolNameFromCandidates(toolNameCandidates, config);
+  const titleToolName = isAcpUiMcpTitle ? resolveToolNameFromMcpTitle(title) : '';
+
+  let toolName = candidateToolName || titleToolName || event.toolName || '';
   const patternMatch = matchToolIdPattern(rawId, config) || matchToolIdPattern(title, config);
+  const lowerTitle = title.toLowerCase();
 
   // Handle MCP tool identifiers in ID or Title
-  if (patternMatch?.toolName) {
+  if (candidateToolName) {
+    toolName = candidateToolName;
+  } else if (titleToolName) {
+    toolName = titleToolName;
+  } else if (patternMatch?.toolName) {
     toolName = patternMatch.toolName;
-  } else if (title.toLowerCase().includes('invoke sub agents') || title.toLowerCase() === 'ux_invoke_subagents') {
-    toolName = 'ux_invoke_subagents';
-  } else if (title.toLowerCase() === 'ux_invoke_counsel') {
-    toolName = 'ux_invoke_counsel';
-  } else if (title.toLowerCase().startsWith('running:')) {
-    toolName = 'ux_invoke_shell';
+  } else if (lowerTitle.includes('invoke sub agents') || lowerTitle === ACP_UX_TOOL_NAMES.invokeSubagents) {
+    toolName = ACP_UX_TOOL_NAMES.invokeSubagents;
+  } else if (lowerTitle === ACP_UX_TOOL_NAMES.invokeCounsel) {
+    toolName = ACP_UX_TOOL_NAMES.invokeCounsel;
+  } else if (lowerTitle.startsWith('running:')) {
+    toolName = ACP_UX_TOOL_NAMES.invokeShell;
   }
 
   // Fallback to ACP Kind mapping or ID extraction if still not identified
@@ -498,56 +570,54 @@ export function normalizeTool(event, update) {
 
   // 2. Finalize Title
   // Custom override for UI-owned tools to ensure the frontend trigger matches
-  if (toolName === 'ux_invoke_subagents') {
+  if (toolName === ACP_UX_TOOL_NAMES.invokeSubagents) {
     title = 'Invoke Subagents';
-  } else if (toolName === 'ux_invoke_counsel') {
+  } else if (toolName === ACP_UX_TOOL_NAMES.invokeCounsel) {
     title = 'Invoke Counsel';
-  } else if (toolName === 'ux_invoke_shell') {
+  } else if (toolName === ACP_UX_TOOL_NAMES.invokeShell) {
     // Idempotent: if already normalized on a previous normalizeTool call, preserve it
     if (!title.toLowerCase().startsWith('invoke shell:')) {
       // 1. Try robust input extraction for a description field
-      const input = mergeInputObjects(collectInputObjects(
-        update?.rawInput,
-        update?.arguments,
-        update?.params,
-        update?.input,
-        update?.toolCall?.arguments
-      ));
       const shellDesc = input.description;
 
       if (shellDesc) {
-        title = `Invoke Shell: ${shellDesc}`;
+        title = 'Invoke Shell: ' + shellDesc;
       } else if (title.toLowerCase().startsWith('running:')) {
-        // 2. Gemini sends "Running: <description>" — extract the description
+        // 2. Gemini sends "Running: <description>" - extract the description
         const afterRunning = title.slice('running:'.length).trim();
-        title = afterRunning ? `Invoke Shell: ${afterRunning}` : 'Invoke Shell';
+        title = afterRunning ? 'Invoke Shell: ' + afterRunning : 'Invoke Shell';
       } else {
         title = 'Invoke Shell';
       }
     }
-  } else if (toolName === 'replace' || toolName === 'edit_file' || rawId.startsWith('replace')) {
-    if (title.includes('=>') || title.length > 50) {
-      title = 'Editing';
-    }
-  } else if (toolName === 'read_file' || rawId.startsWith('read_file')) {
-    if (!title.toLowerCase().includes('read')) {
-      title = 'Reading';
-    }
-  } else if (toolName === 'write_file' || rawId.startsWith('write_file')) {
-    if (!title.toLowerCase().includes('writ')) {
-      title = 'Writing';
-    }
-  } else if (toolName === 'list_directory' || rawId.startsWith('list_directory')) {
-    if (!title.toLowerCase().includes('list')) {
-      title = `Listing Directory: ${title}`;
-    }
-  } else if (toolName === 'glob' || rawId.startsWith('glob')) {
-    if (!title.toLowerCase().includes('search')) {
-      title = `Searching for: ${title}`;
-    }
-  } else if (toolName === 'grep_search' || rawId.startsWith('grep_search')) {
-    if (!title.toLowerCase().includes('search')) {
-      title = `Searching: ${title}`;
+  } else {
+    const acpTitle = acpUiToolTitle(toolName, input, { filePath: event.filePath });
+    if (acpTitle) {
+      title = acpTitle;
+    } else if (toolName === 'replace' || toolName === 'edit_file' || rawId.startsWith('replace')) {
+      if (title.includes('=>') || title.length > 50) {
+        title = 'Editing';
+      }
+    } else if (toolName === 'read_file' || rawId.startsWith('read_file')) {
+      if (!title.toLowerCase().includes('read')) {
+        title = 'Reading';
+      }
+    } else if (toolName === 'write_file' || rawId.startsWith('write_file')) {
+      if (!title.toLowerCase().includes('writ')) {
+        title = 'Writing';
+      }
+    } else if (toolName === 'list_directory' || rawId.startsWith('list_directory')) {
+      if (!title.toLowerCase().includes('list')) {
+        title = 'Listing Directory: ' + title;
+      }
+    } else if (toolName === 'glob' || rawId.startsWith('glob')) {
+      if (!title.toLowerCase().includes('search')) {
+        title = 'Searching for: ' + title;
+      }
+    } else if (toolName === 'grep_search' || rawId.startsWith('grep_search')) {
+      if (!title.toLowerCase().includes('search')) {
+        title = 'Searching: ' + title;
+      }
     }
   }
 
@@ -561,7 +631,7 @@ export function normalizeTool(event, update) {
 
   // Ensure filePath is visible in the title
   if (event.filePath && title && !title.toLowerCase().includes(path.basename(event.filePath).toLowerCase())) {
-    title += `: ${path.basename(event.filePath)}`;
+    title += ': ' + path.basename(event.filePath);
   }
 
   return { ...event, toolName, title };
@@ -569,55 +639,24 @@ export function normalizeTool(event, update) {
 
 export function extractToolInvocation(update = {}, context = {}) {
   const event = context.event || {};
+  const sessionId = context.sessionId || event.sessionId;
   const { config } = getProvider();
-  const normalized = normalizeTool({ ...event }, update);
-  const input = mergeInputObjects(collectInputObjects(
-    update.rawInput,
-    update.arguments,
-    update.params,
-    update.input,
-    update.toolCall?.arguments
-  ));
+  const normalized = normalizeTool({ ...event, sessionId }, update);
+  const input = inputFromUpdate(update, { sessionId, event });
   const canonicalName = normalized.toolName || '';
   const rawName = update.toolName || update.name || update.toolCallId || event.id || update.title || event.title || '';
   const patternMatch = matchToolIdPattern(rawName, config) ||
     matchToolIdPattern(update.title || event.title || '', config);
-  const isAcpUiTool = canonicalName === 'ux_invoke_shell' ||
-    canonicalName === 'ux_invoke_subagents' ||
-    canonicalName === 'ux_invoke_counsel';
+  const isAcpUiTool = isAcpUxToolName(canonicalName);
+  const isMcpTool = Boolean(patternMatch) || isAcpUiTool;
 
-  // Deep search for description and command if Gemini CLI wraps them in unexpected keys
-  if (isAcpUiTool && (!input.description || !input.command)) {
-    const findDeep = (obj, targetKey) => {
-      if (!obj || typeof obj !== 'object') return null;
-      if (obj[targetKey]) return obj[targetKey];
-      for (const val of Object.values(obj)) {
-        if (val && typeof val === 'object') {
-          const res = findDeep(val, targetKey);
-          if (res) return res;
-        }
-      }
-      return null;
-    };
-
-    let rawArgs = update.arguments || update.rawInput || update.toolCall?.arguments;
-    if (typeof rawArgs === 'string') {
-      try { rawArgs = JSON.parse(rawArgs); } catch {}
-    }
-
-    if (!input.description) {
-      const deepDesc = findDeep(rawArgs, 'description');
-      if (deepDesc) input.description = deepDesc;
-    }
-    if (!input.command && canonicalName === 'ux_invoke_shell') {
-      const deepCmd = findDeep(rawArgs, 'command');
-      if (deepCmd) input.command = deepCmd;
-    }
-  }
-
-  let finalTitle = event.title || update.title || (isAcpUiTool ? '' : normalized.title);
-  if (isAcpUiTool && normalized.title && normalized.title.includes(':')) {
-    finalTitle = normalized.title;
+  const normalizedFilePath = normalized.filePath || event.filePath;
+  const normalizedAcpUiTitle = isAcpUiTool
+    ? acpUiToolTitle(canonicalName, input, { filePath: normalizedFilePath })
+    : null;
+  let finalTitle = normalizedAcpUiTitle || normalized.title || event.title || update.title || '';
+  if (isAcpUiTool && normalizedAcpUiTitle) {
+    finalTitle = normalizedAcpUiTitle;
   } else if (isAcpUiTool && (finalTitle === 'Invoke Shell' || finalTitle === 'Invoke Subagents' || finalTitle === 'Invoke Counsel')) {
     // If we have a generic title for an AcpUI tool, return empty to allow the resolver to use cached title
     finalTitle = '';
@@ -625,14 +664,14 @@ export function extractToolInvocation(update = {}, context = {}) {
 
   return {
     toolCallId: update.toolCallId || event.id,
-    kind: isAcpUiTool ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+    kind: isMcpTool ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
     rawName,
     canonicalName,
     mcpServer: patternMatch?.mcpName || (isAcpUiTool ? config.mcpName : undefined),
     mcpToolName: patternMatch?.toolName || (isAcpUiTool ? canonicalName : undefined),
     input,
     title: finalTitle,
-    filePath: normalized.filePath || event.filePath,
+    filePath: normalizedFilePath,
     category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
   };
 }

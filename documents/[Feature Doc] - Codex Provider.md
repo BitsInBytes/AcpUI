@@ -1,275 +1,500 @@
 # Codex Provider
 
-The Codex provider connects AcpUI to the `codex-acp` executable. The main implementation risk is that Codex advertises models and config options dynamically, while AcpUI already owns the model selector.
+The Codex provider integrates AcpUI with the `codex-acp` daemon. It owns Codex-specific startup, authentication, quota status, dynamic model/config handling, rollout JSONL lifecycle, context replay, and MCP tool normalization.
+
+This doc matters because Codex exposes models, config options, tools, quota, and saved history through several protocol shapes. The provider normalizes those shapes before generic AcpUI backend and frontend code consume them.
 
 ## Overview
 
-**What It Does**
+### What It Does
 
-- Starts `codex-acp` as a provider runtime.
-- Initializes ACP with terminal support and AcpUI client metadata.
-- Authenticates only when configured or when API-key environment variables are present.
-- Captures Codex dynamic models from `session/new` and `session/load`.
-- Filters the Codex `model` config option while preserving `reasoning_effort`.
-- Finds, clones, archives, restores, and parses recursive Codex rollout JSONL files.
-- **Fetches background quota status** on startup, turn completion, and 30s poll.
-- **Manages automatic OAuth token refresh** by deriving `client_id` from JWT access tokens in `auth.json`.
-- **Extracts canonical tool identity** via `extractToolInvocation()` using `toolIdPattern` (`{mcpName}/{toolName}`).
-- **Tracks active prompts via provider hooks** (`onPromptStarted` / `onPromptCompleted`) to only poll quota while a real prompt is in flight.
-- **Replays persisted context usage** through `emitCachedContext(sessionId)` when the backend loads or hot-resumes a session.
+- Starts `codex-acp` from provider config and performs ACP `initialize`.
+- Sends optional `authenticate` requests from `authMethod`, provider API-key fields, and environment keys.
+- Prepares child-process environment values including `CODEX_API_KEY`, `OPENAI_API_KEY`, and `NO_BROWSER`.
+- Captures dynamic model catalogs from ACP responses and Codex config-option updates.
+- Filters Codex's `model` config option while keeping `reasoning_effort` as a provider setting.
+- Converts Codex command updates into `_codex/commands/available` slash-command extensions.
+- Normalizes Codex built-in tools, core AcpUI MCP tools, optional IO MCP tools, and optional Google search MCP tools.
+- Manages Codex rollout JSONL files for fork, archive, restore, delete, and rehydration.
+- Fetches quota status from saved ChatGPT OAuth credentials and emits `_codex/provider/status`.
+- Persists context usage in `acp_session_context.json` and replays it through `_codex/metadata`.
+- Emits Codex MCP timeout metadata only when `acpSupportsMcpTimeouts` is enabled.
 
-**Why This Matters**
+### Why This Matters
 
-- Codex rollouts are not flat files; cleanup and forking must search recursively.
-- Codex command updates omit leading slashes; the frontend slash-command UI expects them.
-- Codex `session/set_config_option` expects a raw string value for value IDs.
-- Quota information requires standard ChatGPT OAuth credentials (`auth.json`), which expire and need reactive refreshing to prevent UI "Stale" states.
+- Codex model data is dynamic, so model catalogs and provider config options must stay separated.
+- Codex rollout files are recursive and schema-rich, so cloning and parsing are provider-owned.
+- Codex MCP tool IDs use `AcpUI/<toolName>`, while backend Tool System V2 expects canonical names such as `ux_invoke_shell` and `ux_read_file`.
+- Optional IO/Search MCP tool categories come from shared AcpUI tool registry handlers, while the provider extracts identity and input from Codex payloads.
+- Quota status depends on `paths.home/auth.json`, not on ACP session state.
+- Context usage needs a provider cache because a loaded or hot-resumed session can render before fresh `usage_update` events arrive.
 
-## How It Works
+Architectural role: provider-specific backend adapter for Codex ACP, integrated through provider loader, ACP update handling, MCP proxy, Tool System V2, SQLite session persistence, and frontend Unified Timeline rendering.
 
-1. **Provider Registry Loads Codex**
+## How It Works - End-to-End Flow
 
-   `configuration/providers.json` includes:
+1. **Provider registration loads Codex config**
 
-   ```json
-   { "id": "Codex", "path": "./providers/codex", "enabled": true }
-   ```
-
-   `backend/services/providerLoader.js:96` merges the provider module with default hooks. `normalizeConfigOptions` is part of the default contract at `backend/services/providerLoader.js:73`.
-
-2. **Daemon Startup**
-
-   `backend/services/acpClient.js:91` spawns `config.command` with `config.args`. Codex uses `codex-acp` with no extra args.
-
-3. **Environment Preparation**
-
-   `providers/codex/index.js` (Function: `prepareAcpEnvironment`, Line: 344) injects configured `CODEX_API_KEY` or `OPENAI_API_KEY` into the child environment. It also supports `noBrowser`.
-
-4. **Handshake**
-
-   `providers/codex/index.js` (Function: `performHandshake`, Line: 430) sends:
+   File: `providers/codex/provider.json` (Config keys: `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `clientInfo`)
 
    ```json
    {
-     "protocolVersion": 1,
-     "clientCapabilities": { "terminal": true },
+     "name": "Codex",
+     "protocolPrefix": "_codex/",
+     "mcpName": "AcpUI",
+     "toolIdPattern": "{mcpName}/{toolName}",
      "clientInfo": { "name": "AcpUI", "version": "1.0.0" }
    }
    ```
 
-   It sends `authenticate` only if `authMethod` or env/configured API keys require it.
+   `backend/services/providerLoader.js` loads `provider.json`, `branding.json`, and local `user.json`, then imports `providers/codex/index.js` through `getProviderModule()`.
 
-5. **Session Creation**
+2. **Environment prep configures the daemon process**
 
-   `backend/sockets/sessionHandlers.js` (Lines 214-268) sends `session/new` with `cwd`, AcpUI MCP server config, and provider session params.
+   File: `providers/codex/index.js` (Function: `prepareAcpEnvironment`)
 
-6. **Initial Model And Config Capture**
+   `prepareAcpEnvironment()` copies the backend environment, injects Codex/OpenAI API keys, sets `NO_BROWSER=1` when `noBrowser` is true, stores provider-extension/log callbacks, loads `acp_session_context.json`, and starts an initial quota fetch when `fetchQuotaStatus` is enabled.
 
-   `backend/sockets/sessionHandlers.js` (Function: `captureModelState`) calls `captureModelState`. The helper captures both model state and normalized config options.
+   ```javascript
+   // FILE: providers/codex/index.js (Function: prepareAcpEnvironment)
+   if (config.codexApiKey) next.CODEX_API_KEY = config.codexApiKey;
+   if (config.openaiApiKey) next.OPENAI_API_KEY = config.openaiApiKey;
+   if (config.apiKey) {
+     const keyName = config.apiKeyEnv === 'OPENAI_API_KEY' ? 'OPENAI_API_KEY' : 'CODEX_API_KEY';
+     next[keyName] = config.apiKey;
+   }
+   if (config.noBrowser === true) next.NO_BROWSER = '1';
+   ```
 
-7. **Config Option Updates**
+3. **Handshake initializes Codex ACP and authenticates when configured**
 
-   `providers/codex/index.js` (Function: `intercept`, Line: 178) filters `model` and marks `reasoning_effort`. `providers/codex/index.js` (Line 202) converts `config_option_update` into `_codex/config_options`.
+   File: `providers/codex/index.js` (Functions: `performHandshake`, `resolveAuthMethod`)
 
-8. **Slash Commands**
+   `performHandshake()` sends `initialize` with protocol version `1`, `clientCapabilities.terminal=true`, and `clientInfo` from provider config. It then sends `authenticate` when `resolveAuthMethod()` returns `chatgpt`, `codex-api-key`, or `openai-api-key`.
 
-   `providers/codex/index.js` (Function: `intercept`, Line: 163) also converts `available_commands_update` to `_codex/commands/available` and prefixes `/`.
+   ```javascript
+   // FILE: providers/codex/index.js (Function: performHandshake)
+   await acpClient.transport.sendRequest('initialize', {
+     protocolVersion: 1,
+     clientCapabilities: { terminal: true },
+     clientInfo: config.clientInfo || { name: 'AcpUI', version: '1.0.0' }
+   });
+   const auth = resolveAuthMethod(config);
+   if (auth) await acpClient.transport.sendRequest('authenticate', auth);
+   ```
 
-9. **Tool Calls**
+4. **Session creation injects the AcpUI MCP proxy**
 
-   `providers/codex/index.js` (Function: `extractToolOutput`, Line: 116) extracts output from ACP content blocks or Codex raw output. `providers/codex/index.js` (Function: `extractToolInvocation`, Line: 302) implements `extractToolInvocation()` to resolve canonical identity and input using `toolIdPattern` (e.g. `{mcpName}/{toolName}`). `normalizeTool()` uses the same pattern to strip `Tool: AcpUI/` prefixes for display.
+   File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)
+   File: `providers/codex/index.js` (Functions: `buildSessionParams`, `getMcpServerMeta`)
 
-10. **Session Files**
+   `buildSessionParams()` returns `undefined`, so Codex receives the generic `session/new` or `session/load` payload plus the MCP server entry. `getMcpServers()` names the stdio proxy from `mcpName`, binds provider/session context with `ACP_UI_MCP_PROXY_ID`, and appends provider `_meta` when `getMcpServerMeta()` returns timeout data.
 
-    `providers/codex/index.js` finds rollout JSONL files recursively, clones/prunes by user-turn boundaries, trims from the next turn start boundary (so forked files never retain orphan `response_item` user prompts), copies matching task directories, and parses modern Codex rollout records for rehydration (`event_msg`, `response_item`, and `compacted`).
-    - Rehydration links tool starts/ends through `call_id` across `function_call`, `function_call_output`, `exec_command_end`, `custom_tool_call`, and `patch_apply_end`.
-    - `compacted.replacement_history` is treated as the replacement source-of-truth for earlier messages when compaction records appear.
+5. **Model and config state are normalized separately**
 
-11. **Quota & OAuth Management**
+   File: `providers/codex/index.js` (Functions: `normalizeModelState`, `normalizeConfigOptions`, `intercept`)
+   File: `backend/sockets/sessionHandlers.js` (Function: `captureModelState`)
+   File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`)
 
-    `providers/codex/index.js` (Line 365) starts background fetching in `prepareAcpEnvironment()`.
-    - **Initial Load:** Fetches quota immediately on boot and emits `_codex/provider/status`.
-    - **Reactive Refresh:** `fetchCodexQuota()` (Lines 430-456) implements a retry loop. On 401, it reads `auth.json`, refreshes the token, saves it, and retries.
-    - **Client ID Derivation:** `extractClientIdFromAccessToken()` (Lines 506-516) decodes the JWT `access_token` from `auth.json` to find the `client_id` automatically.
-    - **Poll Control:** `onPromptStarted()` / `onPromptCompleted()` track `_activePromptCount` and `_inFlightSessions`. Polling only occurs while prompts are in flight.
+   `normalizeModelState()` deduplicates model options, preserves slash-qualified model IDs, augments model options from the Codex `model` select option, and sets `replaceModelOptions: true`. `normalizeConfigOptions()` removes `model` and marks `reasoning_effort` / `effort` with `kind: "reasoning_effort"`.
+
+   `intercept()` rewrites Codex `config_option_update` notifications into `_codex/config_options` provider extensions containing `options`, `modelOptions`, `replace`, and `removeOptionIds`.
+
+6. **Command updates become slash commands**
+
+   File: `providers/codex/index.js` (Functions: `intercept`, `normalizeCommands`, `parseExtension`)
+
+   Codex emits command names without requiring a slash. The provider converts them into `_codex/commands/available` and prefixes command names for the UI.
+
+   ```javascript
+   // FILE: providers/codex/index.js (Function: normalizeCommands)
+   return commands.map(command => ({
+     name: command.name.startsWith('/') ? command.name : `/${command.name}`,
+     description: command.description || '',
+     ...(command.input?.hint ? { meta: { hint: command.input.hint } } : {})
+   }));
+   ```
+
+7. **Quota status is provider-owned**
+
+   File: `providers/codex/index.js` (Functions: `fetchCodexQuota`, `refreshCodexOAuthToken`, `buildCodexProviderStatus`, `fetchAndEmitQuota`, `onPromptStarted`, `onPromptCompleted`, `stopQuotaFetching`)
+
+   `fetchCodexQuota()` reads `auth.json` under `paths.home`, sends OAuth bearer headers to `quotaStatusEndpoint` or the default ChatGPT usage endpoint, and retries after OAuth refresh when a `401` response arrives and `refreshQuotaOAuth` is enabled. `refreshCodexOAuthToken()` derives `client_id` from the access-token JWT payload and writes refreshed tokens back to `auth.json`.
+
+   `onPromptStarted()` starts interval polling while prompts are active. `onPromptCompleted()` stops polling when no prompt remains active and triggers a turn-complete quota refresh.
+
+8. **Context usage is cached and replayed**
+
+   File: `providers/codex/index.js` (Functions: `intercept`, `_loadContextState`, `_saveContextState`, `emitCachedContext`)
+
+   `intercept()` watches `usage_update`, calculates `(used / size) * 100`, stores the percentage by session ID, and persists the map to `paths.home/acp_session_context.json`. `emitCachedContext(sessionId)` emits `_codex/metadata` with `contextUsagePercentage` once per session when cached data exists.
+
+9. **Tool calls become canonical Tool System V2 invocations**
+
+   File: `providers/codex/index.js` (Functions: `normalizeTool`, `extractToolInvocation`, `categorizeToolCall`, `extractToolOutput`, `extractFilePath`, `extractDiffFromToolCall`)
+   File: `backend/services/tools/toolInvocationResolver.js` (Functions: `resolveToolInvocation`, `applyInvocationToEvent`)
+   File: `backend/services/tools/providerToolNormalization.js` (Functions: `mcpInvocationFromRaw`, `inputFromToolUpdate`, `resolvePatternToolName`, `commandFromRawInput`)
+
+   Codex titles AcpUI MCP tools as `Tool: AcpUI/<toolName>` and can include raw invocation data in `rawInput.invocation`. The provider extracts canonical name, MCP server, MCP tool name, input, title, file path, output, and category.
+
+   ```javascript
+   // FILE: providers/codex/index.js (Function: extractToolInvocation)
+   return {
+     toolCallId: update.toolCallId || event.id,
+     kind: invocation.server || invocation.tool ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+     rawName,
+     canonicalName,
+     mcpServer: invocation.server,
+     mcpToolName: invocation.tool,
+     input,
+     title: normalized.title || update.title || event.title,
+     filePath: normalized.filePath,
+     category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
+   };
+   ```
+
+10. **MCP handler execution metadata wins when available**
+
+    File: `backend/mcp/mcpServer.js` (Functions: `createToolHandlers`, `wrapToolHandlers`)
+    File: `backend/services/tools/mcpExecutionRegistry.js` (Functions: `begin`, `complete`, `fail`, `describeAcpUxToolExecution`, `invocationFromMcpExecution`)
+    File: `backend/services/tools/handlers/ioToolHandler.js` (Handlers: `onStart`, `onUpdate`, `onEnd`)
+
+    `wrapToolHandlers()` records public MCP tool input in `mcpExecutionRegistry.begin()`, completes/fails the record after handler execution, and lets `resolveToolInvocation()` prefer handler-known title/category/file metadata over generic provider titles.
+
+    Shared IO/Search title behavior comes from `backend/services/tools/acpUiToolTitles.js` (`acpUiToolTitle`) and `backend/services/tools/acpUxTools.js` (`ACP_UX_IO_TOOL_CONFIG`):
+
+    | Tool | Title pattern | Category source |
+    |---|---|---|
+    | `ux_read_file` | `Read File: <basename>` | `ACP_UX_IO_TOOL_CONFIG` |
+    | `ux_write_file` | `Write File: <basename>` | `ACP_UX_IO_TOOL_CONFIG` |
+    | `ux_replace` | `Replace In File: <basename>` | `ACP_UX_IO_TOOL_CONFIG` |
+    | `ux_list_directory` | `List Directory: <dir_path>` | `ACP_UX_IO_TOOL_CONFIG` |
+    | `ux_glob` | `Glob: <description or pattern>` | `ACP_UX_IO_TOOL_CONFIG` |
+    | `ux_grep_search` | `Search: <description or pattern>` | `ACP_UX_IO_TOOL_CONFIG` |
+    | `ux_web_fetch` | `Fetch: <url>` | `ACP_UX_IO_TOOL_CONFIG` |
+    | `ux_google_web_search` | `Web Search: <query>` | `ACP_UX_IO_TOOL_CONFIG` |
+
+11. **Rollout files drive session-file lifecycle**
+
+    File: `providers/codex/index.js` (Functions: `getSessionPaths`, `cloneSession`, `deleteSessionFiles`, `archiveSessionFiles`, `restoreSessionFiles`)
+
+    `getSessionPaths()` searches `paths.sessions` recursively for a JSONL filename containing the session ID, then by file content, and falls back to `<sessionId>.jsonl` under the sessions directory. `cloneSession()` copies the rollout, companion JSON file, and task directory; it replaces the old session ID with the fork ID and prunes at whole turn boundaries when `pruneAtTurn` is provided. `archiveSessionFiles()` writes `restore_meta.json`, copies active files into the archive, and removes the active copies. `restoreSessionFiles()` restores files from archive metadata.
+
+12. **History parsing creates Unified Timeline messages**
+
+    File: `providers/codex/index.js` (Functions: `parseSessionHistory`, `handleEventMsg`, `handleResponseItem`, `resetFromCompactedRecord`)
+
+    `parseSessionHistory()` reads Codex JSONL records and returns AcpUI messages. It handles `event_msg` records such as `user_message`, `agent_message`, `agent_reasoning`, `exec_command_begin`, `exec_command_end`, `mcp_tool_call_begin`, `mcp_tool_call_end`, `web_search_begin`, `web_search_end`, `patch_apply_begin`, and `patch_apply_end`. It handles `response_item` records such as `message`, `reasoning`, `function_call`, `function_call_output`, `custom_tool_call`, and `custom_tool_call_output`. `compacted` records replace prior history with user messages from `replacement_history`.
 
 ## Architecture Diagram
 
 ```mermaid
-flowchart LR
-  UI[Frontend] -->|create_session| Socket[sessionHandlers.js]
-  Socket -->|session/new or session/load| Client[AcpClient]
-  Client -->|stdio JSON-RPC| Codex[codex-acp]
-  Codex -->|models/configOptions| Socket
-  Socket -->|normalizeProviderConfigOptions| Provider[providers/codex/index.js]
-  Socket -->|callback configOptions/modelOptions| UI
-  Codex -->|session/update| Client
-  Client -->|intercept| Provider
-  Provider -->|_codex/* extension| UI
-  Provider -->|recursive JSONL ops| Rollouts[.codex/sessions/YYYY/MM/DD]
-  Provider -->|401 retry| OAuth[ChatGPT OAuth API]
-  Provider -->|write updated tokens| AuthFile[auth.json]
+flowchart TB
+  Config[providers/codex config/docs] --> Loader[providerLoader\ngetProvider/getProviderModule]
+  Loader --> Provider[providers/codex/index.js]
+  Provider --> Env[prepareAcpEnvironment]
+  Provider --> Handshake[performHandshake]
+  Env --> Daemon[codex-acp]
+  Handshake --> Daemon
+  Daemon --> Client[acpClient\nhandleAcpMessage]
+  Client --> Intercept[intercept]
+  Intercept --> Updates[acpUpdateHandler\nhandleUpdate]
+  Updates --> Resolver[toolInvocationResolver]
+  Resolver --> Registry[toolRegistry + handlers]
+  Registry --> Events[Socket.IO system_event]
+  Updates --> Extensions[provider_extension]
+  Events --> UI[Unified Timeline]
+  Extensions --> UI
+  Provider --> Rollouts[paths.sessions JSONL]
+  Provider --> Context[paths.home/acp_session_context.json]
+  Provider --> Quota[paths.home/auth.json + quota endpoint]
+  Registry --> McpApi[/api/mcp/tool-call]
 ```
 
-## Critical Contract
+## The Critical Contract
 
-Codex exposes `model` twice: once through `models.availableModels` and once as a select config option. AcpUI must use `models.availableModels` for the model selector and remove the `model` config option before it reaches the provider settings UI.
+### Contract: Codex Normalization Before Generic Emission
 
-For **Quota Status**, the provider depends on `~/.codex/auth.json` containing a standard ChatGPT OAuth payload. The `access_token` **must** be a valid JWT for the provider to automatically derive the `client_id` needed for token refreshes.
+1. `providers/codex/provider.json` must keep `protocolPrefix: "_codex/"`, `mcpName: "AcpUI"`, and `toolIdPattern: "{mcpName}/{toolName}"` aligned with Codex MCP titles and raw invocations.
+2. `providers/codex/index.js` must explicitly export every provider contract function required by `backend/test/providerContract.test.js`.
+3. `intercept()` must return rewritten extension payloads, return `null` only to swallow a message, and return the original payload for pass-through messages.
+4. `normalizeConfigOptions()` must remove `model`; model choices flow through model state and `modelOptions`.
+5. `normalizeModelState()` must preserve full Codex model IDs and set `replaceModelOptions: true`.
+6. `setConfigOption()` must route `mode` to `session/set_mode`, `model` to `session/set_model`, and generic options to `session/set_config_option` with raw string values.
+7. `extractToolInvocation()` must return stable identity fields so `toolInvocationResolver` can mark AcpUI MCP tools, merge sticky metadata, and dispatch tool handlers.
+8. `parseSessionHistory()` must treat rollout JSONL as mixed `event_msg`, `response_item`, and `compacted` records while preserving turn boundaries.
+9. `getMcpServerMeta()` must return `undefined` unless `acpSupportsMcpTimeouts` is exactly `true` and at least one positive timeout exists.
 
-## Configuration
+Breaking this contract causes duplicated model controls, missing slash commands, generic tool titles, missing shell/sub-agent panels, lost context usage, broken quota status, or malformed replayed timelines.
 
-Provider files:
+## Configuration / Provider-Specific Behavior
 
-| File | Purpose |
-| --- | --- |
-| `providers/codex/provider.json` | Static provider identity, protocol prefix, MCP name, tool categories |
-| `providers/codex/branding.json` | UI labels and image compression size |
-| `providers/codex/user.json` | Local command, auth mode, paths, model defaults |
-| `providers/codex/index.js` | Provider contract implementation |
+### Provider Directory Files
 
-Important local settings:
+| File | Anchors | Purpose |
+|---|---|---|
+| `providers/codex/provider.json` | `name`, `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `clientInfo` | Provider identity, extension prefix, MCP tool ID format, built-in/core tool categories. |
+| `providers/codex/branding.json` | `title`, `assistantName`, `busyText`, `inputPlaceholder`, `modelLabel`, `maxImageDimension` | Codex UI branding payload. |
+| `providers/codex/user.json.example` | `command`, `args`, `authMethod`, `fetchQuotaStatus`, `refreshQuotaOAuth`, `quotaStatusIntervalMs`, `defaultSubAgentName`, `paths`, `models`, `acpSupportsMcpTimeouts` | Local deployment config template. |
+| `providers/codex/README.md` | `Authentication`, `Quota Status`, `Context Usage Persistence`, `Configuring Agents and Tool Permissions`, `MCP Tools`, `Session Files`, `Tests` | Human setup and operation guide. |
+| `providers/codex/ACP_PROTOCOL_SAMPLES.md` | `initialize`, `authenticate`, `session/new`, `available_commands_update`, `set_model`, `set_mode`, `set_config_option`, `Tool Calls` | Codex ACP protocol shapes the provider normalizes. |
+| `providers/codex/index.js` | Provider contract exports | Runtime behavior, normalization, quota, context, session file lifecycle, and replay parsing. |
 
-- `"command": "codex-acp"`
-- `"authMethod": "auto"`
-- `"fetchQuotaStatus": true` (Enables status display)
-- `"refreshQuotaOAuth": true` (Enables background 401 refresh)
-- `"quotaStatusIntervalMs": 30000` (Poll frequency)
-- `"paths.sessions": "%USERPROFILE%\\.codex\\sessions"`
+### Important Config Keys
 
-## Data Flow
+| Config key | Runtime behavior |
+|---|---|
+| `command`, `args` | Spawn command for `codex-acp`. |
+| `authMethod` | Selects `chatgpt`, `codex-api-key`, `openai-api-key`, `auto`, or disabled auth behavior. |
+| `codexApiKey`, `openaiApiKey`, `apiKey`, `apiKeyEnv` | Controls API-key environment injection and auto-auth method selection. |
+| `noBrowser` | Adds `NO_BROWSER=1` to the child process environment. |
+| `fetchQuotaStatus` | Enables startup quota fetch and prompt-scoped polling. |
+| `refreshQuotaOAuth` | Allows OAuth refresh after quota endpoint `401` responses. |
+| `quotaStatusIntervalMs` | Poll interval while prompts are in flight; `0` disables interval polling. |
+| `quotaStatusEndpoint`, `quotaOAuthRefreshEndpoint` | Override quota and OAuth refresh endpoints. |
+| `paths.home` | Location of `auth.json` and `acp_session_context.json`. |
+| `paths.sessions` | Recursive rollout JSONL search root. |
+| `paths.agents`, `paths.attachments`, `paths.archive` | Codex agents, attachment, and archive directories. |
+| `models.default`, `models.quickAccess`, `models.titleGeneration`, `models.subAgent` | Provider model defaults and AcpUI quick-select options. |
+| `acpSupportsMcpTimeouts`, `acpMcpStartupTimeoutSec`, `acpMcpToolTimeoutSec` | Controls `_meta.codex_acp` timeout overrides. |
 
-Raw Codex response:
+### MCP Tool Availability
 
-```json
+AcpUI MCP tools are controlled by `configuration/mcp.json` or the file referenced by `MCP_CONFIG`.
+
+- Core tools: `ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`.
+- Optional IO tools: `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`.
+- Optional Google search tool: `ux_google_web_search`.
+
+Codex sees enabled tools through the `AcpUI` MCP stdio server. The provider extracts identity from `AcpUI/<toolName>` titles and `rawInput.invocation`; backend handlers record authoritative titles and categories for enabled tools.
+
+## Data Flow / Rendering Pipeline
+
+### Model and Config Flow
+
+```text
+Codex session/new or session/load response
+  -> backend/sockets/sessionHandlers.js captureModelState
+  -> providers/codex/index.js normalizeModelState
+  -> model selector receives currentModelId + modelOptions
+  -> providers/codex/index.js normalizeConfigOptions
+  -> provider settings receive non-model options
+```
+
+Config extension flow:
+
+```text
+Codex session/update config_option_update
+  -> providers/codex/index.js intercept
+  -> _codex/config_options provider extension
+  -> backend/services/acpClient.js handleProviderExtension
+  -> DB config option persistence + frontend provider_extension
+```
+
+### Tool Invocation Flow
+
+```text
+Codex tool_call / tool_call_update
+  -> backend/services/acpUpdateHandler.js handleUpdate
+  -> providers/codex/index.js normalizeTool + extractToolInvocation
+  -> backend/services/tools/toolInvocationResolver.js resolveToolInvocation
+  -> backend/services/tools/toolRegistry dispatch
+  -> backend/services/tools/handlers/* apply metadata
+  -> Socket.IO system_event
+  -> frontend ToolStep
+```
+
+Canonical provider extraction shape:
+
+```javascript
 {
-  "models": {
-    "currentModelId": "model/medium",
-    "availableModels": [{ "id": "model/medium", "name": "Model (medium)" }]
-  },
-  "configOptions": [
-    { "id": "model", "currentValue": "model" },
-    { "id": "reasoning_effort", "currentValue": "medium" }
-  ]
+  toolCallId: 'call-id',
+  kind: 'mcp',
+  rawName: 'ux_read_file',
+  canonicalName: 'ux_read_file',
+  mcpServer: 'AcpUI',
+  mcpToolName: 'ux_read_file',
+  input: { file_path: 'D:/repo/src/app.ts' },
+  title: 'Read File: app.ts',
+  filePath: 'D:/repo/src/app.ts',
+  category: {}
 }
 ```
 
-Backend capture:
+`toolInvocationResolver` upgrades AcpUI MCP identities to `kind: "acpui_mcp"`, sets `isAcpUxTool`, and merges handler-derived `titleSource`, category, file path, and public input from `mcpExecutionRegistry` when available.
 
-```js
-const configOptions = normalizeProviderConfigOptions(providerModule, source.configOptions);
-meta.configOptions = mergeConfigOptions(meta.configOptions, configOptions);
+### Quota and Context Flow
+
+```text
+prepareAcpEnvironment
+  -> load acp_session_context.json
+  -> fetchAndEmitQuota with emitInitial when enabled
+  -> provider_extension _codex/provider/status
+
+prompt starts
+  -> onPromptStarted
+  -> quota interval polling while active prompts exist
+
+prompt completes
+  -> onPromptCompleted
+  -> stop interval when no prompts are active
+  -> fetchAndEmitQuota turn-complete refresh
+
+usage_update
+  -> intercept caches contextUsagePercentage
+  -> _saveContextState persists acp_session_context.json
+  -> emitCachedContext replays _codex/metadata on load/hot-resume
 ```
 
-Frontend receives:
+### Rollout Replay Flow
 
-```json
-{
-  "modelOptions": [{ "id": "model/medium", "name": "Model (medium)" }],
-  "configOptions": [
-    { "id": "reasoning_effort", "kind": "reasoning_effort", "currentValue": "medium" }
-  ]
-}
+```text
+Codex rollout JSONL
+  -> parseSessionHistory
+  -> event_msg / response_item / compacted record handlers
+  -> AcpUI messages
+  -> assistant.timeline thought/tool steps
+  -> frontend Unified Timeline rendering
 ```
 
 ## Component Reference
 
-| File | Key Functions | Purpose |
-| --- | --- | --- |
-| `providers/codex/index.js` | `performHandshake`, `prepareAcpEnvironment` | Startup, auth, and quota init |
-| `providers/codex/index.js` | `intercept`, `normalizeConfigOptions` | Config/Command updates and error message promotion |
-| `providers/codex/index.js` | `onPromptStarted`, `onPromptCompleted` | Prompt lifecycle hooks used for quota polling control and turn-complete quota refresh |
-| `providers/codex/index.js` | `fetchCodexQuota` | Handled OAuth-backed quota retrieval with 401 retry |
-| `providers/codex/index.js` | `refreshCodexOAuthToken` | Refreshes and persists tokens to `auth.json` |
-| `providers/codex/index.js` | `buildCodexProviderStatus` | Maps raw ChatGPT usage JSON to UI status shape |
-| `providers/codex/index.js` | `getMcpServerMeta` | Injects MCP timeout overrides into server config `_meta` when `acpSupportsMcpTimeouts` is enabled |
-| `providers/codex/index.js` | `emitCachedContext` | Emits cached `{protocolPrefix}metadata` context usage after session load or hot-resume |
-| `providers/codex/index.js` | `setConfigOption` | Routes mode/model/reasoning changes |
-| `providers/codex/index.js` | `extractToolInvocation` | V2 canonical tool identity extraction |
-| `providers/codex/index.js` | `getSessionPaths`, `cloneSession`, `parseSessionHistory` | Rollout lifecycle |
-| `backend/sockets/sessionHandlers.js` | `captureModelState` | Captures response-time config options |
-| `backend/services/sessionManager.js` | `normalizeProviderConfigOptions` | Shared provider config normalization |
-| `backend/services/acpUpdateHandler.js` | `handleUpdate` | Applies normalization to native config updates |
+### Provider and Backend
 
-## MCP Timeout Configuration
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Provider Runtime | `providers/codex/index.js` | `prepareAcpEnvironment`, `performHandshake`, `setConfigOption`, `buildSessionParams`, `setInitialAgent`, `getHooksForAgent` | Startup, auth, environment, config routing, no-op agent hooks. |
+| Provider Models | `providers/codex/index.js` | `normalizeModelState`, `normalizeConfigOptions`, `intercept`, `parseExtension` | Dynamic model/config updates and provider extension parsing. |
+| Provider Tools | `providers/codex/index.js` | `normalizeTool`, `extractToolInvocation`, `categorizeToolCall`, `extractToolOutput`, `extractFilePath`, `extractDiffFromToolCall` | Codex tool identity, title, output, file path, and diff extraction. |
+| Provider Quota | `providers/codex/index.js` | `fetchCodexQuota`, `readCodexAuth`, `refreshCodexOAuthToken`, `buildCodexProviderStatus`, `fetchAndEmitQuota`, `getQuotaState`, `stopQuotaFetching`, `onPromptStarted`, `onPromptCompleted` | Quota fetching, OAuth refresh, provider status, prompt-scoped polling. |
+| Provider Context | `providers/codex/index.js` | `emitCachedContext`, `_loadContextState`, `_saveContextState` | Context usage persistence and replay. |
+| Provider Files | `providers/codex/index.js` | `getSessionPaths`, `cloneSession`, `deleteSessionFiles`, `archiveSessionFiles`, `restoreSessionFiles`, `parseSessionHistory` | Rollout lifecycle and history parsing. |
+| Provider Loader | `backend/services/providerLoader.js` | `getProvider`, `getProviderModule`, `getProviderModuleSync`, `bindProviderModule` | Loads Codex config/module and binds provider context. |
+| ACP Updates | `backend/services/acpUpdateHandler.js` | `handleUpdate` | Applies provider normalization, resolves tools, dispatches handlers, emits stream events. |
+| Session Socket | `backend/sockets/sessionHandlers.js` | `captureModelState`, `create_session`, `set_session_option`, `set_session_model`, `fork_session` | Captures Codex model/config state and calls provider file hooks. |
+| MCP Server | `backend/mcp/mcpServer.js` | `getMcpServers`, `createToolHandlers`, `wrapToolHandlers` | Injects MCP proxy and wraps enabled MCP tools. |
+| MCP API | `backend/routes/mcpApi.js` | `GET /api/mcp/tools`, `POST /api/mcp/tool-call`, `resolveToolContext` | Advertises enabled tools and executes MCP calls. |
+| Tool Resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider extraction, sticky state, and MCP execution metadata. |
+| MCP Execution | `backend/services/tools/mcpExecutionRegistry.js` | `begin`, `complete`, `fail`, `describeAcpUxToolExecution`, `invocationFromMcpExecution` | Tracks public input and authoritative display metadata. |
+| Tool Names | `backend/services/tools/acpUxTools.js` | `ACP_UX_TOOL_NAMES`, `ACP_UX_CORE_TOOL_NAMES`, `ACP_UX_IO_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`, `isAcpUxToolName` | Shared core and optional AcpUI MCP tool registry. |
+| Tool Titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `basenameForToolPath` | Shared optional IO/Search title builder. |
+| Provider Tool Helpers | `backend/services/tools/providerToolNormalization.js` | `mcpInvocationFromRaw`, `inputFromToolUpdate`, `resolvePatternToolName`, `commandFromRawInput`, `stripToolTitlePrefix` | Shared provider parsing helpers. |
+| IO Tool Handler | `backend/services/tools/handlers/ioToolHandler.js` | `onStart`, `onUpdate`, `onEnd` | Applies optional IO/Search categories, titles, and file paths. |
 
-Codex ACP has a known upstream bug where MCP tool calls can time out around the 2-minute mark (see https://github.com/zed-industries/codex-acp/issues/277). When a future `codex-acp` release adds support for MCP timeout overrides via `_meta`, AcpUI can inject them automatically.
+### Configuration, Docs, and Tests
 
-Enable in `providers/codex/user.json`:
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Provider Config | `providers/codex/provider.json` | `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `clientInfo` | Codex identity and tool category seed. |
+| Provider Branding | `providers/codex/branding.json` | `assistantName`, `busyText`, `modelLabel`, `maxImageDimension` | UI branding payload. |
+| Provider User Config | `providers/codex/user.json.example` | `authMethod`, `fetchQuotaStatus`, `paths`, `models`, `acpSupportsMcpTimeouts` | Local settings template. |
+| Provider README | `providers/codex/README.md` | `Authentication`, `Quota Status`, `Context Usage Persistence`, `MCP Tools`, `Session Files`, `Tests` | Human setup guide. |
+| Protocol Reference | `providers/codex/ACP_PROTOCOL_SAMPLES.md` | `initialize`, `authenticate`, `session/new`, `available_commands_update`, `Tool Calls` | Protocol examples. |
+| MCP Config | `configuration/mcp.json.example` | `tools.invokeShell.enabled`, `tools.subagents.enabled`, `tools.counsel.enabled`, `tools.io.enabled`, `tools.googleSearch.enabled`, `googleSearch.apiKey` | Tool advertisement and handler availability. |
+| Codex Provider Tests | `providers/codex/test/index.test.js` | `Codex Provider`, `performHandshake`, `prepareAcpEnvironment`, `quota status`, `prompt lifecycle hooks`, `intercept`, `normalizeModelState`, `setConfigOption`, `tool helpers`, `getMcpServerMeta`, `session file operations` | Codex behavior coverage. |
+| Contract Tests | `backend/test/providerContract.test.js` | `every provider explicitly exports every contract function` | Required provider exports. |
+| Tool Resolver Tests | `backend/test/toolInvocationResolver.test.js` | `uses provider extraction as canonical tool identity`, `prefers centrally recorded MCP execution details over provider generic titles`, `can claim a recent MCP execution when the provider tool id arrives later` | Tool System V2 merge behavior. |
+| Tool Normalization Tests | `backend/test/providerToolNormalization.test.js` | `extracts Codex-style MCP invocation metadata and command text`, `resolves AcpUI tool names from nested candidates and human MCP titles` | Shared parsing helpers. |
+| MCP Server Tests | `backend/test/mcpServer.test.js` | `createToolHandlers`, optional IO/Search handler cases, idempotent subagent/counsel cases | MCP handler registration and execution wrapping. |
+| MCP API Tests | `backend/test/mcpApi.test.js` | `GET /api/mcp/tools`, `POST /api/mcp/tool-call` | Tool advertisement and execution route behavior. |
 
-```json
-{
-  "acpSupportsMcpTimeouts": true,
-  "acpMcpStartupTimeoutSec": 30,
-  "acpMcpToolTimeoutSec": 3600
-}
-```
+## Gotchas & Important Notes
 
-When `acpSupportsMcpTimeouts` is `true`, `getMcpServerMeta()` returns:
+1. **`model` config options are filtered out**
+   - Codex exposes model selection as model catalog state and as a config option.
+   - `normalizeConfigOptions()` removes `model` so the UI does not render duplicate model controls.
 
-```json
-{
-  "codex_acp": { "startup_timeout_sec": 30, "tool_timeout_sec": 3600 }
-}
-```
+2. **`reasoning_effort` stays in provider settings**
+   - `normalizeConfigOptions()` marks `reasoning_effort` and `effort` with `kind: "reasoning_effort"`.
+   - Keep effort handling separate from model catalog handling.
 
-This is spread as `_meta` on the MCP server config entry in both `session/new` and `session/load` requests. Fields are omitted individually if their value is not a positive integer. Set `acpSupportsMcpTimeouts: false` (the default) until upstream support is confirmed.
+3. **Generic config options use raw values**
+   - `setConfigOption()` sends `{ sessionId, configId, value }` for generic options.
+   - Codex expects raw values such as `high`, not wrapped value objects.
 
-Because Codex can retry or cancel long-running MCP calls when the upstream timeout path is hit or a result is lost, AcpUI's `ux_invoke_subagents` and `ux_invoke_counsel` handlers are replay-protected and abort-aware. Duplicate calls with the same provider/session/tool/MCP request identity join the active invocation or return the recent cached result instead of spawning another sub-agent batch. When the MCP request is actually cancelled, the stdio proxy and backend route propagate abort signals so `SubAgentInvocationManager` cascades cancellation through nested sub-agents instead of leaving them running.
+4. **AcpUI MCP tool titles have two sources**
+   - Provider `normalizeTool()` builds titles from Codex payloads.
+   - `mcpExecutionRegistry` and tool handlers can replace generic provider titles with handler-known titles such as `Invoke Shell: Run tests` or `Web Search: current docs`.
 
-## Gotchas
+5. **Optional IO/Search tools need shared registry support**
+   - Provider extraction recognizes names like `ux_read_file` and `ux_google_web_search`.
+   - Categories and title details for optional tools come from `ACP_UX_IO_TOOL_CONFIG` and `ioToolHandler`.
 
-1. **Do not advertise `fs` in initialize.** AcpUI does not implement Codex fs proxy requests.
-2. **Do not advertise Codex terminal-output metadata until the backend consumes it.** Without it, Codex keeps normal tool output in content/raw output.
-3. **Do not send API keys inside JSON-RPC params.** Codex ACP reads API keys from child process env vars during `authenticate`.
-4. **Do not wrap config option values.** `session/set_config_option` must send `"value": "high"`.
-5. **Do not assume flat session files.** Codex stores rollouts in dated subdirectories.
-6. **Do not auto-trigger ChatGPT auth in `"auto"` mode.** It can launch browser/device login during backend startup.
-7. **Do not persist the Codex `model` config option.** It is represented by AcpUI model state instead.
-8. **Automatic OAuth refresh requires a valid JWT.** If `auth.json` contains an opaque token without a `client_id`, refresh will fail.
-9. **Codex buries the user-facing error message in `error.data.message`.** The JSON-RPC top-level `error.message` is always the generic sentinel `"Internal error"` (-32603). The `intercept()` function promotes `error.data.message` to `error.message` so the real cause (e.g. `usage_limit_exceeded`) surfaces in logs and in the UI error box.
-10. **Avoid double-counting assistant text during rehydration.** When `event_msg/agent_message` exists, treat `response_item/message(role=assistant)` as fallback-only for text to prevent duplicate assistant outputs.
-11. **`acpSupportsMcpTimeouts` is `false` by default.** The `_meta` timeout injection only activates when explicitly set to `true`. Until `codex-acp` officially supports MCP `_meta` timeout overrides, leave this disabled to avoid sending unexpected fields to the daemon.
-12. **Sub-agent MCP retries must stay idempotent and abort-aware.** Codex may retry or cancel a long-running MCP tool call. Do not remove the sub-agent idempotency key path in `backend/mcp/mcpServer.js`, the active/completed replay cache in `backend/mcp/subAgentInvocationManager.js`, or the abort signal propagation through `backend/mcp/stdio-proxy.js` and `backend/routes/mcpApi.js`.
+6. **Quota refresh depends on JWT-shaped access tokens**
+   - `refreshCodexOAuthToken()` derives `client_id` from the access-token JWT payload.
+   - Opaque tokens or missing `client_id` fields make refresh fail with a clear error.
+
+7. **Quota polling is prompt-scoped**
+   - `onPromptStarted()` and `onPromptCompleted()` maintain active prompt count.
+   - Streaming chunks alone do not start polling.
+
+8. **Rollout cloning is turn-boundary aware**
+   - `cloneSession()` prunes at the next whole turn boundary based on `turn_context`, `event_msg`, and `response_item` turn metadata.
+   - Avoid direct file slicing that can leave orphaned turn records.
+
+9. **History parsing handles multiple record families**
+   - `parseSessionHistory()` handles `event_msg`, `response_item`, and `compacted` records.
+   - Missing one record family drops thoughts, tools, user prompts, or compacted replacement history.
+
+10. **MCP timeout metadata is opt-in**
+    - `getMcpServerMeta()` returns data only when `acpSupportsMcpTimeouts` is exactly `true`.
+    - Invalid timeout values are omitted, and an empty timeout object returns `undefined`.
 
 ## Unit Tests
 
-- `providers/codex/test/index.test.js`
-  - **Quota Status:** Handshake, 401 refresh loop, client ID derivation, status mapping
-  - Handshake and auth selection
-  - Environment injection
-  - Command/config update normalization; error message promotion
-  - Config option routing
-  - Tool output/path/diff extraction
-  - Tool normalization/categorization
-  - Rollout cloning and parsing (modern Codex JSONL schema + compaction handling)
+### Provider Tests
 
-- `backend/test/sessionHandlers.test.js`
-  - `captures normalized config options returned by session/new`
+File: `providers/codex/test/index.test.js`
 
-## How To Use This Guide
+Important test groups and cases:
 
-**For extending Codex provider behavior**
+- `performHandshake`: `sends initialize and skips auth when no auto auth source exists`, `authenticates with codex-api-key when CODEX_API_KEY is present`.
+- `prepareAcpEnvironment`: `injects configured API keys into the child environment`, `emits persisted context for a loaded session on request`.
+- `quota status`: `fetches quota with Codex OAuth headers from auth.json`, `derives client ID from access_token JWT payload and refreshes on 401`, `fails when access_token JWT has no client_id field`, `builds provider status with 5h, weekly, and credit details`, `emits provider status when quota fetching is enabled`.
+- `prompt lifecycle hooks`: `exports onPromptStarted and onPromptCompleted`, `onPromptCompleted is a no-op for unknown sessions`.
+- `intercept`: command normalization, config-option filtering, model-only update handling, error promotion, and polling guard behavior.
+- `normalizeModelState`: slash-qualified model IDs, non-effort slash IDs, and config-option model catalogs.
+- `setConfigOption`: `mode`, `model`, and generic option routing.
+- `tool helpers`: output extraction, file paths, diffs, AcpUI MCP title normalization, optional IO/Search title normalization, standard input locations, canonical invocation metadata, and built-in tool name normalization.
+- `getMcpServerMeta`: timeout metadata gating and numeric parsing.
+- `session file operations`: recursive clone/prune, modern turn pruning, rollout parsing, modern record parsing, and compacted history reset.
 
-1. Start at `providers/codex/index.js`.
-2. Check whether the behavior is live-streaming, response-time capture, or rollout parsing.
-3. Update provider tests first if the protocol shape is new.
-4. Keep `providers/codex/ACP_PROTOCOL_SAMPLES.md` aligned with the source-derived shape.
+### Backend Tool and Contract Tests
 
-**For debugging**
+- `backend/test/providerContract.test.js` (Test: `every provider explicitly exports every contract function`)
+- `backend/test/providerToolNormalization.test.js` (Tests: `extracts Codex-style MCP invocation metadata and command text`, `resolves AcpUI tool names from nested candidates and human MCP titles`)
+- `backend/test/toolInvocationResolver.test.js` (Tests: `uses provider extraction as canonical tool identity`, `prefers centrally recorded MCP execution details over provider generic titles`, `can claim a recent MCP execution when the provider tool id arrives later`)
+- `backend/test/mcpServer.test.js` (Anchors: `createToolHandlers`, optional IO/Search registration, subagent/counsel idempotency)
+- `backend/test/mcpApi.test.js` (Routes: `GET /api/mcp/tools`, `POST /api/mcp/tool-call`)
 
-1. Confirm `codex-acp` is on `PATH`.
-2. Check `providers/codex/user.json` paths.
-3. Check whether the data arrived in the response (`session/new` or `session/load`) or as `session/update`.
-4. For rehydration/forking bugs, inspect the rollout file under `.codex/sessions/YYYY/MM/DD`.
-5. If Quota is stale, check `auth.json` last modified time and backend logs for refresh errors.
+## How to Use This Guide
+
+### For implementing/extending this feature
+
+1. Start in `providers/codex/index.js` and confirm the export is covered by `backend/test/providerContract.test.js`.
+2. Check `providers/codex/provider.json` when the change affects `protocolPrefix`, `mcpName`, `toolIdPattern`, or `toolCategories`.
+3. Use `normalizeModelState()`, `normalizeConfigOptions()`, and `intercept()` for model/config protocol changes.
+4. Use `normalizeTool()` and `extractToolInvocation()` for Codex tool payload changes, then verify `toolInvocationResolver` behavior.
+5. Use `parseSessionHistory()` and related rollout helpers for JSONL replay, fork, archive, restore, and delete behavior.
+6. Add or update tests in `providers/codex/test/index.test.js` and the relevant backend tool test when shared tool behavior changes.
+
+### For debugging issues with this feature
+
+1. Verify `providers/codex/user.json` values for `command`, `args`, `authMethod`, `paths.home`, `paths.sessions`, and quota settings.
+2. For handshake/auth failures, inspect `performHandshake()`, `resolveAuthMethod()`, and `prepareAcpEnvironment()`.
+3. For duplicated or missing model/settings UI, inspect `normalizeModelState()`, `normalizeConfigOptions()`, and `intercept()`.
+4. For tool title/category/file-path issues, inspect `normalizeTool()`, `extractToolInvocation()`, `mcpExecutionRegistry`, and `ioToolHandler`.
+5. For quota status issues, inspect `readCodexAuth()`, `fetchCodexQuota()`, `refreshCodexOAuthToken()`, and `buildCodexProviderStatus()`.
+6. For replay/fork/archive issues, inspect `getSessionPaths()`, `cloneSession()`, `archiveSessionFiles()`, `restoreSessionFiles()`, and `parseSessionHistory()`.
 
 ## Summary
 
-- Codex is a normal AcpUI provider with `_codex/` extension events.
-- Models are dynamic and come from Codex ACP response metadata.
-- **Quota Status** is fetched from ChatGPT OAuth APIs with automatic token refresh.
-- The `model` config option is filtered by design.
-- `reasoning_effort` is retained and marked for footer/settings rendering.
-- Sessions are recursive Codex rollout JSONL files.
-- Provider tests cover protocol translation and rollout lifecycle behavior.
+- The Codex provider is centered on `providers/codex/index.js` and configured by `providers/codex/provider.json`, `branding.json`, and local `user.json`.
+- `performHandshake()` sends ACP `initialize` and optional Codex auth.
+- `prepareAcpEnvironment()` handles API-key environment injection, context-cache loading, and initial quota status setup.
+- `normalizeModelState()` and `normalizeConfigOptions()` keep dynamic model catalogs separate from provider settings.
+- `intercept()` converts Codex command/config/usage/error shapes into AcpUI provider extensions or pass-through payloads.
+- `extractToolInvocation()` and `normalizeTool()` canonicalize Codex built-in and MCP tool calls for Tool System V2.
+- `mcpExecutionRegistry`, `acpUiToolTitle`, `ACP_UX_IO_TOOL_CONFIG`, and `ioToolHandler` provide authoritative metadata for optional IO/Search MCP tools.
+- `parseSessionHistory()` converts mixed Codex rollout JSONL records into AcpUI messages and timeline steps.
+- The critical contract is stable provider exports plus Codex-specific normalization before generic backend emission.

@@ -4,6 +4,19 @@ import { getProvider } from '../services/providerLoader.js';
 import { writeLog } from '../services/logger.js';
 import { modelOptionsFromProviderConfig } from '../services/modelOptions.js';
 import { resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
+import {
+  isCounselMcpEnabled,
+  isGoogleSearchMcpEnabled,
+  isInvokeShellMcpEnabled,
+  isIoMcpEnabled,
+  isSubagentsMcpEnabled
+} from '../services/mcpConfig.js';
+import {
+  getCounselMcpToolDefinition,
+  getInvokeShellMcpToolDefinition,
+  getSubagentsMcpToolDefinition
+} from '../mcp/coreMcpToolDefinitions.js';
+import { getGoogleSearchMcpToolDefinitions, getIoMcpToolDefinitions } from '../mcp/ioMcpToolDefinitions.js';
 
 function resolveToolContext(providerId, proxyId) {
   const proxy = resolveMcpProxy(proxyId);
@@ -39,8 +52,8 @@ function canWriteResponse(res, abortSignal) {
  * The proxy forwards tool calls here; we execute them using the real tool handlers.
  *
  * IMPORTANT: If you add/rename/remove tools in mcpServer.js, you must also update
- * the JSON Schema definitions in the GET /tools response below, AND the proxy will
- * pick up the changes automatically on next ACP session creation.
+ * the MCP tool definition modules, AND the proxy will pick up the changes
+ * automatically on next ACP session creation.
  */
 export default function createMcpApiRoutes(io) {
   const router = Router();
@@ -49,7 +62,7 @@ export default function createMcpApiRoutes(io) {
   /**
    * GET /tools — returns tool definitions with JSON Schema for the stdio proxy.
    * The proxy registers these with the ACP so the agent knows what tools are available.
-   * SYNC THIS with the tool handlers in mcpServer.js when adding/changing tools.
+   * SYNC THIS with the tool handlers and definition modules when adding/changing tools.
    */
   router.get('/tools', (req, res) => {
     const query = req?.query || {};
@@ -60,60 +73,22 @@ export default function createMcpApiRoutes(io) {
     const modelDescription = quickModels.length > 0
       ? `Optional model to use for these agents. Pass the model id. Available: ${quickModels.map(model => `${model.name} (id: ${model.id})`).join(', ')}`
       : 'Optional model id to use for these agents.';
-    const toolList = [
-      { name: 'ux_invoke_shell', title: 'Interactive shell', description: 'Execute a shell command in a real terminal with live streaming output and user-interactive stdin while the process is running. Always use this tool for shell commands; never use system shell, bash, or powershell tools when they are present. This is a full replacement for shell execution. Use for running build commands, tests, scripts, package installs, CLIs that may prompt, and other command-line operations. Multiple ux_invoke_shell calls may be invoked concurrently; each command gets its own terminal. Use parallel calls for independent commands that do not contend for the same files, ports, packages, or other shared resources. The tool call returns after the command exits or the user terminates it, and the terminal becomes read-only after exit.', annotations: {
-        title: 'Interactive shell',
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: false,
-        openWorldHint: true
-      }, _meta: {
-        'acpui/concurrentInvocationsSupported': true
-      }, inputSchema: {
-        type: 'object',
-        properties: {
-          description: { type: 'string', description: 'A short description (1 sentence, 3-10 words) that will be displayed to the user when this command runs so they can understand the purpose of the command at a glance.' },
-          command: { type: 'string', description: 'The shell command to execute' },
-          cwd: { type: 'string', description: 'Working directory (absolute path)' },
-        },
-        required: ['description', 'command'],
-      }},
-      { name: 'ux_invoke_subagents', description: 'Spawn and coordinate multiple AI agents in parallel. Each agent runs as a visible session in the UI. Returns when all agents complete.', inputSchema: {
-        type: 'object',
-        properties: {
-          model: { 
-            type: 'string', 
-            description: modelDescription
-          },
-          requests: {
-            type: 'array',
-            description: 'Array of sub-agent requests to run in parallel',
-            items: {
-              type: 'object',
-              properties: {
-                prompt: { type: 'string', description: 'The task prompt for this agent' },
-                name: { type: 'string', description: 'Short display name for this agent' },
-                agent: { type: 'string', description: 'Agent name' },
-                cwd: { type: 'string', description: 'Working directory' },
-              },
-              required: ['prompt'],
-            },
-          },
-        },
-        required: ['requests'],
-      }},
-      { name: 'ux_invoke_counsel', description: 'Spawn multiple AI sub-agents with different perspectives to evaluate a question or decision. Always includes Advocate (argues for), Critic (argues against), and Pragmatist (practical assessment). Optionally include domain experts.', inputSchema: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: 'The question, decision, or topic to evaluate from multiple perspectives' },
-          architect: { type: 'boolean', description: 'Include a Software Architecture expert' },
-          performance: { type: 'boolean', description: 'Include a Software Performance expert' },
-          security: { type: 'boolean', description: 'Include a Software Security expert' },
-          ux: { type: 'boolean', description: 'Include a Software UX expert' },
-        },
-        required: ['question'],
-      }},
-    ];
+    const toolList = [];
+    if (isInvokeShellMcpEnabled()) {
+      toolList.push(getInvokeShellMcpToolDefinition());
+    }
+    if (isSubagentsMcpEnabled()) {
+      toolList.push(getSubagentsMcpToolDefinition({ modelDescription }));
+    }
+    if (isCounselMcpEnabled()) {
+      toolList.push(getCounselMcpToolDefinition());
+    }
+    if (isIoMcpEnabled()) {
+      toolList.push(...getIoMcpToolDefinitions());
+    }
+    if (isGoogleSearchMcpEnabled()) {
+      toolList.push(...getGoogleSearchMcpToolDefinitions());
+    }
     res.json({ tools: toolList, serverName });
   });
 

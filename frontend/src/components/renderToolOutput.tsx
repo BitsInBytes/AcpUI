@@ -41,6 +41,76 @@ const getLangFromPath = (filePath: string): string => {
   return EXT_TO_LANG[ext] || 'text';
 };
 
+type WebFetchResult = {
+  type: 'web_fetch_result';
+  url?: string;
+  status?: number;
+  contentType?: string;
+  title?: string;
+  text?: string;
+};
+
+type GrepSearchMatch = {
+  filePath?: string;
+  lineNumber?: number;
+  line?: string;
+  submatches?: Array<{ text?: string; start?: number; end?: number }>;
+};
+
+type GrepSearchResult = {
+  type: 'ux_grep_search_result';
+  pattern?: string;
+  dirPath?: string;
+  matchCount?: number;
+  matches?: GrepSearchMatch[];
+  context?: Array<{
+    filePath?: string;
+    lineNumber?: number;
+    line?: string;
+  }>;
+  truncated?: boolean;
+};
+
+const tryParseJsonObject = (text: string): Record<string, unknown> | null => {
+  if (!text.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const isWebFetchResult = (value: Record<string, unknown> | null): value is WebFetchResult => (
+  value?.type === 'web_fetch_result'
+);
+
+const isGrepSearchResult = (value: Record<string, unknown> | null): value is GrepSearchResult => (
+  value?.type === 'ux_grep_search_result'
+);
+
+const renderHighlightedMatch = (line: string, submatches: GrepSearchMatch['submatches'] = []) => {
+  if (!submatches.length) return line;
+
+  const pieces: React.ReactNode[] = [];
+  let cursor = 0;
+  [...submatches]
+    .filter(match => Number.isInteger(match.start) && Number.isInteger(match.end) && (match.end as number) >= (match.start as number))
+    .sort((a, b) => (a.start as number) - (b.start as number))
+    .forEach((match, index) => {
+      const start = Math.max(cursor, match.start as number);
+      const end = Math.min(line.length, match.end as number);
+      if (start > cursor) pieces.push(line.slice(cursor, start));
+      if (end > start) {
+        pieces.push(<mark key={`match-${index}`} className="grep-match-highlight">{line.slice(start, end)}</mark>);
+      }
+      cursor = Math.max(cursor, end);
+    });
+
+  if (cursor < line.length) pieces.push(line.slice(cursor));
+  return pieces.length ? pieces : line;
+};
+
 /**
  * Renders tool output with priority: diff (create-only → syntax-highlighted, mixed → colored diff)
  * > ANSI terminal colors > shell JSON {stdout,stderr} > file read (syntax-highlighted)
@@ -101,6 +171,58 @@ export const renderToolOutput = (output: string | undefined, _markdownComponents
       codeLines.pop(); // remove last line (```)
       displayText = codeLines.join('\n');
     }
+  }
+
+  const structuredObject = !shellOutput ? tryParseJsonObject(displayText) : null;
+  if (isWebFetchResult(structuredObject)) {
+    const title = structuredObject.title?.trim();
+    const bodyText = structuredObject.text || '';
+    return (
+      <div className="web-fetch-output">
+        <div className="web-fetch-meta">
+          {title && <div className="web-fetch-title">{title}</div>}
+          {structuredObject.url && (
+            <a className="web-fetch-url" href={structuredObject.url} target="_blank" rel="noreferrer">
+              {structuredObject.url}
+            </a>
+          )}
+          <div className="web-fetch-details">
+            {structuredObject.status ? <span>Status {structuredObject.status}</span> : null}
+            {structuredObject.contentType ? <span>{structuredObject.contentType}</span> : null}
+          </div>
+        </div>
+        <pre className="web-fetch-text">{bodyText || 'No fetched page text returned.'}</pre>
+      </div>
+    );
+  }
+
+  if (isGrepSearchResult(structuredObject)) {
+    const matches = structuredObject.matches || [];
+    return (
+      <div className="grep-output">
+        <div className="grep-output-meta">
+          <span>{structuredObject.matchCount ?? matches.length} matches</span>
+          {structuredObject.pattern ? <span>Pattern {structuredObject.pattern}</span> : null}
+          {structuredObject.dirPath ? <span>{structuredObject.dirPath}</span> : null}
+          {structuredObject.truncated ? <span>Truncated</span> : null}
+        </div>
+        {matches.length ? (
+          <div className="grep-match-list">
+            {matches.map((match, index) => (
+              <div className="grep-match-row" key={`${match.filePath || 'match'}-${match.lineNumber || index}-${index}`}>
+                <div className="grep-match-location">
+                  <span>{match.filePath || '(unknown file)'}</span>
+                  {match.lineNumber ? <span>:{match.lineNumber}</span> : null}
+                </div>
+                <pre className="grep-match-line">{renderHighlightedMatch(match.line || '', match.submatches)}</pre>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="grep-no-matches">No matches found.</div>
+        )}
+      </div>
+    );
   }
 
   // File read: wrap in syntax-highlighted code block

@@ -1,4 +1,6 @@
 import { toolCallState } from './toolCallState.js';
+import { isAcpUxToolName } from './acpUxTools.js';
+import { invocationFromMcpExecution, mcpExecutionRegistry } from './mcpExecutionRegistry.js';
 
 function phaseFor(update, event) {
   if (event?.type === 'tool_start' || update?.sessionUpdate === 'tool_call') return 'start';
@@ -14,7 +16,7 @@ function compactObject(obj) {
   return out;
 }
 
-function normalizeProviderInvocation(result) {
+function normalizeInvocation(result, defaultTitleSource = 'provider') {
   if (!result || typeof result !== 'object') return {};
   const identity = result.identity || {};
   return {
@@ -29,11 +31,39 @@ function normalizeProviderInvocation(result) {
     input: result.input || {},
     display: compactObject({
       title: result.display?.title || result.title,
-      titleSource: result.display?.titleSource || (result.title ? 'provider' : undefined)
+      titleSource: result.display?.titleSource || (result.title ? defaultTitleSource : undefined)
     }),
     category: result.category || {},
-    filePath: result.filePath
+    filePath: result.filePath,
+    output: result.output,
+    execution: result.execution
   };
+}
+
+function isAcpUiMcpIdentity(identity = {}, acpUiMcpServerName) {
+  if (identity.kind === 'acpui_mcp') return true;
+  if (isAcpUxToolName(identity.canonicalName) || isAcpUxToolName(identity.mcpToolName)) return true;
+  if (!acpUiMcpServerName) return false;
+  return identity.mcpServer === acpUiMcpServerName;
+}
+
+function lookupMcpExecution({ providerId, sessionId, update, event, toolCallId, providerInvocation, cached }) {
+  const toolName = providerInvocation.identity?.canonicalName
+    || cached?.identity?.canonicalName
+    || event?.toolName
+    || update?.toolName
+    || providerInvocation.identity?.mcpToolName
+    || cached?.identity?.mcpToolName;
+
+  if (!toolCallId && !toolName) return null;
+  if (toolName && !isAcpUxToolName(toolName)) return null;
+
+  return mcpExecutionRegistry.find({
+    providerId,
+    sessionId,
+    toolCallId,
+    toolName
+  });
 }
 
 export function resolveToolInvocation({
@@ -42,7 +72,8 @@ export function resolveToolInvocation({
   update,
   event,
   providerModule,
-  phase
+  phase,
+  acpUiMcpServerName
 }) {
   const providerResult = providerModule?.extractToolInvocation?.(update, {
     providerId,
@@ -50,11 +81,48 @@ export function resolveToolInvocation({
     event,
     phase: phase || phaseFor(update, event)
   });
-  const providerInvocation = normalizeProviderInvocation(providerResult);
-  const toolCallId = providerInvocation.toolCallId || update?.toolCallId || event?.id;
-  const cached = toolCallState.get(providerId, sessionId, toolCallId);
+  const providerInvocation = normalizeInvocation(providerResult, 'provider');
+  const initialToolCallId = providerInvocation.toolCallId || update?.toolCallId || event?.id;
+  const cached = toolCallState.get(providerId, sessionId, initialToolCallId);
+  const mcpInvocation = normalizeInvocation(invocationFromMcpExecution(lookupMcpExecution({
+    providerId,
+    sessionId,
+    update,
+    event,
+    toolCallId: initialToolCallId,
+    providerInvocation,
+    cached
+  })), 'mcp_handler');
+  const toolCallId = mcpInvocation.toolCallId || initialToolCallId;
   const resolvedPhase = phase || phaseFor(update, event);
   const eventToolName = event?.toolName || update?.toolName;
+
+  const mergedIdentity = compactObject({
+    ...(providerInvocation.identity || {}),
+    ...(cached?.identity || {}),
+    ...(mcpInvocation.identity || {}),
+    canonicalName: mcpInvocation.identity?.canonicalName
+      || cached?.identity?.canonicalName
+      || providerInvocation.identity?.canonicalName
+      || eventToolName,
+    rawName: mcpInvocation.identity?.rawName
+      || cached?.identity?.rawName
+      || providerInvocation.identity?.rawName
+      || eventToolName,
+    mcpServer: mcpInvocation.identity?.mcpServer
+      || cached?.identity?.mcpServer
+      || providerInvocation.identity?.mcpServer,
+    mcpToolName: mcpInvocation.identity?.mcpToolName
+      || cached?.identity?.mcpToolName
+      || providerInvocation.identity?.mcpToolName
+  });
+  if (isAcpUiMcpIdentity(mergedIdentity, acpUiMcpServerName)) {
+    mergedIdentity.kind = 'acpui_mcp';
+    if (!mergedIdentity.mcpServer && acpUiMcpServerName) mergedIdentity.mcpServer = acpUiMcpServerName;
+    if (!mergedIdentity.mcpToolName && mergedIdentity.canonicalName) {
+      mergedIdentity.mcpToolName = mergedIdentity.canonicalName;
+    }
+  }
 
   const invocation = toolCallState.upsert({
     providerId,
@@ -62,28 +130,33 @@ export function resolveToolInvocation({
     toolCallId,
     phase: resolvedPhase,
     status: update?.status,
-    identity: compactObject({
-      ...(cached?.identity || {}),
-      ...(providerInvocation.identity || {}),
-      canonicalName: providerInvocation.identity?.canonicalName || cached?.identity?.canonicalName || eventToolName,
-      rawName: providerInvocation.identity?.rawName || cached?.identity?.rawName || eventToolName
-    }),
+    identity: mergedIdentity,
     input: {
       ...(cached?.input || {}),
-      ...(providerInvocation.input || {})
+      ...(providerInvocation.input || {}),
+      ...(mcpInvocation.input || {})
     },
     display: compactObject({
-      title: providerInvocation.display?.title || event?.title || update?.title || cached?.display?.title,
-      titleSource: providerInvocation.display?.titleSource || (event?.title || update?.title ? 'provider' : cached?.display?.titleSource)
+      title: mcpInvocation.display?.title
+        || providerInvocation.display?.title
+        || event?.title
+        || update?.title
+        || cached?.display?.title,
+      titleSource: mcpInvocation.display?.titleSource
+        || providerInvocation.display?.titleSource
+        || (event?.title || update?.title ? 'provider' : undefined)
+        || cached?.display?.titleSource
     }),
     category: {
+      ...(providerInvocation.category || {}),
       ...(cached?.category || {}),
-      ...(providerInvocation.category || {})
+      ...(mcpInvocation.category || {})
     },
-    filePath: providerInvocation.filePath || event?.filePath || cached?.filePath,
-    output: event?.output,
+    filePath: mcpInvocation.filePath || cached?.filePath || providerInvocation.filePath || event?.filePath,
+    output: event?.output ?? mcpInvocation.output,
     raw: {
-      providerInvocation
+      providerInvocation,
+      mcpExecution: mcpInvocation.execution
     }
   });
 
@@ -94,13 +167,16 @@ export function applyInvocationToEvent(event, invocation) {
   if (!invocation) return event;
   const identity = invocation.identity || {};
   const category = invocation.category || {};
+  const isAcpUxTool = identity.kind === 'acpui_mcp';
   return {
     ...event,
     ...(identity.canonicalName ? { toolName: identity.canonicalName, canonicalName: identity.canonicalName } : {}),
     ...(identity.mcpServer ? { mcpServer: identity.mcpServer } : {}),
     ...(identity.mcpToolName ? { mcpToolName: identity.mcpToolName } : {}),
+    ...(isAcpUxTool ? { isAcpUxTool: true } : {}),
     ...(invocation.filePath ? { filePath: invocation.filePath } : {}),
     ...(invocation.display?.title ? { title: invocation.display.title } : {}),
+    ...(invocation.display?.titleSource ? { titleSource: invocation.display.titleSource } : {}),
     ...category
   };
 }

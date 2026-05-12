@@ -1,894 +1,441 @@
-# Feature Doc — Chat Input and Prompt Area
-
-The footer-positioned input interface for composing and sending prompts, including file attachments, model selection, and context visibility. Supports textarea auto-expansion, image compression, slash command autocomplete, and per-session file uploads.
-
----
+# Feature Doc - Chat Input and Prompt Area
 
 ## Overview
+The Chat Input and Prompt Area is the prompt composition surface for an active chat session. It coordinates draft text, attachments, slash commands, voice entry controls, prompt submission/cancel actions, model quick-select, reasoning-effort options, context usage display, and footer actions for terminal, canvas, auto-scroll, notes, and fork merge.
+
+This feature matters because it is the frontend boundary that creates `prompt` socket payloads and the backend path that converts those payloads into ACP `session/prompt` parts. Small mismatches between the UI attachment shape, socket payload, provider model state, or context metadata path can break prompt submission while the rest of the session UI still renders.
 
 ### What It Does
-- **Textarea input** — Multi-line expandable text area with keyboard shortcuts (Enter to send, Shift+Enter for newline)
-- **File attachments** — Upload/paste files with visual thumbnails and removal buttons; images automatically compressed before sending to ACP
-- **Model quick-select** — Footer dropdown showing provider-configured quick-access models with active state
-- **Slash command autocomplete** — Dropdown menu for slash commands (e.g., `/compact`, `/context`, `/agent`) with arrow key navigation
-- **Context progress bar** — Real-time percentage display of token usage (color-coded: green <50%, blue 50-60%, yellow 60-80%, red ≥80%)
-- **Reasoning effort selector** — Animated footer toggle for models supporting reasoning levels (e.g., `low`, `medium`, `high`)
-- **Canvas/Terminal toggles** — Quick-access pills to open canvas pane or spawn new terminals
-- **Auto-scroll toggle pill** — Footer control to enable/disable chat viewport auto-scroll (detailed behavior documented in `[Feature Doc] - Auto-scroll System.md`)
-- **Merge fork button** — Appears when chat is a fork; summarizes work and sends back to parent
-- **Send/Cancel button** — Changes to cancel button during generation; disabled when no input/attachments or engine not ready
+- Renders the active session textarea and keeps draft text in `useInputStore.inputs` by UI session id.
+- Uses `useFileUpload` to send file picker and clipboard files to `POST /upload/:uiId`, then stores attachment metadata in `useInputStore.attachmentsMap`.
+- Merges provider slash commands with local custom commands and routes selected commands through the same submit path as typed prompts.
+- Emits `save_snapshot`, `prompt`, `cancel_prompt`, `set_session_model`, `set_session_option`, and `merge_fork` socket events through store and component handlers.
+- Displays footer state from provider branding, session model metadata, config options, context usage, compaction state, canvas state, terminal state, and auto-scroll state.
+- Converts attachments into ACP prompt parts in `registerPromptHandlers` before sending `session/prompt` to the active provider runtime.
 
 ### Why This Matters
-- Unified prompt submission point for all chat functionality
-- Real-time visual feedback on model selection and context consumption
-- File attachments enable multi-modal reasoning and context injection
-- Auto-compression prevents image bloat while maintaining clarity
-- Keyboard-driven workflow (slash commands, Enter to send) speeds up interaction
-- Footer positioning maximizes chat message visibility (vs. header-positioned input)
+- `useChatStore.handleSubmit` is the only normal UI path that emits the `prompt` socket event.
+- Attachment upload and attachment prompt conversion are separate phases with different failure points.
+- Model selection has an optimistic frontend update and a backend ACP `session/set_model` enforcement path.
+- Slash command visibility depends on provider extension data and local custom command data arriving through socket handlers.
+- Context usage is displayed from metadata and stats state keyed by ACP session id, not UI session id.
 
----
+## How It Works - End-to-End Flow
+1. Active session state is selected in the input component.
 
-## How It Works — End-to-End Flow
+   File: `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`)
 
-### 1. User Focuses Textarea or Clicks Chat Area
-**File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 139-143)
+   `ChatInput` reads the active session from `useSessionLifecycleStore.sessions` and `activeSessionId`. It pulls connectivity from `useSystemStore`, draft text from `useInputStore.inputs`, footer state from `useUIStore` and `useCanvasStore`, voice state from `useVoiceStore`, and provider branding through `useSystemStore.getBranding(activeSession?.provider)`.
 
-```typescript
-useEffect(() => {
-  if (!isDisabled && textareaRef.current) {
-    textareaRef.current.focus();  // LINE 141
-  }
-}, [isDisabled, activeSession?.id]);
-```
+2. The textarea is enabled only when the session can accept input.
 
-When a session is selected or becomes available, the textarea auto-focuses. The `isDisabled` flag (Line 81) prevents focus when engine is not ready or session is warming up.
+   File: `frontend/src/components/ChatInput/ChatInput.tsx` (Derived state: `isDisabled`)
 
-### 2. User Types "/" — Slash Command Autocomplete
-**File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 104-112)
+   The textarea and file/mic actions are disabled when the socket is disconnected, the engine is not ready, the session is typing, or the session is warming up. Sub-agent sessions render a read-only input wrapper instead of the prompt form.
 
-```typescript
-const filteredCommands = useMemo(() => {
-  const HIDDEN = ['/usage', '/reply', '/quit', '/plan', '/clear', '/knowledge', '/paste'];
-  if (!input.startsWith('/')) return [];  // LINE 106
-  const query = input.toLowerCase();
-  return slashCommands
-    .filter(c => !HIDDEN.includes(c.name))  // LINE 109
-    .filter(c => c.name.toLowerCase().startsWith(query));  // LINE 110
-}, [input, slashCommands]);
-const showSlash = filteredCommands.length > 0 && input.startsWith('/') && !input.includes(' ');  // LINE 112
-```
+3. Slash commands are assembled from provider and local command sources.
 
-As user types `/`, the component:
-1. Checks if input starts with `/` (Line 106)
-2. Filters out hidden commands (Line 109)
-3. Matches commands starting with the input prefix (Line 110)
-4. Shows dropdown if matches exist and no space yet (Line 112)
+   Files: `frontend/src/hooks/useSocket.ts` (Socket events: `custom_commands`, `provider_extension`), `frontend/src/utils/extensionRouter.ts` (Function: `routeExtension`), `frontend/src/components/ChatInput/ChatInput.tsx` (Memo: `slashCommands`)
 
-The `slashCommands` array comes from two sources (Lines 39-45):
-- Provider-specific commands (if active session has a provider)
-- Global custom commands (from `configuration/commands.json`)
+   `custom_commands` stores local command definitions in `useSystemStore.customCommands` and also surfaces prompt-backed commands as `SlashCommand` entries with `meta.local`. `provider_extension` calls `routeExtension`; a `commands/available` extension returns provider commands plus any prompt-backed custom commands. `ChatInput` prefers `slashCommandsByProviderId[activeProvider]` when present and prefixes local commands while removing duplicate command names.
 
-### 3. User Navigates Slash Dropdown with Arrow Keys
-**File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 152-157)
+4. Slash autocomplete filters and handles keyboard selection.
 
-```typescript
-const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-  if (showSlash) {
-    if (e.key === 'ArrowDown') { e.preventDefault(); setSlashIndex(i => Math.min(i + 1, filteredCommands.length - 1)); return; }  // LINE 154
-    if (e.key === 'ArrowUp') { e.preventDefault(); setSlashIndex(i => Math.max(i - 1, 0)); return; }  // LINE 155
-    if (e.key === 'Tab' || (e.key === 'Enter' && slashIndex >= 0)) { e.preventDefault(); selectSlashCommand(filteredCommands[Math.max(slashIndex, 0)]); return; }  // LINE 156
-    if (e.key === 'Escape') { e.preventDefault(); setInput(activeSessionId || '', ''); return; }  // LINE 157
-  }
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    handleSubmit(socket);  // LINE 161
-  }
-};
-```
+   Files: `frontend/src/components/ChatInput/ChatInput.tsx` (Memo: `filteredCommands`, Function: `handleKeyDown`, Function: `selectSlashCommand`), `frontend/src/components/ChatInput/SlashDropdown.tsx` (Component: `SlashDropdown`)
 
-Arrow keys navigate the dropdown. Tab or Enter selects the command. Shift+Enter adds a newline (not intercepted). Plain Enter sends the message.
+   The dropdown appears only when the draft starts with `/`, contains no spaces, and has matching commands after hidden command names are removed. Arrow keys move `slashIndex`; `Tab` and `Enter` select a command; `Escape` clears the draft. Commands with `meta.inputType === 'panel'` or `meta.hint` leave a trailing space for arguments. Commands without arguments immediately call `handleSubmit(socket)` after storing the command name.
 
-### 4. User Selects Slash Command
-**File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 130-137)
+5. File picker and paste events enter the upload hook.
 
-```typescript
-const selectSlashCommand = (cmd: typeof slashCommands[0]) => {
-  const hasArgs = cmd.meta?.inputType === 'panel' || cmd.meta?.hint;
-  setInput(activeSessionId || '', cmd.name + (hasArgs ? ' ' : ''));  // LINE 132
-  if (!hasArgs) {
-    setTimeout(() => handleSubmit(socket), 0);  // LINE 134
-  }
-  textareaRef.current?.focus();  // LINE 136
-};
-```
+   File: `frontend/src/hooks/useFileUpload.ts` (Hook: `useFileUpload`, Functions: `handleFileUpload`, `handlePaste`)
 
-The command is inserted into the textarea. If it has arguments (metadata `inputType === 'panel'` or hint), the prompt waits for user input. Otherwise, it auto-submits.
+   `handleFileUpload` builds a `FormData` payload with repeated `files` fields and posts it to `${BACKEND_URL}/upload/${currentSessionId}`. `handlePaste` listens on `window` and intercepts clipboard file payloads before delegating to `handleFileUpload`.
 
-### 5. User Pastes or Drags Image/File
-**File:** `frontend/src/hooks/useFileUpload.ts` (Lines 55-79)
+6. The upload route stores files under the provider attachment root.
 
-```typescript
-const handlePaste = useCallback((e: ClipboardEvent) => {
-  const clipboardData = e.clipboardData;
-  if (!clipboardData) return;
+   Files: `backend/routes/index.js` (Route mount: `router.use('/upload', uploadRoutes)`), `backend/routes/upload.js` (Route: `POST /:uiId`), `backend/services/attachmentVault.js` (Functions: `getAttachmentsRoot`, `upload`, `handleUpload`)
 
-  if (clipboardData.files && clipboardData.files.length > 0) {
-    e.preventDefault();
-    handleFileUpload(clipboardData.files);  // LINE 61
-    return;
-  }
+   The route applies `upload.array('files')` from multer. The storage destination is `path.join(getAttachmentsRoot(providerId), uiId)`, where `providerId` may come from request query or body. Filenames are timestamped and sanitized. `handleUpload` returns `{ success: true, files }` with each file shaped as `{ name, path, size, mimeType }`.
 
-  const items = clipboardData.items;
-  const files: File[] = [];
-  for (let i = 0; i < items.length; i++) {
-    if (items[i].kind === 'file') {
-      const file = items[i].getAsFile();
-      if (file) files.push(file);  // LINE 70
-    }
-  }
-  
-  if (files.length > 0) {
-    e.preventDefault();
-    e.stopPropagation();
-    handleFileUpload(files);  // LINE 77
-  }
-}, [handleFileUpload]);
+7. Uploaded attachments are stored for the active UI session.
 
-useEffect(() => {
-  window.addEventListener('paste', handlePaste);  // LINE 82
-  return () => window.removeEventListener('paste', handlePaste);
-}, [handlePaste]);
-```
+   Files: `frontend/src/hooks/useFileUpload.ts` (Function: `handleFileUpload`), `frontend/src/store/useInputStore.ts` (Actions: `setAttachments`, `clearInput`), `frontend/src/components/FileTray.tsx` (Component: `FileTray`)
 
-The hook listens for paste events (Line 82). If clipboard has files, `handleFileUpload` is called.
+   Image responses are enriched with base64 `data` from the original browser `File` for immediate preview and prompt submission. The hook appends attachments with `setAttachments(currentSessionId, prev => [...prev, ...filesWithData])`. `FileTray` renders chips with name, formatted size, a file-type icon, and a remove button that filters the session attachment array.
 
-### 6. handleFileUpload POSTs to Backend
-**File:** `frontend/src/hooks/useFileUpload.ts` (Lines 11-53)
+8. The form submits through the chat store.
 
-```typescript
-const handleFileUpload = useCallback(async (files: FileList | File[] | null) => {
-  if (!files) return;
-  const currentSessionId = activeSessionIdRef.current;
-  if (!currentSessionId) {
-    alert('Please select a chat session before uploading files.');
-    return;
-  }
-  
-  const fileArray = Array.from(files);
-  if (fileArray.length === 0) return;
+   Files: `frontend/src/components/ChatInput/ChatInput.tsx` (Function: `handleKeyDown`, Form `onSubmit`), `frontend/src/store/useChatStore.ts` (Action: `handleSubmit`)
 
-  const formData = new FormData();
-  for (const file of fileArray) {
-    formData.append('files', file);  // LINE 24
-  }
+   `Enter` without Shift and the submit button call `handleSubmit(socket)`. If the active session is typing, the form calls `handleCancel(socket)` instead. `handleSubmit` requires an active UI session, socket, active session object, non-empty prompt or attachments, and an ACP session id.
 
-  try {
-    const response = await fetch(`${BACKEND_URL}/upload/${currentSessionId}`, {  // LINE 28
-      method: 'POST',
-      body: formData
-    });
-    const result = await response.json();
-    if (result.success) {
-      // Read base64 data for image preview in chat bubbles
-      const filesWithData = await Promise.all(result.files.map(async (f: { mimeType?: string }, i: number) => {
-        if (fileArray[i] && (f.mimeType || '').startsWith('image/')) {
-          const data = await new Promise<string>(resolve => {
-            const reader = new FileReader();
-            reader.onload = (e) => resolve((e.target?.result as string).split(',')[1]);  // LINE 39
-            reader.readAsDataURL(fileArray[i]);
-          });
-          return { ...f, data };  // LINE 42
-        }
-        return f;
-      }));
-      setAttachments(currentSessionId, prev => [...prev, ...filesWithData]);  // LINE 46
-    } else {
-      alert(`Upload failed: ${result.error}`);
-    }
-  } catch (err: unknown) {
-    alert(`Upload network error: ${(err as Error).message || 'Unknown error'}`);
-  }
-}, [activeSessionIdRef, setAttachments]);
-```
+9. Submit creates optimistic messages and emits the prompt payload.
 
-Files are POSTed to `POST /upload/{sessionId}` (Line 28). Backend multer stores them on disk. For images, base64 data is read locally (Line 39) and stored in the Zustand input store so thumbnails can be displayed immediately (Line 46).
+   File: `frontend/src/store/useChatStore.ts` (Action: `handleSubmit`)
 
-### 7. Backend Stores Files on Disk
-**File:** `backend/services/attachmentVault.js` (Lines 14-40)
+   The store trims the prompt, resolves attachments from `attachmentsMap[activeSessionId]` unless an override is provided, intercepts exact prompt-backed custom commands from `useSystemStore.customCommands`, marks the ACP stream active in `useStreamStore`, clears the input and attachments, appends a user message plus an assistant placeholder, emits `save_snapshot`, then emits `prompt`.
 
-```javascript
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    const { uiId } = _req.params;
-    const providerId = (_req?.query || {}).providerId || (_req?.body || {}).providerId || null;
-    const sessionDir = path.join(getAttachmentsRoot(providerId), uiId);  // LINE 18
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-    cb(null, sessionDir);
-  },
-  filename: (_req, file, cb) => {
-    const safeName = file.originalname.replace(/[^a-z0-9.]/gi, '_').toLowerCase();  // LINE 23
-    cb(null, `${Date.now()}_${safeName}`);  // LINE 24
-  }
-});
+10. The backend resolves provider runtime and model state.
 
-export function handleUpload(req, res) {
-  const { uiId } = req.params;
-  const files = req.files.map(f => ({
-    name: f.originalname,
-    path: f.path,
-    size: f.size,
-    mimeType: f.mimetype  // LINE 36
-  }));
-  writeLog(`[UPLOAD] ${files.length} file(s) added to session ${uiId}`);
-  res.json({ success: true, files });
-}
-```
+    Files: `backend/sockets/promptHandlers.js` (Function: `registerPromptHandlers`, Socket event: `prompt`), `backend/services/modelOptions.js` (Function: `resolveModelSelection`)
 
-Files are stored in a session-specific directory (`{attachments_root}/{sessionId}/`) with a timestamp + sanitized filename. The response includes file metadata (Line 36).
+    The prompt handler resolves the runtime through `providerRuntimeManager.getRuntime(providerId)`. It requires `sessionMetadata` for the ACP session. It resolves the requested model against provider config and session model options, sends ACP `session/set_model` when the metadata model differs, updates `meta.model`, increments `meta.promptCount`, and records `meta.userPrompt` for the first string prompt.
 
-### 8. FileTray Component Displays Attachments
-**File:** `frontend/src/components/FileTray.tsx` (Lines 12-50)
+11. Attachments become ACP prompt parts.
 
-```typescript
-const FileTray: React.FC<FileTrayProps> = ({ attachments, onRemove }) => {
-  const getIcon = (mime: string) => {
-    if (mime.startsWith('image/')) return <FileImage size={14} />;  // LINE 14
-    if (mime.includes('javascript') || mime.includes('typescript') || mime.includes('json') || mime.includes('sql')) return <FileCode size={14} />;
-    return <FileText size={14} />;
-  };
+    File: `backend/sockets/promptHandlers.js` (Socket event: `prompt`, Attachment conversion block)
 
-  const formatSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
+    Image attachments use `file.data` or `fs.readFileSync(file.path).toString('base64')`, resize through `sharp`, and emit ACP image parts with `mimeType: 'image/jpeg'` when compression succeeds. Image compression uses `runtime.provider.config.branding.maxImageDimension` or `1568`, `fit: 'inside'`, `withoutEnlargement: true`, and JPEG quality `85`. If compression fails, the original image mime type and base64 data are sent. Non-image attachments with `data` become text parts. Non-image attachments with `path` become `resource_link` parts with a `file:///` URI.
 
-  if (attachments.length === 0) return null;
+12. The prompt is sent to ACP and completion state is emitted.
 
-  return (
-    <div className="file-chips-wrapper">
-      <AnimatePresence>
-        {attachments.map((file, idx) => (
-          <motion.div 
-            key={`${file.name}-${idx}`}
-            initial={{ opacity: 0, scale: 0.8, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.8, y: 10 }}
-            className="file-chip"
-          >
-            <span className="file-chip-icon">{getIcon(file.mimeType || '')}</span>  // LINE 38
-            <div className="file-chip-info">
-              <span className="file-chip-name">{file.name}</span>  // LINE 40
-              <span className="file-chip-size">{formatSize(file.size)}</span>  // LINE 41
-            </div>
-            <button className="file-chip-remove" onClick={() => onRemove(idx)}>
-              <X size={12} />
-            </button>
-          </motion.div>
-        ))}
-      </AnimatePresence>
-    </div>
-  );
-};
-```
+    File: `backend/sockets/promptHandlers.js` (Socket event: `prompt`, ACP request: `session/prompt`)
 
-Each attachment renders as an animated chip (motion.div) with icon (Line 38), name (Line 40), size (Line 41), and remove button.
+    The handler appends the text prompt or array prompt parts after attachment parts, prepends `meta.spawnContext` on the first prompt when present, resets response buffers, calls `providerModule.onPromptStarted(sessionId)`, sends ACP `session/prompt`, emits `stats_push` when ACP usage is present, and emits `token_done` plus `autoSaveTurn` when the stream controller has no pending stats capture. Errors emit formatted `token` and `token_done` events with `error: true`.
 
-### 9. User Clicks Send Button
-**File:** `frontend/src/components/ChatInput/ChatInput.tsx` (Lines 193-198)
+13. Footer model and session option controls update session state.
 
-```typescript
-<form
-  onSubmit={(e) => {
-    e.preventDefault();
-    if (activeSession?.isTyping) handleCancel(socket);  // LINE 196
-    else handleSubmit(socket);  // LINE 197
-  }}
-  className="input-form"
->
-```
+    Files: `frontend/src/components/ChatInput/ModelSelector.tsx` (Component: `ModelSelector`), `frontend/src/utils/modelOptions.ts` (Functions: `getFooterModelChoices`, `getModelLabel`, `isModelChoiceActive`), `frontend/src/store/useSessionLifecycleStore.ts` (Actions: `handleActiveSessionModelChange`, `handleSessionModelChange`, `handleSetSessionOption`)
 
-Form submission calls `handleSubmit` from `useChatStore`, which emits the `prompt` socket event.
+    `ModelSelector` displays the label from `currentModelId`, session model options, and provider branding `models.quickAccess`. Dropdown choices come from quick-access branding only. Selecting a model calls `handleActiveSessionModelChange`, which calls `handleSessionModelChange`, applies local model state, and emits `set_session_model`. A `reasoning_effort` config option renders segmented buttons in `ChatInput`; selecting a value calls `handleSetSessionOption`, updates local `configOptions`, and emits `set_session_option`.
 
-### 10. handleSubmit Emits Socket Event with Attachments
-**File:** `frontend/src/store/useChatStore.ts` (referenced via handleSubmit)
+14. Context usage is displayed in two places.
 
-The `prompt` event includes attachments array:
-```typescript
-socket.emit('prompt', {
-  providerId,
-  uiId: sessionId,
-  sessionId: acpSessionId,
-  prompt,
-  model,
-  attachments  // From useInputStore
-});
-```
+    Files: `frontend/src/hooks/useSocket.ts` (Socket event: `provider_extension`), `frontend/src/utils/extensionRouter.ts` (Extension result: `metadata`), `frontend/src/store/useSystemStore.ts` (Action: `setContextUsage`), `frontend/src/store/useSessionLifecycleStore.ts` (Functions: `fetchStats`, `maybeHydrateContextUsage`), `frontend/src/components/ChatInput/ChatInput.tsx` (CSS classes: `context-bar-track`, `context-bar-fill`), `frontend/src/components/ChatInput/ModelSelector.tsx` (Label: context percentage and compaction suffix)
 
-### 11. Backend promptHandlers Compresses Images
-**File:** `backend/sockets/promptHandlers.js` (Lines 57-92)
-
-```javascript
-const acpPromptParts = [];
-
-if (attachments && attachments.length > 0) {
-  for (const file of attachments) {
-    const isImage = (file.mimeType || '').startsWith('image/');  // LINE 60
-    if (isImage) {
-      const data = file.data || (file.path ? fs.readFileSync(file.path).toString('base64') : null);
-      if (data) {
-        try {
-          const buf = Buffer.from(data, 'base64');
-          const maxDim = runtime.provider.config.branding?.maxImageDimension || 1568;  // LINE 66
-          const compressed = await sharp(buf)
-            .resize({ width: maxDim, height: maxDim, fit: 'inside', withoutEnlargement: true })  // LINE 68
-            .jpeg({ quality: 85 })  // LINE 69
-            .toBuffer();  // LINE 70
-          const origKB = Math.round(buf.length / 1024);
-          const newKB = Math.round(compressed.length / 1024);
-          writeLog(`[IMAGE] Compressed ${origKB}KB → ${newKB}KB`);
-          acpPromptParts.push({ type: 'image', mimeType: 'image/jpeg', data: compressed.toString('base64') });  // LINE 74
-        } catch (err) {
-          writeLog(`[IMAGE] Compression failed, sending original: ${err.message}`);
-          acpPromptParts.push({ type: 'image', mimeType: file.mimeType, data });
-        }
-      }
-    } else if (file.data) {
-      // Drag/drop file — decode base64 and include as text
-      const text = Buffer.from(file.data, 'base64').toString('utf8');  // LINE 82
-      acpPromptParts.push({ type: 'text', text: `--- File: ${file.name} ---\n${text}\n--- End File ---` });  // LINE 83
-    } else if (file.path) {
-      acpPromptParts.push({
-        type: 'resource_link',
-        uri: `file:///${file.path.replace(/\\/g, '/')}`,  // LINE 87
-        name: file.name,
-        mimeType: file.mimeType  // LINE 89
-      });
-    }
-  }
-}
-```
-
-For images (Line 60):
-- Reads base64 data from attachment or disk (Line 62)
-- Resizes to max dimension (default 1568px) using `inside` fit (Lines 66-68)
-- Compresses to JPEG with quality 85 (Line 69)
-- Logs compression ratio (Line 73)
-- Sends compressed image to ACP (Line 74)
-
-For text files with base64 data (Line 80):
-- Decodes base64 and wraps in markdown (Lines 82-83)
-
-For files with disk paths (Line 84):
-- Sends as resource_link (Lines 87-89)
-
-### 12. ACP Receives and Processes Multi-Part Prompt
-**File:** `backend/sockets/promptHandlers.js` (Lines 117-120)
-
-```javascript
-const response = await acpClient.transport.sendRequest('session/prompt', {
-  sessionId: sessionId,
-  prompt: acpPromptParts  // Array of { type, mimeType, data/text/uri }
-});
-```
-
-The ACP daemon receives the structured prompt parts and processes them according to its protocol.
-
-### 13. ModelSelector Footer Updates on Model Change
-**File:** `frontend/src/components/ChatInput/ModelSelector.tsx` (Lines 42-90)
-
-```typescript
-if (!activeSession) return null;
-const modelName = getModelLabel(activeSession, brandingModels);  // LINE 43
-const label = isCompacting ? `${modelName} (Compacting...)` : contextPct !== undefined ? `${modelName} (${Math.round(contextPct)}%)` : modelName;  // LINE 44
-const modelChoices = getFooterModelChoices(activeSession, brandingModels);  // LINE 45
-const hasQuickAccessModels = modelChoices.length > 0;  // LINE 46
-const canOpenModelDropdown = !disabled && hasQuickAccessModels;  // LINE 47
-
-return (
-  <div className="model-indicator" ref={modelDropdownRef}>
-    {onOpenSettings && (
-      <button
-        type="button"
-        className="model-settings-btn"
-        onClick={onOpenSettings}
-        title="Open chat config"
-        aria-label="Open chat config"
-      >
-        <Settings size={12} />
-      </button>
-    )}
-    <span>Using </span>
-    <button 
-      type="button"
-      onClick={() => canOpenModelDropdown && setIsModelDropdownOpen(!isModelDropdownOpen)}
-      className={`model-indicator-btn ${!hasQuickAccessModels ? 'static' : ''}`}  // LINE 66
-      disabled={disabled || !hasQuickAccessModels}
-    >
-      {label}  // LINE 69
-    </button>
-
-    {isModelDropdownOpen && hasQuickAccessModels && (
-      <div className="model-dropdown-menu">
-        {modelChoices.map(choice => (
-          <button
-            key={choice.selection}
-            type="button"
-            className={`model-dropdown-item ${isModelChoiceActive(activeSession, choice, brandingModels) ? 'active' : ''}`}  // LINE 78
-            onClick={() => { onModelSelect(choice.selection); setIsModelDropdownOpen(false); }}  // LINE 79
-            title={choice.description}
-          >
-            <span className="model-dropdown-item-name">{choice.name}</span>
-            {choice.description && <span className="model-dropdown-item-desc">{choice.description}</span>}
-          </button>
-        ))}
-      </div>
-    )}
-  </div>
-);
-```
-
-The model selector displays:
-- Current model name with context usage % (Line 44)
-- Settings button to open advanced config (Lines 51-60)
-- Dropdown toggle with quick-access models (Lines 63-70)
-- Active state styling (Line 78)
-- Selection triggers `onModelSelect` callback (Line 79)
-
----
+    Provider metadata extensions with `contextUsagePercentage` update `contextUsageBySession[acpSessionId]`. Session stats can also hydrate the value from `usedTokens / totalTokens`. `ChatInput` clamps the percentage to `0..100` for the thin context bar and selects green/yellow/red/accent colors by threshold. `ModelSelector` appends a rounded percentage to the model label when context data exists and shows a compacting suffix while `compactingBySession[acpSessionId]` is true.
 
 ## Architecture Diagram
+```mermaid
+flowchart TD
+  User[User types, pastes, selects files, or clicks footer controls]
+  ChatInput[ChatInput.tsx]
+  Slash[SlashDropdown.tsx]
+  UploadHook[useFileUpload.ts]
+  InputStore[useInputStore]
+  ChatStore[useChatStore.handleSubmit]
+  Lifecycle[useSessionLifecycleStore]
+  SystemStore[useSystemStore]
+  ModelSelector[ModelSelector.tsx]
+  UploadRoute[POST /upload/:uiId]
+  Vault[attachmentVault.js]
+  PromptHandlers[promptHandlers.js]
+  ModelService[modelOptions.js]
+  ACP[ACP transport]
+  SocketHook[useSocket.ts]
+  ExtensionRouter[extensionRouter.ts]
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Frontend: Chat Input                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  ┌─ User Types "/" ──────────────────────────────────────────────────────┐ │
-│  │  Textarea detects "/" prefix in input                                │ │
-│  │  ↓                                                                    │ │
-│  │  SlashDropdown filters commands (slashCommands array)                │ │
-│  │  ↓                                                                    │ │
-│  │  User navigates with arrow keys (slashIndex state)                   │ │
-│  │  ↓                                                                    │ │
-│  │  User presses Tab/Enter → selectSlashCommand() → setInput + maybe    │ │
-│  │  auto-submit if no args needed                                       │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-│  ┌─ User Pastes/Uploads Image/File ─────────────────────────────────────┐ │
-│  │  handlePaste() detects clipboard files                               │ │
-│  │  OR fileInputRef.click() → file picker                               │ │
-│  │  ↓                                                                    │ │
-│  │  handleFileUpload(files) → fetch POST /upload/{sessionId}            │ │
-│  │  ↓                                                                    │ │
-│  │  Backend (multer) stores files on disk                               │ │
-│  │  Returns: { files: [{name, path, size, mimeType}] }                │ │
-│  │  ↓                                                                    │ │
-│  │  Frontend reads base64 for images → FileTray displays chips          │ │
-│  │  ↓                                                                    │ │
-│  │  setAttachments(sessionId, [...]) → Zustand store                    │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-│  ┌─ User Selects Model from Footer ──────────────────────────────────────┐ │
-│  │  ModelSelector shows current model + context %                       │ │
-│  │  Click → isModelDropdownOpen = true                                  │ │
-│  │  ↓                                                                    │ │
-│  │  modelChoices = getFooterModelChoices(session, brandingModels)       │ │
-│  │  ↓                                                                    │ │
-│  │  User clicks choice → onModelSelect(modelId)                         │ │
-│  │  ↓                                                                    │ │
-│  │  handleActiveSessionModelChange(socket, modelId)                     │ │
-│  │  → socket.emit('set_session_model', {model: modelId})               │ │
-│  │  → Backend updates session.model + persists to DB                    │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-│  ┌─ User Clicks Send ────────────────────────────────────────────────────┐ │
-│  │  Form submit → handleSubmit(socket)                                  │ │
-│  │  ↓                                                                    │ │
-│  │  socket.emit('prompt', {                                            │ │
-│  │    providerId, sessionId, acpSessionId,                             │ │
-│  │    prompt: input,                                                    │ │
-│  │    model: session.model,                                             │ │
-│  │    attachments: [...]  ← from useInputStore                         │ │
-│  │  })                                                                   │ │
-│  │  ↓                                                                    │ │
-│  │  Clear input: setInput(sessionId, '')                                │ │
-│  │  Clear attachments: setAttachments(sessionId, [])                    │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  │ socket.emit('prompt')
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                   Backend: promptHandlers.js                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  1. Validate provider and session                                            │
-│  2. For each attachment:                                                     │
-│     - If image: sharp.resize() + jpeg(quality:85) → compress               │
-│     - If text file: decode base64 + wrap in markdown                        │
-│     - If path: create resource_link                                         │
-│  3. Build acpPromptParts array (mixed type content)                         │
-│  4. sendRequest('session/prompt', { prompt: acpPromptParts })              │
-│  5. Router updates per-session streaming, emits 'token' events to UI        │
-│                                                                               │
-└─────────────────────────────────────────────────────────────────────────────┘
+  User --> ChatInput
+  ChatInput --> Slash
+  ChatInput --> UploadHook
+  UploadHook --> UploadRoute
+  UploadRoute --> Vault
+  Vault --> UploadHook
+  UploadHook --> InputStore
+  ChatInput --> ChatStore
+  ChatStore --> InputStore
+  ChatStore -->|save_snapshot + prompt| PromptHandlers
+  PromptHandlers --> ModelService
+  PromptHandlers -->|session/set_model| ACP
+  PromptHandlers -->|session/prompt| ACP
+  ChatInput --> ModelSelector
+  ModelSelector --> Lifecycle
+  Lifecycle -->|set_session_model + set_session_option| PromptHandlers
+  SocketHook --> ExtensionRouter
+  ExtensionRouter --> SystemStore
+  SystemStore --> ChatInput
+  SystemStore --> ModelSelector
 ```
 
----
+## The Critical Contract: Prompt Payload, Attachment Shape, and Session Keys
+The prompt contract starts in `useChatStore.handleSubmit` and is consumed by `registerPromptHandlers`.
 
-## The Critical Contract: Prompt Submission Structure
+```ts
+// FILE: frontend/src/store/useChatStore.ts (Action: handleSubmit)
+socket.emit('prompt', {
+  providerId: activeSession.provider,
+  uiId: activeSession.id,
+  sessionId: acpId,
+  prompt: promptText,
+  model: activeSession.model,
+  attachments
+});
+```
 
-The `prompt` socket event must include structured data that the backend can route, compress, and send to the ACP daemon:
+The payload depends on these keys:
+- `providerId`: resolves `providerRuntimeManager.getRuntime(providerId)` on the backend.
+- `uiId`: identifies the frontend session and upload folder namespace.
+- `sessionId`: identifies the ACP session and indexes backend `sessionMetadata`.
+- `prompt`: string text or prebuilt ACP prompt parts when an override supplies an array.
+- `model`: frontend selection that the backend resolves and applies through ACP `session/set_model`.
+- `attachments`: `Attachment[]` from `frontend/src/types.ts`.
 
-```typescript
-interface PromptEvent {
-  providerId: string;           // Required: identifies the provider/runtime
-  uiId: string;                 // UI session ID (used for display/DB)
-  sessionId: string;            // ACP session ID (used for routing to daemon)
-  prompt: string | ContentBlock[];  // User input (string or pre-structured)
-  model?: string;               // Optional model override
-  attachments?: Attachment[];   // Optional: files to include
-}
-
+Attachment shape:
+```ts
+// FILE: frontend/src/types.ts (Interface: Attachment)
 interface Attachment {
-  name: string;                 // Original filename
-  path?: string;                // Disk path (for resource_link)
-  size: number;                 // File size in bytes
-  mimeType?: string;            // MIME type (e.g., 'image/jpeg')
-  type?: string;                // Legacy compat field
-  data?: string;                // Base64-encoded file content
+  name: string;
+  path?: string;
+  size: number;
+  mimeType?: string;
+  type?: string;
+  data?: string;
 }
 ```
 
-### Backend Processing Contract
-
-The backend must:
-1. **Validate provider** — throw error if providerId invalid
-2. **Validate session** — check session exists in provider's acpClient.sessionMetadata
-3. **Process attachments**:
-   - **Images**: Extract base64 data, resize with sharp, convert to JPEG quality 85, re-encode to base64
-   - **Text files**: Extract base64 data, decode to UTF-8, wrap in `--- File: name ---\n...\n--- End File ---`
-   - **Paths**: Create resource_link with file:// URI
-4. **Build acpPromptParts** — array of { type, mimeType, data/text/uri }
-5. **Send to ACP** — `sendRequest('session/prompt', { sessionId, prompt: acpPromptParts })`
-6. **Stream response** — emit 'token' events per stream chunk
-
-### Image Compression Specifics
-
-```
-Input: Any image format (PNG, JPG, WebP, etc.)
-Max Dimension: provider.config.branding?.maxImageDimension || 1568px
-Resize Mode: { fit: 'inside', withoutEnlargement: true }
-  → Fits image within max dimension without upscaling
-Output Format: JPEG
-Output Quality: 85 (balanced: high quality, reasonable file size)
-Output Encoding: Base64 (for JSON transmission)
-Log: '[IMAGE] Compressed {origKB}KB → {newKB}KB'
-```
-
----
-
-## Configuration / Provider Support
-
-This feature requires **no provider-specific configuration** beyond standard branding:
-
-1. **`provider.json`**:
-   - `branding.maxImageDimension` (optional, default 1568) — max image dimension for compression
-
-2. **`branding.json`**:
-   - `models.quickAccess` (optional array) — quick-access model list shown in footer
-   - `models.default` (optional string) — default model ID on session creation
-
-3. **`user.json`**:
-   - `attachmentDir` (optional, recommended) — where uploaded files are stored per session
-
-### Example branding.json:
+Upload response shape:
 ```json
 {
-  "models": {
-    "default": "provider-model-standard",
-    "quickAccess": [
-      { "id": "provider-model-fast", "name": "Fast", "description": "Fast, cheap" },
-      { "id": "provider-model-standard", "name": "Standard", "description": "Balanced" },
-      { "id": "provider-model-capable", "name": "Capable", "description": "Powerful" }
-    ]
-  }
+  "success": true,
+  "files": [
+    { "name": "example.txt", "path": "...", "size": 123, "mimeType": "text/plain" }
+  ]
 }
 ```
 
----
+The key session distinction is mandatory:
+- UI session id (`ChatSession.id`) indexes `useInputStore.inputs`, `useInputStore.attachmentsMap`, upload route `:uiId`, file chips, and footer actions.
+- ACP session id (`ChatSession.acpSessionId`) indexes backend prompt handling, context usage, compaction state, stats, streaming, and ACP transport calls.
+
+If these keys are mixed, the visible prompt can submit against the wrong backend session, attachments can render for one session but send with another, or context usage can appear blank even though metadata exists.
+
+## Configuration / Provider-Specific Behavior
+- Provider branding controls prompt placeholder and busy state strings through `inputPlaceholder`, `busyText`, `hooksText`, `warmingUpText`, and `resumingText`.
+- Provider branding `models.default` seeds new sessions through `getDefaultModelSelection` in `useSessionLifecycleStore.handleNewChat`.
+- Provider branding `models.quickAccess` is the only source for `ModelSelector` footer dropdown choices through `getFooterModelChoices`.
+- Provider branding `maxImageDimension` controls image resize limits in `registerPromptHandlers`; the fallback value is `1568`.
+- Provider branding `protocolPrefix` controls how `useSocket` routes `provider_extension` methods through `routeExtension`.
+- Session `configOptions` can include a `select` option with `kind: 'reasoning_effort'`; `ChatInput` renders it as a segmented footer control and emits `set_session_option` when changed.
+- Prompt-backed custom commands arrive through `custom_commands` and are stored in `useSystemStore.customCommands`; only entries with `prompt` are surfaced as local slash commands.
 
 ## Data Flow / Rendering Pipeline
+### Draft Text and Submit
+1. `ChatInput` reads `input = inputs[activeSession.id] || ''`.
+2. Textarea `onChange` calls `useInputStore.setInput(activeSession.id, value)`.
+3. `Enter` without Shift, the send button, or a no-argument slash command calls `useChatStore.handleSubmit(socket)`.
+4. `handleSubmit` clears the draft with `useInputStore.clearInput(activeSessionId)` after it builds the prompt payload.
+5. The optimistic user message stores `content: promptText` and a copy of the submitted attachments.
 
-### File Upload Pipeline
+### Attachment Upload and Prompt Conversion
+1. Browser files enter `useFileUpload.handleFileUpload` from the hidden file input or `window` paste listener.
+2. The hook posts `FormData(files)` to `POST /upload/:uiId`.
+3. `attachmentVault.handleUpload` returns server paths and MIME metadata.
+4. The hook adds image `data` for preview/submission and appends the returned entries to `attachmentsMap[uiId]`.
+5. `FileTray` renders `attachmentsMap[uiId]` and removes by array index.
+6. `handleSubmit` includes the array in the `prompt` socket payload.
+7. `registerPromptHandlers` converts each attachment to an ACP `image`, `text`, or `resource_link` prompt part.
 
-```
-User pastes/drops image.png (2MB)
-  │
-  ▼
-handleFileUpload(files)
-  │
-  ├─ FormData.append('files', file)
-  ├─ fetch POST /upload/{sessionId}
-  │
-  ▼ (Backend: multer disk storage)
-  │
-  ├─ Validate sessionId
-  ├─ Mkdir {attachmentsRoot}/{sessionId}/
-  ├─ Save as {timestamp}_{sanitized_name}.png
-  │
-  ▼ Response: { success: true, files: [{name, path, size, mimeType}] }
-  │
-  ├─ For each file:
-  │  └─ If mime=image/*:
-  │     └─ FileReader.readAsDataURL() → base64
-  │
-  ▼ setAttachments(sessionId, [...prev, {...file, data: base64}])
-  │
-  ▼ Zustand: useInputStore.attachmentsMap[sessionId] = [...]
-  │
-  ▼ FileTray renders:
-   └─ <file-chip name="image.png" size="1.8 MB" icon={FileImage} />
-```
+### Slash Commands
+1. `useSocket` receives provider command extensions and custom commands.
+2. `useSystemStore` stores global and provider-scoped slash command arrays.
+3. `ChatInput` picks active provider commands when available and prefixes local commands.
+4. `filteredCommands` hides internal commands and filters by prefix.
+5. `SlashDropdown` renders command names/descriptions and calls `onSelect` on `mouseDown`.
+6. `selectSlashCommand` stores the command, optionally appends an argument space, and submits no-argument commands.
+7. `useChatStore.handleSubmit` replaces exact prompt-backed custom command names with their configured prompt text.
 
-### Prompt Submission + Image Compression Pipeline
-
-```
-User types "Analyze this" + 1 attachment (image.png)
-User clicks Send
-  │
-  ▼ handleSubmit(socket)
-  │
-  ├─ socket.emit('prompt', {
-  │    providerId, sessionId, attachments: [{
-  │      name: 'image.png',
-  │      path: '{attachmentsRoot}/sess-123/1234567_image.png',
-  │      size: 1843200,
-  │      mimeType: 'image/png',
-  │      data: 'iVBORw0KGg...'  // base64 from FileReader
-  │    }]
-  │  })
-  │
-  ▼ (Backend: promptHandlers.js, Line 58-79)
-  │
-  ├─ for (file of attachments):
-  │    isImage = file.mimeType.startsWith('image/')
-  │    │
-  │    ├─ Read file.data (base64) → Buffer
-  │    │
-  │    ├─ sharp(buf)
-  │    │   .resize(1568, 1568, { fit: 'inside', withoutEnlargement: true })
-  │    │   .jpeg({ quality: 85 })
-  │    │   .toBuffer()
-  │    │
-  │    └─ Log: '[IMAGE] Compressed 1843KB → 156KB'
-  │       → compressed.toString('base64')
-  │
-  ▼ acpPromptParts.push({
-      type: 'image',
-      mimeType: 'image/jpeg',
-      data: 'FFD8FF...'  // compressed base64
-    })
-  │
-  ▼ acpPromptParts.push({
-      type: 'text',
-      text: 'Analyze this'
-    })
-  │
-  ▼ acpClient.sendRequest('session/prompt', {
-      sessionId: acp-123,
-      prompt: [{type: 'image', ...}, {type: 'text', ...}]
-    })
-  │
-  ▼ ACP daemon receives multi-part prompt, processes image
-```
-
-### Model Selection Pipeline
-
-```
-User clicks footer dropdown (currently shows "Using Sonnet (62%)")
-  │
-  ▼ setIsModelDropdownOpen(true)
-  │
-  ▼ ModelSelector re-renders:
-  │
-  ├─ getFooterModelChoices(session, brandingModels)
-  │   → filters provider.branding.models.quickAccess
-  │
-  ├─ Renders list:
-  │   [x] Model Fast  ← active
-  │   [ ] Model Standard
-  │   [ ] Model Capable
-  │
-  ▼ User clicks "Model Capable"
-  │
-  ├─ onModelSelect('provider-model-capable')
-  │
-  ├─ handleActiveSessionModelChange(socket, modelId)
-  │
-  ├─ socket.emit('set_session_model', {
-  │    uiId: 'sess-123',
-  │    acpSessionId: 'acp-123',
-  │    model: 'provider-model-capable'
-  │  })
-  │
-  ▼ (Backend: sessionHandlers.js)
-  │
-  ├─ session.model = 'provider-model-capable'
-  ├─ Persist to SQLite
-  ├─ Emit 'session_model_options' to UI
-  │
-  ▼ Frontend:
-  │
-  └─ ModelSelector re-renders:
-     "Using Opus (62%)" ← updated label
-```
-
----
+### Model and Context Display
+1. `ModelSelector` subscribes to provider branding in `useSystemStore.providersById[activeSession.provider]`, with global branding as fallback.
+2. `getModelLabel` prefers `activeSession.currentModelId` and names from `activeSession.modelOptions` or `models.quickAccess`.
+3. `getFooterModelChoices` returns quick-access model choices from branding.
+4. Selecting a quick-access item calls `handleActiveSessionModelChange`, then `handleSessionModelChange`, then socket event `set_session_model`.
+5. `useSocket` routes context metadata from `provider_extension` through `routeExtension`; stats hydration can also call `setContextUsage`.
+6. `ChatInput` renders a context bar from `contextUsageBySession[activeSession.acpSessionId]`; `ModelSelector` appends rounded context percentage or compaction state to the model label.
 
 ## Component Reference
+### Frontend Components and Hooks
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Input UI | `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput`, `filteredCommands`, `selectSlashCommand`, `handleKeyDown`, `handleMergeFork`, `reasoningEffortOption`, `context-bar-track` | Main prompt form, slash command control, footer pills, context bar, reasoning-effort selector, merge fork action |
+| Model footer | `frontend/src/components/ChatInput/ModelSelector.tsx` | `ModelSelector`, `getModelLabel`, `getFooterModelChoices`, `isModelChoiceActive` | Model label, quick-access dropdown, settings button, context/compaction suffix |
+| Slash dropdown | `frontend/src/components/ChatInput/SlashDropdown.tsx` | `SlashDropdown`, `onMouseDown`, `selectedIndex` | Render-only command list and mouse selection surface |
+| File chips | `frontend/src/components/FileTray.tsx` | `FileTray`, `getIcon`, `formatSize`, `onRemove` | Attachment chip rendering and removal callback |
+| Upload hook | `frontend/src/hooks/useFileUpload.ts` | `useFileUpload`, `handleFileUpload`, `handlePaste` | HTTP upload, image base64 enrichment, paste interception |
+| Socket hook | `frontend/src/hooks/useSocket.ts` | `custom_commands`, `provider_extension`, `session_model_options` | Receives custom commands, provider extensions, context metadata, model options |
 
-### Frontend Components
+### Frontend Stores and Utilities
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Input state | `frontend/src/store/useInputStore.ts` | `inputs`, `attachmentsMap`, `setInput`, `setAttachments`, `clearInput`, `handleFileUpload` | Session-scoped drafts and attachments |
+| Submit state | `frontend/src/store/useChatStore.ts` | `handleSubmit`, `handleCancel` | Optimistic messages, prompt/cancel socket emission, custom command prompt substitution |
+| Session lifecycle | `frontend/src/store/useSessionLifecycleStore.ts` | `handleActiveSessionModelChange`, `handleSessionModelChange`, `handleSetSessionOption`, `fetchStats`, `maybeHydrateContextUsage` | Model mutation, session options, stats and context hydration |
+| System state | `frontend/src/store/useSystemStore.ts` | `SlashCommand`, `setSlashCommands`, `setCustomCommands`, `setContextUsage`, `setCompacting`, `getBranding` | Provider branding, command lists, context usage, compaction state |
+| UI state | `frontend/src/store/useUIStore.ts` | `isModelDropdownOpen`, `setModelDropdownOpen`, `toggleAutoScroll`, `setSettingsOpen`, `setNotesOpen` | Dropdown, auto-scroll, settings, and notes modal state |
+| Canvas state | `frontend/src/store/useCanvasStore.ts` | `terminals`, `isCanvasOpen`, `openTerminal`, `setIsCanvasOpen` | Terminal and canvas footer pill behavior |
+| Model utilities | `frontend/src/utils/modelOptions.ts` | `getDefaultModelSelection`, `getModelIdForSelection`, `getModelLabel`, `getFooterModelChoices`, `getFullModelChoices`, `isModelChoiceActive` | Frontend model labels and option lists |
+| Extension routing | `frontend/src/utils/extensionRouter.ts` | `routeExtension`, result types `commands`, `metadata`, `config_options`, `compaction_started`, `compaction_completed` | Pure parser for provider extension payloads |
+| Types | `frontend/src/types.ts` | `Attachment`, `ChatSession`, `ProviderConfigOption`, `ProviderModelOption`, `StatsPushData`, `ProviderExtensionData` | Shared frontend data contracts |
 
-| File | Component/Function | Lines | Purpose |
-|------|-------------------|-------|---------|
-| `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput` | 18-373 | Main footer input component; manages form, attachments, keyboard handlers |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | `handleKeyDown` | 152-163 | Slash command navigation; Enter to send; Shift+Enter for newline |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | `selectSlashCommand` | 130-137 | Insert command into textarea; auto-submit if no args |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | `handleMergeFork` | 86-102 | Emit merge_fork socket event |
-| `frontend/src/components/ChatInput/ModelSelector.tsx` | `ModelSelector` | 19-92 | Footer model selector; dropdown menu; context % display |
-| `frontend/src/components/ChatInput/SlashDropdown.tsx` | `SlashDropdown` | 11-30 | Dropdown menu for slash command autocomplete |
-| `frontend/src/components/FileTray.tsx` | `FileTray` | 12-50 | Animated file chips; remove buttons; file icons & size |
-| `frontend/src/hooks/useFileUpload.ts` | `useFileUpload` | 5-92 | File upload via HTTP POST; paste handler; base64 reading for images |
-| `frontend/src/utils/modelOptions.ts` | `getModelLabel` | 45-54 | Get current model display name |
-| `frontend/src/utils/modelOptions.ts` | `getFooterModelChoices` | 74-77 | Extract quick-access models from branding |
-| `frontend/src/utils/modelOptions.ts` | `isModelChoiceActive` | 104-108 | Check if a model choice is currently selected |
-| `frontend/src/store/useInputStore.ts` | `setInput` | N/A | Zustand action: update textarea input for a session |
-| `frontend/src/store/useInputStore.ts` | `setAttachments` | N/A | Zustand action: update attachments array for a session |
+### Backend Routes and Services
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Route mount | `backend/routes/index.js` | `router.use('/upload', uploadRoutes)` | Mounts upload route tree |
+| Upload route | `backend/routes/upload.js` | `router.post('/:uiId', upload.array('files'), handleUpload)` | Receives multipart attachment uploads |
+| Attachment service | `backend/services/attachmentVault.js` | `getAttachmentsRoot`, `upload`, `handleUpload`, multer `destination`, multer `filename` | Resolves attachment storage root, stores files, sanitizes filenames, returns metadata |
+| Prompt socket | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, socket events `prompt`, `cancel_prompt`, `respond_permission`, `set_mode`, ACP requests `session/set_model`, `session/prompt` | Prompt conversion, model enforcement, attachment transformation, cancel and permission forwarding |
+| Model service | `backend/services/modelOptions.js` | `normalizeModelOptions`, `modelOptionsFromProviderConfig`, `findModelConfigOption`, `extractModelState`, `mergeModelOptions`, `resolveModelSelection` | Backend model selection normalization and resolution |
 
-### Backend Handlers
-
-| File | Handler/Function | Lines | Purpose |
-|------|------------------|-------|---------|
-| `backend/sockets/promptHandlers.js` | `prompt` socket handler | 11-173 | Main prompt handler; image compression; ACP routing |
-| `backend/sockets/promptHandlers.js` | Image compression logic | 59-92 | Resize with sharp; JPEG encode; log ratio |
-| `backend/routes/upload.js` | `POST /upload/:uiId` | 6 | Express route; delegates to multer + handleUpload |
-| `backend/services/attachmentVault.js` | `storage` (multer) | 14-26 | Disk storage configuration; sanitizes filenames |
-| `backend/services/attachmentVault.js` | `handleUpload` | 30-40 | Returns file metadata; logs upload |
-
-### Zustand Stores (Modified)
-
-| Store | State | Purpose |
-|-------|-------|---------|
-| `useInputStore` | `inputs` | Textarea content per session |
-| `useInputStore` | `attachmentsMap` | Attachments per session |
-| `useUIStore` | `isModelDropdownOpen` | Footer model dropdown visibility |
-| `useSystemStore` | `slashCommandsByProviderId` | Provider-specific slash commands |
-| `useSystemStore` | `slashCommands` | Global slash commands |
-| `useSystemStore` | `contextUsageBySession` | Token % per session (for display) |
-| `useSessionLifecycleStore` | `sessions[].currentModelId` | Selected model per session |
-| `useSessionLifecycleStore` | `sessions[].model` | Session's model ID (persisted) |
-
----
+### Routes, Events, and Protocol Fields
+| Type | Name | Producer | Consumer | Purpose |
+|---|---|---|---|---|
+| HTTP route | `POST /upload/:uiId` | `useFileUpload.handleFileUpload` | `backend/routes/upload.js` | Multipart upload endpoint for prompt attachments |
+| Socket event | `prompt` | `useChatStore.handleSubmit` | `registerPromptHandlers` | Prompt dispatch with model and attachments |
+| Socket event | `cancel_prompt` | `useChatStore.handleCancel` | `registerPromptHandlers` | ACP cancel forwarding and sub-agent cancellation |
+| Socket event | `set_session_model` | `useSessionLifecycleStore.handleSessionModelChange` | Session handlers | Session model update request |
+| Socket event | `set_session_option` | `useSessionLifecycleStore.handleSetSessionOption` | Session handlers | Session config option update request |
+| Socket event | `custom_commands` | Backend socket setup | `useSocket` | Local slash command and prompt substitution data |
+| Socket event | `provider_extension` | Provider runtime stream | `useSocket` and `routeExtension` | Commands, context metadata, provider status, config options, compaction status |
+| Socket event | `stats_push` | `registerPromptHandlers` | Stream/system handlers | Token usage push after ACP usage response |
+| ACP request | `session/set_model` | `registerPromptHandlers` | Provider ACP daemon | Enforces backend model before prompt |
+| ACP request | `session/prompt` | `registerPromptHandlers` | Provider ACP daemon | Sends prompt parts to ACP |
 
 ## Gotchas & Important Notes
+1. UI and ACP session ids are different keys. `attachmentsMap` and textarea drafts use `ChatSession.id`; context usage, compaction, streaming, and backend prompt routing use `ChatSession.acpSessionId`.
 
-### 1. **Textarea Auto-Height Relies on scrollHeight**
-- **Problem:** Height calculation happens on every keystroke; can cause jank on fast typing.
-- **Why:** `scrollHeight` is a computed property; accessing it triggers layout recalc.
-- **Mitigation:** useEffect debounces height calculation (Line 145-150). Acceptable trade-off for simplicity.
+2. Upload success is not prompt success. `POST /upload/:uiId` only proves that files reached disk and metadata returned. ACP prompt conversion happens later inside `registerPromptHandlers` and can fail independently.
 
-### 2. **Image Compression Happens at Prompt Time, Not Upload Time**
-- **Problem:** If image upload shows "original" size, but compressed size is sent to ACP, there's a mismatch.
-- **Why:** Frontend doesn't know the max dimension from branding until send time; backend is source of truth.
-- **Fine because:** File tray shows uploaded size; backend logs compression ratio; agent sees compressed image.
+3. The frontend upload request does not include `providerId`. `attachmentVault` can read `providerId` from query or body, but `useFileUpload` posts only to `/upload/:uiId`. Follow-up file/function for provider-specific upload roots: `frontend/src/hooks/useFileUpload.ts` (Function: `handleFileUpload`) and `backend/services/attachmentVault.js` (Function: `getAttachmentsRoot`).
 
-### 3. **Base64 Images in Memory Doubled During Compression**
-- **Problem:** Backend loads base64, decodes to buffer, compresses, re-encodes—3x memory usage.
-- **Why:** Sharp library expects Buffer; JSON-RPC requires base64 for transmission.
-- **Mitigation:** Compression happens per-file in loop (not all at once); typical image << 5MB so negligible.
+4. Paste handling is global. `useFileUpload` attaches a `window` `paste` listener, so clipboard files are intercepted even when the textarea is not the active element.
 
-### 4. **Paste Handler Blocks Default Paste Behavior**
-- **Problem:** If clipboard has mixed text + files, only files are uploaded; text is lost.
-- **Why:** `handlePaste` calls `e.preventDefault()` if files are detected (Line 74, useFileUpload.ts).
-- **Acceptable because:** User can paste text separately; files take precedence (expected UX).
+5. Slash autocomplete is prefix-only. A space in the draft hides `SlashDropdown`; commands requiring arguments append a trailing space and do not auto-submit.
 
-### 5. **Slash Command State Resets on Any Input Change**
-- **Problem:** `useEffect` on Line 114 sets `slashIndex = -1` whenever input changes.
-- **Why:** Prevents stale index from persisting across deletions/edits.
-- **Fine because:** User can immediately re-navigate with arrow keys; expected behavior.
+6. Prompt-backed custom command substitution is exact-match only. `useChatStore.handleSubmit` replaces the prompt only when `promptText === customCommand.name` and the custom command has a `prompt`.
 
-### 6. **Model Dropdown Doesn't Close on Outside Click (Click Capture Used)**
-- **File:** `ChatInput.tsx` (Lines 117-128)
-- **Problem:** `pointerdown` listener closes dropdown on any click outside ref.
-- **Why:** Needed because model button is inside ref; click on button would close instantly.
-- **Result:** Click model button → opens. Click item → closes + selects. Click outside → closes.
+7. Model footer choices come from provider branding quick-access entries. Session `modelOptions` can label the active model, but `ModelSelector` dropdown choices come from `branding.models.quickAccess` through `getFooterModelChoices`.
 
-### 7. **Disabled State Prevents Both Input and Submission**
-- **Problem:** When engine warms up or session types, textarea is disabled and focused impossible.
-- **Why:** `isDisabled` flag (Line 81) is true when `isEngineReady = false` or `activeSession.isTyping = true`.
-- **Expected:** User sees placeholder text (e.g., "Engine warming up...") and can't interact until ready.
+8. Backend model enforcement can change ACP state even after the frontend local model update. `handleSessionModelChange` updates the UI optimistically; `registerPromptHandlers` still resolves `model` and sends ACP `session/set_model` when needed.
 
-### 8. **Context Usage % May Not Exist for All Providers**
-- **Problem:** `contextUsageBySession` may be undefined/unknown even when a session is active.
-- **Why:** Context reporting is optional per provider, and persisted fallback stats can have unknown totals during resume.
-- **Behavior:** Footer context bar renders a neutral empty state when usage is unknown (no forced `0%` fill).
-- **Fallback:** Once valid `used/total` arrives (`total > 0`), UI shows %. Fallback stats paths do not downgrade an already-positive cached value to `0%`.
+9. Context bar absence can be valid state. No fill renders until `contextUsageBySession[acpSessionId]` exists from metadata or stats hydration.
 
-### 9. **Paste Handler Requires Clipboard API (Not Supported in Older Browsers)**
-- **Problem:** ClipboardEvent.items or .files may be undefined in IE/old Safari.
-- **Why:** Clipboard API added in later specs; fallback is missing.
-- **Fine because:** App targets modern browsers (Windows 11, modern Electron); IE not supported.
-
-### 10. **Attachments Cleared After Submit But Not on Cancel**
-- **Problem:** If user clicks cancel during agent response, attachments stay in tray.
-- **Why:** `handleCancel` cancels agent, not prompt submission (different control flow).
-- **Expected behavior:** User can re-submit with same attachments, or manually clear them.
-
----
+10. Input clear is eager. `handleSubmit` clears draft text and attachments before the backend prompt completes; submit failures emit error timeline events but do not restore the previous draft.
 
 ## Unit Tests
+### Frontend
+- `frontend/src/test/ChatInput.test.tsx`
+  - `automatically focuses the textarea when enabled`
+  - `does NOT focus the textarea when disabled (e.g. warming up)`
+  - `renders model selector and allows model change`
+  - `submits on Enter key press`
+  - `shows slash command dropdown when input starts with /`
+  - `selecting a slash command fills the input`
+  - `send button is disabled when input is empty`
+  - `shows cancel button when session isTyping`
+  - `uses provider-specific input placeholder when session has a provider`
+- `frontend/src/test/ChatInputExtended.test.tsx`
+  - `renders textarea and updates store on change`
+  - `triggers handleSubmit on Enter (without shift)`
+  - `shows slash command dropdown when typing /`
+  - `handles file upload trigger`
+- `frontend/src/test/ModelSelector.test.tsx`
+  - `returns null when activeSession is undefined`
+  - `renders "Using" prefix and the current model name`
+  - `shows context percentage appended to model name when available`
+  - `rounds fractional context percentages`
+  - `shows "Compacting..." suffix when isCompacting is true`
+  - `model button has "static" class and is disabled when quickAccess is empty`
+  - `calls onModelSelect with the choice selection when a dropdown item is clicked`
+  - `shows the alt-provider quick-access models (not the default provider models) for a session owned by alt-provider`
+  - `reactively updates to show alt-provider models when providersById is populated after initial render`
+- `frontend/src/test/SlashDropdown.test.tsx`
+  - `returns null when visible is false`
+  - `renders all command names`
+  - `applies the "active" class only to the item at selectedIndex`
+  - `calls onSelect with the correct command on mouseDown`
+  - `does not call onSelect on click — only on mouseDown (prevents textarea blur)`
+- `frontend/src/test/FileTray.test.tsx`
+  - `renders nothing when empty`
+  - `renders file chips correctly`
+  - `calls onRemove when remove button is clicked`
+  - `formats file size in MB for large files`
+- `frontend/src/test/useFileUpload.test.ts`
+  - `initializes with attachments from store`
+  - `handleFileUpload uploads files and updates store`
+  - `handleFileUpload alerts if no active session`
+  - `handlePaste processes files from clipboard`
+  - `handlePaste does not prevent default for non-file clipboard data`
+  - `handleFileUpload returns early with null files`
+- `frontend/src/test/useInputStore.test.ts`
+  - `setInput stores per-session input text`
+  - `setAttachments handles direct values`
+  - `setAttachments handles functional updaters`
+  - `addAttachment and removeAttachment update state`
+  - `clearInput resets input and attachments`
+  - `handleFileUpload reads files and adds to attachmentsMap`
+- `frontend/src/test/useChatStore.test.ts`
+  - `creates messages and emits prompt`
+  - `intercepts custom commands with prompt`
+  - `emits cancel_prompt`
+- `frontend/src/test/useSessionLifecycleStore.test.ts`
+  - `fetchStats updates session with stats`
+  - `fetchStats does not overwrite existing positive context usage with zero percent`
+  - `handleSetSessionOption updates local state and emits`
+  - `handleSessionSelect hydrates context usage from persisted session stats`
+- `frontend/src/test/useSessionLifecycleStoreExtended.test.ts`
+  - `handleActiveSessionModelChange calls handleSessionModelChange`
+- `frontend/src/test/extensionRouter.test.ts`
+  - `routes commands/available with system + custom commands merged`
+  - `routes metadata with sessionId and percentage`
+  - `routes config_options with various modes`
+  - `routes compaction_started`
+  - `routes compaction_completed with summary`
+- `frontend/src/test/modelOptions.test.ts`
+  - `getDefaultModelSelection handles missing models`
+  - `getModelIdForSelection returns selection`
+  - `normalizeModelOptions handles arrays`
 
-### Frontend Tests
-
-| Test File | Test Names | Location | Coverage |
-|-----------|-----------|----------|----------|
-| `frontend/src/test/ChatInput.test.tsx` | `renders textarea` | ? | Basic rendering |
-| `frontend/src/test/ChatInput.test.tsx` | `sends prompt on Enter` | ? | Keyboard submission |
-| `frontend/src/test/ChatInput.test.tsx` | `cancels on cancel button` | ? | Cancel flow |
-| `frontend/src/test/ChatInputExtended.test.tsx` | Slash command tests | ? | Autocomplete logic |
-| `frontend/src/test/ChatInputExtended.test.tsx` | Model selector tests | ? | Model selection |
-| `frontend/src/test/useInputStore.test.ts` | `setInput` | ? | Textarea state |
-| `frontend/src/test/useInputStore.test.ts` | `setAttachments` | ? | Attachment state |
-
-### Backend Tests
-
-| Test File | Test Names | Location | Coverage |
-|-----------|-----------|----------|----------|
-| `backend/test/promptHandlers.test.js` | Image compression tests | ? | Sharp integration |
-| `backend/test/promptHandlers.test.js` | Attachment inclusion tests | ? | Multi-part prompt |
-| `backend/test/attachmentVault.test.js` | File upload tests | ? | Multer disk storage |
-| `backend/test/attachmentVault.test.js` | Filename sanitization | ? | Path safety |
-
----
+### Backend
+- `backend/test/routes-upload.test.js`
+  - `registers POST /:uiId and responds via handleUpload`
+  - `passes the uiId route param to the handler`
+  - `runs the upload middleware before handleUpload`
+  - `does not register a GET route`
+- `backend/test/attachmentVault.test.js`
+  - `handleUpload should return file information`
+  - `getAttachmentsRoot returns dir from providerModule`
+  - `multer destination callback creates session directory`
+  - `multer destination callback skips mkdir when dir already exists`
+  - `multer filename callback sanitizes original filename`
+- `backend/test/promptHandlers.test.js`
+  - `should handle incoming prompt and send to ACP`
+  - `should handle attachments (images and resource links)`
+  - `should handle base64 image attachments without disk path`
+  - `should decode non-image base64 files as text content`
+  - `should compress image attachments via sharp before sending to ACP`
+  - `should send original image as fallback if sharp fails`
+  - `should reject prompts to sessions not loaded in current process`
+  - `should cancel prompt when cancel_prompt received`
+  - `should cancel running sub-agents and emit completion on cancel_prompt`
+- `backend/test/modelOptions.test.js`
+  - `normalizes model options from ACP and filters invalid or duplicate entries`
+  - `derives quick model options from provider quickAccess entries`
+  - `finds model config options by id, category, or kind`
+  - `resolves quick access ids, raw ids, advertised ids, and fallbacks`
 
 ## How to Use This Guide
+### For implementing/extending this feature
+1. Start with `frontend/src/components/ChatInput/ChatInput.tsx` and identify whether the change touches draft text, attachments, slash commands, footer pills, model controls, session options, or context display.
+2. For attachments, update `frontend/src/hooks/useFileUpload.ts`, `frontend/src/store/useInputStore.ts`, `frontend/src/components/FileTray.tsx`, `backend/routes/upload.js`, `backend/services/attachmentVault.js`, and the attachment conversion block in `backend/sockets/promptHandlers.js` as a single contract.
+3. For model footer changes, update `frontend/src/components/ChatInput/ModelSelector.tsx`, `frontend/src/utils/modelOptions.ts`, `frontend/src/store/useSessionLifecycleStore.ts`, and backend `resolveModelSelection` behavior when ACP model ids are affected.
+4. For slash commands, verify `frontend/src/hooks/useSocket.ts`, `frontend/src/utils/extensionRouter.ts`, `frontend/src/store/useSystemStore.ts`, `ChatInput` filtering, and `useChatStore.handleSubmit` custom command substitution.
+5. For context usage, verify `provider_extension` metadata routing, `useSystemStore.setContextUsage`, `useSessionLifecycleStore.fetchStats`, `ChatInput` context bar rendering, and `ModelSelector` label rendering.
+6. Update the tests listed in this guide when the corresponding contract changes.
 
-### For Implementing / Extending This Feature
-
-1. **Understand attachment flow** — Read Steps 5-11 to grasp upload → compression → prompt pipeline.
-2. **Add new input capability** — Modify ChatInput.tsx around the form (Lines 193-277). Follow existing patterns: check `isDisabled`, emit socket event.
-3. **Support new file types** — Update promptHandlers.js (Lines 58-93) to handle new MIME types.
-4. **Customize model selector** — Edit `provider.json` `branding.models.quickAccess` array to customize quick choices.
-5. **Add custom slash commands** — Load from `configuration/commands.json`; they auto-appear in dropdown.
-6. **Adjust image compression** — Set `branding.maxImageDimension` per provider; tweak quality in promptHandlers.js Line 69.
-
-### For Debugging Issues with This Feature
-
-1. **Textarea not focusing** — Check `isDisabled` condition (Line 81). Engine ready? Session warming up?
-2. **Attachments not uploading** — Check browser console for fetch error. Verify `POST /upload/{sessionId}` endpoint. Check disk permissions on attachments directory.
-3. **Images look blurry** — Quality 85 is default (Line 68, promptHandlers.js). Increase if needed; accept larger file size.
-4. **Slash dropdown not appearing** — Check that filtered commands exist (Line 112). Hidden commands excluded (Line 109)?
-5. **Model dropdown doesn't close** — Check pointerdown listener (Lines 117-128). Click outside? Click on model-dropdown-item?
-6. **Context % not showing** — Verify provider emits context updates and/or persisted stats have `totalTokens > 0`. If value is unknown, neutral bar state is expected (not `0%`).
-
----
+### For debugging issues with this feature
+1. Check `useSystemStore.connected`, `useSystemStore.isEngineReady`, `activeSession.isTyping`, and `activeSession.isWarmingUp` before debugging textarea or button disabled state.
+2. Check `activeSessionId` and `activeSession.acpSessionId` separately before debugging a missing `prompt` event.
+3. Inspect `useInputStore.inputs[uiId]` and `useInputStore.attachmentsMap[uiId]` before submit, then inspect the `prompt` socket payload from `useChatStore.handleSubmit`.
+4. For upload failures, inspect `POST /upload/:uiId`, `upload.array('files')`, multer storage callbacks, and `handleUpload` response shape.
+5. For attachment prompt failures, inspect the attachment conversion block in `registerPromptHandlers` and confirm whether the file has `data`, `path`, and a correct `mimeType`.
+6. For missing slash commands, inspect `custom_commands`, `provider_extension`, `routeExtension`, `setSlashCommands`, and `slashCommandsByProviderId[activeProvider]`.
+7. For model dropdown issues, inspect provider branding in `providersById[activeSession.provider].branding.models.quickAccess` and the session fields `model`, `currentModelId`, and `modelOptions`.
+8. For context display issues, inspect `contextUsageBySession[activeSession.acpSessionId]`, `stats.usedTokens`, `stats.totalTokens`, and compaction state in `compactingBySession`.
 
 ## Summary
-
-The **Chat Input and Prompt Area** is a unified footer component for composing and sending messages with attachments, model selection, and contextual feedback. Key points:
-
-1. **Textarea input** with auto-height, keyboard shortcuts (Enter, Shift+Enter), focus management.
-2. **Slash command autocomplete** (arrow keys, Tab/Enter to select) with hidden/visible filtering.
-3. **File attachment system**: paste/drag → HTTP POST to backend → multer disk storage → base64 reading for images.
-4. **Image compression**: sharp.resize(maxDim, fit:'inside') + JPEG quality 85 → ~90% size reduction.
-5. **Model quick-select footer** dropdown from `branding.models.quickAccess`, shows context usage % when known, disabled when loading.
-6. **Reasoning effort selector** (animated) for models supporting tuning.
-7. **Canvas/Terminal toggles** and merge-fork button (contextual).
-
-**Critical Contract:** Prompt submission includes structured attachments array; backend must handle image compression before sending to ACP. Model selection is session-scoped and persisted to DB.
-
-**Provider Agnostic:** Feature requires only optional `branding.maxImageDimension` config. Slash commands and model choices come from provider config.
-
-This feature enables fast, keyboard-driven multi-modal interaction while maintaining compatibility across all ACP providers.
+- `ChatInput` coordinates prompt composition, attachments, slash commands, voice controls, footer actions, context display, and model/session option controls for the active session.
+- `useInputStore` owns UI-session-scoped drafts and attachments; `useChatStore.handleSubmit` owns prompt emission and optimistic message insertion.
+- Attachment upload returns disk metadata first; ACP prompt conversion later transforms attachments into `image`, `text`, or `resource_link` parts.
+- Model quick-select is sourced from provider branding quick-access entries and enforced again in the backend prompt handler through ACP `session/set_model`.
+- Slash command data comes from provider extensions and prompt-backed custom commands; exact custom command names can substitute configured prompt text.
+- Context display is keyed by ACP session id and can be populated from provider metadata or stats hydration.
+- The critical contract is the `prompt` payload plus the `Attachment` shape and the separation between UI session id and ACP session id.

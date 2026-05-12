@@ -1,310 +1,328 @@
-# Feature Doc — Pop Out Chat
+# Feature Doc - Pop Out Chat
 
-Allows users to open a chat session in a detached browser window while coordinating session state across multiple windows using the BroadcastChannel API.
+Pop Out Chat opens a single chat session in a detached browser window while the main window keeps navigation and other sessions available. The feature is easy to misread because ownership coordination is split between `sessionOwnership.ts`, `App`, `PopOutApp`, backend socket rooms, and UI components that gate actions by the `?popout` URL parameter.
 
 ---
 
 ## Overview
 
 ### What It Does
-- Opens a selected chat session in a separate browser window (width=1000px, height=750px)
-- Isolates session ownership to prevent simultaneous editing in main and pop-out windows
-- Maintains session synchronization across windows via BroadcastChannel messaging
-- Hides sidebar, system settings, and file explorer buttons in the pop-out window
-- Supports full canvas pane functionality in the pop-out (split-screen editor)
-- Automatically switches main window away from the popped-out session
-- Restores session to main window when pop-out is closed
+- Opens `/?popout={uiSessionId}` in a named browser window with `width=1000,height=750`.
+- Routes detached windows to `PopOutApp` instead of the normal `App` shell.
+- Claims and releases session ownership through the `acpui-session-ownership` `BroadcastChannel`.
+- Clears the main window's active session when the popped session is active there.
+- Marks popped-out sessions in the sidebar and redirects sidebar clicks to the detached window when a window reference exists.
+- Reuses `ChatHeader`, `MessageList`, `ChatInput`, and `CanvasPane` inside the detached window without rendering the sidebar or modal roots.
 
 ### Why This Matters
-- Users can compare multiple chats side-by-side on multi-monitor setups
-- Prevents streaming conflicts when the same session receives updates in two windows
-- Maintains a clean separation between main navigation and focused chat windows
-- Reduces cognitive load by hiding irrelevant UI elements in pop-out mode
+- The UI must avoid editing or actively viewing the same session in two windows.
+- BroadcastChannel state is in-memory and per browser context, so session ownership must be treated as ephemeral coordination.
+- Socket room membership depends on `watch_session` and `unwatch_session`, which use ACP session IDs rather than UI session IDs.
+- Pop-out mode changes header controls and modal availability while keeping chat input, canvas, terminal, and model controls available.
+- This is a frontend orchestration feature with backend Socket.IO support; it has no provider-specific behavior.
 
 ---
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-### 1. User Clicks "Pop Out" Button in Sidebar
-**File:** `frontend/src/components/SessionItem.tsx` (Lines 87-89)
+### 1. Sidebar session rows expose the pop-out action
 
-```javascript
-<button 
-  className="session-action-btn" 
-  title="Pop Out" 
-  onClick={(e) => { e.stopPropagation(); openPopout(session.id); }}
+File: `frontend/src/components/SessionItem.tsx` (Component: `SessionItem`, Functions: `openPopout`, `isSessionPoppedOut`, `focusPopout`)
+
+```tsx
+// FILE: frontend/src/components/SessionItem.tsx (Component: SessionItem)
+<div
+  className={`session-item ... ${isSessionPoppedOut(session.id) ? 'popped-out' : ''}`}
+  onClick={() => !isEditing && (isSessionPoppedOut(session.id) ? focusPopout(session.id) : onSelect())}
 >
-  <ExternalLink size={12} />
-</button>
+  ...
+  <button className="session-action-btn" title="Pop Out" onClick={(e) => { e.stopPropagation(); openPopout(session.id); }}>
+    <ExternalLink size={12} />
+  </button>
+</div>
 ```
 
-The ExternalLink icon appears in the session actions menu. Clicking invokes `openPopout(sessionId)` from the sessionOwnership module.
+Normal session rows show the `Pop Out` action. Sub-agent rows use their own action branch and do not render the pop-out button. When a session is marked as owned by another window, the row receives the `popped-out` class and the row click attempts `focusPopout(session.id)` rather than selecting the session in the main window.
 
-### 2. openPopout() Opens New Window and Claims Ownership
-**File:** `frontend/src/lib/sessionOwnership.ts` (Lines 81-97)
+### 2. `openPopout` creates or focuses the detached window
 
-```typescript
+File: `frontend/src/lib/sessionOwnership.ts` (Function: `openPopout`)
+
+```ts
+// FILE: frontend/src/lib/sessionOwnership.ts (Function: openPopout)
 export async function openPopout(sessionId: string): Promise<Window | null> {
-  const existing = popoutWindows.get(sessionId);  // LINE 82
+  const existing = popoutWindows.get(sessionId);
   if (existing && !existing.closed) {
     existing.focus();
     return existing;
   }
-  const win = window.open(`/?popout=${sessionId}`, `popout-${sessionId}`, 'width=1000,height=750');  // LINE 87
+
+  const win = window.open(`/?popout=${sessionId}`, `popout-${sessionId}`, 'width=1000,height=750');
   if (win) {
-    popoutWindows.set(sessionId, win);  // LINE 89
-    // Switch main window away from the popped-out session
-    const { activeSessionId } = useSessionLifecycleStore.getState();  // LINE 91
+    popoutWindows.set(sessionId, win);
+    const { activeSessionId } = useSessionLifecycleStore.getState();
     if (activeSessionId === sessionId) {
-      useSessionLifecycleStore.getState().setActiveSessionId(null);  // LINE 93
+      useSessionLifecycleStore.getState().setActiveSessionId(null);
     }
   }
   return win;
 }
 ```
 
-If a pop-out already exists for this session and is not closed, it focuses the existing window. Otherwise, it opens a new window with URL parameter `?popout=sessionId` and dimensions 1000x750. The main window's active session is cleared.
+`popoutWindows` stores `Window` references by UI session ID in the opener window. A second click for the same open session focuses the existing window. When the opened session is active in the main window, `setActiveSessionId(null)` moves the main shell to the empty-state view and triggers the normal session switch effect.
 
-### 3. Main Window Broadcasts Ownership Change
-**File:** `frontend/src/lib/sessionOwnership.ts` (Lines 26-55)
+### 3. Main `App` listens for ownership changes and manages socket rooms
 
-When the main window's `openPopout()` completes, the pop-out window will initialize its BroadcastChannel listener. When the channel is ready, the pop-out will broadcast a `claim` message to the main window (via the BroadcastChannel) and the main window will receive it.
+File: `frontend/src/App.tsx` (Component: `App`, Function: `setOwnershipChangeCallback`, Socket events: `watch_session`, `unwatch_session`, `canvas_load`)
 
-The main window's channel listener (Lines 31-33):
-```typescript
-if (msg.type === 'claim' && msg.windowId !== windowId) {
-  poppedOutSessions.set(msg.sessionId, msg.windowId);  // LINE 32
-  onOwnershipChange?.(msg.sessionId, true);  // LINE 33
-}
+```tsx
+// FILE: frontend/src/App.tsx (Component: App)
+useEffect(() => {
+  setOwnershipChangeCallback(() => forceUpdate(n => n + 1));
+}, []);
+
+useEffect(() => {
+  if (activeSessionId !== lastActiveSessionIdRef.current) {
+    const oldSession = sessions.find(s => s.id === lastActiveSessionIdRef.current);
+    const newSession = sessions.find(s => s.id === activeSessionId);
+    if (oldSession?.acpSessionId && socket && !oldSession.isTyping) socket.emit('unwatch_session', { sessionId: oldSession.acpSessionId });
+    if (newSession?.acpSessionId && socket) socket.emit('watch_session', { sessionId: newSession.acpSessionId });
+    ...
+  }
+
+  if (activeSessionId && socket) {
+    socket.emit('canvas_load', { sessionId: activeSessionId }, ...);
+  }
+}, [activeSessionId, socket, ...]);
 ```
 
-This registers that the session is now owned by the pop-out window.
+`setOwnershipChangeCallback` forces a React re-render when `sessionOwnership.ts` receives `claim`, `release`, or `announce` messages from another window. The session switch effect handles room changes for the main window: the former active ACP session is unwatched when appropriate, the selected ACP session is watched, and canvas artifacts load for the selected UI session.
 
-### 4. main.tsx Routes to PopOutApp
-**File:** `frontend/src/main.tsx` (Lines 7-26)
+### 4. `main.tsx` selects the pop-out root by URL parameter
 
-```typescript
-const isPopout = new URLSearchParams(window.location.search).has('popout');  // LINE 7
+File: `frontend/src/main.tsx` (Bootstrap branch: `isPopout`)
+
+```tsx
+// FILE: frontend/src/main.tsx (Bootstrap branch: isPopout)
+const isPopout = new URLSearchParams(window.location.search).has('popout');
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    {isPopout ? <PopOutApp /> : <App />}  // LINE 24
+    {isPopout ? <PopOutApp /> : <App />}
   </StrictMode>,
-)
+);
 ```
 
-The URL is examined for the `popout` query parameter. If present, `PopOutApp` is rendered instead of the main `App`.
+The detached window has the same bundled frontend code as the main window. The `popout` query parameter selects `PopOutApp`, which omits main-window navigation and modal roots.
 
-### 5. PopOutApp Initializes and Loads Session
-**File:** `frontend/src/PopOutApp.tsx` (Lines 25-75)
+### 5. `PopOutApp` claims ownership and hydrates the target session
 
-```typescript
-function PopOutApp() {
-  const popoutSessionId = new URLSearchParams(window.location.search).get('popout')!;  // LINE 26
-  const [ready, setReady] = useState(false);
+File: `frontend/src/PopOutApp.tsx` (Component: `PopOutApp`, Function: `claimSession`, Store action: `hydrateSession`, Socket events: `load_sessions`, `watch_session`)
 
-  const { sessions, activeSessionId } = useSessionLifecycleStore();  // LINE 29
-  const { socket } = useSocket();  // LINE 38
+```tsx
+// FILE: frontend/src/PopOutApp.tsx (Component: PopOutApp)
+const popoutSessionId = new URLSearchParams(window.location.search).get('popout')!;
 
-  // Initialize: load the specific session and claim ownership
-  useEffect(() => {
-    if (!socket || !popoutSessionId || ready) return;
-
-    // Claim ownership via BroadcastChannel
-    claimSession(popoutSessionId);  // LINE 55
-
-    // Set the active session
-    useSessionLifecycleStore.setState({ activeSessionId: popoutSessionId });  // LINE 58
-
-    // Load sessions from backend
-    socket.emit('load_sessions', (res: { sessions?: ChatSession[] }) => {  // LINE 61
-      if (res.sessions) {
-        const mapped = res.sessions.map((s: ChatSession) => ({ ...s, isTyping: false, isWarmingUp: false }));
-        useSessionLifecycleStore.setState({ sessions: mapped, activeSessionId: popoutSessionId });  // LINE 64
-
-        // Hydrate the session
-        const session = mapped.find((s: ChatSession) => s.id === popoutSessionId);  // LINE 67
-        if (session?.acpSessionId) {
-          socket.emit('watch_session', { sessionId: session.acpSessionId });  // LINE 69
-          useSessionLifecycleStore.getState().hydrateSession(socket, popoutSessionId);  // LINE 70
-        }
-        setReady(true);  // LINE 72
-      }
-    });
-  }, [socket, popoutSessionId, ready]);
-}
-```
-
-The pop-out window:
-1. Extracts the sessionId from the URL query parameter
-2. Calls `claimSession()` to announce ownership via BroadcastChannel
-3. Sets itself as the active session in the Zustand store
-4. Emits `load_sessions` to fetch all sessions from the backend
-5. Finds the pop-out session and emits `watch_session` to start listening for updates
-6. Calls `hydrateSession()` to restore chat history
-7. Sets `ready: true` to render the UI
-
-### 6. BroadcastChannel Notifies Main Window
-**File:** `frontend/src/lib/sessionOwnership.ts` (Lines 26-55)
-
-The pop-out window calls `claimSession()`, which posts a message to the BroadcastChannel:
-
-```typescript
-export function claimSession(sessionId: string) {
-  getChannel().postMessage({ type: 'claim', sessionId, windowId });  // LINE 65
-}
-```
-
-The main window receives this message in its channel listener (established at Lines 26-55) and updates its internal map of popped-out sessions.
-
-### 7. Main Window's Sidebar Re-renders with Ownership Status
-**File:** `frontend/src/App.tsx` (Lines 92-98)
-
-```typescript
-// Session ownership changes (pop-out open/close) — force sidebar re-render
-const [, forceUpdate] = useState(0);
 useEffect(() => {
-  setOwnershipChangeCallback(() => forceUpdate(n => n + 1));  // LINE 97
-}, []);
+  if (!socket || !popoutSessionId || ready) return;
+
+  claimSession(popoutSessionId);
+  useSessionLifecycleStore.setState({ activeSessionId: popoutSessionId });
+
+  socket.emit('load_sessions', (res: { sessions?: ChatSession[] }) => {
+    if (res.sessions) {
+      const mapped = res.sessions.map((s: ChatSession) => ({ ...s, isTyping: false, isWarmingUp: false }));
+      useSessionLifecycleStore.setState({ sessions: mapped, activeSessionId: popoutSessionId });
+
+      const session = mapped.find((s: ChatSession) => s.id === popoutSessionId);
+      if (session?.acpSessionId) {
+        socket.emit('watch_session', { sessionId: session.acpSessionId });
+        useSessionLifecycleStore.getState().hydrateSession(socket, popoutSessionId);
+      }
+      setReady(true);
+    }
+  });
+}, [socket, popoutSessionId, ready]);
 ```
 
-When ownership changes are detected, the main window re-renders the Sidebar. The SessionItem now shows the session as "popped-out" (CSS class applied at Line 38 of SessionItem.tsx):
+The detached window uses the UI session ID from the URL for Zustand selection and uses the ACP session ID from the loaded session for the backend room. `load_sessions` populates the pop-out store with the backend session list, then `PopOutApp` keeps `activeSessionId` pinned to the popped session and hydrates that session's timeline.
 
-```typescript
-const isActive = activeSessionId === session.id;
-...
-className={`session-item ... ${isSessionPoppedOut(session.id) ? 'popped-out' : ''}`}
+### 6. Backend socket events provide the session and room contract
+
+Files:
+- `backend/sockets/sessionHandlers.js` (Socket events: `load_sessions`, `get_session_history`)
+- `backend/sockets/index.js` (Socket events: `watch_session`, `unwatch_session`)
+- `backend/sockets/canvasHandlers.js` (Socket event: `canvas_load`)
+
+```js
+// FILE: backend/sockets/index.js (Socket events: watch_session, unwatch_session)
+socket.on('watch_session', ({ providerId = null, sessionId }) => {
+  if (sessionId) {
+    socket.join(`session:${sessionId}`);
+    emitShellRunSnapshotsForSession(socket, { providerId, sessionId });
+    emitSubAgentSnapshotsForSession(socket, { providerId, sessionId });
+  }
+});
+
+socket.on('unwatch_session', ({ sessionId }) => {
+  if (sessionId) {
+    socket.leave(`session:${sessionId}`);
+  }
+});
 ```
 
-### 8. PopOutApp Displays Chat with Locked Sidebar
-**File:** `frontend/src/PopOutApp.tsx` (Lines 103-134)
+`watch_session` and `unwatch_session` operate on ACP session IDs and Socket.IO rooms named `session:{acpSessionId}`. `load_sessions` and `get_session_history` use the database-backed UI session records that connect UI IDs to ACP IDs.
 
-```typescript
-if (!ready) {
-  return <div>Loading session...</div>;  // LINE 104
-}
+### 7. `PopOutApp` renders the focused chat shell
 
+File: `frontend/src/PopOutApp.tsx` (Component: `PopOutApp`, Hooks: `useScroll`, `useChatManager`, Function: `computeResizeWidthNoSidebar`)
+
+```tsx
+// FILE: frontend/src/PopOutApp.tsx (Component: PopOutApp)
 return (
-  <div className={`app-container ${isCanvasOpen ? 'split-screen' : ''}`}>  // LINE 108
+  <div className={`app-container ${isCanvasOpen ? 'split-screen' : ''}`}>
     <div className="main-content" style={chatWidth ? { flex: 'none', width: chatWidth } : undefined}>
-      <ChatHeader />  // LINE 110
+      <ChatHeader />
       <MessageList ... />
       <ChatInput />
     </div>
 
     {isCanvasOpen && <div className="canvas-resize-handle" onMouseDown={onResizeStart} />}
-    {isCanvasOpen && <CanvasPane ... />}  // LINE 124
+    {isCanvasOpen && (
+      <ErrorBoundary key={activeSessionId} onError={() => resetCanvas()}>
+        <CanvasPane ... />
+      </ErrorBoundary>
+    )}
   </div>
 );
 ```
 
-PopOutApp renders the chat UI without the Sidebar. ChatHeader is aware of pop-out mode and hides the menu/settings buttons (Lines 19, 28, 47-64 of ChatHeader.tsx).
+The detached shell has no `Sidebar`, `SessionSettingsModal`, `SystemSettingsModal`, `NotesModal`, or `FileExplorer` component roots. It still registers chat socket listeners through `useChatManager`, scroll behavior through `useScroll`, canvas file handlers through `useCanvasStore`, and resize behavior through `computeResizeWidthNoSidebar`.
 
-### 9. User Closes Pop-out Window
-**File:** `frontend/src/lib/sessionOwnership.ts` (Lines 109-116)
+### 8. `ChatHeader` switches controls by pop-out mode
 
-```typescript
-if (typeof window !== 'undefined') {
-  window.addEventListener('beforeunload', () => {  // LINE 110
-    const popoutId = new URLSearchParams(window.location.search).get('popout');
-    if (popoutId) {
-      releaseSession(popoutId);  // LINE 114
-    }
-  });
-}
+File: `frontend/src/components/ChatHeader/ChatHeader.tsx` (Component: `ChatHeader`, URL parameter: `popout`)
+
+```tsx
+// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Component: ChatHeader)
+const isPopout = new URLSearchParams(window.location.search).has('popout');
+
+{!isPopout && (
+  <button onClick={() => setSidebarOpen(true)} className="mobile-header-menu-btn" title="Open Sidebar">
+    <Menu size={20} />
+  </button>
+)}
+
+{!isPopout && (
+  <div className="header-actions">
+    <button title="File Explorer">...</button>
+    <button title="System Settings">...</button>
+  </div>
+)}
 ```
 
-Before the pop-out window unloads, it calls `releaseSession()` to broadcast a release message:
+Pop-out headers keep the status indicator, provider/session title, sub-agent label, and workspace label. They hide the mobile sidebar menu plus the File Explorer and System Settings header actions because those shells are only mounted by `App`.
 
-```typescript
+### 9. `ChatInput` keeps normal chat controls in the detached window
+
+File: `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`, Store actions: `setInput`, `handleSubmit`, `handleCancel`, `openTerminal`, `setIsCanvasOpen`, `toggleAutoScroll`, `handleActiveSessionModelChange`, `handleSetSessionOption`)
+
+```tsx
+// FILE: frontend/src/components/ChatInput/ChatInput.tsx (Component: ChatInput)
+const input = activeSession ? (inputs[activeSession.id] || '') : '';
+const isDisabled = !connected || !isEngineReady || activeSession?.isTyping || activeSession?.isWarmingUp;
+
+<form onSubmit={(e) => {
+  e.preventDefault();
+  if (activeSession?.isTyping) handleCancel(socket);
+  else handleSubmit(socket);
+}}>
+  <textarea
+    value={input}
+    onChange={(e) => setInput(activeSession?.id || '', e.target.value)}
+    onKeyDown={handleKeyDown}
+    disabled={isDisabled}
+  />
+  ...
+</form>
+```
+
+`ChatInput` does not branch on `popout`. It follows the detached window's active UI session and per-window Zustand state. File attachments, slash commands, voice input, send/cancel, Terminal, Canvas, Auto-scroll, Merge Fork, reasoning effort controls, context usage, and the footer `ModelSelector` are available when their normal session conditions are met.
+
+### 10. Closing the detached window releases ownership
+
+File: `frontend/src/lib/sessionOwnership.ts` (Functions: `releaseSession`, `beforeunload` listener)
+
+```ts
+// FILE: frontend/src/lib/sessionOwnership.ts (Functions: releaseSession, beforeunload listener)
 export function releaseSession(sessionId: string) {
-  getChannel().postMessage({ type: 'release', sessionId, windowId });  // LINE 69
-  poppedOutSessions.delete(sessionId);  // LINE 70
+  getChannel().postMessage({ type: 'release', sessionId, windowId });
+  poppedOutSessions.delete(sessionId);
 }
+
+window.addEventListener('beforeunload', () => {
+  const popoutId = new URLSearchParams(window.location.search).get('popout');
+  if (popoutId) {
+    releaseSession(popoutId);
+  }
+});
 ```
 
-### 10. Main Window Receives Release and Updates Sidebar
-**File:** `frontend/src/lib/sessionOwnership.ts` (Lines 34-37)
-
-The main window receives the release message:
-
-```typescript
-else if (msg.type === 'release' && msg.windowId !== windowId) {
-  poppedOutSessions.delete(msg.sessionId);  // LINE 35
-  popoutWindows.delete(msg.sessionId);  // LINE 36
-  onOwnershipChange?.(msg.sessionId, false);  // LINE 37
-}
-```
-
-This triggers `forceUpdate` in the main App (see Step 7), which re-renders the Sidebar. The session no longer shows the "popped-out" CSS class, and the ExternalLink button is functional again.
+A pop-out window broadcasts `release` as it unloads. Other windows remove the session from `poppedOutSessions`, delete any opener window reference for that session, and invoke the ownership callback so the sidebar rerenders.
 
 ---
 
 ## Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Main Browser Window (App)                       │
-├─────────────────────────────────────────────────────────────────────┤
-│  Sidebar (SessionItem with "Pop Out" button)                         │
-│                                                                       │
-│  ┌────────────────────────────────────────────────────────────────┐ │
-│  │ sessionOwnership.ts:                                           │ │
-│  │ - BroadcastChannel listener (receives claim/release/query)     │ │
-│  │ - poppedOutSessions map (tracks popped-out session IDs)        │ │
-│  │ - popoutWindows map (stores window references)                 │ │
-│  └────────────────────────────────────────────────────────────────┘ │
-│                            │                                         │
-│                            │ Ownership callback                      │
-│                            ▼                                         │
-│  ┌────────────────────────────────────────────────────────────────┐ │
-│  │ App.tsx: setOwnershipChangeCallback()                          │ │
-│  │ Triggers forceUpdate() to re-render Sidebar                    │ │
-│  └────────────────────────────────────────────────────────────────┘ │
-│                                                                       │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              │ window.open('/?popout=sessionId')
-                              │ URL parameter passed to new window
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                   Pop-Out Browser Window (PopOutApp)                 │
-├─────────────────────────────────────────────────────────────────────┤
-│  main.tsx: Detects '?popout' in URL, renders PopOutApp              │
-│                            │                                         │
-│                            ▼                                         │
-│  PopOutApp (Lines 25-134):                                           │
-│  1. Extract sessionId from ?popout parameter                         │
-│  2. Call claimSession(sessionId) ──────────────────────────┐        │
-│  3. Load sessions from backend (load_sessions socket event)│        │
-│  4. Hydrate session (watch_session + hydrateSession)       │        │
-│  5. Render ChatHeader, MessageList, ChatInput, CanvasPane  │        │
-│                                                            │        │
-│  ┌────────────────────────────────────────────────────────┘        │
-│  │ BroadcastChannel: posts { type: 'claim', sessionId, windowId }  │
-│  │                                                                   │
-│  └─────────────────────────────────────────────────────────────────┘
-│                            │                                         │
-│                            │ beforeunload event                      │
-│                            ▼                                         │
-│  releaseSession(sessionId): posts { type: 'release', ... }          │
-│                                                                       │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+  subgraph MainWindow[Main browser window - App]
+    Sidebar[Sidebar and SessionItem]
+    MainSessionStore[useSessionLifecycleStore]
+    MainOwnership[sessionOwnership.ts\npoppedOutSessions and popoutWindows]
+    MainChat[ChatHeader, MessageList, ChatInput]
+  end
+
+  subgraph PopoutWindow[Detached browser window - PopOutApp]
+    PopoutRoot[main.tsx chooses PopOutApp]
+    PopoutSessionStore[useSessionLifecycleStore\nactiveSessionId = popout UI ID]
+    PopoutOwnership[claimSession and releaseSession]
+    PopoutChat[ChatHeader, MessageList, ChatInput, CanvasPane]
+  end
+
+  subgraph Backend[Backend Socket.IO]
+    SessionHandlers[sessionHandlers.js\nload_sessions, get_session_history]
+    Rooms[sockets/index.js\nwatch_session, unwatch_session]
+    CanvasHandlers[canvasHandlers.js\ncanvas_load]
+  end
+
+  Sidebar -->|openPopout UI session ID| MainOwnership
+  MainOwnership -->|window.open /?popout=UI ID| PopoutRoot
+  MainOwnership -->|clear activeSessionId when selected| MainSessionStore
+  MainSessionStore -->|watch_session / unwatch_session with ACP ID| Rooms
+
+  PopoutRoot --> PopoutSessionStore
+  PopoutSessionStore -->|load_sessions| SessionHandlers
+  PopoutSessionStore -->|watch_session with ACP ID| Rooms
+  PopoutSessionStore -->|hydrateSession -> get_session_history| SessionHandlers
+  PopoutChat -->|canvas_load and canvas actions| CanvasHandlers
+
+  PopoutOwnership <-.->|BroadcastChannel acpui-session-ownership| MainOwnership
+  MainOwnership -->|rerender after claim/release/announce| Sidebar
 ```
 
 ---
 
-## The Critical Contract: Session Ownership Coordination
+## The Critical Contract: Broadcast Ownership Plus Socket Room Isolation
 
-The feature depends on **BroadcastChannel-based ownership messaging** to ensure:
-
-1. **Only one window processes updates** — The pop-out window claims ownership, preventing the main window from streaming updates to the same session.
-2. **Main window respects popped-out state** — When a session is owned by the pop-out, the main window disables the click-to-activate handler and shows "popped-out" styling.
-3. **Cleanup on close** — When the pop-out closes, it releases ownership so the main window can resume.
+The feature depends on two connected contracts: BroadcastChannel ownership uses UI session IDs, and backend room membership uses ACP session IDs.
 
 ### Ownership Message Contract
 
-```typescript
+File: `frontend/src/lib/sessionOwnership.ts` (Type: `OwnershipMessage`, Constant: `CHANNEL_NAME`)
+
+```ts
+// FILE: frontend/src/lib/sessionOwnership.ts (Type: OwnershipMessage)
 type OwnershipMessage =
   | { type: 'claim'; sessionId: string; windowId: string }
   | { type: 'release'; sessionId: string; windowId: string }
@@ -312,183 +330,189 @@ type OwnershipMessage =
   | { type: 'announce'; sessionId: string; windowId: string };
 ```
 
-**claim** — Pop-out window announces ownership (sent in `claimSession`)
-**release** — Pop-out window releases ownership on unload (sent in `releaseSession`)
-**query** — Main window asks: "Any pop-outs here?" (sent on BroadcastChannel init)
-**announce** — Pop-out responds: "Yes, I own this session" (sent in response to query)
+- `claim`: a pop-out announces that it owns a UI session ID.
+- `release`: a pop-out announces that the UI session ID is available to other windows.
+- `query`: a newly initialized channel asks existing pop-outs to announce their claims.
+- `announce`: a pop-out answers `query` with the UI session ID it owns.
+- `windowId`: self-originated `claim`, `release`, and `announce` messages are ignored by the sender.
 
-### Session Ownership Invariants
+### Invariants
 
-- **Only one window owns a session at a time** — The `poppedOutSessions` map in the main window tracks which sessions are owned elsewhere.
-- **Ownership is ephemeral** — If the pop-out closes without calling `releaseSession`, the main window will eventually detect the closed window via `!win.closed` checks in `focusPopout()`.
-- **Each pop-out window has a unique `windowId`** — Generated at module load time (Line 18): `windowId = 'win-' + Date.now() + random().`
-- **Ownership is independent per session** — Multiple sessions can be popped out simultaneously.
+- `poppedOutSessions` stores sessions owned by other windows, keyed by UI session ID.
+- `popoutWindows` stores opener-owned `Window` references, keyed by UI session ID.
+- `SessionItem` must call `isSessionPoppedOut(session.id)` before selecting a session from the sidebar.
+- `PopOutApp` must call `claimSession(popoutSessionId)` during initialization and `releaseSession(popoutSessionId)` during unload.
+- `PopOutApp` must use the UI session ID for Zustand state and `hydrateSession`, and the ACP session ID for `watch_session`.
+- Main `App` must keep `setOwnershipChangeCallback` wired so sidebar state reflects BroadcastChannel messages.
+
+Breaking this contract causes one of three visible failures: the main window can select an active popped session, a closed pop-out can leave stale sidebar state, or a detached window can miss streaming updates because it joined the wrong socket room.
 
 ---
 
 ## Configuration / Provider Support
 
-This feature is **provider-agnostic** and requires no provider-specific configuration. The feature depends only on:
+Pop Out Chat is provider-agnostic. Providers do not need `provider.json`, branding, model, tool, or protocol changes for this feature.
 
-1. **Backend socket events**: `load_sessions`, `watch_session`, `unwatch_session` (already implemented)
-2. **Zustand stores**: `useSessionLifecycleStore`, `useUIStore`, `useCanvasStore` (already in place)
-3. **BroadcastChannel API**: Available in all modern browsers
-
-No changes to `provider.json`, `branding.json`, or provider logic are needed.
+Runtime dependencies:
+- Browser API: `BroadcastChannel` with channel name `acpui-session-ownership`.
+- Browser API: `window.open` using URL `/?popout={uiSessionId}` and window name `popout-{uiSessionId}`.
+- Frontend route state: query parameter `popout` for detached windows.
+- Socket events: `load_sessions`, `get_session_history`, `watch_session`, `unwatch_session`, `canvas_load`, `save_snapshot`, `prompt`, `cancel_prompt`, `set_session_model`, `set_session_option`, `merge_fork`.
+- Store keys: `useSessionLifecycleStore.activeSessionId`, `useSessionLifecycleStore.sessions`, `useInputStore.inputs`, `useInputStore.attachmentsMap`, `useCanvasStore.isCanvasOpen`, `useUIStore.isModelDropdownOpen`.
 
 ---
 
 ## Data Flow / Rendering Pipeline
 
-### Pop-Out Initialization Sequence
+### URL and Ownership Flow
 
-```
-User clicks "Pop Out" button
-    │
-    ▼
-openPopout(sessionId)
-    ├─ Check: existing window open? → yes: focus & return
-    └─ Create: window.open('/?popout=sessionId', ...)
-    │
-    ▼ (Pop-out window loads)
-main.tsx: detect ?popout parameter
-    │
-    ├─ isPopout = true
-    └─ render PopOutApp instead of App
-    │
-    ▼
-PopOutApp mounts (Lines 25-75)
-    │
-    ├─ Extract: popoutSessionId from URL
-    │
-    ├─ Call: claimSession(popoutSessionId)
-    │   └─ BroadcastChannel.postMessage({ type: 'claim', ... })
-    │       (Main window receives → marks session as poppedOut)
-    │
-    ├─ Call: socket.emit('load_sessions', callback)
-    │   └─ Backend returns: { sessions: [...] }
-    │       → Zustand store updates
-    │
-    ├─ Find: target session in loaded sessions list
-    │
-    ├─ Call: socket.emit('watch_session', { sessionId: acpSessionId })
-    │   └─ Backend starts streaming updates for this session
-    │
-    ├─ Call: hydrateSession(socket, popoutSessionId)
-    │   └─ Rebuilds chat history from JSONL/DB
-    │
-    └─ Set: ready = true → UI renders
+```text
+SessionItem Pop Out button
+  -> openPopout(uiSessionId)
+  -> window.open('/?popout={uiSessionId}', 'popout-{uiSessionId}', 'width=1000,height=750')
+  -> main useSessionLifecycleStore.setActiveSessionId(null) when that session is selected
+  -> detached main.tsx renders PopOutApp
+  -> PopOutApp claimSession(uiSessionId)
+  -> BroadcastChannel claim message reaches main window
+  -> main sessionOwnership poppedOutSessions.set(uiSessionId, ownerWindowId)
+  -> App ownership callback forces sidebar render
 ```
 
-### Session State in Each Window
+### Detached Session Hydration Flow
 
-**Main Window State:**
-```typescript
+```text
+PopOutApp reads popout UI session ID
+  -> socket.emit('load_sessions')
+  -> backend sessionHandlers.js returns UI session records
+  -> PopOutApp sets useSessionLifecycleStore.sessions and activeSessionId
+  -> PopOutApp finds the matching UI session
+  -> socket.emit('watch_session', { sessionId: acpSessionId })
+  -> hydrateSession(socket, uiSessionId)
+  -> socket.emit('get_session_history', { uiId })
+  -> useSessionLifecycleStore updates messages, model state, config options, and ACP session state
+  -> ready=true renders ChatHeader, MessageList, ChatInput, and optional CanvasPane
+```
+
+### Store Shape by Window
+
+```ts
+// Main window state after popping out the selected session
 {
-  sessions: [{ id: 'sess-1', ... }, { id: 'sess-2', ... }],
-  activeSessionId: null,  // Cleared when pop-out opens
-  poppedOutSessions: { 'sess-1': 'win-abc123' }  // session → ownerWindowId
+  activeSessionId: null,
+  sessions: [/* all loaded sessions */],
+  // sessionOwnership module state, not Zustand:
+  poppedOutSessions: new Map([[uiSessionId, ownerWindowId]]),
+  popoutWindows: new Map([[uiSessionId, windowRef]])
+}
+
+// Detached window state after load_sessions resolves
+{
+  activeSessionId: uiSessionId,
+  sessions: [/* all loaded sessions with isTyping=false and isWarmingUp=false */],
+  inputs: { [uiSessionId]: draftText },
+  attachmentsMap: { [uiSessionId]: attachments },
+  isCanvasOpen: false | true
 }
 ```
 
-**Pop-Out Window State:**
-```typescript
-{
-  sessions: [{ id: 'sess-1', ... }],  // Only the popped-out session
-  activeSessionId: 'sess-1'  // Always the pop-out's session
-}
-```
+### Header and Input Rendering in Pop-Out Mode
+
+- `ChatHeader` reads `new URLSearchParams(window.location.search).has('popout')` and hides only the sidebar menu, File Explorer action, and System Settings action.
+- `ChatHeader` still renders `StatusIndicator`, provider title, session name, sub-agent suffix, and workspace label.
+- `ChatInput` does not read the `popout` query parameter. It uses `activeSessionId`, `activeSession`, provider branding, input store state, canvas store state, and system connectivity exactly as it does in the main shell.
+- `ChatInput` can open Terminal and Canvas because `PopOutApp` renders `CanvasPane` and wires canvas handlers.
+- `ChatInput` can set UI flags for Scratch Pad and chat config, but `PopOutApp` does not render `NotesModal` or `SessionSettingsModal`, so those modal roots are unavailable in the detached shell.
 
 ---
 
 ## Component Reference
 
-### Frontend Components
+### Frontend
 
-| File | Functions/Components | Lines | Purpose |
-|------|----------------------|-------|---------|
-| `frontend/src/lib/sessionOwnership.ts` | `claimSession()` | 64-66 | Claim ownership via BroadcastChannel |
-| `frontend/src/lib/sessionOwnership.ts` | `releaseSession()` | 68-71 | Release ownership on unload |
-| `frontend/src/lib/sessionOwnership.ts` | `openPopout()` | 81-97 | Open new window and trigger main window cleanup |
-| `frontend/src/lib/sessionOwnership.ts` | `focusPopout()` | 99-106 | Focus existing pop-out window |
-| `frontend/src/lib/sessionOwnership.ts` | `isSessionPoppedOut()` | 73-75 | Check if session is owned by another window |
-| `frontend/src/lib/sessionOwnership.ts` | `getChannel()` | 26-55 | Initialize and get BroadcastChannel singleton |
-| `frontend/src/PopOutApp.tsx` | `PopOutApp` | 25-137 | Root component for pop-out windows |
-| `frontend/src/main.tsx` | Conditional render | 7, 24 | Route to PopOutApp or App based on URL |
-| `frontend/src/App.tsx` | `setOwnershipChangeCallback()` | 92-98 | Listen for ownership changes and force re-render |
-| `frontend/src/components/SessionItem.tsx` | "Pop Out" button handler | 87-89 | Trigger pop-out via click |
-| `frontend/src/components/ChatHeader/ChatHeader.tsx` | Conditional rendering | 19, 28, 47-64 | Hide menu/settings buttons in pop-out mode |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Routing | `frontend/src/main.tsx` | `isPopout`, `PopOutApp`, `App` | Chooses detached or main root from the `popout` query parameter. |
+| Detached root | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `claimSession`, `load_sessions`, `watch_session`, `hydrateSession`, `computeResizeWidthNoSidebar` | Owns detached session initialization, hydration, rendering, and canvas resizing. |
+| Main root | `frontend/src/App.tsx` | `App`, `setOwnershipChangeCallback`, `watch_session`, `unwatch_session`, `canvas_load` | Rerenders sidebar on ownership changes and manages main-window socket room membership. |
+| Ownership | `frontend/src/lib/sessionOwnership.ts` | `CHANNEL_NAME`, `OwnershipMessage`, `setOwnershipChangeCallback`, `claimSession`, `releaseSession`, `isSessionPoppedOut`, `getWindowId`, `openPopout`, `focusPopout`, `beforeunload` listener | Coordinates cross-window ownership with BroadcastChannel and opener window references. |
+| Sidebar row | `frontend/src/components/SessionItem.tsx` | `SessionItem`, `openPopout`, `isSessionPoppedOut`, `focusPopout`, `popped-out` class | Displays the pop-out action and gates sidebar selection for popped sessions. |
+| Header | `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, `isPopout`, `StatusIndicator`, `setSidebarOpen`, `setFileExplorerOpen`, `setSystemSettingsOpen` | Renders title/status and hides main-window-only controls in pop-out mode. |
+| Input | `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput`, `handleSubmit`, `handleCancel`, `setInput`, `openTerminal`, `setIsCanvasOpen`, `toggleAutoScroll`, `handleMergeFork` | Sends prompts, controls drafts/attachments, and exposes terminal/canvas/model controls in the detached window. |
+| Model footer | `frontend/src/components/ChatInput/ModelSelector.tsx` | `ModelSelector`, `onModelSelect`, `onOpenSettings`, `isModelDropdownOpen` | Shows active model/context state and emits model changes. |
+| Socket singleton | `frontend/src/hooks/useSocket.ts` | `useSocket`, `getOrCreateSocket`, Socket events `ready`, `providers`, `branding`, `session_model_options`, `provider_extension` | Creates the per-window Socket.IO client and stores backend/provider state. |
+| Chat events | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, events `token`, `thought`, `system_event`, `permission_request`, `token_done` | Registers stream/event listeners in both main and detached windows. |
+| Session store | `frontend/src/store/useSessionLifecycleStore.ts` | `activeSessionId`, `sessions`, `setActiveSessionId`, `handleInitialLoad`, `hydrateSession`, `handleActiveSessionModelChange`, `handleSetSessionOption` | Tracks session selection and hydrates UI session history. |
+| Input store | `frontend/src/store/useInputStore.ts` | `inputs`, `attachmentsMap`, `setInput`, `setAttachments`, `clearInput`, `handleFileUpload` | Stores drafts and attachments per UI session within each browser context. |
+| Canvas store | `frontend/src/store/useCanvasStore.ts` | `isCanvasOpen`, `canvasArtifacts`, `activeCanvasArtifact`, `openTerminal`, `handleOpenFileInCanvas`, `handleFileEdited`, `handleCloseArtifact` | Supports canvas and terminal state in the detached shell. |
+| Resize helper | `frontend/src/utils/resizeHelper.ts` | `computeResizeWidthNoSidebar`, `computeResizeWidth` | Computes split-screen chat width with and without sidebar offset. |
 
-### Zustand Stores (Modified by Pop-Out)
+### Backend
 
-| Store | State | Modified By | Purpose |
-|-------|-------|-------------|---------|
-| `useSessionLifecycleStore` | `activeSessionId` | PopOutApp (Line 58), App (Line 93 in sessionOwnership) | Pop-out sets its session active; main clears |
-| `useSessionLifecycleStore` | `sessions` | PopOutApp (Line 64) | Pop-out receives session list from backend |
-| `useUIStore` | `visibleCount` | PopOutApp (Line 30) | Controls message pagination in both windows |
-| `useCanvasStore` | `isCanvasOpen`, `canvasArtifacts` | PopOutApp (Lines 32-35) | Canvas pane state independent per window |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Session records | `backend/sockets/sessionHandlers.js` | Socket events `load_sessions`, `get_session_history`, `save_snapshot`, `set_session_model`, `set_session_option`, `merge_fork` | Provides UI session metadata and hydrated history for the pop-out. |
+| Socket rooms | `backend/sockets/index.js` | Socket events `watch_session`, `unwatch_session`, helpers `emitShellRunSnapshotsForSession`, `emitSubAgentSnapshotsForSession` | Joins/leaves `session:{acpSessionId}` rooms and replays shell/sub-agent snapshots. |
+| Canvas persistence | `backend/sockets/canvasHandlers.js` | Socket events `canvas_load`, `canvas_save`, `canvas_delete`, `canvas_apply_to_file` | Loads and saves canvas artifacts used by `CanvasPane`. |
 
-### Backend Socket Events (No Changes Needed)
+### Tests
 
-| Event | Emitted By | Handler | Purpose |
-|-------|-----------|---------|---------|
-| `load_sessions` | PopOutApp (Line 61) | Backend sessionHandlers.js | Fetch all sessions |
-| `watch_session` | PopOutApp (Line 69) | Backend sessionHandlers.js | Start streaming updates |
-| `unwatch_session` | App.tsx (Line 107) | Backend sessionHandlers.js | Stop streaming to main window |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Detached app | `frontend/src/test/PopOutApp.test.tsx` | `PopOutApp`, mocked `useSocket`, mocked `claimSession` | Verifies detached loading, rendering, title, hydration, `watch_session`, and ownership claim. |
+| Ownership | `frontend/src/test/sessionOwnership.test.ts` | `claimSession`, `releaseSession`, `setOwnershipChangeCallback`, `isSessionPoppedOut`, `openPopout`, `focusPopout`, `getWindowId` | Verifies BroadcastChannel messaging, self-message filtering, window open/focus behavior, and release handling. |
+| Sidebar row | `frontend/src/test/SessionItem.test.tsx` | `SessionItem`, `Pop Out`, sub-agent branch | Verifies pop-out button presence for normal sessions and absence for sub-agent action branch. |
+| Sidebar list | `frontend/src/test/Sidebar.test.tsx` | `Sidebar - popped-out sessions`, `popped-out` class, `Pop Out` button | Verifies popped-out class rendering and pop-out buttons on session items. |
+| Header | `frontend/src/test/ChatHeader.test.tsx` | `hides sidebar menu and action buttons in pop-out mode`, provider/session title tests | Verifies header gating by `?popout` and title rendering. |
+| Input | `frontend/src/test/ChatInput.test.tsx` | `automatically focuses the textarea when enabled`, `renders model selector and allows model change`, `submits on Enter key press`, slash command tests, send/cancel tests | Verifies core input behavior reused by `PopOutApp`. |
+| Input extended | `frontend/src/test/ChatInputExtended.test.tsx` | `renders textarea and updates store on change`, `triggers handleSubmit on Enter (without shift)`, `shows slash command dropdown when typing /`, `handles file upload trigger` | Verifies additional draft, submit, slash, and upload behavior. |
+| Main app rooms | `frontend/src/test/App.test.tsx` | `switches between sessions and emits watch events`, canvas resize tests | Verifies main-window watch/unwatch and canvas behavior used when the main active session changes. |
+| Backend rooms | `backend/test/sockets-index.test.js` | `watch_session joins the session room`, `unwatch_session leaves the session room`, snapshot tests | Verifies socket room operations used by main and detached windows. |
+| Backend sessions | `backend/test/sessionHandlers.test.js` | `handles load_sessions with cleanup`, `handles get_session_history`, `handles save_snapshot`, model/config option tests | Verifies session metadata and history socket handlers. |
+| Backend canvas | `backend/test/canvasHandlers.test.js` | `canvas_load returns artifacts`, canvas error tests | Verifies canvas artifact loading used by split-screen pop-outs. |
 
 ---
 
 ## Gotchas & Important Notes
 
-### 1. **Window.open() May Be Blocked by Browser Pop-up Blocker**
-- **Problem:** The `window.open()` call in `openPopout()` can be silently blocked if triggered outside a user interaction context.
-- **Why:** Browsers restrict pop-ups unless they originate from a direct user click (event handler).
-- **Solution:** The click handler is properly attached to the button (`onClick` event), so this should work. If users report blocked pop-ups, check browser security settings.
+### 1. UI session IDs and ACP session IDs are both required
 
-### 2. **BroadcastChannel Not Available in All Contexts**
-- **Problem:** BroadcastChannel API requires same-origin windows. Pop-outs on different subdomains won't communicate.
-- **Why:** Security boundary prevents cross-origin window communication.
-- **Solution:** Ensure both main and pop-out windows are served from the exact same origin (same protocol, domain, port).
+The URL, `poppedOutSessions`, `popoutWindows`, and `hydrateSession` use the UI session ID. `watch_session` and `unwatch_session` use the ACP session ID. Passing the UI ID to `watch_session` joins the wrong room and streaming events will not arrive.
 
-### 3. **Session Ownership Not Persisted Across Browser Restarts**
-- **Problem:** If the browser crashes while a session is popped out, the main window won't remember ownership.
-- **Why:** Ownership is stored in-memory in `poppedOutSessions` map, not in persistent storage.
-- **Why it's fine:** The main window will detect the orphaned pop-out if user tries to click it (window will be `closed`), or the pop-out's `beforeunload` will eventually fire.
+### 2. `poppedOutSessions` tracks other windows only
 
-### 4. **Rapid Pop-Out/Close Cycles Can Cause Race Conditions**
-- **Problem:** If user pops out, immediately closes, and pops out again, race conditions in BroadcastChannel message ordering can occur.
-- **Why:** Messages are asynchronous; release and claim can arrive out of order.
-- **Mitigation:** Use window name as idempotent key (`popout-${sessionId}`) so same session always uses same window name (see Line 87).
+A pop-out owns its own session but does not store that ownership as a local `poppedOutSessions` entry. The map means "owned elsewhere" from the perspective of the current window.
 
-### 5. **Canvas State Is NOT Shared Between Windows**
-- **Problem:** If user opens canvas in main window, then pops out the same session, the pop-out starts with canvas closed.
-- **Why:** Canvas open/closed state (`canvasOpenBySession` map) is separate per window.
-- **Why it's fine:** Each window has independent canvas management; this is intentional to avoid conflicts.
+### 3. `popoutWindows` only contains opener-held window references
 
-### 6. **Active Session Set to null in Main Window**
-- **Problem:** When a session is popped out, main window's `activeSessionId` becomes null, showing the empty state.
-- **Why:** Prevents dual streaming of the same session.
-- **Expectation:** User will select a different session in the main window, or focus the pop-out.
+BroadcastChannel `announce` can mark a session as popped out even when the current window has no `Window` reference for `focusPopout`. In that state the sidebar can show `popped-out` while a click cannot focus the detached window from this main page context.
 
-### 7. **Pop-Out Window Size is Hard-Coded (1000x750)**
-- **Problem:** Dimensions are fixed; users can't customize initial size via config.
-- **Why:** Window dimensions are hard-coded in `openPopout()` (Line 87).
-- **Future improvement:** Could read default size from config.json or localStorage.
+### 4. `ready` depends on `load_sessions` returning a `sessions` array
 
-### 8. **Back/Forward Navigation Breaks Pop-Out URL**
-- **Problem:** If user uses browser back button while in pop-out, URL changes and pop-out becomes orphaned.
-- **Why:** BroadcastChannel listens on the `popout` URL parameter; navigating away clears it.
-- **Mitigation:** Pop-out window is designed for active chat use; users shouldn't navigate away.
+`PopOutApp` renders `Loading session...` until the `load_sessions` callback includes `res.sessions`. Socket failures or callback shape changes leave the detached UI in the loading state.
 
-### 9. **Socket Connection Is Not Exclusive to Pop-Out**
-- **Problem:** Both main and pop-out windows share the same Socket.IO connection (singleton in useSocket).
-- **Why:** Socket is created at module load; both windows connect to the same backend socket.
-- **Safe because:** Streaming events are routed by `sessionId` through `watch_session`, so the backend correctly routes to only the owning window.
+### 5. Header controls and modal roots are different in the detached shell
 
-### 10. **Pop-Out Title Reflects Session Name, Not "Pop Out" Indicator**
-- **Problem:** If multiple windows are open, title might not clearly indicate it's a pop-out.
-- **Why:** `document.title` is set to `'${sessionName} — Pop Out'` (Line 100), but visual distinction depends on browser tab design.
-- **Fine for:** Users who track windows by position, monitor, or app switcher; less clear for tab-only users.
+`ChatHeader` hides File Explorer and System Settings controls in pop-out mode. `ChatInput` still renders Scratch Pad and chat config triggers through normal input controls, but `PopOutApp` does not mount `NotesModal` or `SessionSettingsModal`.
+
+### 6. Canvas resize uses the no-sidebar helper
+
+`PopOutApp` must use `computeResizeWidthNoSidebar`. The main `App` uses `computeResizeWidth` because its chat width depends on sidebar offset.
+
+### 7. Every browser window has its own frontend module state
+
+`useSocket` is a module singleton inside one browser execution context. The main window and each pop-out each create their own Socket.IO client and each register `useChatManager` listeners.
+
+### 8. BroadcastChannel requires same-origin windows
+
+The main and detached windows communicate through `BroadcastChannel`, so they must share protocol, host, and port. A different origin prevents `claim`, `release`, `query`, and `announce` coordination.
+
+### 9. Pop-up blockers can return `null`
+
+`openPopout` returns `null` when `window.open` is blocked. Callers should not assume a detached window exists unless the returned value is truthy.
+
+### 10. Sub-agent session rows do not expose pop-out controls
+
+`SessionItem` renders a delete-only action branch for sub-agent sessions when they are not typing. Pop-out behavior is implemented for normal session rows.
 
 ---
 
@@ -496,69 +520,118 @@ PopOutApp mounts (Lines 25-75)
 
 ### Frontend Tests
 
-| Test File | Test Names | Location | Coverage |
-|-----------|-----------|----------|----------|
-| `frontend/src/test/PopOutApp.test.tsx` | `renders loading state initially` | Lines 87-90 | Loading UI before socket ready |
-| `frontend/src/test/PopOutApp.test.tsx` | `renders ChatHeader and ChatInput when ready` | Lines 92-114 | Full render after ready |
-| `frontend/src/test/PopOutApp.test.tsx` | `does NOT render Sidebar` | Lines 116-120 | Sidebar correctly hidden |
-| `frontend/src/test/PopOutApp.test.tsx` | `sets document.title with session name when ready` | Lines 122-143 | Title generation |
-| `frontend/src/test/PopOutApp.test.tsx` | `hydrates session and emits watch_session when ready` | Lines 145-172 | Session hydration & socket events |
-| `frontend/src/test/PopOutApp.test.tsx` | `claims session ownership on mount` | Lines 174-179 | BroadcastChannel claim |
-| `frontend/src/test/sessionOwnership.test.ts` | `claimSession posts a claim message` | Lines 33-38 | Ownership claim |
-| `frontend/src/test/sessionOwnership.test.ts` | `releaseSession posts a release message` | Lines 40-45 | Ownership release |
-| `frontend/src/test/sessionOwnership.test.ts` | `isSessionPoppedOut returns false initially` | Lines 47-49 | Initial state |
-| `frontend/src/test/sessionOwnership.test.ts` | `getWindowId returns a string starting with win-` | Lines 51-53 | Window ID generation |
-| `frontend/src/test/sessionOwnership.test.ts` | `setOwnershipChangeCallback initializes the channel` | Lines 55-59 | Channel initialization |
-| `frontend/src/test/sessionOwnership.test.ts` | `claim from another window marks session as popped out` | Lines 61-67 | Ownership tracking |
-| `frontend/src/test/sessionOwnership.test.ts` | `release from another window removes popped out status` | Lines 69-76 | Ownership cleanup |
-| `frontend/src/test/sessionOwnership.test.ts` | `announce from another window marks session as popped out` | Lines 78-84 | Query response handling |
-| `frontend/src/test/sessionOwnership.test.ts` | `claim from own window is ignored` | Lines 86-93 | Self-message filtering |
-| `frontend/src/test/sessionOwnership.test.ts` | `openPopout opens a new window` | Lines 95-101 | Window.open() call |
-| `frontend/src/test/sessionOwnership.test.ts` | `openPopout focuses existing window if not closed` | Lines 103-110 | Focus logic |
-| `frontend/src/test/sessionOwnership.test.ts` | `openPopout opens new window if existing is closed` | Lines 112-119 | Closed window replacement |
-| `frontend/src/test/sessionOwnership.test.ts` | `focusPopout returns false when no window exists` | Lines 121-123 | Focus error case |
-| `frontend/src/test/sessionOwnership.test.ts` | `focusPopout returns true and focuses existing window` | Lines 125-131 | Focus success |
-| `frontend/src/test/sessionOwnership.test.ts` | `focusPopout returns false when window is closed` | Lines 133-139 | Closed window detection |
-| `frontend/src/test/SessionItem.test.tsx` | Tests for "Pop Out" button rendering | Sidebar.test.tsx references | Button visibility |
-| `frontend/src/test/ChatHeader.test.tsx` | Tests for hidden buttons in pop-out mode | Line 19 detects `isPopout` | Pop-out UI adjustment |
+- `frontend/src/test/PopOutApp.test.tsx`
+  - `renders loading state initially`
+  - `renders ChatHeader and ChatInput when ready`
+  - `does NOT render Sidebar`
+  - `sets document.title with session name when ready`
+  - `hydrates session and emits watch_session when ready`
+  - `claims session ownership on mount`
+
+- `frontend/src/test/sessionOwnership.test.ts`
+  - `claimSession posts a claim message`
+  - `releaseSession posts a release message`
+  - `isSessionPoppedOut returns false initially`
+  - `getWindowId returns a string starting with win-`
+  - `setOwnershipChangeCallback initializes the channel`
+  - `claim from another window marks session as popped out`
+  - `release from another window removes popped out status`
+  - `announce from another window marks session as popped out`
+  - `claim from own window is ignored`
+  - `openPopout opens a new window`
+  - `openPopout focuses existing window if not closed`
+  - `openPopout opens new window if existing is closed`
+  - `focusPopout returns false when no window exists`
+  - `focusPopout returns true and focuses existing window`
+  - `focusPopout returns false when window is closed`
+
+- `frontend/src/test/SessionItem.test.tsx`
+  - `calls openPopout when pop-out button is clicked`
+  - `shows only delete button for sub-agent when not typing`
+  - `hides delete button for sub-agent when typing`
+
+- `frontend/src/test/Sidebar.test.tsx`
+  - `popped-out sessions show popped-out class`
+  - `pop-out button exists on session items`
+
+- `frontend/src/test/ChatHeader.test.tsx`
+  - `renders provider title and session name correctly`
+  - `hides sidebar menu and action buttons in pop-out mode`
+
+- `frontend/src/test/ChatInput.test.tsx`
+  - `automatically focuses the textarea when enabled`
+  - `does NOT focus the textarea when disabled (e.g. warming up)`
+  - `renders model selector and allows model change`
+  - `submits on Enter key press`
+  - `shows slash command dropdown when input starts with /`
+  - `selecting a slash command fills the input`
+  - `send button is disabled when input is empty`
+  - `shows cancel button when session isTyping`
+  - `uses provider-specific input placeholder when session has a provider`
+
+- `frontend/src/test/ChatInputExtended.test.tsx`
+  - `renders textarea and updates store on change`
+  - `triggers handleSubmit on Enter (without shift)`
+  - `shows slash command dropdown when typing /`
+  - `handles file upload trigger`
+
+- `frontend/src/test/App.test.tsx`
+  - `switches between sessions and emits watch events`
+  - `persists canvas open state per session`
+  - `handles resize handle mouse events`
+
+### Backend Tests
+
+- `backend/test/sockets-index.test.js`
+  - `watch_session joins the session room`
+  - `watch_session emits shell run snapshots`
+  - `unwatch_session leaves the session room`
+  - `watch_session does nothing when sessionId is falsy`
+  - `unwatch_session does nothing when sessionId is falsy`
+
+- `backend/test/sessionHandlers.test.js`
+  - `handles load_sessions with cleanup`
+  - `handles get_session_history`
+  - `handles save_snapshot`
+  - `handles set_session_model`
+  - `handles set_session_option`
+
+- `backend/test/canvasHandlers.test.js`
+  - `canvas_load returns artifacts`
+  - `canvas_load calls callback with error when DB fails`
 
 ---
 
 ## How to Use This Guide
 
-### For Implementing / Extending This Feature
+### For Implementing or Extending This Feature
 
-1. **Understand session ownership coordination** — Read Section "The Critical Contract" to grasp BroadcastChannel messaging.
-2. **Follow the end-to-end flow** — Trace Steps 1-10 in "How It Works" to understand initialization order.
-3. **Add new pop-out features** — Modify `PopOutApp.tsx` (Lines 25-137) to add new UI elements. Ensure they respect the pop-out constraint (no sidebar, no global settings).
-4. **Extend canvas support** — Canvas pane already works in pop-out; to add new canvas features, check `PopOutApp` Lines 77-92 for canvas resize handling.
-5. **Add configuration** — If you want user-customizable pop-out dimensions, read the hard-coded Line 87 in `sessionOwnership.ts` and replace with a config lookup.
+1. Start with `frontend/src/lib/sessionOwnership.ts` and confirm whether the change affects ownership messages, window references, or sidebar click gating.
+2. For detached-window initialization, update `frontend/src/PopOutApp.tsx` and keep UI session ID usage separate from ACP session ID usage.
+3. For main-window coordination, update `frontend/src/App.tsx` and `frontend/src/components/SessionItem.tsx` together so selection, socket rooms, and sidebar state stay aligned.
+4. For header behavior, update `frontend/src/components/ChatHeader/ChatHeader.tsx` and `frontend/src/test/ChatHeader.test.tsx` with the `popout` query parameter as the stable mode switch.
+5. For input behavior, update `frontend/src/components/ChatInput/ChatInput.tsx`, `frontend/src/components/ChatInput/ModelSelector.tsx`, and the `ChatInput` tests while remembering that pop-out mode does not mount modal roots.
+6. For canvas behavior, update `frontend/src/PopOutApp.tsx`, `frontend/src/store/useCanvasStore.ts`, and tests that cover `CanvasPane` or resize helpers.
 
-### For Debugging Issues with This Feature
+### For Debugging Issues With This Feature
 
-1. **Pop-out doesn't open** — Check browser console for `window.open()` errors. Verify pop-up blocker is disabled. Check that button click is properly wired (SessionItem.tsx Line 87).
-2. **Session content not loading** — Check that `socket.emit('load_sessions')` is responding. Verify `acpSessionId` exists in session object. Check Network tab for socket errors.
-3. **Main window shows session as "popped out" but pop-out is closed** — Manually close the orphaned pop-out window reference; main window will detect `window.closed` on next focus attempt. Or refresh main window.
-4. **BroadcastChannel messages not received** — Verify main and pop-out windows are same-origin (same protocol, domain, port). Check browser console for BroadcastChannel errors.
-5. **Pop-out shows stale data** — Verify `hydrateSession()` is being called (Line 70 of PopOutApp.tsx). Check Network tab for `load_sessions` and `watch_session` socket events.
-6. **Pop-out title doesn't update** — Check Line 99-101 in PopOutApp.tsx; verify `activeSession?.name` is being updated by socket events or Zustand store changes.
+1. If a pop-out does not open, inspect `openPopout` and confirm `window.open` returns a truthy `Window` object.
+2. If the sidebar shows the wrong popped-out state, inspect `setOwnershipChangeCallback`, `getChannel`, and the `claim`/`release`/`announce` message flow.
+3. If the detached window loads indefinitely, inspect `PopOutApp` and the `load_sessions` callback shape from `backend/sockets/sessionHandlers.js`.
+4. If messages do not stream in the detached window, verify the loaded session has `acpSessionId` and that `watch_session` receives that ACP session ID.
+5. If header actions appear in a detached window, inspect `ChatHeader` and the `popout` URL parameter.
+6. If input controls set state but a modal does not appear, check whether the target modal component is mounted by `PopOutApp`.
+7. If canvas resizing is offset, verify `PopOutApp` uses `computeResizeWidthNoSidebar` rather than the main-window sidebar-aware helper.
 
 ---
 
 ## Summary
 
-The **Pop Out Chat** feature allows users to detach a chat session into a separate browser window while maintaining session ownership coordination via the BroadcastChannel API. Key points:
-
-1. **User clicks ExternalLink icon** in SessionItem to trigger `openPopout(sessionId)`.
-2. **New window opens** with URL `/?popout=sessionId`; main window clears active session.
-3. **PopOutApp initializes**: claims ownership, loads sessions, hydrates chat history.
-4. **BroadcastChannel messaging** notifies main window of ownership change (main window updates sidebar styling).
-5. **Pop-out renders** without sidebar, with full canvas pane support, and window title includes session name.
-6. **On close**: `beforeunload` listener calls `releaseSession()` to broadcast release message.
-7. **Main window re-renders** Sidebar to show session as available again.
-
-**Critical Contract:** Only one window owns a session at a time (enforced via `poppedOutSessions` map and BroadcastChannel messages). Ownership is ephemeral and session-specific—multiple sessions can be popped out simultaneously.
-
-**Provider Agnostic:** No provider configuration needed; feature depends only on existing Socket.IO events and Zustand stores.
-
-This feature enables side-by-side comparison of chats on multi-monitor setups while preventing streaming conflicts through ownership coordination.
+- `SessionItem` starts the flow with `openPopout(session.id)` and uses `isSessionPoppedOut` to gate sidebar selection.
+- `sessionOwnership.ts` owns BroadcastChannel messaging, opener window references, and unload release behavior.
+- `main.tsx` routes `?popout` windows to `PopOutApp`.
+- `PopOutApp` claims the UI session ID, loads sessions, watches the ACP session room, hydrates the session, and renders the detached chat shell.
+- `ChatHeader` hides main-window-only controls in pop-out mode.
+- `ChatInput` keeps normal prompt, attachment, terminal, canvas, model, and context controls, with modal roots limited by the detached shell.
+- Backend socket rooms use ACP session IDs; frontend ownership uses UI session IDs.
+- The critical contract is to keep BroadcastChannel ownership, Zustand active session state, and Socket.IO room membership aligned.

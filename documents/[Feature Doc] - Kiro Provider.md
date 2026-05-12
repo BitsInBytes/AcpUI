@@ -1,1088 +1,545 @@
-# Feature Doc — Kiro Provider
+# Feature Doc - Kiro Provider
+
+The Kiro provider adapts `kiro-cli acp` to AcpUI's provider contract. It owns Kiro-specific update normalization, `_kiro.dev/` extension handling, canonical MCP tool identity, context usage persistence, slash-command agent switching, hooks, and Kiro session file operations.
+
+This is a provider-specific sidecar to `documents/[Feature Doc] - Provider System.md`. Use both docs together when changing Kiro provider behavior.
 
 ## Overview
 
-Kiro is implemented via the `kiro-cli` ACP daemon. This document is a **sidecar supplement** to `[Feature Doc] - Provider System.md` and assumes you understand the provider contract. It exists solely to show how Kiro specifically implements or deviates from that contract, with real code, line numbers, and Kiro-specific terminology.
+### What It Does
 
-**Load this doc alongside `[Feature Doc] - Provider System.md` when working on the Kiro provider.** This doc makes no sense in isolation.
+- Exports every provider contract function required by `backend/test/providerContract.test.js`.
+- Starts `kiro-cli acp` using `providers/kiro/user.json` command, args, paths, and model settings.
+- Normalizes Kiro update objects by converting PascalCase `type` values to `sessionUpdate` and string `content` values to `{ text }`.
+- Persists `_kiro.dev/metadata` context usage values in `<paths.home>/acp_session_context.json` and re-emits cached values when sessions load.
+- Converts Kiro MCP tool names such as `@AcpUI/ux_invoke_shell` into AcpUI's canonical tool invocation contract.
+- Uses `/agent <agentName>` through `session/prompt` for initial agent selection and drains the confirmation output.
+- Manages Kiro's flat session file layout for JSONL rehydration, forking, archiving, restoring, and deletion.
+- Reads per-agent hook configuration through `getHooksForAgent` and skips hook types listed in `provider.json.cliManagedHooks`.
 
----
+### Why This Matters
 
-## What Kiro Implements
+- Kiro sends provider-specific wire shapes, so generic ACP handling depends on Kiro's normalization hooks.
+- Kiro MCP tool identity uses `@{mcpName}/{toolName}`, which must be parsed by provider code before `toolInvocationResolver` can route AcpUI tools.
+- Kiro context usage arrives as provider extension metadata, not as generic ACP token stats.
+- Kiro agent switching is prompt based; routing it through unsupported mode/config methods destabilizes the daemon.
+- Kiro session files are provider-owned, so lifecycle features must use `providers/kiro/index.js` file operations instead of generic path guesses.
 
-Kiro implements all required provider contract functions:
+Architectural role: backend provider adapter with frontend effects through normalized Socket.IO events (`system_event`, `token`, `thought`, `provider_extension`, `session_model_options`).
 
-- **intercept()** — Maps agent switch notifications to include currentModelId
-- **normalizeUpdate()** — Converts PascalCase types to snake_case and normalizes string content to `{ text }` format
-- **extractToolOutput()** — Extracts tool output from rawOutput.items array
-- **extractFilePath()** — Multi-step detection from locations, content, or arguments
-- **extractDiffFromToolCall()** — Extracts diffs from content array or rawInput
-- **extractToolInvocation()** — **V2 Tool Routing**: Extracts canonical identity using `toolIdPattern` (`@{mcpName}/{toolName}`)
-- **normalizeTool()** — Strips `@ServerName/` MCP prefix using pattern and resolves generic tool IDs to standard names
-- **categorizeToolCall()** — Maps Kiro's tool names to UI categories
-- **parseExtension()** — Routes Kiro's `_kiro.dev/` protocol extensions
-- **emitCachedContext()** — Replays persisted context usage when the backend loads or hot-resumes a session
-- **performHandshake()** — Single `initialize` call
-- **setInitialAgent()** — Actively switches agents via `/agent {name}` prompt post-creation
-- **buildSessionParams()** — Returns `undefined`
-- **getHooksForAgent()** — Reads agent-specific hook configs from `~/.kiro/agents/{agentName}.json`
-- **onPromptStarted() / onPromptCompleted()** — Explicit no-op lifecycle hooks required by the provider contract
-- **setConfigOption()** — Only handles 'model'; returns null for other options
-- **Session file operations** — Flat directory layout
-- **parseSessionHistory()** — Reconstructs Unified Timeline from Kiro's JSONL format
+## How It Works - End-to-End Flow
 
-### Kiro-Specific Characteristics
+1. **Provider registration selects Kiro**
 
-| Aspect | Implementation |
-|--------|-----------------|
-| **Agent Switching** | Post-creation via `/agent` slash command |
-| **Tool ID Pattern** | `@AcpUI/toolName` (single @ symbol) |
-| **Session Layout** | Flat directory; no project-scoped subdirectories |
-| **Update Normalization** | PascalCase types converted to snake_case |
-| **Content Format** | Flat string normalized to `{ text }` structure |
-| **Hook Configuration** | Per-agent JSON files in agents directory |
-| **Session JSONL** | `kind`-based format: `Prompt`, `AssistantMessage`, `ToolResults` |
+   Files: `configuration/providers.json` (Provider entries), `backend/services/providerRegistry.js` (Function: `buildRegistry`), `backend/services/providerLoader.js` (Functions: `getProvider`, `getProviderModule`, `bindProviderModule`)
 
----
+   The runtime uses `configuration/providers.json` unless `ACP_PROVIDERS_CONFIG` points at another provider registry. Kiro is available to the backend when an enabled registry entry points to `./providers/kiro`. `getProvider` merges `providers/kiro/provider.json`, `providers/kiro/branding.json`, and `providers/kiro/user.json`; `getProviderModule` imports `providers/kiro/index.js` and `bindProviderModule` wraps its exports in `runWithProvider`.
 
-## How Kiro Starts — Startup Flow
+   ```javascript
+   // FILE: backend/services/providerLoader.js (Functions: getProvider, bindProviderModule)
+   const config = {
+     providerId: resolvedId,
+     providerPath: entry.path,
+     basePath,
+     ...providerData,
+     ...userData,
+     title,
+     branding: brandingFields,
+   };
+   ```
 
-### Step 1: Spawn & Handshake
+2. **Runtime starts the Kiro daemon**
 
-**File:** `providers/kiro/index.js` (Lines 332–339)
+   Files: `backend/services/providerRuntimeManager.js` (Function: `init`), `backend/services/acpClient.js` (Functions: `start`, `buildAcpSpawnCommand`), `providers/kiro/user.json` (Keys: `command`, `args`)
 
-Kiro's startup is straightforward. `prepareAcpEnvironment()` (Line 314-316) does nothing special:
+   `providerRuntimeManager.init` creates an `AcpClient` for each enabled provider. For Kiro, `AcpClient.start` reads `command: "kiro-cli"` and `args: ["acp"]`, resolves the Windows-safe spawn command with `buildAcpSpawnCommand`, and spawns the ACP process with JSON-safe environment defaults.
 
-```javascript
-// FILE: providers/kiro/index.js (Lines 314-316)
-export async function prepareAcpEnvironment(env) {
-  return env;  // LINE 315: No modification needed
-}
+   ```javascript
+   // FILE: backend/services/acpClient.js (Function: start)
+   const { config } = getProvider(providerId);
+   const shell = config.command;
+   const baseArgs = config.args || ['acp'];
+   const spawnTarget = buildAcpSpawnCommand(shell, baseArgs);
+   ```
+
+3. **Kiro prepares context persistence**
+
+   File: `providers/kiro/index.js` (Functions: `prepareAcpEnvironment`, `expandPath`, `_loadContextState`, `_saveContextState`, `emitCachedContext`)
+
+   Before spawn, `AcpClient.start` calls `prepareAcpEnvironment`. Kiro stores the backend-provided `emitProviderExtension` callback, resolves `paths.home` with `expandPath`, sets `_contextStateFile` to `<home>/acp_session_context.json`, and loads cached `{ sessionId: contextUsagePercentage }` values into `_sessionContextCache`.
+
+   ```javascript
+   // FILE: providers/kiro/index.js (Function: prepareAcpEnvironment)
+   const homePath = expandPath(config.paths?.home || path.join(os.homedir(), '.kiro'));
+   _contextStateFile = path.join(homePath, 'acp_session_context.json');
+   _loadContextState();
+   ```
+
+4. **Handshake initializes the ACP session layer**
+
+   Files: `backend/services/acpClient.js` (Function: `performHandshake`), `providers/kiro/index.js` (Function: `performHandshake`), `providers/kiro/provider.json` (Key: `clientInfo`), `providers/kiro/ACP_PROTOCOL_SAMPLES.md` (Section: `initialize`)
+
+   `AcpClient.performHandshake` delegates the initialization RPC to Kiro's `performHandshake`. Kiro sends `initialize` with protocol version `1`, filesystem and terminal capabilities, and `clientInfo` from `provider.json`.
+
+   ```javascript
+   // FILE: providers/kiro/index.js (Function: performHandshake)
+   await acpClient.transport.sendRequest('initialize', {
+     protocolVersion: 1,
+     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+     clientInfo: config.clientInfo || { name: 'ACP-UI', version: '1.0.0' }
+   });
+   ```
+
+5. **Session creation and load inject AcpUI MCP tools**
+
+   Files: `backend/sockets/sessionHandlers.js` (Socket event: `create_session`, Helper: `captureModelState`), `backend/services/sessionManager.js` (Functions: `getMcpServers`, `loadSessionIntoMemory`), `backend/mcp/mcpProxyRegistry.js` (Functions: `createMcpProxyBinding`, `bindMcpProxy`), `providers/kiro/index.js` (Functions: `buildSessionParams`, `getMcpServerMeta`)
+
+   `create_session` and `loadSessionIntoMemory` call `buildSessionParams`; Kiro returns `undefined`, so no Kiro-specific extra request keys are spread into `session/new` or `session/load`. `getMcpServers` injects a stdio proxy named by `provider.json.mcpName` (`AcpUI`) and includes `ACP_SESSION_PROVIDER_ID` plus `ACP_UI_MCP_PROXY_ID` so MCP tool calls can be routed back to the correct provider/session.
+
+   ```javascript
+   // FILE: providers/kiro/index.js (Functions: buildSessionParams, getMcpServerMeta)
+   export function buildSessionParams(_agent) {
+     return undefined;
+   }
+
+   export function getMcpServerMeta() {
+     return undefined;
+   }
+   ```
+
+6. **Model state is captured and model changes use `session/set_model`**
+
+   Files: `backend/sockets/sessionHandlers.js` (Helper: `captureModelState`, Socket event: `set_session_model`), `backend/services/sessionManager.js` (Functions: `setSessionModel`, `updateSessionModelMetadata`), `providers/kiro/index.js` (Functions: `normalizeModelState`, `setConfigOption`), `providers/kiro/ACP_PROTOCOL_SAMPLES.md` (Sections: `session/new`, `session/load`, `session/set_model`)
+
+   Kiro returns dynamic model catalogs in `result.models.currentModelId` and `result.models.availableModels`. Backend model helpers extract that shape, Kiro's `normalizeModelState` passes it through, and metadata/DB state are updated. Explicit model changes call `session/set_model`. `setConfigOption` handles only `optionId === 'model'` and returns `null` for unsupported config options.
+
+7. **Initial agent selection is drain-aware**
+
+   Files: `backend/sockets/sessionHandlers.js` (Socket event: `create_session`), `backend/mcp/subAgentInvocationManager.js` (Method: `runInvocation`), `providers/kiro/index.js` (Function: `setInitialAgent`), `providers/kiro/provider.json` (Keys: `supportsAgentSwitching`, `defaultSystemAgentName`), `providers/kiro/user.json` (Key: `defaultSubAgentName`)
+
+   When a requested agent differs from Kiro's baseline agent, the backend calls `setInitialAgent`. Kiro begins stream draining, sends `/agent <agentName>` as `session/prompt`, waits for drain completion, and resumes normal streaming so the agent-switch confirmation stays out of the chat timeline. Sub-agent creation uses `defaultSubAgentName` when the MCP request omits `agent` and calls `setInitialAgent` when the selected agent differs from `defaultSystemAgentName`.
+
+   ```javascript
+   // FILE: providers/kiro/index.js (Function: setInitialAgent)
+   acpClient.stream.beginDraining(sessionId);
+   await sendWithTimeout('session/prompt', {
+     sessionId,
+     prompt: [{ type: 'text', text: `/agent ${agent}` }]
+   });
+   await acpClient.stream.waitForDrainToFinish(sessionId, 1000);
+   ```
+
+8. **Raw JSON-RPC messages pass through Kiro interception**
+
+   Files: `backend/services/acpClient.js` (Function: `handleAcpMessage`, Function: `handleProviderExtension`), `providers/kiro/index.js` (Functions: `intercept`, `parseExtension`, `emitCachedContext`), `frontend/src/utils/extensionRouter.ts` (Function: `routeExtension`), `frontend/src/hooks/useSocket.ts` (Socket event: `provider_extension`)
+
+   `handleAcpMessage` calls Kiro `intercept` before routing. `intercept` persists `_kiro.dev/metadata` context usage values and maps `_kiro.dev/agent/switched` `params.model` to `params.currentModelId` so `handleProviderExtension` can update model state. Live frontend routing uses `provider_extension` plus `routeExtension`; Kiro's `parseExtension` remains a provider contract helper and provider-local test anchor.
+
+   ```javascript
+   // FILE: providers/kiro/index.js (Function: intercept)
+   if (payload.method === `${config.protocolPrefix}agent/switched` &&
+       typeof payload.params?.model === 'string' &&
+       !payload.params.currentModelId) {
+     return { ...payload, params: { ...payload.params, currentModelId: payload.params.model } };
+   }
+   ```
+
+9. **Kiro updates enter the Unified Timeline pipeline**
+
+   Files: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`), `providers/kiro/index.js` (Functions: `normalizeUpdate`, `extractFilePath`, `extractDiffFromToolCall`, `extractToolOutput`, `normalizeTool`, `extractToolInvocation`, `categorizeToolCall`), `backend/services/tools/toolInvocationResolver.js` (Functions: `resolveToolInvocation`, `applyInvocationToEvent`), `backend/services/tools/index.js` (Exports: `toolRegistry`, `toolCallState`)
+
+   `handleUpdate` calls Kiro `normalizeUpdate` before generic routing. Tool calls then flow through Kiro's path/diff/output extraction, display normalization, category mapping, canonical invocation extraction, central resolver merge, tool registry dispatch, and Socket.IO emission. This is the Tool Invocation V2 path for Kiro MCP tools.
+
+   ```javascript
+   // FILE: providers/kiro/index.js (Function: extractToolInvocation)
+   return {
+     toolCallId: update.toolCallId || event.id,
+     kind: mcpMatch ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
+     rawName,
+     canonicalName,
+     mcpServer: mcpMatch?.mcpName,
+     mcpToolName: mcpMatch?.toolName,
+     input,
+     title: normalized.title || title,
+     filePath: normalized.filePath || event.filePath,
+     category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
+   };
+   ```
+
+10. **Kiro owns session files and JSONL reconstruction**
+
+    Files: `backend/services/jsonlParser.js` (Function: `parseJsonlSession`), `backend/sockets/sessionHandlers.js` (Socket events: `get_session_history`, `rehydrate_session`, `fork_session`, `export_session`), `providers/kiro/index.js` (Functions: `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, `parseSessionHistory`)
+
+    Kiro stores session files in a flat layout: `<paths.sessions>/<acpId>.jsonl`, `<paths.sessions>/<acpId>.json`, and `<paths.sessions>/<acpId>/` for task files. `parseJsonlSession` asks the provider for the JSONL path and delegates parsing to Kiro `parseSessionHistory`, which reconstructs user messages, assistant text, and tool timeline steps from Kiro `Prompt`, `AssistantMessage`, and `ToolResults` entries.
+
+## Architecture Diagram
+
+```mermaid
+flowchart TD
+  Registry[configuration/providers.json or ACP_PROVIDERS_CONFIG] --> Loader[providerLoader.getProvider/getProviderModule]
+  Loader --> Config[providers/kiro/provider.json + branding.json + user.json]
+  Loader --> Module[providers/kiro/index.js bound exports]
+
+  Module --> Runtime[AcpClient.start]
+  Runtime --> Env[prepareAcpEnvironment]
+  Env --> ContextFile[paths.home/acp_session_context.json]
+  Runtime --> Daemon[kiro-cli acp]
+  Daemon --> Raw[AcpClient.handleAcpMessage]
+
+  Raw --> Intercept[kiro.intercept]
+  Intercept --> Update[session/update -> acpUpdateHandler.handleUpdate]
+  Intercept --> Extension[_kiro.dev/* -> handleProviderExtension]
+  Intercept --> Response[JSON-RPC responses]
+
+  Update --> Normalize[normalizeUpdate]
+  Normalize --> ToolPipeline[normalizeTool + extractToolInvocation + categorizeToolCall]
+  ToolPipeline --> Resolver[toolInvocationResolver + toolRegistry + toolCallState]
+  Resolver --> Timeline[system_event/token/thought]
+
+  Extension --> FrontendSocket[provider_extension]
+  FrontendSocket --> Router[frontend routeExtension]
+  Router --> SystemStore[useSystemStore context/slash/config/compaction state]
+
+  SessionHandlers[sessionHandlers create/load/fork/export] --> McpProxy[getMcpServers + mcpProxyRegistry]
+  McpProxy --> Daemon
+  SessionHandlers --> AgentSwitch[setInitialAgent /agent prompt with drain]
+  AgentSwitch --> Daemon
+
+  Jsonl[jsonlParser.parseJsonlSession] --> SessionFiles[Kiro flat session files]
+  SessionFiles --> History[kiro.parseSessionHistory]
 ```
 
-Then `performHandshake()` sends a single `initialize` request:
+## Critical Contract - Kiro Adapter Guarantees
 
-```javascript
-// FILE: providers/kiro/index.js (Lines 332-339)
-export async function performHandshake(acpClient) {
-  const { config } = getProvider();
-  await acpClient.transport.sendRequest('initialize', {  // LINE 334: Single initialize call
-    protocolVersion: 1,
-    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
-    clientInfo: config.clientInfo || { name: 'ACP-UI', version: '1.0.0' }
-  });
-}
-```
+Kiro must preserve these contracts for backend and frontend compatibility:
 
-### Step 2: Set Initial Agent (If Provided)
+1. **Provider export surface:** `providers/kiro/index.js` explicitly exports the full function list enforced by `backend/test/providerContract.test.js` (`requiredExports`). Missing exports fail contract validation.
+2. **Update normalization:** `normalizeUpdate` must set `sessionUpdate` from Kiro `type` and wrap string `content` values as `{ text }` before `acpUpdateHandler.handleUpdate` routes the update.
+3. **Extension normalization:** `intercept` must persist `_kiro.dev/metadata` context usage and must map `_kiro.dev/agent/switched` `model` to `currentModelId` before `AcpClient.handleProviderExtension` runs.
+4. **Tool Invocation V2:** `extractToolInvocation` must return canonical identity fields (`kind`, `rawName`, `canonicalName`, `mcpServer`, `mcpToolName`) plus `input`, `title`, `filePath`, and `category`. `toolInvocationResolver` depends on these fields to mark AcpUI MCP tools and dispatch registered handlers.
+5. **Tool ID pattern ownership:** Kiro tool parsing must use `provider.json.toolIdPattern` (`@{mcpName}/{toolName}`) through `matchToolIdPattern`, `replaceToolIdPattern`, and `resolvePatternToolName`; generic backend code must not hardcode Kiro's prefix shape.
+6. **Agent switching:** `setInitialAgent` must use `session/prompt` with `/agent <agentName>` and stream draining. Kiro code must not route startup agent selection through `session/set_mode`.
+7. **Model setting:** `setConfigOption` must call `session/set_model` only for `optionId === 'model'` and return `null` for unsupported option IDs so backend config-option flow can stop cleanly.
+8. **Session files:** `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, and `parseSessionHistory` must match Kiro's flat on-disk layout.
 
-**File:** `providers/kiro/index.js` (Lines 345–365)
+If these guarantees drift, AcpUI can lose context usage, misroute MCP tools, emit incorrect model state, show slash-command chatter, or fail fork/archive/rehydration flows.
 
-Kiro actively switches agents post-creation via the `/agent` slash command:
+## Configuration/Data Flow
 
-```javascript
-// FILE: providers/kiro/index.js (Lines 345-365)
-export async function setInitialAgent(acpClient, sessionId, agent) {
-  if (!agent) return;  // LINE 346: No agent specified
+### Provider Registration
 
-  console.log(`[KIRO PROVIDER] Setting initial agent to: ${agent}`);
+File: `configuration/providers.json` (Keys: `defaultProviderId`, `providers[].id`, `providers[].path`, `providers[].enabled`)
 
-  const sendWithTimeout = (method, params, timeout = 30000) => {
-    return Promise.race([
-      acpClient.transport.sendRequest(method, params),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
-    ]);
-  };
+Kiro starts only when the active provider registry contains an enabled Kiro entry whose `path` points at `./providers/kiro`. The checked-in provider directory is not enough by itself; the registry controls runtime creation.
 
-  acpClient.stream.beginDraining(sessionId);  // LINE 357: Pause stream to avoid race conditions
-  await sendWithTimeout('session/prompt', {
-    sessionId: sessionId,
-    prompt: [{ type: 'text', text: `/agent ${agent}` }]  // LINE 360: Send /agent command
-  });
-  await acpClient.stream.waitForDrainToFinish(sessionId, 1000);  // LINE 362: Resume stream
-  
-  console.log(`[KIRO PROVIDER] Agent switch complete.`);
-}
-```
+### Provider Identity
 
-**Key:** Kiro sends an actual prompt (`/agent {name}`) to switch agents. The stream must be paused/resumed to prevent message ordering issues.
+File: `providers/kiro/provider.json` (Keys: `name`, `protocolPrefix`, `mcpName`, `defaultSystemAgentName`, `supportsAgentSwitching`, `cliManagedHooks`, `toolIdPattern`, `toolCategories`, `clientInfo`)
 
----
+- `protocolPrefix`: `_kiro.dev/` routes provider extensions.
+- `mcpName`: `AcpUI` names the injected MCP server.
+- `toolIdPattern`: `@{mcpName}/{toolName}` parses Kiro MCP tool IDs.
+- `defaultSystemAgentName`: `kiro_default` identifies the baseline Kiro agent.
+- `supportsAgentSwitching`: `true` exposes agent-aware UI affordances through branding.
+- `cliManagedHooks`: `["stop"]` tells `hookRunner.runHooks` to skip backend execution for stop hooks.
+- `toolCategories`: maps built-in Kiro tool names (`bash`, `read_file`, `write_file`, `replace`, `list_directory`, `glob`) to UI category flags.
+- `clientInfo`: sent in Kiro's `initialize` request.
 
-## Configuration Files
+### Local Runtime Config
 
-### provider.json
+Files: `providers/kiro/user.json`, `providers/kiro/user.json.example` (Keys: `command`, `args`, `defaultSubAgentName`, `paths`, `models`)
 
-**File:** `providers/kiro/provider.json` (Complete)
+`user.json` overrides matching `provider.json` keys during `getProvider` merge. Kiro uses:
+
+- `command` and `args` for daemon spawn.
+- `paths.home` for `acp_session_context.json`.
+- `paths.sessions` for JSONL, JSON metadata, and task directories.
+- `paths.agents` for per-agent config files read by `getHooksForAgent`.
+- `paths.attachments` and `paths.archive` for provider file lifecycle support.
+- `defaultSubAgentName` when `ux_invoke_subagents` requests omit an explicit `agent`.
+- `models.default`, `models.quickAccess`, `models.titleGeneration`, and `models.subAgent` for UI model selection and sub-agent model resolution.
+
+`expandPath` supports `~`, `%USERPROFILE%`, and `$HOME` in path values before resolving them.
+
+### Branding Data
+
+File: `providers/kiro/branding.json` (Keys: `title`, `assistantName`, `busyText`, `hooksText`, `warmingUpText`, `resumingText`, `inputPlaceholder`, `emptyChatMessage`, `notificationTitle`, `appHeader`, `sessionLabel`, `modelLabel`, `maxImageDimension`)
+
+`backend/sockets/index.js` builds provider branding through `buildBrandingPayload` and emits it on `providers` and `branding`. The frontend stores it in `useSystemStore` and uses `protocolPrefix` from that branding when routing `provider_extension` events.
+
+### AcpUI MCP Tool Advertisement
+
+Files: `configuration/mcp.json.example` (Keys: `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch`), `backend/services/mcpConfig.js` (Functions: `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`), `backend/mcp/mcpServer.js` (Function: `createToolHandlers`), `backend/mcp/stdio-proxy.js` (Function: `runProxy`)
+
+Kiro sees AcpUI tools through the injected MCP server named `AcpUI`. Core tools and optional IO/search tools are advertised by backend MCP config, then Kiro refers to them with the `@AcpUI/<toolName>` shape. Agent files can allow all AcpUI tools with `@AcpUI/*` or specific tools such as `@AcpUI/ux_invoke_shell`.
+
+### Extension Data Flow
+
+Raw Kiro extension:
 
 ```json
 {
-    "name": "Kiro",
-    "protocolPrefix": "_kiro.dev/",
-    "mcpName": "AcpUI",
-    "defaultSystemAgentName": "kiro_default",
-    "supportsAgentSwitching": true,
-    "cliManagedHooks": ["stop"],
-    "toolIdPattern": "@{mcpName}/{toolName}",
-    "toolCategories": {
-        "bash": { "category": "shell", "isShellCommand": true, "isStreamable": true },
-        "read_file": { "category": "file_read", "isFileOperation": true },
-        "read_file_parallel": { "category": "file_read", "isFileOperation": true },
-        "write_file": { "category": "file_write", "isFileOperation": true },
-        "replace": { "category": "file_edit", "isFileOperation": true },
-        "list_directory": { "category": "glob", "isFileOperation": true },
-        "glob": { "category": "glob", "isFileOperation": true }
-    },
-    "clientInfo": {
-        "name": "AcpUI",
-        "version": "1.0.0"
-    }
+  "method": "_kiro.dev/metadata",
+  "params": { "sessionId": "acp-session-id", "contextUsagePercentage": 42 }
 }
 ```
 
-**Critical fields:**
-- **`protocolPrefix: "_kiro.dev/"`** — All Kiro extensions use this prefix (e.g., `_kiro.dev/agent/switched`)
-- **`toolIdPattern: "@{mcpName}/{toolName}"`** — **SINGLE @ symbol**. Becomes `@AcpUI/ux_invoke_shell`.
-- **`supportsAgentSwitching: true`** — Agents CAN be changed post-creation. This enables post-spawn agent switching via slash commands.
-- **`defaultSystemAgentName: "kiro_default"`** — The default agent if none is specified
-- **`cliManagedHooks: ["stop"]`** — The "stop" hook is managed by Kiro CLI (via `agent/exit` method), not via JSON config
-- **`toolCategories`** — Uses final tool names (`read_file`, `write_file`, `replace`, etc.), not short aliases
+Flow:
 
-### branding.json
+1. `providers/kiro/index.js` `intercept` caches and saves the percentage.
+2. `backend/services/acpClient.js` `handleProviderExtension` emits `provider_extension` with `providerId`, `method`, and `params`.
+3. `frontend/src/hooks/useSocket.ts` handles `provider_extension` and passes it to `routeExtension`.
+4. `frontend/src/utils/extensionRouter.ts` returns `{ type: 'metadata', sessionId, contextUsagePercentage }` for `metadata`.
+5. `frontend/src/store/useSystemStore.ts` `setContextUsage` stores the value by session ID.
 
-**File:** `providers/kiro/branding.json` (Complete)
+### Tool Invocation Data Flow
 
-```json
+Raw Kiro tool call data can contain `name`, `title`, `arguments`, `rawInput`, `locations`, `content`, or `rawOutput.items`. Kiro normalization extracts:
+
+```javascript
 {
-    "title": "Kiro",
-    "assistantName": "Kiro",
-    "busyText": "Kiro is busy...",
-    "hooksText": "Hooks running...",
-    "warmingUpText": "Engine warming up...",
-    "resumingText": "Resuming...",
-    "inputPlaceholder": "Send a message...",
-    "emptyChatMessage": "Send a message to start chatting with Kiro.",
-    "notificationTitle": "Kiro",
-    "appHeader": "Kiro",
-    "sessionLabel": "Kiro Session",
-    "modelLabel": "Kiro model",
-    "maxImageDimension": 1568
+  toolCallId,
+  kind,          // mcp | provider_builtin | unknown; resolver may promote AcpUI tools to acpui_mcp
+  rawName,
+  canonicalName,
+  mcpServer,
+  mcpToolName,
+  input,
+  title,
+  filePath,
+  category
 }
 ```
 
-**Note:** Kiro has `maxImageDimension: 1568` — indicates image attachment support.
+`toolInvocationResolver` merges this provider result with `toolCallState` and `mcpExecutionRegistry`; `applyInvocationToEvent` writes `toolName`, `canonicalName`, `mcpServer`, `mcpToolName`, `isAcpUxTool`, title, category flags, and sticky file path onto the emitted `system_event`.
 
-### user.json (Example)
+### Agent Hooks Data Flow
 
-```json
-{
-    "command": "kiro-cli",
-    "args": ["acp"],
-    "defaultSubAgentName": "agent-dev",
-    "paths": {
-        "home": "~/.kiro",
-        "sessions": "~/.kiro/sessions/cli",
-        "agents": "~/.kiro/agents",
-        "attachments": "~/.kiro/attachments",
-        "archive": "~/.kiro/archive"
-    },
-    "models": {
-        "default": "claude-sonnet-4.6",
-        "quickAccess": [
-            { "id": "claude-opus-4.6", "displayName": "Opus" },
-            { "id": "claude-sonnet-4.6", "displayName": "Sonnet" },
-            { "id": "claude-haiku-4.5", "displayName": "Haiku" }
-        ]
-    }
-}
-```
+Files: `providers/kiro/index.js` (Constant: `KIRO_HOOK_MAP`, Function: `getHooksForAgent`), `backend/services/hookRunner.js` (Function: `runHooks`)
 
-**Note:** Kiro's session directory is **flat** (`~/.kiro/sessions/cli/`) — all sessions sit directly in this directory.
-
----
-
-## normalizeUpdate() — PascalCase to snake_case Conversion
-
-**File:** `providers/kiro/index.js` (Lines 49–61)
-
-Kiro sends update types in PascalCase (e.g., `AgentMessageChunk`, `ToolUseStart`). These must be converted to snake_case for the ACP standard pipeline. The provider normalizes on entry:
+AcpUI passes generic hook types (`session_start`, `pre_tool`, `post_tool`, `stop`) to `getHooksForAgent`. Kiro maps them to agent JSON keys:
 
 ```javascript
-// FILE: providers/kiro/index.js (Lines 49-61)
-export function normalizeUpdate(update) {
-  // Normalize PascalCase types
-  if (!update.sessionUpdate && update.type) {
-    update.sessionUpdate = toSnakeCase(update.type);  // LINE 52: Convert type to sessionUpdate field
-  }
-
-  // Normalize flat string content to { text } format (LINE 55-57)
-  if (typeof update.content === 'string') {
-    return {
-      ...update,
-      _originalContent: update.content,  // Preserve original for debugging
-      content: { text: update.content }  // Wrap in standard format
-    };
-  }
-
-  return update;
-}
-
-// Helper function (Lines 40-43)
-function toSnakeCase(str) {
-  return str.replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '');
-}
-```
-
-**Why?** Kiro's PascalCase (`AgentMessageChunk`) doesn't match the ACP standard (`agent_message_chunk`). The normalization bridges the gap.
-
----
-
-## intercept() — Agent Switch Normalization
-
-**File:** `providers/kiro/index.js` (Lines 15–36)
-
-When Kiro switches agents, it sends an `agent/switched` extension event that includes the active model. This is mapped to AcpUI's expected field name:
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 15-36)
-export function intercept(payload) {
-  const { config } = getProvider();
-
-  // Kiro reports the active model on agent switch notifications
-  if (
-    payload.method === `${config.protocolPrefix}agent/switched` &&
-    typeof payload.params?.model === 'string' &&
-    !payload.params.currentModelId  // Only if not already set
-  ) {
-    return {
-      ...payload,
-      params: {
-        ...payload.params,
-        currentModelId: payload.params.model  // LINE 30: Map 'model' to 'currentModelId'
-      }
-    };
-  }
-
-  return payload;  // LINE 35: Most messages pass through unchanged
-}
-```
-
-**Purpose:** When Kiro switches agents, it includes the active model in the `model` field. This is normalized to `currentModelId` so the backend can persist it correctly.
-
----
-
-## Tool Pipeline — How Kiro Tools Are Normalized
-
-Kiro's tool handling uses the V2 Tool Invocation system, resolving canonical identities before display normalization.
-
-### 1. V2 Tool Invocation Routing
-
-**File:** `providers/kiro/index.js` (Lines 546–575)
-
-Kiro implements `extractToolInvocation()` to provide authoritative metadata for the backend tool registry. It uses `toolIdPattern` (`@{mcpName}/{toolName}`) from `provider.json` to resolve the canonical tool name.
-
-```javascript
-export function extractToolInvocation(update = {}, context = {}) {
-  const event = context.event || {};
-  const { config } = getProvider();
-  const normalized = normalizeTool({ ...event }, update);
-  const input = mergeInputObjects(collectInputObjects(
-    update.rawInput,
-    update.arguments,
-    update.params,
-    update.input,
-    update.toolCall?.arguments
-  ));
-  const rawName = update.name || update.toolName || event.toolName || event.title || event.id || '';
-  const title = update.title || event.title || '';
-  const mcpMatch = matchToolIdPattern(rawName, config) || matchToolIdPattern(title, config);
-  const canonicalName = normalized.toolName || '';
-
-  return {
-    toolCallId: update.toolCallId || event.id,
-    kind: mcpMatch ? 'mcp' : (canonicalName ? 'provider_builtin' : 'unknown'),
-    rawName,
-    canonicalName,
-    mcpServer: mcpMatch?.mcpName,
-    mcpToolName: mcpMatch?.toolName,
-    input,
-    title: normalized.title || title,
-    filePath: normalized.filePath || event.filePath,
-    category: categorizeToolCall({ ...normalized, toolName: canonicalName }) || {}
-  };
-}
-```
-
-### 2. Tool ID Pattern Detection
-
-**File:** `providers/kiro/index.js` (Lines 506–510)
-
-Kiro's tools use identifiers matching the pattern `@{mcpName}/{toolName}` (e.g. `@AcpUI/ux_invoke_shell`). `normalizeTool()` uses `matchToolIdPattern` and `replaceToolIdPattern` to manage these identifiers:
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 506-510)
-const configuredToolMatch = matchToolIdPattern(toolName, config);
-if (configuredToolMatch?.toolName) toolName = configuredToolMatch.toolName;
-
-// Clean configured MCP tool ids from the display title (Line 521)
-if (event.title) {
-  event = { ...event, title: replaceToolIdPattern(event.title, config) };
-}
-```
-
-### 3. Resolve Generic Tool IDs from Title
-
-**File:** `providers/kiro/index.js` (Lines 512–534)
-
-If the tool ID is still generic after pattern matching, Kiro extracts from the title:
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 512-534)
-if (toolName.startsWith('tooluse_') || toolName.startsWith('call_') || toolName.startsWith('toolu_')) {
-  const title = event.title || '';
-  const titleToolMatch = matchToolIdPattern(title, config);
-  if (titleToolMatch?.toolName) toolName = titleToolMatch.toolName;
-}
-```
-
-**Key:** If the tool name is generic, Kiro uses the configured pattern to resolve it from the display title.
-
-### 4. Clean Title and Format
-
-**File:** `providers/kiro/index.js` (Lines 407–431)
-
-Remove MCP prefixes from display title and apply UX tool naming:
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 407-431)
-// Clean any @ServerName/ prefix from the display title
-if (event.title) {
-  event = { ...event, title: event.title.replace(/@[^/]+\//g, '') };  // LINE 409: Strip prefix
-}
-
-// Format title: replace any "Running: <toolName>" prefix with a human-readable label
-if (event.title && toolName) {
-  const UX_TOOL_TITLES = {
-    ux_invoke_shell: 'Invoke Shell',
-    ux_invoke_subagents: 'Invoke Subagents',
-    ux_invoke_counsel: 'Invoke Counsel'
-  };
-  const pretty = UX_TOOL_TITLES[toolName] ||
-    toolName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-  event = { ...event, title: event.title.replace(/Running:\s*\S+/, pretty) };
-}
-
-return { ...event, toolName };
-```
-
-### 4. Categorization
-
-**File:** `providers/kiro/index.js` (Lines 436–450)
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 436-450)
-export function categorizeToolCall(event) {
-  const { config } = getProvider();
-  const toolName = event.toolName;
-  if (!toolName) return null;
-
-  const metadata = (config.toolCategories || {})[toolName];  // LINE 441: Look up in provider.json
-  if (!metadata) return null;
-
-  return {
-    toolCategory: metadata.category,
-    isFileOperation: metadata.isFileOperation || false,
-    isShellCommand: metadata.isShellCommand || false,  // LINE 447: Kiro has shell-specific metadata
-    isStreamable: metadata.isStreamable || false
-  };
-}
-```
-
-**Note:** Kiro includes `isShellCommand` and `isStreamable` metadata, unique to this provider.
-
----
-
-## extractToolOutput() — Kiro's Unique rawOutput Format
-
-**File:** `providers/kiro/index.js` (Lines 67–85)
-
-Kiro stores tool output in `rawOutput.items` array, not the standard `content` array:
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 67-85)
-export function extractToolOutput(update) {
-  if (update.rawOutput?.items) {
-    const parts = update.rawOutput.items.map(item => {
-      if (item.Text) return item.Text;  // LINE 70: Extract Text field
-      if (item.Json?.content) {
-        // LINE 71-72: Handle JSON responses
-        return item.Json.content.map(c => c.text || '').join('');
-      }
-      if (item.Json) return JSON.stringify(item.Json, null, 2);  // LINE 74: Stringify JSON
-      return '';
-    }).filter(Boolean);
-    
-    const joined = parts.join('\n');
-    
-    // Skip plain success messages so diffs from tool_start are preserved (LINE 79)
-    if (joined && !/^Successfully (created|replaced|inserted)\b/i.test(joined)) {
-      return joined;
-    }
-    
-    return undefined;
-  }
-  return undefined;
-}
-```
-
-**Key:** Kiro's format is `rawOutput.items[{ Text?, Json? }]`, not the standard `content[]`.
-
----
-
-## extractFilePath() — Multi-Step Detection
-
-**File:** `providers/kiro/index.js` (Lines 91–123)
-
-Kiro embeds file paths in multiple places:
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 91-123)
-export function extractFilePath(update, resolvePath) {
-  const kind = update.kind || '';
-  const title = (update.title || '').toLowerCase();
-
-  // NOISE FILTERING: Skip generic commands (Lines 95-96)
-  if (title.startsWith('listing') || title.startsWith('running:')) return undefined;
-
-  // KIND FILTERING: Only extract for file-related tools (Lines 98-103)
-  if (!['edit', 'read'].includes(kind)) {
-    const id = (update.toolCallId || '').toLowerCase();
-    if (!['write_file', 'replace', 'read_file', 'read_file_parallel'].some(t => id.includes(t))) {
-      return undefined;
-    }
-  }
-
-  // STEP 1: Check locations (Kiro sends these for file tools) (Lines 106-108)
-  if (update.locations?.length > 0 && update.locations[0].path) {
-    return resolvePath(update.locations[0].path);
-  }
-
-  // STEP 2: Check content for diff paths (Lines 111-113)
-  if (update.content && Array.isArray(update.content) && update.content.length > 0 && update.content[0].path) {
-    return resolvePath(update.content[0].path);
-  }
-
-  // STEP 3: Check standard tool arguments (Lines 116-120)
-  const args = update.arguments || update.params || update.rawInput;
-  if (args) {
-    const p = args.path || args.file_path || args.filePath;
-    if (p) return resolvePath(p);
-  }
-
-  return undefined;
-}
-```
-
----
-
-## Session Files — Flat Layout
-
-Kiro stores sessions in a **flat directory** structure.
-
-### Layout
-
-```
-~/.kiro/sessions/cli/
-├── {sessionId}.jsonl
-├── {sessionId}.json
-└── {sessionId}/
-    └── (task files)
-```
-
-All sessions are directly in `~/.kiro/sessions/cli/`, with no subdirectories for different projects.
-
-### getSessionPaths()
-
-**File:** `providers/kiro/index.js` (Lines 197–205)
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 197-205)
-export function getSessionPaths(acpId) {
-  const { config } = getProvider();
-  const dir = config.paths.sessions;  // LINE 199: Direct directory (no subdirectory scanning)
-  return {
-    jsonl: path.join(dir, `${acpId}.jsonl`),
-    json: path.join(dir, `${acpId}.json`),
-    tasksDir: path.join(dir, acpId),
-  };
-}
-```
-
-**Simple:** Direct path construction since sessions are not scoped to projects.
-
-### cloneSession()
-
-**File:** `providers/kiro/index.js` (Lines 210–245)
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 210-245)
-export function cloneSession(oldAcpId, newAcpId, pruneAtTurn) {
-  const oldPaths = getSessionPaths(oldAcpId);
-  const newPaths = getSessionPaths(newAcpId);
-
-  // Clone JSONL (optionally pruned)
-  if (fs.existsSync(oldPaths.jsonl)) {
-    const lines = fs.readFileSync(oldPaths.jsonl, 'utf-8').split('\n').filter(l => l.trim());
-    
-    if (pruneAtTurn != null) {
-      let userTurnCount = 0;
-      let pruneAt = lines.length;
-      
-      for (let i = 0; i < lines.length; i++) {
-        try {
-          const entry = JSON.parse(lines[i]);
-          // LINE 224: Kiro uses 'Prompt' kind for user turns
-          if (entry.kind === 'Prompt') userTurnCount++;
-          if (userTurnCount > pruneAtTurn) { pruneAt = i; break; }
-        } catch { /* skip */ }
-      }
-      
-      fs.writeFileSync(newPaths.jsonl, lines.slice(0, pruneAt).join('\n') + '\n', 'utf-8');
-    } else {
-      fs.copyFileSync(oldPaths.jsonl, newPaths.jsonl);  // LINE 230: No ID replacement needed (flat layout)
-    }
-  }
-
-  // Clone JSON with ID replacement
-  if (fs.existsSync(oldPaths.json)) {
-    let json = fs.readFileSync(oldPaths.json, 'utf-8');
-    json = json.replaceAll(oldAcpId, newAcpId);  // LINE 237: Simple text replacement
-    fs.writeFileSync(newPaths.json, json, 'utf-8');
-  }
-
-  // Clone tasks folder
-  if (fs.existsSync(oldPaths.tasksDir)) {
-    fs.cpSync(oldPaths.tasksDir, newPaths.tasksDir, { recursive: true });
-  }
-}
-```
-
-**Key:** User turns in Kiro JSONL are marked by `kind: 'Prompt'`, not `type: 'user'`.
-
-### archiveSessionFiles() & restoreSessionFiles()
-
-**File:** `providers/kiro/index.js` (Lines 254–286)
-
-Both are straightforward because the flat layout doesn't require metadata:
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 254-286, abbreviated)
-export function archiveSessionFiles(acpId, archiveDir) {
-  const paths = getSessionPaths(acpId);
-  // Copy files to archiveDir (no restore_meta.json needed for flat layout)
-  if (paths.jsonl && fs.existsSync(paths.jsonl)) {
-    fs.copyFileSync(paths.jsonl, path.join(archiveDir, `${acpId}.jsonl`));
-    fs.unlinkSync(paths.jsonl);
-  }
-  // ... copy .json and tasks ...
-}
-
-export function restoreSessionFiles(savedAcpId, archiveDir) {
-  const { config } = getProvider();
-  const sessionsDir = config.paths.sessions;  // Direct directory
-  
-  const jsonlSrc = path.join(archiveDir, `${savedAcpId}.jsonl`);
-  if (fs.existsSync(jsonlSrc)) {
-    fs.copyFileSync(jsonlSrc, path.join(sessionsDir, `${savedAcpId}.jsonl`));  // Restore directly
-  }
-  // ... restore .json and tasks ...
-}
-```
-
-**No metadata file needed** — flat layout makes restoration trivial.
-
----
-
-## parseSessionHistory() — Kiro's JSONL Format
-
-Kiro's JSONL uses a `kind`-based entry format:
-
-**Kiro entry kinds:**
-- `Prompt` — User message
-- `AssistantMessage` — Assistant response
-- `ToolResults` — Tool execution results
-
-**File:** `providers/kiro/index.js` (Lines 455–566)
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 455-566, abbreviated)
-export async function parseSessionHistory(filePath, Diff) {
-  if (!fs.existsSync(filePath)) return null;
-
-  try {
-    const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(l => l.trim());
-    const entries = lines.map(l => JSON.parse(l));
-
-    const messages = [];
-    let currentAssistant = null;
-
-    for (const entry of entries) {
-      const { kind, data } = entry;
-
-      // PROMPT: User message (LINE 468)
-      if (kind === 'Prompt') {
-        if (currentAssistant) {
-          messages.push(currentAssistant);
-          currentAssistant = null;
-        }
-
-        const textBlocks = (data.content || []).filter(b => b.kind === 'text');
-        const text = textBlocks.map(b => b.data).join('\n');
-        if (text) {
-          messages.push({ role: 'user', content: text, id: data.message_id });
-        }
-      }
-
-      // ASSISTANT MESSAGE: Assistant response (LINE 480)
-      else if (kind === 'AssistantMessage') {
-        if (!currentAssistant) {
-          currentAssistant = {
-            role: 'assistant',
-            content: '',
-            id: data.message_id,
-            isStreaming: false,
-            timeline: []
-          };
-        }
-
-        for (const block of data.content || []) {
-          if (block.kind === 'text') {
-            if (currentAssistant.content) currentAssistant.content += '\n\n';
-            currentAssistant.content += block.data;  // LINE 495: Access .data field
-          } else if (block.kind === 'toolUse') {
-            // LINE 496-511: Process tool use blocks
-            const tool = block.data;
-            const inp = tool.input || {};
-            const titleArg = inp.path || inp.filePath || inp.file_path || inp.command || inp.pattern || inp.query || '';
-            const title = titleArg ? `Running ${tool.name}: ${titleArg}` : `Running ${tool.name}`;
-
-            // Generate fallback diffs for write/edit tools
-            let fallbackOutput = null;
-            const isWrite = ['write', 'write_file', 'strReplace', 'str_replace', 'edit'].includes(tool.name);
-            if (isWrite && inp.command === 'strReplace' && inp.newStr) {
-              fallbackOutput = Diff.createPatch(inp.path || 'file', inp.oldStr || '', inp.newStr, 'old', 'new');
-            } else if (isWrite && inp.newStr && inp.oldStr) {
-              fallbackOutput = Diff.createPatch(inp.path || 'file', inp.oldStr, inp.newStr, 'old', 'new');
-            } else if (isWrite && inp.content) {
-              fallbackOutput = Diff.createPatch(inp.path || 'file', '', inp.content, 'old', 'new');
-            }
-
-            currentAssistant.timeline.push({
-              type: 'tool',
-              isCollapsed: true,
-              event: {
-                id: tool.toolUseId,  // LINE 517: Use toolUseId field
-                title,
-                status: 'pending_result',
-                output: null,
-                _fallbackOutput: fallbackOutput,
-                startTime: Date.now(),
-                endTime: Date.now()
-              }
-            });
-          }
-        }
-      }
-
-      // TOOL RESULTS: Tool execution results (LINE 528)
-      else if (kind === 'ToolResults') {
-        if (currentAssistant && data.results) {
-          // LINE 530-544: Attach results to pending tool calls
-          for (const [toolUseId, resultData] of Object.entries(data.results)) {
-            const toolStep = currentAssistant.timeline.find(
-              t => t.type === 'tool' && t.event.id === toolUseId
-            );
-            if (toolStep) {
-              toolStep.event.status = 'completed';
-              let toolOutput = extractToolOutput(resultData);
-              if (toolOutput === undefined) {
-                toolOutput = toolStep.event._fallbackOutput || undefined;
-              }
-              toolStep.event.output = toolOutput;
-            }
-          }
-        }
-      }
-    }
-
-    // Flush final assistant message
-    if (currentAssistant) messages.push(currentAssistant);
-
-    // Cleanup fallback metadata
-    for (const msg of messages) {
-      for (const step of (msg.timeline || [])) {
-        if (step.type === 'tool' && step.event) {
-          if (!step.event.output && step.event._fallbackOutput) {
-            step.event.output = step.event._fallbackOutput;
-          }
-          delete step.event._fallbackOutput;
-        }
-      }
-    }
-
-    return messages;
-  } catch (err) {
-    throw new Error(`Failed to parse ${filePath}: ${err.message}`);
-  }
-}
-```
-
-**Key characteristics of Kiro's format:**
-- Entries use `kind` field to identify type: `Prompt`, `AssistantMessage`, `ToolResults`
-- Text content is stored in `block.data` field
-- Tool ID is stored as `tool.toolUseId`
-- Tool results are in a separate `ToolResults` entry (not embedded in user messages)
-
----
-
-## Hooks — Agent-Specific Configuration
-
-Kiro stores hooks in per-agent JSON configuration files.
-
-**File:** `providers/kiro/index.js` (Lines 307–330)
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 307-330)
 const KIRO_HOOK_MAP = {
-  session_start: 'agentSpawn',      // Runs when agent starts
-  pre_tool: 'preToolUse',           // Runs before tool execution
-  post_tool: 'postToolUse',         // Runs after tool completes
-  stop: 'stop',                     // Runs when agent stops
+  session_start: 'agentSpawn',
+  pre_tool: 'preToolUse',
+  post_tool: 'postToolUse',
+  stop: 'stop',
 };
-
-export async function getHooksForAgent(agentName, hookType) {
-  const nativeKey = KIRO_HOOK_MAP[hookType];
-  if (!nativeKey || !agentName) return [];
-  
-  // LINE 321: Read agent's specific config file
-  const configPath = path.join(getAgentsDir(), `${agentName}.json`);
-  try {
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    
-    // LINE 324: Access hooks under the native key (e.g., hooks.agentSpawn)
-    const raw = config.hooks?.[nativeKey] ?? [];
-    
-    // LINE 325: Handle both string and object formats
-    const entries = Array.isArray(raw) ? raw : [raw];
-    
-    // LINE 326: Map strings to command objects
-    return entries.map(e => typeof e === 'string' ? { command: e } : e).filter(e => e?.command);
-  } catch {
-    return [];
-  }
-}
 ```
 
-### Agent Configuration File
-
-**Example:** `~/.kiro/agents/code-reviewer.json`
-
-```json
-{
-  "name": "code-reviewer",
-  "description": "Code review agent",
-  "model": "claude-opus-4.6",
-  "tools": ["read_file", "grep", "@AcpUI/*"],
-  "allowedTools": ["read_file", "@AcpUI/*"],
-  "hooks": {
-    "agentSpawn": [
-      { "command": "echo 'Agent starting'" }
-    ],
-    "preToolUse": {
-      "matcher": "read_file",
-      "command": "echo 'Reading file'"
-    },
-    "postToolUse": [
-      { "command": "echo 'Tool complete'" }
-    ]
-  }
-}
-```
-
-**Hook types are camelCase** in Kiro's configuration.
-
----
-
-## Extension Methods (_kiro.dev/ prefix)
-
-Kiro emits custom protocol events with the `_kiro.dev/` prefix. The provider's `parseExtension()` routes these:
-
-**File:** `providers/kiro/index.js` (Lines 163–190)
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 163-190)
-export function parseExtension(method, params) {
-  const { config } = getProvider();
-  if (!method.startsWith(config.protocolPrefix)) return null;  // LINE 165: Must start with "_kiro.dev/"
-
-  const type = method.slice(config.protocolPrefix.length);
-
-  switch (type) {
-    case 'commands/available':  // LINE 170: Slash commands
-      return { type: 'commands', commands: params.commands };
-    
-    case 'metadata':  // LINE 172: Context usage
-      return { type: 'metadata', sessionId: params.sessionId, contextUsagePercentage: params.contextUsagePercentage };
-    
-    case 'compaction/status':  // LINE 174: Session compaction
-      return { type: 'compaction', sessionId: params.sessionId, status: params.status, summary: params.summary };
-    
-    case 'agent/switched':  // LINE 176: Agent switched (Kiro-specific)
-      return {
-        type: 'agent_switched',
-        sessionId: params.sessionId,
-        agentName: params.agentName,
-        previousAgentName: params.previousAgentName,
-        welcomeMessage: params.welcomeMessage,
-        currentModelId: params.currentModelId || params.model || null  // LINE 183: May come from 'model' field
-      };
-    
-    case 'session/update':  // LINE 185: Generic session updates
-      return { type: 'session_update', ...params };
-    
-    default:
-      return { type: 'unknown', method, params };
-  }
-}
-```
-
-**Kiro-unique:** `agent/switched` event fires when agents are switched (enabled by `supportsAgentSwitching: true`).
-
----
-
-## setConfigOption() — Model-Only Support
-
-Kiro only supports setting the model. Other dynamic config options are not advertised:
-
-**File:** `providers/kiro/index.js` (Lines 371–382)
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 371-382)
-export async function setConfigOption(acpClient, sessionId, optionId, value) {
-  if (optionId === 'model') {
-    // LINE 373-376: Only model is supported
-    return acpClient.transport.sendRequest('session/set_model', {
-      sessionId,
-      modelId: value
-    });
-  }
-
-  // Kiro does not advertise dynamic config options, and session/set_mode crashes
-  // current kiro-cli versions. Avoid falling through to generic config methods.
-  return null;  // LINE 381: Return null for unsupported options (don't crash)
-}
-```
-
-**Important:** Return `null` for unsupported options, not undefined. This prevents undefined behavior.
-
----
-
-## buildSessionParams() — No _meta Injection
-
-**File:** `providers/kiro/index.js` (Lines 367–369)
-
-```javascript
-// FILE: providers/kiro/index.js (Lines 367-369)
-export function buildSessionParams(_agent) {
-  return undefined;  // LINE 368: No _meta needed for Kiro
-}
-```
-
-**Purpose:** Kiro doesn't use `_meta` field for session creation. Agent is set post-creation via slash command. Returns `undefined`.
-
----
+`getHooksForAgent` reads `<paths.agents>/<agentName>.json`, normalizes string hook entries to `{ command }`, filters out entries without `command`, and returns the list to `hookRunner.runHooks`. `cliManagedHooks` skips backend execution for hook types Kiro runs itself.
 
 ## Component Reference
 
-### providers/kiro/index.js
+### Provider Module
 
-| Lines | Function | Purpose |
-|-------|----------|---------|
-| 15–36 | intercept() | Map agent switch notifications to currentModelId |
-| 40–43 | toSnakeCase() | Convert PascalCase to snake_case |
-| 49–61 | normalizeUpdate() | Convert PascalCase types and normalize content |
-| 67–85 | extractToolOutput() | Extract from rawOutput.items array |
-| 91–123 | extractFilePath() | Multi-step file path detection |
-| 129–155 | extractDiffFromToolCall() | Extract diffs from content or rawInput |
-| 163–190 | parseExtension() | Route _kiro.dev/ extensions |
-| – | emitCachedContext() | Replay cached `_kiro.dev/metadata` context usage after session load or hot-resume |
-| 197–205 | getSessionPaths() | Return session file paths (flat layout) |
-| 210–245 | cloneSession() | Clone with pruning (simple, no subdir scanning) |
-| 247–252 | deleteSessionFiles() | Delete session files |
-| 254–268 | archiveSessionFiles() | Archive without metadata |
-| 270–286 | restoreSessionFiles() | Restore directly (flat layout) |
-| 289–303 | Path helpers | getSessionDir(), getAttachmentsDir(), getAgentsDir() |
-| 307–330 | KIRO_HOOK_MAP + getHooksForAgent() | Hook lookup from agent JSON |
-| 332–339 | performHandshake() | Send initialize request |
-| 345–365 | setInitialAgent() | Switch agent via /agent prompt |
-| 367–369 | buildSessionParams() | Return undefined |
-| 488–495 | onPromptStarted() / onPromptCompleted() | Required prompt lifecycle hook exports (intentional no-op for Kiro) |
-| 371–382 | setConfigOption() | Set model only |
-| 389–431 | normalizeTool() | Strip MCP prefix, resolve generic IDs, format title |
-| 436–450 | categorizeToolCall() | Tool categorization |
-| 546–575 | extractToolInvocation() | V2 canonical tool identity extraction |
-| 455–566 | parseSessionHistory() | JSONL to Unified Timeline |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Provider | `providers/kiro/index.js` | `prepareAcpEnvironment`, `expandPath`, `_loadContextState`, `_saveContextState`, `emitCachedContext` | Context cache setup, persistence, and replay |
+| Provider | `providers/kiro/index.js` | `intercept`, `parseExtension`, `normalizeModelState`, `normalizeConfigOptions` | Raw JSON-RPC interception plus contract helpers |
+| Provider | `providers/kiro/index.js` | `normalizeUpdate`, `extractToolOutput`, `extractFilePath`, `extractDiffFromToolCall` | Kiro update shape, output, path, and diff normalization |
+| Provider | `providers/kiro/index.js` | `normalizeTool`, `extractToolInvocation`, `categorizeToolCall` | Tool display, canonical identity, and category flags |
+| Provider | `providers/kiro/index.js` | `performHandshake`, `setInitialAgent`, `setConfigOption`, `buildSessionParams`, `getMcpServerMeta` | ACP initialization, agent switching, model setting, and session params |
+| Provider | `providers/kiro/index.js` | `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, `parseSessionHistory` | Kiro file lifecycle and JSONL reconstruction |
+| Provider | `providers/kiro/index.js` | `getSessionDir`, `getAttachmentsDir`, `getAgentsDir`, `getHooksForAgent`, `KIRO_HOOK_MAP` | Provider path helpers and hook mapping |
 
-### Configuration Files
+### Backend Integration
 
-| File | Purpose |
-|------|---------|
-| `providers/kiro/provider.json` | Provider identity, tool patterns, categories |
-| `providers/kiro/branding.json` | UI text and labels |
-| `providers/kiro/user.json` | Local overrides (optional) |
-| `providers/kiro/README.md` | Install and agent config guide |
-| `providers/kiro/ACP_PROTOCOL_SAMPLES.md` | Full captured protocol examples |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Registry | `backend/services/providerRegistry.js` | `buildRegistry`, `getProviderEntries`, `resolveProviderId` | Active provider registry and ID resolution |
+| Loader | `backend/services/providerLoader.js` | `getProvider`, `getProviderModule`, `bindProviderModule`, `runWithProvider`, `DEFAULT_MODULE` | Provider config merge and contract binding |
+| Runtime | `backend/services/providerRuntimeManager.js` | `init`, `getRuntime`, `getClient` | Per-provider ACP client lifecycle |
+| ACP Client | `backend/services/acpClient.js` | `start`, `buildAcpSpawnCommand`, `performHandshake`, `handleAcpMessage`, `handleProviderExtension`, `handleModelStateUpdate` | Spawn, route, extension, and model handling |
+| Updates | `backend/services/acpUpdateHandler.js` | `handleUpdate` | Unified Timeline emission and tool pipeline |
+| Sessions | `backend/sockets/sessionHandlers.js` | Socket events `create_session`, `set_session_model`, `set_session_option`, `get_session_history`, `rehydrate_session`, `fork_session`, `export_session`; Helper `captureModelState` | Session creation/load/config/history flows |
+| Session Manager | `backend/services/sessionManager.js` | `getMcpServers`, `loadSessionIntoMemory`, `setSessionModel`, `setProviderConfigOption`, `reapplySavedConfigOptions`, `autoLoadPinnedSessions` | MCP injection, hot-load, and session state reapply |
+| JSONL | `backend/services/jsonlParser.js` | `parseJsonlSession` | Provider-owned history parser dispatch |
+| Hooks | `backend/services/hookRunner.js` | `runHooks` | Backend-managed hook execution and `cliManagedHooks` skip |
+| Sub-agents | `backend/mcp/subAgentInvocationManager.js` | `runInvocation`, `trackSubAgentParent`, `cancelAllForParent` | Kiro sub-agent creation, default agent selection, and cancellation |
+| MCP Proxy | `backend/mcp/mcpProxyRegistry.js` | `createMcpProxyBinding`, `bindMcpProxy`, `getMcpProxyIdFromServers` | Session-scoped MCP proxy binding |
+| Tool Resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Canonical invocation merge and event enrichment |
+| Tool Patterns | `backend/services/tools/toolIdPattern.js` | `toolIdPatternToRegex`, `matchToolIdPattern`, `replaceToolIdPattern` | Provider-configurable MCP tool ID parsing |
+| Tool Normalization | `backend/services/tools/providerToolNormalization.js` | `inputFromToolUpdate`, `resolvePatternToolName`, `prettyToolTitle` | Shared provider-side tool input/name helpers |
+| Tool Titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `basenameForToolPath` | AcpUI MCP tool display titles |
+| Tool Registry | `backend/services/tools/index.js` | `toolRegistry`, `toolCallState`, `mcpExecutionRegistry` | Registered AcpUI handlers and sticky tool state |
 
----
+### Frontend Integration
 
-## Gotchas & Important Notes
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket | `frontend/src/hooks/useSocket.ts` | Socket event `provider_extension`, Socket event `session_model_options` | Routes provider extensions and model catalogs into stores |
+| Extension Router | `frontend/src/utils/extensionRouter.ts` | `routeExtension`, Type `ExtensionResult` | Parses `_kiro.dev/` suffixes for commands, metadata, config options, compaction, and provider status |
+| System Store | `frontend/src/store/useSystemStore.ts` | `setContextUsage`, `setSlashCommands`, `setProviderStatus`, `setCompacting`, `getBranding` | Stores provider-scoped extension state |
 
-### 1. toolIdPattern uses single @ symbol
-Kiro's pattern is `@AcpUI/toolName` (one @ symbol). The MCP prefix detection must match this specific format.
+### Provider Config and Docs
 
-**Avoid:** Incorrect regex patterns for MCP prefix detection.
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Provider Config | `providers/kiro/provider.json` | `protocolPrefix`, `mcpName`, `defaultSystemAgentName`, `supportsAgentSwitching`, `cliManagedHooks`, `toolIdPattern`, `toolCategories`, `clientInfo` | Kiro protocol and tool identity contract |
+| Branding | `providers/kiro/branding.json` | Branding keys listed in Configuration/Data Flow | UI-facing Kiro labels and limits |
+| Local Config | `providers/kiro/user.json` | `command`, `args`, `defaultSubAgentName`, `paths`, `models` | Machine/runtime settings consumed by `getProvider` |
+| Local Config Template | `providers/kiro/user.json.example` | `command`, `args`, `defaultSubAgentName`, `paths`, `models` | Placeholder shape for Kiro user config |
+| Protocol Reference | `providers/kiro/ACP_PROTOCOL_SAMPLES.md` | Sections `initialize`, `session/new`, `session/prompt - Agent Switch`, `session/set_model`, `session/load`, `Extension Notifications`, `Unsupported Methods` | Kiro wire-format reference |
+| Operational Notes | `providers/kiro/README.md` | Sections `Configuring Agents and Tool Permissions`, `Extension Protocol`, `Dynamic Models`, `Session Files`, `Agent Switching`, `Hooks` | Kiro-specific operator-facing notes |
+| MCP Config | `configuration/mcp.json.example` | `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch` | Controls AcpUI MCP tool advertisement |
 
-### 2. JSONL format uses kind-based structure
-Kiro entries use `kind: 'Prompt'`, `'AssistantMessage'`, `'ToolResults'`. Text is stored in `block.data`, not `block.text`.
+## Gotchas
 
-**Avoid:** Assuming JSONL structure is consistent across all providers.
+1. **Provider directory does not start the runtime**
 
-### 3. Session layout is flat
-All sessions sit directly in `~/.kiro/sessions/cli/`. No subdirectory scanning is needed.
+   Kiro must be present and enabled in the active provider registry. If `providerRuntimeManager.getRuntime('Kiro')` fails, check `configuration/providers.json` or `ACP_PROVIDERS_CONFIG` before debugging `providers/kiro/index.js`.
 
-**Avoid:** Implementing complex directory scanning for session discovery.
+2. **`parseExtension` is not the live frontend parser**
 
-### 4. setInitialAgent() actively switches agents
-Kiro sends `/agent {name}` as a prompt to switch agents post-creation. The stream must be paused/resumed to avoid race conditions.
+   Backend live routing emits raw `provider_extension` events from `AcpClient.handleProviderExtension`; frontend parsing happens in `frontend/src/utils/extensionRouter.ts` `routeExtension`. Keep Kiro `parseExtension` accurate for the provider contract and provider-local tests, but update `routeExtension` for UI behavior.
 
-**Avoid:** Treating this as a no-op or missing the async stream handling.
+3. **Agent hook JSON keys use Kiro native names**
 
-### 5. buildSessionParams() returns undefined
-Kiro doesn't use `_meta` field injection. Returns `undefined` explicitly.
+   `getHooksForAgent` maps AcpUI hook types to `agentSpawn`, `preToolUse`, `postToolUse`, and `stop`. Agent JSON files under `paths.agents` must use those mapped keys for the source code path in `KIRO_HOOK_MAP`.
 
-**Avoid:** Assuming all providers return structured session parameters.
+4. **`setInitialAgent` must drain output**
 
-### 6. normalizeUpdate() is critical
-Kiro's PascalCase types won't match the ACP standard without conversion. If you skip normalization, tool updates won't route correctly.
+   `/agent <agentName>` produces normal `session/update` traffic. Without `beginDraining` and `waitForDrainToFinish`, the agent-switch confirmation can appear in the chat timeline.
 
-**Avoid:** Skipping normalizeUpdate() or calling it after other processing.
+5. **`buildSessionParams` returning `undefined` is expected**
 
-### 7. normalizeUpdate() also wraps string content
-String content is wrapped in `{ text }` format. The original is preserved in `_originalContent`. Don't assume content is always an object.
+   Kiro does agent switching after `session/new`/`session/load` through `setInitialAgent`. Do not add request params unless Kiro's ACP session creation contract requires them and tests cover the spread behavior.
 
-**Avoid:** Assuming content structure is consistent; check for string vs object.
+6. **Tool matching is provider-pattern driven**
 
-### 8. intercept() is needed for agent/switched events
-Agent switch notifications include the new model, but in the `model` field. intercept() maps it to `currentModelId` so the backend can persist it.
+   Kiro MCP tool IDs are parsed through `provider.json.toolIdPattern`. Hardcoded `@AcpUI/` parsing belongs in neither generic backend code nor tests; provider code should call `matchToolIdPattern`, `replaceToolIdPattern`, or `resolvePatternToolName`.
 
-**Avoid:** Assuming model changes are only from setConfigOption().
+7. **Context replay is one-shot per process session ID**
 
-### 9. extractToolOutput() uses rawOutput.items array
-Kiro stores output in `rawOutput.items[{ Text?, Json? }]` format with Text and Json fields.
+   `_emitCachedContext` tracks `_sessionsWithInitialEmit`. Repeated `emitCachedContext(sessionId)` calls return `false` after the first attempt for that process, even when a cached value exists.
 
-**Avoid:** Assuming tool output follows a standard `content[]` array structure.
+8. **Unsupported config options return `null`**
 
-### 10. Hooks are per-agent in JSON files
-Each agent has its own hook config in `~/.kiro/agents/{agentName}.json`.
+   Kiro `setConfigOption` intentionally stops non-model options. This prevents backend fallback to generic `session/configure` or mode-setting behavior.
 
-**Avoid:** Assuming hooks are stored in a global configuration file.
+9. **Kiro tool output uses `rawOutput.items`**
 
-### 11. Hook names are camelCase
-Kiro uses `agentSpawn`, `preToolUse`, `postToolUse`, `stop` in agent configurations.
+   `extractToolOutput` reads `item.Text` and `item.Json`. Standard ACP `content[]` fallback is handled in `acpUpdateHandler`, so provider code should not duplicate that generic fallback.
 
-**Avoid:** Hardcoding hook names from one provider; use the hook map.
+10. **Archive task directories use a fixed archive child name**
 
-### 12. No prepareAcpEnvironment() customization needed
-Kiro doesn't customize the environment. prepareAcpEnvironment() returns env unchanged.
-
-**Avoid:** Assuming all providers need environment setup or modification.
-
-### 13. setConfigOption() returns null for unsupported options
-If an option is not 'model', return `null` (not undefined). This prevents fallthrough to generic methods that would crash.
-
-**Avoid:** Returning undefined or throwing for unsupported options.
-
-### 14. No restore metadata needed for flat layout
-Since sessions are not scoped to projects, archiveSessionFiles() and restoreSessionFiles() don't need metadata.
-
-**Avoid:** Assuming all providers require metadata for session restoration.
-
-### 15. normalizeUpdate() should run before tools extract data
-If update.sessionUpdate is not set, tools won't match in the timeline. Ensure normalizeUpdate() runs early in the pipeline.
-
-**Avoid:** Processing tool updates before normalizeUpdate() is called.
-
----
-
-## Existing References
-
-- **`providers/kiro/ACP_PROTOCOL_SAMPLES.md`** — Full captured protocol with real request/response JSON examples. Load this when debugging protocol issues.
-- **`providers/kiro/README.md`** — Agent configuration guide and tool permission system documentation.
-
----
+    `archiveSessionFiles` copies Kiro task files to `<archiveDir>/tasks`; `restoreSessionFiles` restores that directory to `<paths.sessions>/<savedAcpId>`. Archive consumers must preserve that shape.
 
 ## Unit Tests
 
-Test files: `providers/kiro/test/index.test.js`
+### Provider Tests
 
-Run tests:
-```bash
-npm test -- providers/kiro
-```
+- `providers/kiro/test/index.test.js`
+  - `sends initialize with clientInfo from provider config`
+  - `does not send authenticate`
+  - `returns the provided environment unchanged`
+  - `emits persisted context for a loaded session on request`
+  - `exports onPromptStarted and onPromptCompleted as no-op hooks`
+  - `normalizes agent switch model into currentModelId`
+  - `routes model through session/set_model`
+  - `does not call unsupported config or mode methods`
+  - `normalizes PascalCase type to snake_case sessionUpdate`
+  - `normalizes string content to { text } object`
+  - `explicitly passes config options through unchanged`
+  - `extracts text from rawOutput items`
+  - `extracts json content from rawOutput items`
+  - `ignores success messages`
+  - `getSessionPaths returns correct paths`
+  - `deleteSessionFiles unlinks files`
+  - `archiveSessionFiles copies and unlinks`
+  - `restoreSessionFiles copies back`
+  - `strips primary MCP server prefix from tool name`
+  - `normalizes optional AcpUI MCP tool titles without server prefixes`
+  - `extracts canonical MCP invocation metadata from Kiro names`
+  - `parses agent switch notifications with current model state`
+  - `maps post_tool to postToolUse key`
+  - `sends /agent command via session/prompt with drain lifecycle`
+  - `returns undefined when agent is provided`
 
----
+### Backend Integration Tests
+
+- `backend/test/providerContract.test.js`
+  - `every provider explicitly exports every contract function`
+- `backend/test/providerLoader.test.js`
+  - `loads provider from registry`
+  - `DEFAULT_MODULE functions all have correct default behaviors`
+- `backend/test/sessionManager.test.js`
+  - `should return server config if mcpName exists`
+  - `should attach _meta when getMcpServerMeta returns a value`
+  - `should perform full hot-load lifecycle`
+- `backend/test/sessionHandlers.test.js`
+  - `handles create_session`
+  - `uses provider model-state normalization when creating a session`
+  - `calls buildSessionParams with agent and spreads result into session/new`
+  - `spreads no extra keys into session/new when buildSessionParams returns undefined`
+  - `calls buildSessionParams with agent and spreads result into session/load`
+  - `handles create_session skipping load for hot sessions`
+  - `handles create_session performing load for cold sessions with dbSession`
+  - `set_session_option routes through provider contract setConfigOption`
+- `backend/test/toolInvocationResolver.test.js`
+  - `uses provider extraction as canonical tool identity`
+  - `reuses cached identity and title for incomplete updates`
+  - `marks registered AcpUI UX tool names without relying on a ux prefix`
+  - `prefers centrally recorded MCP execution details over provider generic titles`
+  - `can claim a recent MCP execution when the provider tool id arrives later`
+- `backend/test/providerToolNormalization.test.js`
+  - `builds input from standard update fields and optional deep values`
+  - `resolves AcpUI tool names from nested candidates and human MCP titles`
+- `backend/test/toolIdPattern.test.js`
+  - Pattern parsing and replacement for provider-defined MCP tool IDs.
+- `backend/test/hookRunner.test.js`
+  - `skips hooks listed in cliManagedHooks`
+  - `passes agentName and hookType to getHooksForAgent`
+- `backend/test/subAgentInvocationManager.test.js`
+  - `runs invocation successfully`
+  - `cancelAllForParent cascades through nested sub-agent invocations`
+- `backend/test/mcpServer.test.js`
+  - `passes defaultSubAgentName into session/new when request omits agent`
+  - `binds the MCP proxy id to the sub-agent ACP session after session/new`
+  - `uses models.subAgent when no explicit model arg is provided`
+
+### Frontend Tests
+
+- `frontend/src/test/extensionRouter.test.ts`
+  - `routes commands/available with system + custom commands merged`
+  - `routes metadata with sessionId and percentage`
+  - `routes config_options with various modes`
+  - `routes compaction_started`
+  - `routes compaction_completed with summary`
+- `frontend/src/test/useSocket.test.ts`
+  - `handles "metadata" extension`
+  - `handles "config_options" extension`
+  - `session_model_options updates session model state`
 
 ## How to Use This Guide
 
-### For Implementing or Extending Kiro Features
+### For implementing/extending Kiro provider behavior
 
-1. **Start here:** Read the "Overview" section to understand Kiro's key differences (agent switching, flat layout, PascalCase normalization).
-2. **Understand the flow:** Read the relevant section (e.g., "Tool Pipeline", "Session Files", "Hooks").
-3. **Find the code:** Use exact line numbers to navigate to `index.js`.
-4. **Check gotchas:** Review the gotchas section for edge cases specific to Kiro.
-5. **Reference protocol:** For protocol details, see `ACP_PROTOCOL_SAMPLES.md`.
+1. Start with `providers/kiro/provider.json` and confirm `protocolPrefix`, `mcpName`, `toolIdPattern`, and `toolCategories` match the daemon output you are handling.
+2. Update provider-owned logic in `providers/kiro/index.js`; keep generic backend code provider-agnostic.
+3. For tool behavior, update `normalizeTool`, `extractToolInvocation`, and provider-local tests before touching `toolInvocationResolver` or `toolRegistry`.
+4. For model/agent behavior, trace `backend/sockets/sessionHandlers.js` `create_session` through `captureModelState`, `setInitialAgent`, and `setSessionModel`.
+5. For context usage, trace `_kiro.dev/metadata` through `intercept`, `_saveContextState`, `handleProviderExtension`, `routeExtension`, and `setContextUsage`.
+6. For session lifecycle behavior, update Kiro file functions and run provider tests that cover `getSessionPaths`, archive/restore/delete, and fork/load integration.
 
-### For Debugging Issues with Kiro
+### For debugging Kiro issues
 
-1. **Identify the problem:** Is it about agents, tools, sessions, hooks, or normalization?
-2. **Locate the function:** Use the Component Reference table to find the relevant function.
-3. **Trace the code:** Jump to exact lines and follow the execution.
-4. **Check data formats:** Verify JSONL format, hook config structure, and tool naming.
-5. **Check for normalization:** Verify normalizeUpdate() has run for PascalCase fields.
-
-### For Adding a New Feature
-
-1. **Understand the contract:** Read the Provider System doc first.
-2. **See how Kiro does it:** Load the relevant section in this doc.
-3. **Follow the pattern:** Replicate the structure for your new feature.
-4. **Test format differences:** Always test with Kiro's unique formats (flat sessions, rawOutput.items, etc.).
-5. **Update hooks:** If affecting agents, ensure hook handling is provider-aware.
-
----
+1. **Daemon does not start:** check active provider registry, `providers/kiro/user.json` `command`/`args`, and `AcpClient.start` spawn logs.
+2. **Wrong tool title or handler:** inspect `toolIdPattern`, `normalizeTool`, `extractToolInvocation`, `toolInvocationResolver`, and `mcpExecutionRegistry` state.
+3. **Context percentage missing after reload:** inspect `prepareAcpEnvironment`, `_contextStateFile`, `intercept` metadata handling, and `emitCachedContext` calls from `sessionHandlers` or `sessionManager`.
+4. **Agent selection appears in chat:** inspect `setInitialAgent`, `StreamController.beginDraining`, and `waitForDrainToFinish` timing.
+5. **Slash commands or compaction status missing:** inspect `handleProviderExtension`, provider branding `protocolPrefix`, frontend `routeExtension`, and `useSystemStore` actions.
+6. **JSONL rehydration mismatch:** inspect `getSessionPaths`, `parseJsonlSession`, and `parseSessionHistory` assumptions for Kiro `Prompt`, `AssistantMessage`, and `ToolResults` entries.
 
 ## Summary
 
-Kiro is AcpUI's **agent-switching provider** with distinctive implementation patterns:
-
-- **Agent switching is post-creation** — Active via `/agent` slash command with stream management
-- **Flat session layout** — All sessions in a single directory with simple path construction
-- **PascalCase type normalization** — Update types converted to snake_case on entry
-- **Single @ MCP prefix** — Tool ID format `@AcpUI/toolName`
-- **kind-based JSONL format** — Entries marked by `kind: 'Prompt'`, `'AssistantMessage'`, `'ToolResults'`
-- **Per-agent hook configuration** — Each agent has its own JSON hook file
-- **Hook map translation** — camelCase hook types mapped to provider implementation
-- **Simple model-only config** — setConfigOption() only handles model changes
-
-The critical contract: **Kiro demonstrates post-creation agent switching and flat session management. These patterns differ from other provider implementations.**
-
-**When working on Kiro provider code, always load this doc alongside `[Feature Doc] - Provider System.md`.**
+- Kiro is a backend provider adapter for `kiro-cli acp` with provider-specific normalization, file lifecycle, hooks, and extension behavior.
+- Kiro config is split across `provider.json`, `branding.json`, `user.json`, and the active provider registry.
+- Kiro update normalization converts PascalCase `type` and string `content` into AcpUI's expected update shape.
+- Kiro context usage flows from `_kiro.dev/metadata` into a persisted cache, then into frontend `contextUsageBySession` through `provider_extension`.
+- Kiro tool routing depends on `@{mcpName}/{toolName}`, `extractToolInvocation`, `toolInvocationResolver`, and registered AcpUI tool handlers.
+- Kiro initial agent selection uses `/agent <agentName>` with stream draining.
+- Kiro owns flat session file paths and JSONL reconstruction through provider contract functions.
+- The critical contract is the provider export surface plus stable normalization hooks for updates, extensions, tools, agent switching, model setting, hooks, and session files.

@@ -1,811 +1,502 @@
-# Feature Doc — Session Settings Modal
+# Feature Doc - Session Settings Modal
+
+The Session Settings Modal is the per-session control surface for system identifiers, context usage, model selection, provider config options, JSONL rehydration, export, and permanent deletion. It matters because the modal crosses frontend state, Socket.IO events, SQLite persistence, ACP provider hooks, and provider-specific session files.
 
 ## Overview
 
-The Session Settings Modal is a per-session configuration hub that allows users to view session metadata, change models, adjust provider-specific options, rehydrate session history from JSONL, export sessions, and delete sessions. It's a 5-tab interface accessed from the sidebar and chat header.
+**What It Does**
 
-**Why This Matters:** The modal is a critical interface for session management, but more importantly, it demonstrates a **full rehydration pipeline** (JSONL parsing + DB replacement) that's useful for understanding session persistence and recovery. Model changes show **optimistic UI patterns** with callback reconciliation. Provider settings show **dynamic form generation** from backend config.
+- Opens for one UI session through `useUIStore.setSettingsOpen()` and renders the session selected by `settingsSessionId`.
+- Shows system discovery fields, including `ChatSession.acpSessionId`, the provider-specific `branding.sessionLabel`, and the UI session id.
+- Displays context usage from `useSystemStore.contextUsageBySession[acpSessionId]` through `ContextUsageCard`.
+- Renders model choices from `getFullModelChoices(session, branding.models)` and applies model updates through `handleSessionModelChange()`.
+- Renders provider config options from `ChatSession.configOptions` and applies option updates through `handleSetSessionOption()`.
+- Rehydrates messages from provider JSONL, exports session assets to a user-specified directory, and permanently deletes sessions after confirmation.
 
-## What It Does
+**Why This Matters**
 
-- **System Discovery Tab** — Displays ACP session ID and UI session ID (read-only debugging info)
-- **Context Usage Display** — Real-time percentage bar showing token consumption vs context window limit
-- **Model Selection Tab** — Provider-aware dropdown to switch models; changes apply to session immediately with DB persistence
-- **Provider Settings Tab** — Dynamic form generation for provider-specific options (mode, effort, temperature, etc.)
-- **Rehydration Tab** — Rebuilds session history from raw JSONL files (destructive operation, replaces DB messages)
-- **Export Tab** — Exports entire session (messages, JSONL, attachments) to a user-specified folder
-- **Delete Tab** — Permanently deletes session with two-step confirmation
+- The modal is provider-agnostic, so labels, model choices, and config controls must come from backend/provider data.
+- Model and provider-option updates are optimistic in the frontend and reconciled through backend callbacks or provider extension events.
+- Rehydration replaces `session.messages` in SQLite with provider-parsed JSONL output.
+- Export and delete touch the database, provider session files, and attachment storage.
+- Context usage can arrive through provider extension metadata or from persisted session stats.
 
-## Why This Matters
+This feature spans the frontend modal, Zustand stores, Socket.IO session handlers, session manager helpers, provider hooks, SQLite tables, and focused frontend/backend tests.
 
-- **Powerful recovery** — Rehydration allows recovery from DB corruption or out-of-sync state
-- **Provider flexibility** — Dynamic config options accommodate any ACP provider without code changes
-- **User control** — Full lifecycle management (change model, customize, export, delete) in one place
-- **State integrity** — Model changes demonstrate optimistic patterns that prevent UI lag while ensuring DB consistency
-- **Debugging** — System Discovery tab exposes session IDs for troubleshooting
+## How It Works - End-to-End Flow
 
----
+1. **The modal is mounted once with the app shell**
 
-## How It Works — End-to-End Flows
+   File: `frontend/src/App.tsx` (Component: `App`, Component usage: `SessionSettingsModal`)
 
-### Path A: Opening the Modal
+   `App` renders `<SessionSettingsModal />` next to the other global modals. The modal decides whether to show content by reading `useUIStore`.
 
-**Step 1: User Clicks Settings Button**
-- File: `frontend/src/components/Sidebar.tsx` (Lines 271-422)
-- Multiple trigger points in the sidebar (provider header, session item, context menu) call `setSettingsOpen(true, sessionId)`.
-- File: `frontend/src/components/ChatInput/ChatInput.tsx` (Line 366)
-  - Chat header settings button: `onOpenSettings={() => activeSession && setSettingsOpen(true, activeSession.id, 'config')}`
+2. **A caller opens the modal for a specific session**
 
-**Step 2: Update UIStore**
-- File: `frontend/src/store/useUIStore.ts` (Function: `setSettingsOpen`, Lines 77-81)
-- `setSettingsOpen(isOpen, sessionId, initialTab)` updates the global modal state.
+   Files:
+   - `frontend/src/components/Sidebar.tsx` (Callbacks: `onSettings`, `onSettingsSession`)
+   - `frontend/src/components/ChatInput/ChatInput.tsx` (Prop: `onOpenSettings` passed to `ModelSelector`)
+   - `frontend/src/components/ChatInput/ModelSelector.tsx` (Prop: `onOpenSettings`, Title: `Open chat config`)
+   - `frontend/src/store/useUIStore.ts` (Action: `setSettingsOpen`)
 
-```typescript
-// Lines 77-81 in useUIStore.ts
-setSettingsOpen: (isOpen, sessionId = null, initialTab = 'session') => set({
-  isSettingsOpen: isOpen, 
-  settingsSessionId: isOpen ? sessionId : null,
-  settingsInitialTab: isOpen ? initialTab : 'session',
-})
-```
+   Sidebar session controls open the modal with the default `session` tab. The chat input model settings button opens it with the `config` tab.
 
-**Step 3: Render Modal Component**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Function: `SessionSettingsModal`, Lines 29-96)
-- Component reads `isSettingsOpen` and `settingsSessionId` from `useUIStore` and renders the 5-tab interface.
+   ```typescript
+   // FILE: frontend/src/store/useUIStore.ts (Action: setSettingsOpen)
+   setSettingsOpen: (isOpen, sessionId = null, initialTab = 'session') => set({
+     isSettingsOpen: isOpen,
+     settingsSessionId: isOpen ? sessionId : null,
+     settingsInitialTab: isOpen ? initialTab : 'session',
+   })
+   ```
 
----
+3. **`SessionSettingsModal` resolves the session and resets local modal state**
 
-### Path B: Rehydration Flow (The Deep Focus)
+   File: `frontend/src/components/SessionSettingsModal.tsx` (Component: `SessionSettingsModal`, Hook: `useEffect`, State: `activeTab`, `rehydrateStatus`, `exportStatus`)
 
-**Step 1: User Clicks "Rebuild from JSONL" Button**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Line 259)
-- Condition: Button only enabled if `session.acpSessionId` exists.
+   The component reads `isSettingsOpen`, `settingsSessionId`, and `settingsInitialTab` from `useUIStore`, then finds the session in `useSessionLifecycleStore.sessions`. If no session matches, the component returns `null`. When the modal opens, it resets delete confirmation, tab, and rehydration message state.
 
-**Step 2: Frontend Emits Rehydrate Event**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Function: `handleRehydrate`, Lines 49-71)
-- State updates to `loading`, and the `rehydrate_session` socket event is emitted.
+   ```typescript
+   // FILE: frontend/src/components/SessionSettingsModal.tsx (Component: SessionSettingsModal)
+   const session = sessions.find(s => s.id === settingsSessionId);
+   if (!session) return null;
+   ```
 
-```javascript
-// Lines 49-71 in SessionSettingsModal.tsx
-const handleRehydrate = () => {
-  if (!session?.acpSessionId || !socket) return;
-  setRehydrateStatus('loading');
-  socket.emit('rehydrate_session', { uiId: session.id }, (res) => { ... });
-};
-```
-    if (res.success) {
-      setRehydrateStatus('done');
-      setRehydrateMsg(`Rebuilt ${res.messageCount} messages from JSONL`);
-      // Then fetch fresh messages
-      socket.emit('get_session_history', { uiId: session.id }, (histRes) => {
-        if (histRes?.session) {
-          useSessionLifecycleStore.setState(state => ({
-            sessions: state.sessions.map(s => s.id === session.id
-              ? { ...s, messages: histRes.session!.messages }
-              : s)
-          }));
-        }
-      });
-    } else {
-      setRehydrateStatus('error');
-      setRehydrateMsg(res.error || 'Failed to rehydrate');
-    }
-  });
-};
-```
+4. **The Info tab renders identifiers and context usage**
 
-**Step 3: Backend Looks Up Session**
-- File: `backend/sockets/sessionHandlers.js` (Lines 126–143)
-- Handler receives `{ uiId }` from frontend
-- Queries database: `const session = await db.getSession(uiId);`
-- Validates that `session.acpSessionId` exists (needed to find JSONL file)
-```javascript
-// Lines 126-130 in sessionHandlers.js
-socket.on('rehydrate_session', async ({ uiId }, callback) => {
-  try {
-    const session = await db.getSession(uiId);
-    if (!session?.acpSessionId) {
-      return callback?.({ error: 'No ACP session ID — nothing to rehydrate from' });
-    }
-```
+   Files:
+   - `frontend/src/components/SessionSettingsModal.tsx` (Component: `ContextUsageCard`, Tab: `session`)
+   - `frontend/src/store/useSystemStore.ts` (State: `contextUsageBySession`, Action: `setContextUsage`)
+   - `frontend/src/hooks/useSocket.ts` (Socket event: `provider_extension`, Routed type: `metadata`)
+   - `frontend/src/store/useSessionLifecycleStore.ts` (Helpers: `maybeHydrateContextUsage`, `fetchStats`)
 
-**Step 4: Parse JSONL Session File**
-- File: `backend/services/jsonlParser.js` (Lines 10–28)
-- Called from handler: `const jsonlMessages = await parseJsonlSession(session.acpSessionId, session.provider);`
-- Gets JSONL file path from provider-specific module: `providerModule.getSessionPaths(acpSessionId)`
-- Checks file exists: `if (!fs.existsSync(filePath)) return null;`
-- **Delegates to provider** for parsing: `await providerModule.parseSessionHistory(filePath, Diff)`
-  - Provider receives Diff library to handle message diffs
-  - Provider reconstructs UI messages from ACP JSONL format
-  - Returns array of normalized messages
-```javascript
-// Lines 10-28 in jsonlParser.js
-export async function parseJsonlSession(acpSessionId, providerId = null) {
-  const providerModule = await getProviderModule(providerId);
-  const paths = providerModule.getSessionPaths(acpSessionId);
-  const filePath = paths.jsonl;
+   `ContextUsageCard` indexes context usage by ACP session id. Provider metadata events reach the card through `useSocket`, `routeExtension()`, and `useSystemStore.setContextUsage()`. Persisted stats can also hydrate context usage during initial load, session selection, and stats fetches.
 
-  if (!fs.existsSync(filePath)) return null;
+   ```typescript
+   // FILE: frontend/src/components/SessionSettingsModal.tsx (Component: ContextUsageCard)
+   const pct = useSystemStore(state => acpSessionId ? state.contextUsageBySession[acpSessionId] : undefined);
+   ```
 
-  if (typeof providerModule.parseSessionHistory === 'function') {
-    try {
-      return await providerModule.parseSessionHistory(filePath, Diff);
-    } catch (err) {
-      writeLog(`[JSONL ERR] Provider failed to parse ${filePath}: ${err.message}`);
-      return null;
-    }
-  }
+5. **The Config tab builds model choices from session/provider state**
 
-  writeLog(`[JSONL ERR] Provider missing parseSessionHistory implementation for ${filePath}`);
-  return null;
-}
-```
+   Files:
+   - `frontend/src/components/SessionSettingsModal.tsx` (Tab: `config`)
+   - `frontend/src/utils/modelOptions.ts` (Functions: `getFullModelChoices`, `getFullModelSelectionValue`, `getCurrentModelId`)
+   - `frontend/src/types.ts` (Interfaces: `ChatSession`, `ProviderModelOption`, `ProviderBranding`)
 
-**Step 5: Validate and Replace Messages**
-- File: `backend/sockets/sessionHandlers.js` (Lines 132–138)
-- Backend checks if parsing succeeded: `if (!jsonlMessages) return error`
-- **Destructively** replaces DB messages: `session.messages = jsonlMessages;`
-- Persists to database: `await db.saveSession(session);`
-- Returns success with message count to frontend
-```javascript
-// Lines 132-138 in sessionHandlers.js
-const jsonlMessages = await parseJsonlSession(session.acpSessionId, session.provider);
-if (!jsonlMessages) {
-  return callback?.({ error: 'JSONL file not found or could not be parsed' });
-}
-session.messages = jsonlMessages;  // DESTRUCTIVE: replaces entire message array
-await db.saveSession(session);
-callback?.({ success: true, messageCount: jsonlMessages.length });
-```
+   The modal asks `useSystemStore.getBranding(session.provider)` for provider labels and model metadata. `getFullModelChoices()` renders `session.modelOptions` first, falls back to branding `models.quickAccess`, then falls back to the session's active model id.
 
-**Step 6: Frontend Receives Success Response**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 53–65)
-- Callback triggered with `{ success: true, messageCount: N }`
-- UI state updates: `setRehydrateStatus('done')`, displays message count
-- **Immediately fetches fresh messages**: Emits `get_session_history` to reload UI
-- Maps fresh messages into Zustand store via `useSessionLifecycleStore.setState()`
-```javascript
-// Lines 53-65 in SessionSettingsModal.tsx
-if (res.success) {
-  setRehydrateStatus('done');
-  setRehydrateMsg(`Rebuilt ${res.messageCount} messages from JSONL`);
-  socket.emit('get_session_history', { uiId: session.id }, (histRes) => {
-    if (histRes?.session) {
-      useSessionLifecycleStore.setState(state => ({
-        sessions: state.sessions.map(s => s.id === session.id
-          ? { ...s, messages: histRes.session!.messages }
-          : s)
-      }));
-    }
-  });
-}
-```
+   ```typescript
+   // FILE: frontend/src/components/SessionSettingsModal.tsx (Tab: config)
+   const brandingModels = branding.models;
+   const modelChoices = getFullModelChoices(session, brandingModels);
+   const selectedModelValue = getFullModelSelectionValue(session, brandingModels);
+   ```
 
-**Step 7: Frontend UI Updates with Fresh Messages**
-- Chat message list re-renders via Zustand update
-- Session in sidebar reflects updated message count
-- Modal shows success message with count of rebuilt messages
+6. **Model changes update the frontend optimistically**
 
-### Path C: Model Change Flow
+   File: `frontend/src/store/useSessionLifecycleStore.ts` (Action: `handleSessionModelChange`, Helper: `applyModelState`)
 
-**Step 1: User Selects Model from Dropdown**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 183–193)
-- Dropdown renders options from `modelChoices` (computed from `getFullModelChoices()`)
-- Change handler: `handleSessionModelChange(socket, session.id, e.target.value)`
+   `handleSessionModelChange(socket, uiId, model)` resolves the model id from the selected value, updates the matching `ChatSession` immediately, then emits `set_session_model`.
 
-**Step 2: Store Applies Optimistic Update**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 345–369)
-- Gets current session and branding
-- Resolves model ID from selection value: `getModelIdForSelection(model, providerModels)`
-- **Immediately updates local state** (optimistic):
-```typescript
-// Lines 350-352 in useSessionLifecycleStore.ts
-set(state => ({
-  sessions: state.sessions.map(s => s.id === uiId ? applyModelState(s, { model, currentModelId }) : s)
-}));
-```
-- UI reflects change instantly (no loading spinner)
+   ```typescript
+   // FILE: frontend/src/store/useSessionLifecycleStore.ts (Action: handleSessionModelChange)
+   set(state => ({
+     sessions: state.sessions.map(s => s.id === uiId ? applyModelState(s, { model, currentModelId }) : s)
+   }));
+   socket.emit('set_session_model', { uiId, model }, callback);
+   ```
 
-**Step 3: Emit Socket Event**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 355–367)
-- Sends to backend: `socket.emit('set_session_model', { uiId, model }, callback)`
-- Backend processes change in background
+7. **The backend applies the ACP model change and persists model state**
 
-**Step 4: Backend Switches Model**
-- File: `backend/sockets/sessionHandlers.js` (Lines 442–466)
-- Gets session and ACP client context
-- Calls `setSessionModel()` to switch ACP session to new model (sends RPC)
-- Updates session DB with new model state (model, currentModelId, modelOptions)
-```javascript
-// Lines 451-455 in sessionHandlers.js
-const selectedModelState = await setSessionModel(acpClient, session.acpSessionId, model, models, knownModelOptions);
-session.model = selectedModelState.model;
-session.currentModelId = selectedModelState.currentModelId;
-session.modelOptions = selectedModelState.modelOptions;
-await db.saveSession(session);
-```
-- Returns callback with updated state
+   Files:
+   - `backend/sockets/sessionHandlers.js` (Socket event: `set_session_model`)
+   - `backend/services/sessionManager.js` (Functions: `getKnownModelOptions`, `setSessionModel`, `updateSessionModelMetadata`)
+   - `backend/services/modelOptions.js` (Function: `resolveModelSelection`)
+   - `backend/database.js` (Functions: `saveSession`, `saveModelState`)
 
-**Step 5: Callback Reconciles State**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 355–367)
-- Callback updates store with backend's authoritative model state
-- If model change succeeded, UI is already correct; if it failed, this reconciliation corrects it
-```typescript
-// Lines 357-366 in useSessionLifecycleStore.ts
-socket.emit('set_session_model', { uiId, model }, (res) => {
-  if (!res || res.error) return;
-  set(state => ({
-    sessions: state.sessions.map(s => s.id === uiId ? {
-      ...applyModelState(s, {
-        model: res.model || model,
-        currentModelId: res.currentModelId ?? currentModelId,
-        modelOptions: res.modelOptions
-      }),
-      configOptions: mergeProviderConfigOptions(s.configOptions, res.configOptions)
-    } : s)
-  }));
-});
-```
+   The backend loads the DB session, resolves the provider runtime, merges known model options from DB, metadata, and provider config, then calls `setSessionModel()`. `setSessionModel()` sends ACP `session/set_model` when it has a model id, normalizes the provider response with `providerModule.normalizeModelState()`, updates in-memory session metadata, and persists model state. The socket callback returns the selected model state and any config options returned by the model switch.
 
-### Path D: Provider Config Option Change
+   ```javascript
+   // FILE: backend/services/sessionManager.js (Function: setSessionModel)
+   const result = await acpClient.transport.sendRequest('session/set_model', {
+     sessionId,
+     modelId: resolved.modelId
+   });
+   ```
 
-**Step 1: User Changes a Provider Option**
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 214–240)
-- Option types: select (lines 214–223), boolean toggle (lines 225–231), number input (lines 233–239)
-- All call: `handleSetSessionOption(socket, session.id, opt.id, newValue)`
+8. **The frontend reconciles the model callback**
 
-**Step 2: Store Updates Optimistically**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 380–394)
-- Finds option in `session.configOptions` and updates its `currentValue`
-- UI updates immediately without waiting for backend
-```typescript
-// Lines 385-389 in useSessionLifecycleStore.ts
-set(state => ({
-  sessions: state.sessions.map(s => {
-    if (s.id !== uiId) return s;
+   File: `frontend/src/store/useSessionLifecycleStore.ts` (Action: `handleSessionModelChange`, Utility: `mergeProviderConfigOptions`)
+
+   On a successful callback, the store reapplies authoritative `model`, `currentModelId`, `modelOptions`, and merged `configOptions`. If the callback is missing or contains an error, the optimistic frontend state remains unchanged.
+
+9. **Provider config controls render from `session.configOptions`**
+
+   Files:
+   - `frontend/src/components/SessionSettingsModal.tsx` (Tab: `config`, Controls: `select`, `boolean`, `number`)
+   - `frontend/src/types.ts` (Interface: `ProviderConfigOption`)
+   - `frontend/src/hooks/useSocket.ts` (Routed type: `config_options`)
+   - `frontend/src/utils/configOptions.ts` (Function: `mergeProviderConfigOptions`)
+
+   The modal maps each provider option to a select, toggle button, or number input. Provider extension events can merge, replace, or remove config options for the matching ACP session id.
+
+10. **Provider config changes are fire-and-forget from the frontend**
+
+    File: `frontend/src/store/useSessionLifecycleStore.ts` (Action: `handleSetSessionOption`)
+
+    The store updates the matching option's `currentValue` immediately and emits `set_session_option` without a callback.
+
+    ```typescript
+    // FILE: frontend/src/store/useSessionLifecycleStore.ts (Action: handleSetSessionOption)
     const opts = s.configOptions?.map(o => o.id === optionId ? { ...o, currentValue: value } : o);
-    return { ...s, configOptions: opts };
-  })
-}));
-```
+    socket.emit('set_session_option', { uiId, optionId, value });
+    ```
 
-**Step 3: Emit Socket Event (No Callback)**
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 392)
-- **Fire-and-forget**: `socket.emit('set_session_option', { uiId, optionId, value });`
-- No callback specified (unlike model change)
+11. **The backend routes provider config changes through the provider contract**
 
-**Step 4: Backend Applies Option**
-- File: `backend/sockets/sessionHandlers.js` (Lines 424–440)
-- Calls provider-specific handler: `setProviderConfigOption()`
-- Normalizes config options returned by the provider, then updates runtime metadata and DB
-- Does not emit response (no need to reconcile UI)
+    Files:
+    - `backend/sockets/sessionHandlers.js` (Socket event: `set_session_option`)
+    - `backend/services/sessionManager.js` (Functions: `setProviderConfigOption`, `getConfigOptionsFromSetResult`, `normalizeProviderConfigOptions`)
+    - `backend/services/configOptions.js` (Function: `mergeConfigOptions`)
+    - `backend/database.js` (Function: `saveConfigOptions`)
 
----
+    The handler finds the UI session through `db.getAllSessions()`, requires an ACP session id, calls `providerModule.setConfigOption()`, normalizes returned config options, merges them into `acpClient.sessionMetadata`, and persists them by ACP session id. A provider result of `null` stops persistence.
+
+12. **Rehydration replaces DB messages with provider-parsed JSONL**
+
+    Files:
+    - `frontend/src/components/SessionSettingsModal.tsx` (Handler: `handleRehydrate`)
+    - `backend/sockets/sessionHandlers.js` (Socket events: `rehydrate_session`, `get_session_history`)
+    - `backend/services/jsonlParser.js` (Function: `parseJsonlSession`)
+    - Provider modules (Functions: `getSessionPaths`, `parseSessionHistory`)
+    - `backend/database.js` (Functions: `getSession`, `saveSession`)
+
+    The button is disabled without `session.acpSessionId`. The modal emits `rehydrate_session`, and the backend calls `parseJsonlSession(acpSessionId, provider)`. `parseJsonlSession()` obtains the JSONL path from the provider and delegates parsing to `providerModule.parseSessionHistory(filePath, Diff)`. On success, `session.messages` is replaced and saved. The frontend then emits `get_session_history` and copies the returned `messages` array into the store.
+
+13. **Export writes a session folder under the selected path**
+
+    Files:
+    - `frontend/src/components/SessionSettingsModal.tsx` (Tab: `export`, State: `exportPath`, `exportStatus`)
+    - `backend/sockets/sessionHandlers.js` (Socket event: `export_session`)
+    - `backend/services/attachmentVault.js` (Function: `getAttachmentsRoot`)
+    - Provider modules (Function: `getSessionPaths`)
+
+    The export button is disabled until `exportPath.trim()` has content. The backend resolves a folder named after a sanitized `session.name`, writes `session.json`, copies the provider JSONL file when present, and copies attachment files from `getAttachmentsRoot(providerId)/uiId` into an `attachments` subfolder.
+
+14. **Delete permanently removes the session and fork descendants**
+
+    Files:
+    - `frontend/src/components/SessionSettingsModal.tsx` (Handler: `handleDelete`, State: `showConfirmDelete`)
+    - `frontend/src/store/useSessionLifecycleStore.ts` (Action: `handleDeleteSession`)
+    - `backend/sockets/sessionHandlers.js` (Socket event: `delete_session`)
+    - `backend/mcp/acpCleanup.js` (Function: `cleanupAcpSession`)
+    - Provider modules (Function: `deleteSessionFiles`)
+
+    The Delete tab requires two user actions. `handleDelete()` calls `handleDeleteSession(socket, session.id, true)`, forcing permanent delete instead of archive behavior. The frontend removes the session locally. The backend deletes attachment directories, calls `cleanupAcpSession()` for the ACP session and descendants, deletes DB rows, and traverses descendants using `forkedFrom`.
 
 ## Architecture Diagram
 
 ```mermaid
-graph TB
-  subgraph "Frontend — User Interaction"
-    A["User clicks Settings<br/>button (Sidebar/Header)"]
-    B["setSettingsOpen()<br/>updates UIStore"]
+flowchart TB
+  subgraph Frontend
+    Sidebar[Sidebar settings controls]
+    ModelSelector[ChatInput ModelSelector settings button]
+    UIStore[useUIStore: isSettingsOpen, settingsSessionId, settingsInitialTab]
+    Modal[SessionSettingsModal]
+    Lifecycle[useSessionLifecycleStore]
+    System[useSystemStore]
+    SocketHook[useSocket provider_extension routing]
   end
 
-  subgraph "Frontend — Component Render"
-    C["SessionSettingsModal<br/>reads UIStore state"]
-    D["Lookup session by<br/>settingsSessionId"]
-    E["Render 5 tabs"]
+  subgraph Backend
+    SessionHandlers[backend/sockets/sessionHandlers.js]
+    SessionManager[backend/services/sessionManager.js]
+    JsonlParser[backend/services/jsonlParser.js]
+    Database[backend/database.js sessions table]
+    Cleanup[backend/mcp/acpCleanup.js]
   end
 
-  subgraph "Rehydration Flow"
-    F["User clicks<br/>Rebuild from JSONL"]
-    G["socket.emit<br/>rehydrate_session"]
-    H["Backend:<br/>lookup session by uiId"]
-    I["jsonlParser:<br/>delegate to provider"]
-    J["Provider parses JSONL<br/>with Diff module"]
-    K["Backend: replace DB<br/>messages"]
-    L["socket callback:<br/>success/error"]
-    M["Frontend:<br/>emit get_session_history"]
-    N["Zustand update<br/>messages array"]
-    O["UI re-renders<br/>updated messages"]
+  subgraph Provider
+    ProviderModule[index.js provider hooks]
+    SessionFiles[JSONL and provider session files]
+    AcpDaemon[ACP daemon]
   end
 
-  subgraph "Model Change Flow"
-    P["User selects model<br/>from dropdown"]
-    Q["Store: optimistic<br/>update to UI"]
-    R["socket.emit<br/>set_session_model"]
-    S["Backend:<br/>set_model RPC"]
-    T["Backend: DB update<br/>model state"]
-    U["Callback reconciles<br/>state with backend"]
-    V["UI displays<br/>new model"]
-  end
+  Sidebar --> UIStore
+  ModelSelector --> UIStore
+  UIStore --> Modal
+  Modal --> Lifecycle
+  Modal --> System
+  SocketHook --> System
+  SocketHook --> Lifecycle
 
-  subgraph "Provider Config Flow"
-    W["User changes<br/>config option"]
-    X["Store: optimistic<br/>update"]
-    Y["socket.emit<br/>set_session_option"]
-    Z["Backend applies<br/>option"]
-    AA["UI reflects<br/>change"]
-  end
+  Lifecycle -- set_session_model --> SessionHandlers
+  Lifecycle -- set_session_option --> SessionHandlers
+  Modal -- rehydrate_session --> SessionHandlers
+  Modal -- get_session_history --> SessionHandlers
+  Modal -- export_session --> SessionHandlers
+  Lifecycle -- delete_session --> SessionHandlers
 
-  A --> B
-  B --> C
-  C --> D
-  D --> E
-  
-  E --> F
-  F --> G
-  G --> H
-  H --> I
-  I --> J
-  J --> K
-  K --> L
-  L --> M
-  M --> N
-  N --> O
-
-  E --> P
-  P --> Q
-  Q --> R
-  R --> S
-  S --> T
-  T --> U
-  U --> V
-
-  E --> W
-  W --> X
-  X --> Y
-  Y --> Z
-  Z --> AA
-
-  style G fill:#ffcccc
-  style L fill:#ccffcc
-  style R fill:#ffcccc
-  style U fill:#ccffcc
-  style Y fill:#ffcccc
+  SessionHandlers --> SessionManager
+  SessionManager -- session/set_model --> AcpDaemon
+  SessionManager --> ProviderModule
+  SessionHandlers --> JsonlParser
+  JsonlParser --> ProviderModule
+  ProviderModule --> SessionFiles
+  SessionHandlers --> Database
+  SessionManager --> Database
+  SessionHandlers --> Cleanup
+  Cleanup --> ProviderModule
 ```
 
-**Flow:** Opening triggers UIStore update → component renders 5 tabs. Each tab (Rehydrate, Config, Export, Delete) emits specific socket events. Rehydration shows a destructive DB replacement. Model change shows optimistic UI with callback reconciliation. Provider config is fire-and-forget.
+## The Critical Contract: Session-Scoped State and Provider Hooks
 
----
+1. **Modal state is UI-store scoped**
 
-## The Critical Contract: UIStore Driven
+   `SessionSettingsModal` renders for `useUIStore.settingsSessionId`. Every modal action must operate on the resolved `ChatSession`, not on the active chat by assumption. Closing the modal calls `setSettingsOpen(false)`, which clears `settingsSessionId` and resets `settingsInitialTab` to `session`.
 
-### Contract 1: Modal Visibility & Session Selection
-- **Rule:** Modal exists **only** when `useUIStore.isSettingsOpen === true` **AND** `useUIStore.settingsSessionId !== null`
-- **What it means:** If `settingsSessionId` is null, SessionSettingsModal returns `null` (renders nothing)
-- **Why it matters:** UIStore is the single source of truth for which session's settings are displayed
-- **Breaking point:** If you emit socket events without validating `session` exists, those events will crash or send null IDs
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 39, 96)
+2. **Model identity is provider data, not hardcoded UI state**
+
+   The selected value is a model id from `session.modelOptions`, branding `models.quickAccess`, or the session's active model id. `handleSessionModelChange()` emits the selected value as `model`; the backend resolves it with `resolveModelSelection()` and persists both `model` and `currentModelId`.
+
+3. **Provider config options are session metadata**
+
+   `ProviderConfigOption` objects are merged by `id`. The frontend merge helper is `mergeProviderConfigOptions()`, and the backend merge helper is `mergeConfigOptions()`. Provider extension `config_options` events can request `replace` or `removeOptionIds` through `routeExtension()`.
+
+4. **Rehydration replaces messages**
+
+   `rehydrate_session` assigns the parsed JSONL output to `session.messages` and saves the session. It is a replacement operation. The frontend follow-up `get_session_history` updates only the local `messages` array for that session.
+
+5. **Delete from this modal is permanent**
+
+   `handleDelete()` passes `forcePermanent = true` to `handleDeleteSession()`. The global archive preference does not change the modal's Delete tab behavior.
+
+6. **Provider hooks are mandatory integration points**
+
+   Session settings relies on provider module functions supplied through `getProviderModule()`: `getSessionPaths`, `parseSessionHistory`, `normalizeModelState`, `normalizeConfigOptions`, `setConfigOption`, `emitCachedContext`, and `deleteSessionFiles`. Default hooks exist, but no-op defaults return empty state or perform no provider cleanup.
+
+## Configuration / Data Flow
+
+### Provider and Branding Inputs
+
+| Source | Key or Hook | Used By | Purpose |
+|---|---|---|---|
+| Provider config and branding | `branding.sessionLabel` | `SessionSettingsModal` | Labels provider-specific session id fields. |
+| Provider config and branding | `branding.modelLabel` | `SessionSettingsModal` | Labels the model selector text. |
+| Provider config | `models.default` | `getDefaultModelSelection`, backend `resolveModelSelection` | Supplies fallback model selection. |
+| Provider config | `models.quickAccess` | `getFullModelChoices`, backend `modelOptionsFromProviderConfig` | Supplies quick model choices when the daemon has not advertised `modelOptions`. |
+| Provider module | `normalizeModelState(modelState, source)` | `setSessionModel`, session loading | Normalizes provider model state after ACP calls. |
+| Provider module | `setConfigOption(acpClient, sessionId, optionId, value)` | `set_session_option` | Applies provider config changes. |
+| Provider module | `normalizeConfigOptions(options)` | `normalizeProviderConfigOptions` | Normalizes provider-advertised option shapes. |
+| Provider module | `getSessionPaths(acpSessionId)` | `parseJsonlSession`, `export_session` | Locates provider JSONL files. |
+| Provider module | `parseSessionHistory(filePath, Diff)` | `parseJsonlSession` | Converts provider JSONL into UI `Message[]`. |
+| Provider module | `deleteSessionFiles(acpSessionId)` | `cleanupAcpSession` | Removes provider-owned session files during permanent delete. |
+
+### Socket Events
+
+| Event | Emitter | Handler | Payload | Response |
+|---|---|---|---|---|
+| `set_session_model` | `handleSessionModelChange` | `registerSessionHandlers` | `{ uiId, model }` | `{ success, providerId, model, currentModelId, modelOptions, configOptions }` or `{ error }` |
+| `set_session_option` | `handleSetSessionOption` | `registerSessionHandlers` | `{ uiId, optionId, value }` | No callback |
+| `rehydrate_session` | `handleRehydrate` | `registerSessionHandlers` | `{ uiId }` | `{ success, messageCount }` or `{ error }` |
+| `get_session_history` | `handleRehydrate`, `hydrateSession` | `registerSessionHandlers` | `{ uiId }` | `{ session }` or `{ error }` |
+| `export_session` | Export tab button | `registerSessionHandlers` | `{ uiId, exportPath }` | `{ success, exportDir }` or `{ error }` |
+| `delete_session` | `handleDeleteSession` | `registerSessionHandlers` | `{ providerId, uiId }` from frontend; backend uses `uiId` | No callback |
+| `session_model_options` | Backend socket layer | `useSocket` | `{ sessionId, currentModelId, modelOptions }` | Store update by ACP session id |
+| `provider_extension` | ACP update routing | `useSocket` | `{ method, params, providerId? }` | Store updates for metadata, config options, status, commands, compaction |
+
+### Store Shapes
+
 ```typescript
-const session = sessions.find(s => s.id === settingsSessionId);
-if (!session) return null;  // Guard
+// FILE: frontend/src/types.ts (Interface: ProviderConfigOption)
+export interface ProviderConfigOption {
+  id: string;
+  name: string;
+  description?: string;
+  category?: string;
+  kind?: 'reasoning_effort' | 'generic';
+  type: 'select' | 'boolean' | 'number';
+  currentValue: unknown;
+  options?: Array<{ value: string; name: string; description?: string }>;
+}
 ```
 
-### Contract 2: Rehydration is Destructive
-- **Rule:** `rehydrate_session` handler **fully replaces** `session.messages` array, not merges
-- **What it means:** Any messages in the DB are discarded; JSONL becomes the source of truth
-- **Why it matters:** Rehydration is for recovery/sync, not for merging new messages with old
-- **Breaking point:** Code that assumes messages are merged (appended) will lose state
-- File: `backend/sockets/sessionHandlers.js` (Line 136)
-```javascript
-session.messages = jsonlMessages;  // DESTRUCTIVE replacement
-```
-
-### Contract 3: Model Change is Optimistic
-- **Rule:** UI updates **before** backend response; callback only reconciles if backend differs
-- **What it means:** Users see the change immediately; backend processes asynchronously
-- **Why it matters:** No loading spinners; responsive UX; handles network lag gracefully
-- **Breaking point:** Code that waits for callback before updating UI will feel laggy
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Lines 350–367)
 ```typescript
-// Line 350: Update immediately
-set(state => ({ sessions: state.sessions.map(...applyModelState...) }));
-
-// Lines 355+: Emit and reconcile asynchronously
-socket.emit('set_session_model', { uiId, model }, (res) => {
-  // Update again if backend differs
-  set(state => ({ sessions: state.sessions.map(...) }));
-});
+// FILE: frontend/src/types.ts (Interface: ChatSession, session-settings fields)
+export interface ChatSession {
+  id: string;
+  acpSessionId: string | null;
+  model: string;
+  currentModelId?: string | null;
+  modelOptions?: ProviderModelOption[];
+  provider?: string | null;
+  configOptions?: ProviderConfigOption[];
+  stats?: SessionStats;
+}
 ```
 
-### Contract 4: Provider Config is Fire-and-Forget
-- **Rule:** `set_session_option` emits with **no callback** and **no confirmation**
-- **What it means:** UI updates optimistically; backend applies in background; no two-way synchronization
-- **Why it matters:** Simpler pattern for simple boolean/select changes that rarely fail
-- **Breaking point:** Code expecting an error response will crash or hang
-- File: `frontend/src/store/useSessionLifecycleStore.ts` (Line 392)
-```typescript
-socket.emit('set_session_option', { uiId, optionId, value });  // No callback
-```
+### Database Fields
 
-### Contract 5: Provider Configures Models Dynamically
-- **Rule:** Model choices come from `branding.models` via `getFullModelChoices()`, not hardcoded in modal
-- **What it means:** Each provider defines its own model list; modal adapts automatically
-- **Why it matters:** Modal remains provider-agnostic; adding new models requires no code changes
-- **Breaking point:** Hardcoding model list in modal will break for new providers
-- File: `frontend/src/components/SessionSettingsModal.tsx` (Lines 97–99)
-```typescript
-const brandingModels = branding.models;
-const modelChoices = getFullModelChoices(session, brandingModels);
-const selectedModelValue = getFullModelSelectionValue(session, brandingModels);
-```
-
----
-
-## Configuration / Provider Support
-
-### What a Provider Must Implement for Modal Compatibility
-
-1. **`parseSessionHistory(filePath, Diff)`** (Required for Rehydration)
-   - Takes JSONL file path and Diff library
-   - Returns array of UI messages reconstructed from ACP JSONL
-   - Called by `jsonlParser.parseJsonlSession()` (line 19)
-   - Must handle message diffs to reconstruct original message content
-   - If missing, rehydration returns error: "Provider missing parseSessionHistory implementation"
-
-2. **`getSessionPaths(acpSessionId)`** (Required for Rehydration)
-   - Returns object with `{ jsonl: '/path/to/session.jsonl', ... }`
-   - Used by jsonlParser to find JSONL file
-   - Provider-specific path mapping
-
-3. **Dynamic Model Catalog** (Optional, for Model Selection)
-   - Provider can advertise models in `provider.json` config under `models` key
-   - Example:
-   ```json
-   {
-     "models": {
-       "default": "provider-model-capable",
-       "titleGeneration": "provider-model-fast",
-       "balanced": { "id": "provider-model-standard", "label": "Standard" }
-     }
-   }
-   ```
-   - Modal uses this to populate dropdown
-   - If `models` missing, modal hides model selector
-
-4. **Provider Config Options** (Optional, for Provider Settings Tab)
-   - Provider sends `configOptions` array with structure:
-   ```typescript
-   {
-     id: string;                    // Unique option ID
-     name: string;                  // Display name
-     description?: string;          // Help text
-     type: 'select' | 'boolean' | 'number';
-     currentValue: unknown;         // Current setting
-     options?: Array<{ name, value, description }>;  // For select
-   }
-   ```
-   - Modal renders form based on type
-   - If `configOptions` empty or missing, tab is hidden
-
-### Environment Variables
-
-None specific to Session Settings Modal. Rehydration uses provider-configured paths.
-
-### Socket Events Emitted by Modal
-
-| Event | Payload | Response | Tab |
-|-------|---------|----------|-----|
-| `rehydrate_session` | `{ uiId: string }` | `{ success: boolean, messageCount?: number, error?: string }` | Rehydrate |
-| `get_session_history` | `{ uiId: string }` | `{ session?: { messages: [] } }` | Rehydrate |
-| `set_session_model` | `{ uiId: string, model: string }` | `{ success, currentModelId, modelOptions, configOptions }` | Config |
-| `set_session_option` | `{ uiId: string, optionId: string, value }` | (none) | Config |
-| `export_session` | `{ uiId: string, exportPath: string }` | `{ success?, exportDir?, error? }` | Export |
-| `delete_session` | (via handleDeleteSession) | (none) | Delete |
-
----
-
-## Data Flow / Rendering Pipeline
-
-### Session Info Retrieval
-
-```
-Modal opens
-  → Session found in Zustand by settingsSessionId
-  → Extract: acpSessionId, acp ID
-  → Display in System Discovery section (read-only)
-
-Context usage display
-  → useSystemStore.contextUsageBySession[acpSessionId]
-  → Populated by backend 'metadata' event (provider extension router)
-  → Shown as percentage with progress bar
-  → "No data yet" if not initialized
-```
-
-### Model Selection Rendering
-
-```
-Modal opens to Config tab
-  → Get session from store
-  → Get branding from useSystemStore.getBranding(provider)
-  → Call getFullModelChoices(session, branding.models)
-    → Returns array of { id, name, description, selection }
-  → Render <select> with <option> for each choice
-  → Current selection from getFullModelSelectionValue()
-  → On change: handleSessionModelChange()
-    → Optimistic update
-    → Socket emit
-    → Callback reconciliation
-```
-
-### Provider Config Rendering
-
-```
-Modal opens to Config tab
-  → Check if session.configOptions exists and has length
-  → If yes, map each option:
-    → If type 'select': render <select>
-    → If type 'boolean': render toggle button
-    → If type 'number': render <input type="number">
-  → On change: handleSetSessionOption()
-    → Optimistic update in configOptions array
-    → Socket emit (fire-and-forget)
-  → If no options or empty: hide Provider Settings section
-```
-
-### Rehydration Data Flow
-
-```
-Raw JSONL file on disk
-  ↓ (provider.parseSessionHistory)
-Normalized UI messages array
-  ↓ (socket callback response)
-Frontend receives messageCount
-  ↓ (emit get_session_history)
-Backend returns fresh messages from DB
-  ↓ (Zustand setState)
-Store updates messages array
-  ↓ (React reconciliation)
-MessageList re-renders with fresh messages
-```
-
----
+| Table | Columns | Used By |
+|---|---|---|
+| `sessions` | `ui_id`, `acp_id`, `provider` | Modal session lookup, backend provider/runtime lookup, JSONL path lookup. |
+| `sessions` | `model`, `current_model_id`, `model_options_json` | Model selector state and ACP model switching. |
+| `sessions` | `config_options_json` | Provider settings controls and saved config reapplication. |
+| `sessions` | `messages_json` | Rehydration replacement and session history loading. |
+| `sessions` | `used_tokens`, `total_tokens` | Context usage hydration through `stats`. |
+| `sessions` | `forked_from` | Permanent delete descendant traversal. |
 
 ## Component Reference
 
-### Frontend Files
+### Frontend
 
-| File | Lines | Component/Function | Purpose |
-|------|-------|-------------------|---------|
-| `frontend/src/components/SessionSettingsModal.tsx` | 10–27 | `ContextUsageCard` | Displays context % with progress bar |
-| `frontend/src/components/SessionSettingsModal.tsx` | 29–71 | `SessionSettingsModal` (top-level) | Main modal component |
-| `frontend/src/components/SessionSettingsModal.tsx` | 49–71 | `handleRehydrate()` | Rehydration flow handler |
-| `frontend/src/components/SessionSettingsModal.tsx` | 83–92 | `useEffect` cleanup | Reset state when modal opens |
-| `frontend/src/components/SessionSettingsModal.tsx` | 102–349 | Modal render | 5 tabs + content sections |
-| `frontend/src/components/SessionSettingsModal.tsx` | 134–169 | Info tab | System Discovery + Context Usage |
-| `frontend/src/components/SessionSettingsModal.tsx` | 173–194 | Config: Model Select | Dropdown with model choices |
-| `frontend/src/components/SessionSettingsModal.tsx` | 197–246 | Config: Provider Options | Dynamic form for config options |
-| `frontend/src/components/SessionSettingsModal.tsx` | 250–281 | Rehydrate tab | JSONL rebuild button + status |
-| `frontend/src/components/SessionSettingsModal.tsx` | 283–316 | Export tab | Path input + export button |
-| `frontend/src/components/SessionSettingsModal.tsx` | 319–340 | Delete tab | Delete confirmation |
-| `frontend/src/store/useUIStore.ts` | 77–81 | `setSettingsOpen()` | Manage modal visibility & session selection |
-| `frontend/src/store/useSessionLifecycleStore.ts` | 345–369 | `handleSessionModelChange()` | Model selection logic |
-| `frontend/src/store/useSessionLifecycleStore.ts` | 380–394 | `handleSetSessionOption()` | Provider option changes |
-| `frontend/src/hooks/useSocket.ts` | 78–85 | `'session_model_options'` listener | Passive model option updates from backend |
-| `frontend/src/components/Sidebar.tsx` | 271, 357, 398, 419 | Settings triggers | Open modal from sidebar |
-| `frontend/src/components/ChatInput/ChatInput.tsx` | 366 | Settings trigger | Open modal to Config tab from header |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| App shell | `frontend/src/App.tsx` | Component usage: `SessionSettingsModal` | Mounts the global modal. |
+| Modal | `frontend/src/components/SessionSettingsModal.tsx` | Component: `SessionSettingsModal` | Renders tabs, state, socket actions, and close behavior. |
+| Context card | `frontend/src/components/SessionSettingsModal.tsx` | Component: `ContextUsageCard` | Displays context percentage by ACP session id. |
+| Opening state | `frontend/src/store/useUIStore.ts` | Type: `SettingsTab`, Action: `setSettingsOpen` | Stores modal visibility, target session, and initial tab. |
+| Session store | `frontend/src/store/useSessionLifecycleStore.ts` | Actions: `handleSessionModelChange`, `handleSetSessionOption`, `handleDeleteSession`, `hydrateSession`, `fetchStats`; Helpers: `applyModelState`, `maybeHydrateContextUsage` | Applies optimistic state, emits session events, hydrates stats. |
+| Socket routing | `frontend/src/hooks/useSocket.ts` | Socket events: `session_model_options`, `provider_extension` | Applies backend model/options/context updates. |
+| Model utilities | `frontend/src/utils/modelOptions.ts` | `getFullModelChoices`, `getFullModelSelectionValue`, `getCurrentModelId`, `normalizeModelOptions` | Resolves model selector choices and labels. |
+| Config utilities | `frontend/src/utils/configOptions.ts` | `mergeProviderConfigOptions` | Merges provider config option snapshots and partial updates. |
+| Types | `frontend/src/types.ts` | `ChatSession`, `ProviderConfigOption`, `ProviderModelOption`, `ProviderBranding` | Defines modal data contracts. |
+| Sidebar triggers | `frontend/src/components/Sidebar.tsx` | Callbacks: `onSettings`, `onSettingsSession` | Opens the modal from session rows and sidebar controls. |
+| Chat input trigger | `frontend/src/components/ChatInput/ChatInput.tsx` | Prop: `onOpenSettings` | Opens the modal to the Config tab for the active session. |
+| Model selector trigger | `frontend/src/components/ChatInput/ModelSelector.tsx` | Prop: `onOpenSettings`, Title: `Open chat config` | Renders the compact settings button near the footer model indicator. |
 
-### Backend Files
+### Backend
 
-| File | Lines | Handler/Function | Purpose |
-|------|-------|------------------|---------|
-| `backend/sockets/sessionHandlers.js` | 126–143 | `rehydrate_session` | Main rehydration handler |
-| `backend/sockets/sessionHandlers.js` | 442–466 | `set_session_model` | Model switching handler |
-| `backend/sockets/sessionHandlers.js` | 424–440 | `set_session_option` | Provider config option handler |
-| `backend/services/jsonlParser.js` | 10–28 | `parseJsonlSession()` | Delegate to provider for JSONL parsing |
-| `backend/services/sessionManager.js` | 128–175 | `setSessionModel()` | Perform model switch via RPC |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket handlers | `backend/sockets/sessionHandlers.js` | Function: `registerSessionHandlers`; Events: `set_session_model`, `set_session_option`, `rehydrate_session`, `get_session_history`, `export_session`, `delete_session` | Handles all modal-driven backend actions. |
+| Session manager | `backend/services/sessionManager.js` | `setSessionModel`, `updateSessionModelMetadata`, `getKnownModelOptions`, `setProviderConfigOption`, `getConfigOptionsFromSetResult`, `normalizeProviderConfigOptions`, `reapplySavedConfigOptions` | Applies model/config state to ACP sessions and DB metadata. |
+| JSONL parser | `backend/services/jsonlParser.js` | `parseJsonlSession` | Loads provider JSONL paths and delegates parsing. |
+| Model utilities | `backend/services/modelOptions.js` | `resolveModelSelection`, `extractModelState`, `mergeModelOptions`, `modelOptionsFromProviderConfig`, `normalizeModelOptions` | Resolves backend model ids and option catalogs. |
+| Config utilities | `backend/services/configOptions.js` | `normalizeConfigOptions`, `applyConfigOptionsChange`, `mergeConfigOptions` | Normalizes and merges provider config options. |
+| Persistence | `backend/database.js` | `saveSession`, `getSession`, `getAllSessions`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `deleteSession` | Persists settings, messages, model state, config state, and deletes DB rows. |
+| Cleanup | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | Delegates provider session-file deletion to `deleteSessionFiles`. |
+| Attachments | `backend/services/attachmentVault.js` | `getAttachmentsRoot` | Supplies attachment roots for export and delete. |
+| Runtime | `backend/services/providerRuntimeManager.js` | `getClient`, `getRuntime` | Resolves provider-specific ACP clients. |
+| Provider loading | `backend/services/providerLoader.js` | `getProvider`, `getProviderModule`, `getProviderModuleSync` | Supplies provider config, branding, and hooks. |
 
-### Database
+### Provider Hooks
 
-| Table | Columns (relevant) | Usage |
-|-------|-------------------|-------|
-| `sessions` | `model`, `current_model_id`, `model_options_json`, `config_options_json`, `messages_json` | Persist model state, config, and messages |
-| `sessions` | `acp_id` (acpSessionId) | Link to JSONL file path (via provider) |
+| File Pattern | Anchors | Purpose |
+|---|---|---|
+| `providers/<provider>/index.js` | `getSessionPaths`, `parseSessionHistory` | JSONL rehydration and export source paths. |
+| `providers/<provider>/index.js` | `setConfigOption`, `normalizeConfigOptions` | Provider settings mutation and normalization. |
+| `providers/<provider>/index.js` | `normalizeModelState` | Model-state normalization after ACP model calls. |
+| `providers/<provider>/index.js` | `emitCachedContext` | Replays cached context usage after session load/reuse. |
+| `providers/<provider>/index.js` | `deleteSessionFiles` | Removes provider session files during permanent delete. |
+| `providers/<provider>/provider.json` | Keys: `models`, `mcpName`, provider command/config | Supplies backend model defaults and MCP wiring. |
+| `providers/<provider>/branding.json` | Keys: `sessionLabel`, `modelLabel`, `protocolPrefix` | Supplies modal labels and extension routing prefix. |
 
----
+## Gotchas
 
-## Gotchas & Important Notes
+1. **`isSettingsOpen` alone does not render the modal**
 
-### 1. **Modal Only Renders if settingsSessionId is Non-Null**
-- **Problem:** If `settingsSessionId` is null, `sessions.find()` returns undefined, and modal returns null immediately
-- **Why:** Guard at line 96 prevents rendering when no session is selected
-- **Avoidance:** Always call `setSettingsOpen(true, sessionId)` with a valid session ID
-- **Detection:** Modal won't appear even if `isSettingsOpen = true`; check UIStore for null `settingsSessionId`
+   `SessionSettingsModal` returns `null` unless `settingsSessionId` matches a session in `useSessionLifecycleStore.sessions`. Open it with `setSettingsOpen(true, session.id, tab)`.
 
-### 2. **Rehydration is Destructive and Irreversible**
-- **Problem:** If user rehydrates and the JSONL is corrupt or incomplete, all DB messages are lost
-- **Why:** Backend does `session.messages = jsonlMessages;` without merging or checking
-- **Avoidance:** Warn users in UI that rehydration replaces all messages; consider snapshot backup before rehydrate
-- **Detection:** After rehydrate, message count differs; check JSONL file integrity
+2. **The Info tab labels are provider-branded, but values are fixed fields**
 
-### 3. **Provider Must Implement parseSessionHistory**
-- **Problem:** If provider lacks `parseSessionHistory()` function, rehydration returns error silently
-- **Why:** `jsonlParser.js` catches exceptions and logs errors (lines 20–23)
-- **Avoidance:** Ensure provider module exports `parseSessionHistory` function
-- **Detection:** Rehydrate fails with error "Provider missing parseSessionHistory implementation"
+   `branding.sessionLabel` labels a row that displays `session.acpSessionId`. The row labeled `Attachments` displays `UI ID: {session.id}`. Treat these as the present UI labels when updating tests or copy.
 
-### 4. **JSONL File Path is Provider-Specific**
-- **Problem:** If provider's `getSessionPaths()` returns wrong path, file won't be found
-- **Why:** `jsonlParser` checks `fs.existsSync(filePath)` (line 15)
-- **Avoidance:** Verify provider correctly implements `getSessionPaths(acpSessionId)`
-- **Detection:** Rehydrate fails with error "JSONL file not found"
+3. **The model selector can render with only the active model id**
 
-### 5. **Model Change is Optimistic (May Show Wrong State Briefly)**
-- **Problem:** If backend rejects model change, UI already shows new model; callback reconciles but feels laggy
-- **Why:** Store updates before socket callback for responsiveness
-- **Avoidance:** Accept this pattern; users tolerate it for responsive UX
-- **Detection:** If model change fails, UI briefly shows new model then reverts to old one
+   `getFullModelChoices()` falls back to the active model id when `session.modelOptions` and `branding.models.quickAccess` are empty. An empty dropdown usually means the session has no model id and provider branding has no quick access list.
 
-### 6. **Provider Config Options Are Dynamic (No Hardcoding)**
-- **Problem:** If provider doesn't send `configOptions`, Config tab won't show provider settings section
-- **Why:** Rendering is conditional: `if (session.configOptions && session.configOptions.length > 0)`
-- **Avoidance:** Ensure provider sends `configOptions` in session metadata
-- **Detection:** Config tab shows only Model Selection, not Provider Settings
+4. **Model rollback is not explicit**
 
-### 7. **set_session_option Has No Callback (Fire-and-Forget)**
-- **Problem:** If backend operation fails, frontend doesn't know; UI already updated
-- **Why:** Simple options (boolean, select) rarely fail; no need for confirmation
-- **Avoidance:** Accept this pattern for config options; use full round-trip for critical changes
-- **Detection:** If option fails to apply, UI shows new value but backend hasn't changed
+   `handleSessionModelChange()` updates state before the backend response. If `set_session_model` returns no callback because the DB session or ACP session id is missing, the optimistic value remains in the frontend.
 
-### 8. **ContextUsageCard Depends on Backend Context Events**
-- **Problem:** If backend doesn't emit context usage metadata, card shows "No data yet"
-- **Why:** Frontend only has data if backend sends 'metadata' event via provider extension
-- **Avoidance:** Ensure provider extension emits context usage; check `useSystemStore.setContextUsage()`
-- **Detection:** Card always shows "No data yet" even in active sessions
+5. **Config option updates have no frontend callback**
 
-### 9. **useEffect Resets Modal State When Opening**
-- **Problem:** If user opens settings, switches tabs, then re-opens modal, tab resets to initial tab
-- **Why:** `useEffect` dependency on `isOpen` and `settingsInitialTab` triggers reset
-- **Avoidance:** This is intentional; initial tab defaults to 'session' unless overridden by caller
-- **Detection:** Tab selection doesn't persist across modal open/close cycles
+   `set_session_option` is fire-and-forget. Backend errors are written through `writeLog()`. The frontend learns about later provider-side changes through `provider_extension` events of type `config_options`.
 
-### 10. **Rehydrate Immediately Fetches Fresh Messages (Double Socket Call)**
-- **Problem:** Rehydrate handler succeeds, then frontend immediately emits `get_session_history`
-- **Why:** Ensure UI has latest messages; direct DB access might be stale
-- **Avoidance:** This pattern is safe; `get_session_history` is fast (DB read)
-- **Detection:** Two socket events fired in rapid succession during rehydrate
+6. **Rehydration replaces messages and then reloads only messages into the store**
 
----
+   The backend saves a full session object, but the modal's follow-up `get_session_history` response is applied as `{ ...s, messages: histRes.session.messages }`. Model and config fields from that response are not copied by `handleRehydrate()`.
+
+7. **`get_session_history` also performs lazy JSONL sync**
+
+   Outside forced rehydration, `get_session_history` parses JSONL and saves the DB session only when JSONL contains more messages than the DB copy.
+
+8. **Export has no frontend ACP-id guard**
+
+   The Export tab can emit `export_session` for a session without `acpSessionId`. The backend always writes `session.json`, then asks the provider for `getSessionPaths(session.acpSessionId)` and copies JSONL only if a path exists on disk.
+
+9. **Delete from the modal bypasses archive behavior**
+
+   The modal passes `forcePermanent = true` to `handleDeleteSession()`. This emits `delete_session` even when the global sidebar delete mode would archive a session.
+
+10. **Permanent delete cascades descendants after deleting the parent DB row**
+
+    `delete_session` deletes the parent, reads all sessions, collects descendants by `forkedFrom`, and then deletes each child. Tests must include `db.getAllSessions()` data for descendant behavior.
 
 ## Unit Tests
 
 ### Frontend Tests
 
-**File:** `frontend/src/test/SessionSettingsModal.test.tsx` (164 lines)
-
-| Test Name | Lines | Coverage |
-|-----------|-------|----------|
-| Modal renders when open | – | Component visibility, overlay click close |
-| Tab navigation | – | Switching between 5 tabs |
-| Session info display | – | ACP ID, UI ID rendering |
-| Context usage card | – | Progress bar, percentage display |
-| Model selector | – | Dropdown options, current selection |
-| Delete confirmation | – | Two-step delete confirmation flow |
-| Export button | – | Path input validation, disabled/enabled states |
-| Rehydrate button socket emit | – | Emit with correct payload |
-| Modal close | – | Overlay click, Done button, Delete post-action |
-
-**File:** `frontend/src/test/SessionSettingsModalExtended.test.tsx` (86 lines)
-
-| Test Name | Lines | Coverage |
-|-----------|-------|----------|
-| Tab switching with content verification | – | All 5 tabs render correct content |
-| Rehydrate request callback response | – | Success, error, message count |
-| Delete session flow | – | Confirmation → deletion → modal close |
-| Export request with path and socket | – | Path validation, socket emit, response |
+| File | Test Names / Anchors | Coverage |
+|---|---|---|
+| `frontend/src/test/SessionSettingsModal.test.tsx` | `renders when open with session`; `shows session info tab by default`; `shows ACP session ID`; `switches to export tab`; `switches to rehydrate tab`; `switches to config tab and shows model selector`; `switches to danger tab and shows delete button`; `shows confirm delete after clicking Delete Chat`; `closes modal when Done clicked`; `closes modal when overlay clicked`; `returns null when no session found`; `uses provider-specific session and model labels`; `export action button is disabled when path is empty`; `export action button is enabled when path is provided`; `rehydrate button calls socket emit` | Modal rendering, tab navigation, labels, close behavior, export button state, rehydrate emit. |
+| `frontend/src/test/SessionSettingsModalExtended.test.tsx` | `renders session info by default`; `switches tabs and renders model selection`; `handles rehydrate request`; `handles delete session flow with confirmation`; `handles export request` | Callback status behavior and modal action flows. |
+| `frontend/src/test/useSessionLifecycleStore.test.ts` | `handleDeleteSession removes session and emits archive_session by default`; `handleSetSessionOption updates local state and emits`; context hydration tests around `hydrateSession` and `handleSessionSelect` | Store delete defaults, option optimistic update, context usage hydration. |
+| `frontend/src/test/useSessionLifecycleStoreExtended.test.ts` | `handleActiveSessionModelChange calls handleSessionModelChange`; `handleUpdateModel updates session model locally without socket emit`; `handleSetSessionOption handles missing session gracefully` | Model action delegation and missing-session guards. |
+| `frontend/src/test/useSessionLifecycleStoreDeep.test.ts` | `handleDeleteSession emits archive_session when permanent is false`; `handleDeleteSession emits delete_session when permanent is true` | Delete event selection in store. |
+| `frontend/src/test/useUIStore.test.ts` | `setSettingsOpen manages session ID and tab` | Modal opening state contract. |
+| `frontend/src/test/ModelSelector.test.tsx` | `renders the settings button when onOpenSettings is provided`; `does not render the settings button when onOpenSettings is not provided`; `calls onOpenSettings when the settings button is clicked` | Chat-input settings trigger. |
+| `frontend/src/test/useSocket.test.ts` | `handles "session_model_options" event`; `handles "metadata" extension`; `handles "config_options" extension` | Passive model/context/config updates that feed the modal. |
+| `frontend/src/test/extensionRouter.test.ts` | `routes config_options with various modes` | Provider extension config-options routing. |
+| `frontend/src/test/configOptions.test.ts` | `mergeProviderConfigOptions handles null/undefined`; `merges new options while preserving current values`; `adds brand new options as provided` | Frontend config option merge semantics. |
 
 ### Backend Tests
 
-**File:** `backend/test/sessionHandlers.test.js`
-
-| Test Name | Lines | Coverage |
-|-----------|-------|----------|
-| `rehydrate_session` success | 171–179 | Full flow: lookup → parse → save → callback |
-| `rehydrate_session` no ACP ID | 462–468 | Error: no session ID to rehydrate from |
-| `rehydrate_session` JSONL not found | 470–478 | Error: file doesn't exist or parse fails |
-| `set_session_model` updates DB | 526–540 | Model switch, DB save, callback response |
-| `set_session_option` applies option | 543–554 | Config option merging and persistence |
-
-### Running Tests
-
-```bash
-cd frontend
-npx vitest run frontend/src/test/SessionSettingsModal.test.tsx
-npx vitest run frontend/src/test/SessionSettingsModalExtended.test.tsx
-
-cd backend
-npx vitest run backend/test/sessionHandlers.test.js --reporter=verbose
-```
-
----
+| File | Test Names / Anchors | Coverage |
+|---|---|---|
+| `backend/test/sessionHandlers.test.js` | `handles rehydrate_session`; `handles rehydrate_session when no acpSessionId`; `handles rehydrate_session when JSONL not found`; `handles get_session_history with JSONL having more messages than DB` | Rehydration and lazy JSONL sync. |
+| `backend/test/sessionHandlers.test.js` | `handles set_session_model`; `set_session_model updates metadata when meta exists`; `set_session_model logs error when sendRequest throws` | Model switching, metadata update, error logging. |
+| `backend/test/sessionHandlers.test.js` | `handles set_session_option`; `set_session_option merges configOptions returned by provider`; `set_session_option returns early when session not found`; `set_session_option routes through provider contract setConfigOption`; `set_session_option updates sessionMetadata when meta exists`; `set_session_option logs error when setConfigOption throws` | Provider config option mutation and persistence. |
+| `backend/test/sessionHandlers.test.js` | `handles export_session successfully`; `handles export_session when session not found` | Export folder/session JSON behavior and missing-session error. |
+| `backend/test/sessionHandlers.test.js` | `handles delete_session`; `handles delete_session with cascading child sessions` | Permanent delete and descendant cleanup. |
+| `backend/test/jsonlParser.test.js` | `parses simple prompt/response pair`; `delegates parsing to providerModule`; `returns null on malformed JSON`; `returns null and logs when provider lacks parseSessionHistory` | JSONL parser delegation and null-return behavior. |
+| `backend/test/sessionManager.test.js` | `loadSessionIntoMemory` tests covering `emitCachedContext`, `normalizeModelState`, `saveModelState` | Session-load model/context support that feeds modal state. |
+| `backend/test/persistence.test.js` | `saveConfigOptions returns immediately if nothing to change`; `saveModelState handles null provider path`; `handles saveModelState with modelOptions and 3-arg signature`; `handles saveConfigOptions with 4-arg signature`; `handles saveConfigOptions with invalid existing JSON` | SQLite persistence for model/config settings. |
+| `backend/test/acpCleanup.test.js` | `calls deleteSessionFiles on the provider`; `does nothing for null/undefined acpSessionId` | Delete cleanup hook. |
+| `backend/test/providerContract.test.js` | Provider contract includes `getSessionPaths`, `parseSessionHistory`, `deleteSessionFiles`, `archiveSessionFiles`, `restoreSessionFiles` | Provider hook availability. |
 
 ## How to Use This Guide
 
-### For Implementing or Extending Modal Features
+### For implementing or extending this feature
 
-1. **Understand the opening flow** — Read "Path A: Opening the Modal" (Steps 1–4) to see how `setSettingsOpen()` drives the modal
-2. **For rehydration work** — Read "Path B: Rehydration Flow" completely (Steps 1–7) to understand JSONL parsing, provider delegation, and DB replacement
-3. **For model changes** — Read "Path C: Model Change Flow" (Steps 1–5) to understand optimistic updates and callback reconciliation
-4. **Check the contracts** — Review "The Critical Contract" section before implementing; especially understand that rehydration is **destructive** and model change is **optimistic**
-5. **Verify provider support** — Check "Configuration / Provider Support" to ensure provider implements required functions
-6. **Write tests** — Use test patterns in SessionSettingsModal.test.tsx as templates
-7. **Reference component tables** — Use exact line numbers from component reference to locate code
+1. Start with `frontend/src/components/SessionSettingsModal.tsx` and identify which tab owns the new control.
+2. If the control mutates session model state, follow `handleSessionModelChange()` in `frontend/src/store/useSessionLifecycleStore.ts` and `set_session_model` in `backend/sockets/sessionHandlers.js`.
+3. If the control mutates provider config, use `ProviderConfigOption` in `frontend/src/types.ts`, `handleSetSessionOption()` in `useSessionLifecycleStore`, and `setProviderConfigOption()` in `backend/services/sessionManager.js`.
+4. If the control depends on provider-discovered data, verify `useSocket` routes the provider extension and that the provider module normalizes the data.
+5. If the change affects persisted state, check `backend/database.js` functions `saveSession`, `saveConfigOptions`, and `saveModelState`.
+6. Add or update tests in the frontend modal/store tests and backend `sessionHandlers.test.js` for the socket event path.
 
-### For Debugging Issues
+### For debugging issues with this feature
 
-**Problem: Modal won't open**
-
-1. Check `useUIStore.isSettingsOpen === true` (use React DevTools)
-2. Check `useUIStore.settingsSessionId !== null` (should be session ID, not null)
-3. Verify session exists in `useSessionLifecycleStore.sessions` by matching ID
-4. Check that `setSettingsOpen(true, sessionId)` is being called with valid session ID (not undefined)
-
-**Problem: Rehydrate Fails**
-
-1. Check backend logs for `[DB ERR]` or `[JSONL ERR]` messages
-2. Verify `session.acpSessionId` exists (needed to find JSONL path)
-3. Verify JSONL file exists at `providerModule.getSessionPaths(acpSessionId).jsonl`
-4. Verify provider implements `parseSessionHistory()` (if error says "Provider missing...")
-5. Try manual JSONL parse with provider module to check file integrity
-
-**Problem: Model Dropdown Shows No Options**
-
-1. Check `branding.models` is populated from provider config
-2. Verify `getFullModelChoices(session, brandingModels)` returns non-empty array
-3. Check that session has `modelOptions` in store (might be null if never set)
-4. Provider config must have `models` key in `provider.json`
-
-**Problem: Provider Settings Don't Appear**
-
-1. Check `session.configOptions` exists and has length > 0
-2. Verify backend sent `configOptions` in session metadata
-3. Check each option has correct `type` ('select', 'boolean', or 'number')
-4. For select options, verify `options` array is present
-
-**Problem: Context Usage Shows "No data yet"**
-
-1. Check backend is emitting 'metadata' event via provider extension
-2. Verify `useSystemStore.contextUsageBySession[acpSessionId]` is populated (use DevTools)
-3. Check that `acpSessionId` is not null (card uses it as key)
-4. Verify provider extension includes context metadata in provider config
-
----
+1. For a modal that does not appear, inspect `useUIStore.isSettingsOpen`, `useUIStore.settingsSessionId`, and the presence of that id in `useSessionLifecycleStore.sessions`.
+2. For wrong model display, inspect `session.currentModelId`, `session.modelOptions`, `branding.models.quickAccess`, and `getFullModelChoices()`.
+3. For failed model switching, inspect `set_session_model`, `setSessionModel()`, ACP `session/set_model`, and `db.saveSession()`/`db.saveModelState()`.
+4. For missing provider settings, inspect `session.configOptions`, `provider_extension` routing through `routeExtension()`, and provider `normalizeConfigOptions()`.
+5. For config changes that do not persist, inspect `set_session_option`, provider `setConfigOption()`, `getConfigOptionsFromSetResult()`, `acpClient.sessionMetadata`, and `db.saveConfigOptions()`.
+6. For rehydration errors, inspect `session.acpSessionId`, provider `getSessionPaths()`, `parseJsonlSession()`, and provider `parseSessionHistory()`.
+7. For export errors, inspect `exportPath`, sanitized `session.name`, provider `getSessionPaths()`, and `getAttachmentsRoot(providerId)`.
+8. For delete issues, inspect `handleDeleteSession()`, `delete_session`, `cleanupAcpSession()`, provider `deleteSessionFiles()`, and descendant sessions with `forkedFrom`.
 
 ## Summary
 
-The Session Settings Modal is a comprehensive configuration hub with five distinct tabs:
-
-1. **Info Tab** — Displays system IDs and real-time context usage
-2. **Config Tab** — Model selection and provider-specific options (dynamic form generation)
-3. **Rehydrate Tab** — Rebuilds session history from JSONL (destructive operation)
-4. **Export Tab** — Exports session data to filesystem
-5. **Delete Tab** — Permanent deletion with confirmation
-
-### Key Patterns Demonstrated
-
-1. **Rehydration Pipeline** — Shows full DB replacement workflow: file parsing → provider delegation → DB persistence → UI refresh
-2. **Optimistic Updates** — Model changes update UI immediately, then reconcile with backend via callback
-3. **Fire-and-Forget** — Provider config options update UI without waiting for backend confirmation
-4. **Dynamic Rendering** — Modal adapts to provider capabilities (models, options) without code changes
-
-### Critical Contract Reminder
-
-- **Modal visibility:** Entirely driven by `useUIStore.settingsSessionId`
-- **Rehydration:** Destructive (replaces all messages); requires valid ACP session ID; delegated to provider
-- **Model change:** Optimistic (UI first, callback reconciles)
-- **Config change:** Fire-and-forget with optimistic updates
-- **Provider config:** Dynamic, no hardcoding; provider defines models and options
-
-### Why Agents Should Care
-
-Session Settings Modal touches **three systems** (UIStore + SessionLifecycleStore, backend handlers, provider implementation) across **15+ files**. Understanding the modal prevents silent failures (unopenable modal, failed rehydration, state inconsistencies) and enables confident extensions (new config option types, custom export formats, alternative rehydration strategies, provider-specific UI).
-
-Load this doc when:
-- Implementing new config option types
-- Extending rehydration with new data (attachments, metadata)
-- Adding provider-specific settings to the modal
-- Debugging session state mismatches (rehydration, model switching)
-- Implementing export/import features
-- Optimizing modal rendering performance
+- `SessionSettingsModal` is a global component that renders for one `settingsSessionId`.
+- The Info tab displays ACP/UI identifiers and context percentage by ACP session id.
+- The Config tab renders provider-aware model choices and provider config controls from session state.
+- Model updates are optimistic and reconciled through the `set_session_model` callback.
+- Provider config updates are optimistic and fire-and-forget, with later reconciliation through provider extension events.
+- Rehydration replaces DB messages with provider-parsed JSONL and refreshes local messages through `get_session_history`.
+- Export writes `session.json`, JSONL when available, and attachments into a sanitized session folder.
+- Delete from the modal is permanent and cascades fork descendants through backend cleanup.
+- The critical contract is session-scoped state plus provider hooks: never hardcode model lists, config options, JSONL paths, or cleanup behavior in the modal.

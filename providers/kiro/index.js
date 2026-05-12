@@ -9,7 +9,12 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { getProvider } from '../../backend/services/providerLoader.js';
-import { collectInputObjects, mergeInputObjects } from '../../backend/services/tools/toolInputUtils.js';
+import { acpUiToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
+import {
+  inputFromToolUpdate,
+  prettyToolTitle,
+  resolvePatternToolName
+} from '../../backend/services/tools/providerToolNormalization.js';
 import { matchToolIdPattern, replaceToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
 
 // Cache for context usage percentage
@@ -514,15 +519,15 @@ export async function setConfigOption(acpClient, sessionId, optionId, value) {
 export function normalizeTool(event, update) {
   const { config } = getProvider();
   let toolName = update?.name || event.id || '';
+  const input = inputFromToolUpdate(update);
 
-  const configuredToolMatch = matchToolIdPattern(toolName, config);
-  if (configuredToolMatch?.toolName) toolName = configuredToolMatch.toolName;
+  const configuredToolName = resolvePatternToolName(toolName, config);
+  if (configuredToolName) toolName = configuredToolName;
 
-  // If toolName is still a generic ID, extract from title
+  // If toolName is still a generic ID, extract from title.
   if (toolName.startsWith('tooluse_') || toolName.startsWith('call_') || toolName.startsWith('toolu_')) {
-    const title = event.title || '';
-    const titleToolMatch = matchToolIdPattern(title, config);
-    if (titleToolMatch?.toolName) toolName = titleToolMatch.toolName;
+    const titleToolName = resolvePatternToolName(event.title || '', config);
+    if (titleToolName) toolName = titleToolName;
   }
 
   // Clean configured MCP tool ids from the display title
@@ -541,11 +546,12 @@ export function normalizeTool(event, update) {
     else if (titleLower.includes('replace')) toolName = 'replace';
   }
   
-  // Format title: replace any "Running: <toolName>" prefix with a human-readable label
-  if (event.title && toolName) {
-    const UX_TOOL_TITLES = { ux_invoke_shell: 'Invoke Shell', ux_invoke_subagents: 'Invoke Subagents', ux_invoke_counsel: 'Invoke Counsel' };
-    const pretty = UX_TOOL_TITLES[toolName] || toolName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    event = { ...event, title: event.title.replace(/Running:\s*\S+/, pretty) };
+  const normalizedAcpUiTitle = acpUiToolTitle(toolName, input, { filePath: event.filePath });
+  if (normalizedAcpUiTitle) {
+    event = { ...event, title: normalizedAcpUiTitle };
+  } else if (event.title && toolName) {
+    // Format title: replace any "Running: <toolName>" prefix with a human-readable label.
+    event = { ...event, title: event.title.replace(/Running:\s*\S+/, prettyToolTitle(toolName)) };
   }
 
   return { ...event, toolName };
@@ -555,13 +561,7 @@ export function extractToolInvocation(update = {}, context = {}) {
   const event = context.event || {};
   const { config } = getProvider();
   const normalized = normalizeTool({ ...event }, update);
-  const input = mergeInputObjects(collectInputObjects(
-    update.rawInput,
-    update.arguments,
-    update.params,
-    update.input,
-    update.toolCall?.arguments
-  ));
+  const input = inputFromToolUpdate(update);
   const rawName = update.name || update.toolName || event.toolName || event.title || event.id || '';
   const title = update.title || event.title || '';
   const mcpMatch = matchToolIdPattern(rawName, config) || matchToolIdPattern(title, config);

@@ -1,7 +1,7 @@
 /**
  * MCP Tool Handlers.
  *
- * Plain async functions — no MCP SDK dependency.
+ * Plain async functions -- no MCP SDK dependency.
  * The stdio proxy (stdio-proxy.js) handles the MCP protocol; these are the implementations.
  * Called via POST /api/mcp/tool-call from the proxy.
  *
@@ -9,8 +9,8 @@
  * IMPORTANT: When adding/renaming/removing tools here, also update the schemas in mcpApi.js.
  *
  * Exports:
- *   getMcpServers()           — stdio MCP server config for session/new mcpServers array
- *   createToolHandlers(io, acpClient) — returns { toolName: handler(args) } map
+ *   getMcpServers()           -- stdio MCP server config for session/new mcpServers array
+ *   createToolHandlers(io)    -- returns { toolName: handler(args) } map
  */
 import { getProvider, getProviderModuleSync } from '../services/providerLoader.js';
 import { writeLog } from '../services/logger.js';
@@ -21,17 +21,26 @@ import { subAgentInvocationManager } from './subAgentInvocationManager.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
 import { createMcpProxyBinding } from './mcpProxyRegistry.js';
 import { shellRunManager } from '../services/shellRunManager.js';
-import { toolCallState } from '../services/tools/index.js';
+import {
+  mcpExecutionRegistry,
+  publicMcpToolInput,
+  toolCallIdFromMcpContext
+} from '../services/tools/mcpExecutionRegistry.js';
+import {
+  isCounselMcpEnabled,
+  isGoogleSearchMcpEnabled,
+  isInvokeShellMcpEnabled,
+  isIoMcpEnabled,
+  isSubagentsMcpEnabled
+} from '../services/mcpConfig.js';
+import { ACP_UX_TOOL_NAMES } from '../services/tools/acpUxTools.js';
+import { createGoogleSearchMcpToolHandlers, createIoMcpToolHandlers } from './ioMcpToolHandlers.js';
 
 const DEFAULT_MAX_SHELL_RESULT_LINES = 1000;
 
 export function getMaxShellResultLines(env = process.env) {
   const parsed = Number.parseInt(env.MAX_SHELL_RESULT_LINES || '', 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_SHELL_RESULT_LINES;
-}
-
-function toolCallIdFromMeta(requestMeta) {
-  return requestMeta?.toolCallId || requestMeta?.tool_call_id || requestMeta?.callId || null;
 }
 
 function stableStringify(value) {
@@ -58,53 +67,40 @@ function buildSubAgentInvocationKey({ providerId, acpSessionId, mcpProxyId, mcpR
     return `${scope}::mcp-request::${String(mcpRequestId)}`;
   }
 
-  const toolCallId = toolCallIdFromMeta(requestMeta);
+  const toolCallId = toolCallIdFromMcpContext({ requestMeta, toolName });
   if (toolCallId) return `${scope}::tool-call::${String(toolCallId)}`;
 
   return `${scope}::fingerprint::${hashInvocationInput(input)}`;
 }
 
-function mcpServerName(providerId) {
-  try {
-    return getProvider(providerId).config.mcpName || 'AcpUI';
-  } catch {
-    return 'AcpUI';
-  }
-}
+function wrapToolHandlers(tools, io) {
+  const wrapped = {};
+  for (const [toolName, handler] of Object.entries(tools)) {
+    wrapped[toolName] = async (args = {}) => {
+      const input = publicMcpToolInput(toolName, args);
+      const execution = mcpExecutionRegistry.begin({
+        io,
+        providerId: args.providerId,
+        sessionId: args.acpSessionId,
+        acpSessionId: args.acpSessionId,
+        mcpProxyId: args.mcpProxyId,
+        mcpRequestId: args.mcpRequestId,
+        requestMeta: args.requestMeta,
+        toolName,
+        input
+      });
 
-function cacheMcpToolInvocation({ io, providerId, acpSessionId, toolCallId, toolName, input, title }) {
-  if (!providerId || !acpSessionId || !toolCallId) return;
-  toolCallState.upsert({
-    providerId,
-    sessionId: acpSessionId,
-    toolCallId,
-    identity: {
-      kind: 'acpui_mcp',
-      canonicalName: toolName,
-      rawName: toolName,
-      mcpServer: mcpServerName(providerId),
-      mcpToolName: toolName
-    },
-    input,
-    display: {
-      title,
-      titleSource: 'mcp_handler'
-    }
-  });
-
-  if (io && title) {
-    io.to?.(`session:${acpSessionId}`)?.emit?.('system_event', {
-      providerId,
-      sessionId: acpSessionId,
-      type: 'tool_update',
-      id: toolCallId,
-      toolName,
-      canonicalName: toolName,
-      mcpServer: mcpServerName(providerId),
-      mcpToolName: toolName,
-      title
-    });
+      try {
+        const result = await handler(args);
+        mcpExecutionRegistry.complete(execution, result);
+        return result;
+      } catch (err) {
+        mcpExecutionRegistry.fail(execution, err);
+        throw err;
+      }
+    };
   }
+  return wrapped;
 }
 
 /**
@@ -134,27 +130,21 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
 }
 
 /**
- * Creates tool handlers bound to io and acpClient.
+ * Creates tool handlers bound to io.
  * Returns a map of { toolName: handler(args) }.
  */
 export function createToolHandlers(io) {
   const tools = {};
 
-  tools.ux_invoke_shell = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+  const runShellInvocation = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
     const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
     const maxLines = getMaxShellResultLines();
 
     if (providerId && acpSessionId) {
-      const toolCallId = toolCallIdFromMeta(requestMeta);
-      const title = description ? `Invoke Shell: ${description}` : 'Invoke Shell';
-      cacheMcpToolInvocation({
-        io,
-        providerId,
-        acpSessionId,
-        toolCallId,
-        toolName: 'ux_invoke_shell',
-        input: { description, command, cwd: workingDir },
-        title
+      const toolCallId = toolCallIdFromMcpContext({
+        requestMeta,
+        mcpRequestId,
+        toolName: ACP_UX_TOOL_NAMES.invokeShell
       });
       shellRunManager.setIo?.(io);
       writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
@@ -174,7 +164,11 @@ export function createToolHandlers(io) {
     return { content: [{ type: 'text', text: 'Error: Shell execution context unavailable' }] };
   };
 
-  tools.ux_invoke_subagents = async ({
+  if (isInvokeShellMcpEnabled()) {
+    tools[ACP_UX_TOOL_NAMES.invokeShell] = runShellInvocation;
+  }
+
+  const runSubagentInvocation = async ({
     requests,
     model,
     providerId,
@@ -183,20 +177,9 @@ export function createToolHandlers(io) {
     mcpRequestId,
     requestMeta,
     abortSignal,
-    skipToolState = false,
-    idempotencyToolName = 'ux_invoke_subagents'
+    _skipToolState = false,
+    idempotencyToolName = ACP_UX_TOOL_NAMES.invokeSubagents
   }) => {
-    if (!skipToolState) {
-      cacheMcpToolInvocation({
-        io,
-        providerId,
-        acpSessionId,
-        toolCallId: toolCallIdFromMeta(requestMeta),
-        toolName: 'ux_invoke_subagents',
-        input: { requests, model },
-        title: 'Invoke Subagents'
-      });
-    }
     const idempotencyKey = buildSubAgentInvocationKey({
       providerId,
       acpSessionId,
@@ -217,19 +200,23 @@ export function createToolHandlers(io) {
     });
   };
 
+  if (isSubagentsMcpEnabled()) {
+    tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
+  }
+
   /**
-   * Counsel tool — spawns multiple sub-agents with different perspectives to evaluate a question.
+   * Counsel tool -- spawns multiple sub-agents with different perspectives to evaluate a question.
    * Reuses the ux_invoke_subagents infrastructure with structured role prompts from counsel.json.
    *
    * Agent list is built from counsel.json (loaded via counselConfig.js):
    *   - config.core[] agents are always included (Advocate, Critic, Pragmatist)
    *   - config.optional.{key} agents are added when the matching boolean flag is true
-   * Each agent entry has { name, prompt } — the prompt defines the agent's perspective/role.
+   * Each agent entry has { name, prompt } -- the prompt defines the agent's perspective/role.
    *
    * Delegates to ux_invoke_subagents so counsel agents get the same session lifecycle,
    * UI visibility, and cleanup as any other sub-agent.
    */
-  tools.ux_invoke_counsel = async ({
+  const runCounselInvocation = async ({
     question,
     architect,
     performance,
@@ -243,10 +230,8 @@ export function createToolHandlers(io) {
     abortSignal
   }) => {
     const config = loadCounselConfig();
-    // Core agents (e.g. Advocate, Critic, Pragmatist) are always spawned
     const agents = [...(config.core || [])];
 
-    // Optional domain experts — toggled by boolean flags from the tool schema
     if (architect && config.optional?.architect) agents.push(config.optional.architect);
     if (performance && config.optional?.performance) agents.push(config.optional.performance);
     if (security && config.optional?.security) agents.push(config.optional.security);
@@ -256,23 +241,12 @@ export function createToolHandlers(io) {
       return { content: [{ type: 'text', text: 'Error: No counsel agents configured' }] };
     }
 
-    // Each agent gets its role prompt prepended to the user's question
-    const requests = agents.map(a => ({
-      prompt: `${a.prompt}\n\nThe question/topic to evaluate:\n\n${question}`,
-      name: a.name,
+    const requests = agents.map(agent => ({
+      prompt: `${agent.prompt}\n\nThe question/topic to evaluate:\n\n${question}`,
+      name: agent.name,
     }));
 
-    // Delegate to ux_invoke_subagents — reuses all sub-agent infrastructure
-    cacheMcpToolInvocation({
-      io,
-      providerId,
-      acpSessionId,
-      toolCallId: toolCallIdFromMeta(requestMeta),
-      toolName: 'ux_invoke_counsel',
-      input: { question, architect, performance, security, ux },
-      title: 'Invoke Counsel'
-    });
-    return tools.ux_invoke_subagents({
+    return runSubagentInvocation({
       requests,
       providerId,
       acpSessionId,
@@ -280,10 +254,22 @@ export function createToolHandlers(io) {
       mcpRequestId,
       requestMeta,
       abortSignal,
-      skipToolState: true,
-      idempotencyToolName: 'ux_invoke_counsel'
+      _skipToolState: true,
+      idempotencyToolName: ACP_UX_TOOL_NAMES.invokeCounsel
     });
   };
 
-  return tools;
+  if (isCounselMcpEnabled()) {
+    tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
+  }
+
+  if (isIoMcpEnabled()) {
+    Object.assign(tools, createIoMcpToolHandlers());
+  }
+
+  if (isGoogleSearchMcpEnabled()) {
+    Object.assign(tools, createGoogleSearchMcpToolHandlers());
+  }
+
+  return wrapToolHandlers(tools, io);
 }

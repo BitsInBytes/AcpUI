@@ -28,13 +28,13 @@ AcpUI is a **provider-agnostic** bridge between a web UI and AI agents communica
 When working on changes related to a specific provider, you **must** load and read the following in order:
 
 1. **`documents/[Feature Doc] - Provider System.md`** — The generic provider contract and architecture. Understand how ALL providers work.
-2. **`documents/[Feature Doc] - <Provider> Provider.md`** — The provider-specific supplement. Shows line numbers, gotchas, and implementation details for that provider (e.g., `[Feature Doc] - Claude Provider.md`, `[Feature Doc] - Kiro Provider.md`).
+2. **`documents/[Feature Doc] - <Provider> Provider.md`** — The provider-specific supplement. Shows stable code anchors, gotchas, and implementation details for that provider (e.g., `[Feature Doc] - Claude Provider.md`, `[Feature Doc] - Kiro Provider.md`).
 3. **All `.md` files in `providers/<provider>/`** — Read every markdown file in the provider's directory:
    - **`README.md`** — Installation, configuration, and operational guide
    - **`provider.json`** — Configuration schema, tool patterns, branding, and protocol prefix
    - **Any other `.md` files** — May include `SESSION_META_DATA.md`, `ACP_PROTOCOL_SAMPLES.md`, or other references specific to that provider. Read these when referenced by the Feature Doc.
 
-Load these **in order** and **use them alongside the code** when implementing provider features. The Feature Docs contain exact line numbers that point directly to relevant code sections.
+Load these **in order** and **use them alongside the code** when implementing provider features. The Feature Docs identify relevant files, functions, events, config keys, and snippets that point directly to the implementation.
 
 ### Critical Concept: The Unified Timeline
 Everything in the UI—thoughts, tool calls, text, and permissions—is treated as a chronological sequence of "steps" in a timeline. Never bypass this normalization.
@@ -43,11 +43,11 @@ Everything in the UI—thoughts, tool calls, text, and permissions—is treated 
 
 All system features are documented in **Feature Docs** under `documents/[Feature Doc] - *.md`. These are the authoritative sources for understanding specific systems. Load them based on the task.
 
-**Before exploring a new code area, check if a Feature Doc exists for it.** If you're working on a task and discover you need to understand or modify code outside the scope of your already-loaded Feature Docs, load the relevant Feature Doc for that area **before** diving into code exploration. This prevents wasted time re-reading and re-understanding code that's already documented. The Feature Doc will contain exact line numbers, architecture diagrams, and gotchas you need to know, so you can jump directly to the relevant code instead of exploring blindly.
+**Before exploring a new code area, check if a Feature Doc exists for it.** If you're working on a task and discover you need to understand or modify code outside the scope of your already-loaded Feature Docs, load the relevant Feature Doc for that area **before** diving into code exploration. This prevents wasted time re-reading and re-understanding code that's already documented. The Feature Doc will contain stable file/function/event anchors, architecture diagrams, and gotchas you need to know, so you can jump directly to the relevant implementation instead of exploring blindly.
 
 ### Architecture Overview Docs
 
-Start with these when beginning any backend or frontend work. They provide the foundational architecture understanding, exact line numbers, and end-to-end flows.
+Start with these when beginning any backend or frontend work. They provide the foundational architecture understanding, stable code anchors, and end-to-end flows.
 
 - **[Feature Doc] - Backend Architecture.md** — Full backend layer: server bootstrap, ACP client lifecycle, socket handlers, session management, MCP tool system, and SQLite persistence. **Load this when starting any backend work.**
 - **[Feature Doc] - Frontend Architecture.md** — Full frontend layer: Zustand store split, Socket.IO singleton, streaming/typewriter pipeline, session switching, model state management, and branding system. **Load this when starting any frontend work.**
@@ -74,13 +74,16 @@ Start with these when beginning any backend or frontend work. They provide the f
 - **[Feature Doc] - Provider System.md** — The pluggable adapter architecture. Load this when understanding how providers work, implementing a new provider, or debugging provider-related issues. **Start here for provider work.**
 - **[Feature Doc] - ux_invoke_shell.md** — Custom UI MCP tool for executing shell commands. Load this when implementing shell execution, streaming output, or debugging shell-related features.
 - **[Feature Doc] - ux_invoke_subagents.md** — Custom UI MCP tool for spawning parallel agents. Load this for agent orchestration, parallel execution, or subagent communication features.
-- **[Feature Doc] - MCP Server System.md** — How AcpUI's MCP server works. Load this when adding new MCP tools or debugging MCP protocol issues.
+- **[Feature Doc] - MCP Server.md** — How AcpUI's MCP server works. Load this when adding new MCP tools or debugging MCP protocol issues.
+- **[Feature Doc] - IO MCP Tools.md** — Optional file IO and URL fetch MCP tools controlled by `configuration/mcp.json`. Load this when implementing or debugging `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, or `ux_web_fetch`.
+- **[Feature Doc] - Google Search MCP Tool.md** — Optional grounded Google search MCP tool controlled by `configuration/mcp.json`. Load this when implementing or debugging `ux_google_web_search`.
+- **[Feature Doc] - MCP Feature Flag System.md** — JSON-backed feature flag system for core and optional MCP tool advertisement and handler registration. Load this when adding or changing MCP tool flags.
 - **[Feature Doc] - Auto Chat Title Generation.md** — Background title generation for new and forked sessions. Covers ephemeral session creation, statsCaptures buffering, model selection, rename conditions, and socket emission. Load this when implementing title generation, debugging missing/wrong titles, or extending title logic.
 - **[Feature Doc] - JSONL Rehydration & Session Persistence.md** — Full session persistence lifecycle: DB-first architecture, JSONL as provider ground truth, three rehydration paths (lazy sync, forced rehydration, ACP drain), periodic streaming saves, and provider interface contract. Load this when implementing session recovery, debugging stale/missing messages, extending persistence, or implementing rehydration for a new provider.
 - **[Feature Doc] - Notification System.md** — Multi-modal notifications (desktop toasts, audio, .env config) for background session completion. Covers active session suppression, sub-agent exclusion, workspace-aware notification bodies, environment variable defaults, browser permission flow, and audio fallback patterns. Load this when extending notifications to new events, debugging silent notification failures, or implementing notification preferences.
 
 ### Provider-Specific Feature Docs (Supplements)
-These are **sidecar supplements** to the Provider System doc. Load them **alongside** the main Provider System doc when working on a specific provider. They show provider-specific implementations, gotchas, and line numbers.
+These are **sidecar supplements** to the Provider System doc. Load them **alongside** the main Provider System doc when working on a specific provider. They show provider-specific implementations, gotchas, and stable code anchors.
 
 - **[Feature Doc] - Claude Provider.md** — Claude-specific implementation details. Load this when working on Claude provider features: quota proxy, tool aliasing, project-scoped sessions, spawn-time agents, etc. **Shows the reference implementation.**
 - **[Feature Doc] - Codex Provider.md** — Codex-specific implementation details. Load this when working on Codex provider features: `codex-acp` auth, dynamic models/config options, recursive rollout JSONL files, slash commands, and MCP tool normalization.
@@ -101,7 +104,7 @@ A task is **only complete when**:
 When code changes are made, you **must** review all documentation in the `/documents/` folder to ensure they are still accurate. This is done by:
 1. Identifying which files changed (in `frontend/`, `backend/`, or `providers/`).
 2. Searching for those filenames within the `/documents/` directory.
-3. Updating any documents that reference the changed files to ensure code blocks, line numbers, and descriptions are still accurate.
+3. Updating any documents that reference the changed files to ensure code snippets, stable anchors, and descriptions are still accurate.
 
 **If you change a system's behavior, you MUST update its documentation. Outdated documentation is treated as a bug.**
 
@@ -119,7 +122,7 @@ When you **create or significantly modify** a system (new feature, major archite
 If you discover that a Feature Doc is **out of sync with the code**:
 
 1. **Update the Feature Doc as part of your current task** — Don't defer it
-2. **Update line numbers and code snippets** to match the current implementation
+2. **Update stable anchors and code snippets** to match the current implementation
 3. **Add or remove sections** if architecture has changed
 4. **Update the gotchas** if workarounds are no longer needed or new ones have appeared
 5. **Leave a note** in the gotchas section if the discrepancy was due to recent changes
@@ -127,17 +130,17 @@ If you discover that a Feature Doc is **out of sync with the code**:
 ### Rule 4: Generic Docs vs Provider Docs
 
 - **Generic Feature Docs** (in `documents/`) explain patterns and contracts that apply across all providers. They contain **no provider-specific examples** (no "Claude does X, Kiro does Y").
-- **Provider-Specific Feature Docs** (same location, named `[Feature Doc] - <Provider> Provider.md`) fill in provider-specific details, gotchas, line numbers, and implementation quirks.
+- **Provider-Specific Feature Docs** (same location, named `[Feature Doc] - <Provider> Provider.md`) fill in provider-specific details, gotchas, stable code anchors, and implementation quirks.
 - Load both docs together when working on a provider feature.
 
 ### Rule 5: Documentation Style
 
 All Feature Docs must follow `documents/FEATURE_DOC_TEMPLATE.md`:
-- **Exact line numbers** in every code snippet
+- **Stable file/function/event anchors** in every code snippet; do not use line-number anchors
 - **Architecture diagrams** for complex systems
 - **The Critical Contract** — Explicitly state what contracts/interfaces must be followed
 - **Gotchas section** — List 5-10 things that commonly break or confuse
-- **Component reference table** with file paths and exact line numbers
+- **Component reference table** with file paths and stable anchors
 - **No provider-specific examples in generic docs** — Use pattern language: "A provider must...", not "Claude does..."
 
 ### Rule 6: Document Present State Only
@@ -148,7 +151,7 @@ When updating Feature Docs:
 - **Never mention how the system "used to work"** — Remove references to older implementations, previous architecture, or deprecated patterns
 - **Never use past tense to describe implementation** — Say "The system does X" not "The system used to do X"
 - **Always describe the current implementation** — If the system changed, describe the new behavior only
-- **Update line numbers and code snippets** when code shifts — This keeps the documentation accurate and current
+- **Update stable anchors and code snippets** when code shifts — This keeps the documentation accurate and current
 - **If a section describes an old pattern**, delete it or replace it with the current pattern. Don't keep both.
 - **Example of what to AVOID**: "Previously, sessions were stored flat. Now they are stored in project-scoped subdirectories..."
 
@@ -182,7 +185,7 @@ When updating Feature Docs:
   - **Frontend Lint**: `cd frontend && npm run lint`
 - **Frontend Build Validation**: After all unit tests pass and linting is clean, you **must** run `npm run build` in the `frontend` directory to ensure that TypeScript/Vite bundling succeeds and no runtime type issues were introduced.
 - **Documentation Requirement**: A task is only "done" when the documentation matches the code. If your changes alter architecture, services, stores, or protocols, you **must** update the relevant README (`README.md` at root, `backend/README.md`, or `frontend/README.md`) to reflect the current reality of the codebase.
-- **Final Pre-Commit Documentation Check**: Immediately before executing a commit (when explicitly asked to do so), you **must** perform a final, comprehensive review of ALL documentation in the `/documents/` folder one last time. This "last check" ensures that no documentation was missed during the development phase and that all line numbers and code snippets accurately reflect the final state of the staged changes.
+- **Final Pre-Commit Documentation Check**: Immediately before executing a commit (when explicitly asked to do so), you **must** perform a final, comprehensive review of ALL documentation in the `/documents/` folder one last time. This "last check" ensures that no documentation was missed during the development phase and that all stable anchors and code snippets accurately reflect the final state of the staged changes.
 
 ### Backend Testing
 
@@ -218,7 +221,7 @@ When updating Feature Docs:
 
 ### 7.2 During Implementation
 
-1. **Reference exact line numbers** — Use the Feature Doc as your guide. It contains line numbers that point directly to code you need to understand or modify.
+1. **Reference stable code anchors** — Use the Feature Doc as your guide. It contains file paths, functions, events, config keys, and snippets that point directly to code you need to understand or modify.
 2. **Follow the gotchas** — The Feature Doc lists common mistakes. Check the gotchas before implementing something you think is straightforward.
 3. **Update code AND documentation together** — Never defer documentation updates to "later." Update as you code.
 4. **Create tests alongside code** — Tests are part of development, not an afterthought. Use TDD or write tests immediately after implementation.

@@ -1,380 +1,664 @@
-# Feature Doc — Chat Header
+# Feature Doc - Chat Header
 
-The Chat Header is the top control bar for an active session. It renders live connection state, session identity, and lightweight global controls while staying provider-agnostic.
+The Chat Header is the top control bar rendered above an active chat surface. It displays connection readiness, session identity, provider-derived branding, workspace context, and shallow global controls while keeping provider identity payload-driven.
 
-This area is easy to break because it combines data from multiple stores (`session`, `system`, `ui`) and changes behavior in pop-out mode based on URL query params.
+This feature is easy to regress because it composes state from `useSessionLifecycleStore`, `useSystemStore`, and `useUIStore`, and the same component renders in the main app and the pop-out app with different control visibility.
 
 ## Overview
 
 ### What It Does
-- Renders socket/runtime status via `StatusIndicator` (`Disconnected`, `Warming up...`, `Engine Ready`).
-- Resolves and displays active session identity with provider label and optional sub-agent suffix.
-- Resolves `cwd` display labels from workspace metadata.
-- Uses provider branding fallback (`appHeader`) when no active session exists.
-- Shows/hides menu and action controls based on pop-out mode.
-- Triggers UI state for sidebar open, file explorer open, and system settings open.
+- Renders socket and engine readiness through `StatusIndicator`.
+- Resolves the active `ChatSession` from `useSessionLifecycleStore.sessions` and `useSessionLifecycleStore.activeSessionId`.
+- Builds the session title from provider metadata, optional sub-agent suffix, session name, and optional workspace label.
+- Uses `useSystemStore.getBranding(activeSession?.provider)` for fallback header branding when the component is mounted without an active session name.
+- Suppresses sidebar, file explorer, and system settings controls when `window.location.search` contains the `popout` query key.
+- Dispatches only shallow UI actions: `setSidebarOpen(true)`, `setFileExplorerOpen(true)`, and `setSystemSettingsOpen(true)`.
+- Relies on socket-hydrated provider, branding, readiness, and workspace state rather than hardcoded provider labels.
 
 ### Why This Matters
-- It is the highest-visibility status surface in the chat UI.
-- It enforces provider-agnostic naming by using provider payload data, not hardcoded labels.
-- It prevents split-window ownership conflicts by hiding controls in pop-out windows.
-- It connects backend boot payloads to visible user state with no additional requests.
-- It is a frequent regression point when store shapes or URL behavior change.
+- It is a visible readiness and identity surface for every chat view.
+- It is the main UI merge point for provider metadata and session metadata.
+- It depends on store shapes shared with socket hydration, session lifecycle, sidebar provider selection, and pop-out ownership.
+- It keeps detached chat windows focused by hiding controls that belong to the main app shell.
+- Small changes to provider payloads, store defaults, URL query keys, or session path formatting appear in the header immediately.
 
-Architectural role: frontend rendering component with backend-fed state dependencies (`both`, but logic is frontend-owned).
+Architectural role: frontend rendering component with backend-fed state dependencies.
 
-## How It Works — End-to-End Flow
+## How It Works - End-to-End Flow
 
-1. Backend emits provider/runtime bootstrap payloads on socket connect.
+1. Backend builds provider metadata for socket hydration.
 
 ```javascript
-// FILE: backend/sockets/index.js (Lines 58-61, 67, 74, 76)
-socket.emit('providers', {            // LINE 58
-  defaultProviderId,                  // LINE 59
-  providers: providerPayloads         // LINE 60
+// FILE: backend/sockets/index.js (Functions: buildBrandingPayload, getProviderPayloads)
+function buildBrandingPayload(providerId) {
+  const provider = getProvider(providerId);
+  const providerConfig = provider.config;
+  return {
+    providerId,
+    ...providerConfig.branding,
+    title: providerConfig.title,
+    models: providerConfig.models,
+    defaultModel: providerConfig.models?.default,
+    protocolPrefix: providerConfig.protocolPrefix,
+    supportsAgentSwitching: providerConfig.supportsAgentSwitching ?? false
+  };
+}
+
+function getProviderPayloads() {
+  const defaultProviderId = getDefaultProviderId();
+  return getProviderEntries().map(entry => ({
+    providerId: entry.id,
+    label: entry.label,
+    default: entry.id === defaultProviderId,
+    ready: providerRuntimeManager.getRuntimes().find(runtime => runtime.providerId === entry.id)?.client.isHandshakeComplete === true,
+    branding: buildBrandingPayload(entry.id)
+  }));
+}
+```
+
+The header uses `ProviderSummary.branding.title`, `ProviderSummary.label`, `ProviderSummary.ready`, and `ProviderSummary.branding.appHeader`. The provider payloads are constructed in one backend location and then consumed generically by the frontend.
+
+2. Backend emits the header-facing socket events during connection.
+
+```javascript
+// FILE: backend/sockets/index.js (Function: registerSocketHandlers, Socket events: providers, ready, workspace_cwds, branding)
+io.on('connection', (socket) => {
+  const defaultProviderId = getDefaultProviderId();
+  const providerPayloads = getProviderPayloads();
+
+  socket.emit('providers', { defaultProviderId, providers: providerPayloads });
+
+  for (const runtime of providerRuntimeManager.getRuntimes()) {
+    if (runtime.client.isHandshakeComplete) {
+      socket.emit('ready', { providerId: runtime.providerId, bootId: runtime.client.serverBootId });
+    }
+  }
+
+  socket.emit('workspace_cwds', { cwds: loadWorkspaces() });
+  for (const provider of providerPayloads) {
+    socket.emit('branding', provider.branding);
+  }
 });
-socket.emit('ready', { providerId: runtime.providerId, message: 'Ready to help ⚡', bootId: runtime.client.serverBootId }); // LINE 67
-socket.emit('workspace_cwds', { cwds: loadWorkspaces() }); // LINE 74
-socket.emit('branding', provider.branding);                // LINE 76
 ```
 
-2. `useSocket` listeners normalize those events into `useSystemStore`.
+`providers` gives the catalog and active/default provider basis. `ready` updates provider readiness. `workspace_cwds` supplies path-to-label mappings. `branding` is emitted once per provider with a `providerId`.
+
+3. `useSocket` creates the singleton Socket.IO client and hydrates `useSystemStore`.
 
 ```typescript
-// FILE: frontend/src/hooks/useSocket.ts (Lines 31-35, 40-45, 47-50)
-_socket.on('ready', (data: { bootId: string }) => {                  // LINE 31
-  const providerId = (data as { providerId?: string }).providerId;   // LINE 32
-  if (providerId) useSystemStore.getState().setProviderReady(providerId, true); // LINE 33
-  else useSystemStore.getState().setIsEngineReady(true);             // LINE 34
+// FILE: frontend/src/hooks/useSocket.ts (Function: getOrCreateSocket, Socket listeners: connect, ready, workspace_cwds, providers, branding)
+_socket.on('connect', () => {
+  useSystemStore.getState().setConnected(true);
 });
-_socket.on('workspace_cwds', (data) => { useSystemStore.getState().setWorkspaceCwds(data.cwds); }); // LINE 40-41
-_socket.on('providers', (data) => { useSystemStore.getState().setProviders(data.defaultProviderId || null, data.providers || []); }); // LINE 43-44
-_socket.on('branding', (data: any) => {                               // LINE 47
-  if (data.providerId) useSystemStore.getState().setProviderBranding(data); // LINE 48-49
+
+_socket.on('ready', (data: { bootId: string }) => {
+  const providerId = (data as { providerId?: string }).providerId;
+  if (providerId) useSystemStore.getState().setProviderReady(providerId, true);
+  else useSystemStore.getState().setIsEngineReady(true);
+  useSystemStore.getState().setBackendBootId(data.bootId);
+});
+
+_socket.on('workspace_cwds', (data: { cwds: WorkspaceCwd[] }) => {
+  useSystemStore.getState().setWorkspaceCwds(data.cwds);
+});
+
+_socket.on('providers', (data: { defaultProviderId?: string | null; providers?: ProviderSummary[] }) => {
+  useSystemStore.getState().setProviders(data.defaultProviderId || null, data.providers || []);
+});
+
+_socket.on('branding', (data: any) => {
+  if (data.providerId) useSystemStore.getState().setProviderBranding(data);
+  else useSystemStore.setState({ branding: data });
+  const activeBranding = useSystemStore.getState().branding;
+  document.title = activeBranding.title || activeBranding.assistantName || 'ACP UI';
 });
 ```
 
-3. `ChatHeader` pulls session identity from `useSessionLifecycleStore`.
+The header does not subscribe to socket events directly. It reads the normalized store state produced by these listeners.
+
+4. `useSystemStore` maintains the provider and readiness state consumed by the header.
 
 ```typescript
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 10, 16, 20)
-const { sessions, activeSessionId } = useSessionLifecycleStore(); // LINE 10
-const activeSession = sessions.find(s => s.id === activeSessionId); // LINE 16
-const activeSessionName = activeSession?.name;                      // LINE 20
+// FILE: frontend/src/store/useSystemStore.ts (Store actions: setProviders, setProviderReady, setProviderBranding, getBranding)
+setProviders: (defaultProviderId, providers) => set(state => {
+  const providersById = Object.fromEntries(providers.map(provider => [provider.providerId, provider]));
+  const nextActiveProviderId = state.activeProviderId || defaultProviderId || providers[0]?.providerId || null;
+  const activeBranding = nextActiveProviderId ? providersById[nextActiveProviderId]?.branding : null;
+  return {
+    defaultProviderId,
+    activeProviderId: nextActiveProviderId,
+    providersById,
+    readyByProviderId: {
+      ...state.readyByProviderId,
+      ...Object.fromEntries(providers.map(provider => [provider.providerId, provider.ready === true]))
+    },
+    ...(activeBranding ? { branding: activeBranding } : {})
+  };
+}),
+
+setProviderReady: (providerId, isReady) => set(state => ({
+  readyByProviderId: { ...state.readyByProviderId, [providerId]: isReady },
+  isEngineReady: providerId === (state.activeProviderId || state.defaultProviderId) ? isReady : state.isEngineReady
+})),
+
+getBranding: (providerId) => {
+  const state = get();
+  if (providerId && state.providersById[providerId]) return state.providersById[providerId].branding;
+  return state.branding;
+}
 ```
 
-4. It resolves provider-specific display values through `useSystemStore` indirection.
+`StatusIndicator` receives the global `isEngineReady`, which tracks the active/default provider through `setProviderReady`. The header title lookup uses `providersById[activeSession.provider]` directly so the displayed provider name follows the session provider.
+
+5. Session lifecycle state supplies the active session identity.
 
 ```typescript
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 17-19)
-const branding = useSystemStore(state => state.getBranding(activeSession?.provider)); // LINE 17
-const providerSummary = useSystemStore(state => activeSession?.provider ? state.providersById[activeSession.provider] : undefined); // LINE 18
-const providerName = providerSummary?.branding?.title || providerSummary?.label || activeSession?.provider || ''; // LINE 19
+// FILE: frontend/src/store/useSessionLifecycleStore.ts (Store fields: sessions, activeSessionId; Action: setActiveSessionId)
+sessions: [],
+activeSessionId: null,
+
+setActiveSessionId: (id) => {
+  set({ activeSessionId: id });
+  if (get().isUrlSyncReady) {
+    const url = new URL(window.location.href);
+    if (id) url.searchParams.set('s', id);
+    else url.searchParams.delete('s');
+    window.history.replaceState({}, '', url.toString());
+  }
+}
 ```
 
-5. It resolves optional workspace `cwd` label by matching the session path.
+The header only reads the active session. Session selection, URL sync, hydration, and save behavior remain in `useSessionLifecycleStore` and app roots.
 
-```typescript
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 23-25)
-const cwdLabel = activeSession?.cwd                                      // LINE 23
-  ? useSystemStore.getState().workspaceCwds.find(w => w.path === activeSession.cwd)?.label || null // LINE 24
-  : null;                                                                 // LINE 25
-```
-
-6. It gates UI behavior for detached windows (`?popout=...`).
-
-```typescript
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 21, 30, 53)
-const isPopout = new URLSearchParams(window.location.search).has('popout'); // LINE 21
-{!isPopout && ( /* Open Sidebar button */ )}                                // LINE 30
-{!isPopout && ( /* Header actions block */ )}                               // LINE 53
-```
-
-7. It renders connection/engine status and title/fallback text.
+6. The main app mounts `ChatHeader` only for an active session.
 
 ```tsx
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 28, 35, 40-48)
-<header className={`header ${!connected ? 'disconnected' : ''}`}>  {/* LINE 28 */}
-  <StatusIndicator connected={connected} isEngineReady={isEngineReady} /> {/* LINE 35 */}
-  {activeSessionName ? (                                              // LINE 40
-    <span className="header-session-name">
-      {providerName && `${providerName}${activeSession?.isSubAgent ? ' Subagent' : ''}: `} {/* LINE 42 */}
-      {activeSessionName}
-      {cwdLabel && <span className="header-cwd-label"> ({cwdLabel})</span>} {/* LINE 44 */}
-    </span>
-  ) : (
-    <span className="header-mobile-fallback">{branding.appHeader}</span> {/* LINE 47 */}
-  )}
+// FILE: frontend/src/App.tsx (Component: App, Components: ChatHeader, MessageList, ChatInput)
+{!activeSessionId ? (
+  <div className="empty-state">
+    <MessageSquare size={48} strokeWidth={1} />
+    <p>Select a chat or start a new one</p>
+  </div>
+) : (
+  <>
+    <ChatHeader />
+    <MessageList />
+    <ChatInput />
+  </>
+)}
+```
+
+The component has an internal fallback title, but the main app normally shows the empty state instead of mounting the header without an active session.
+
+7. The pop-out app claims ownership, loads the requested session, and renders the same header.
+
+```tsx
+// FILE: frontend/src/PopOutApp.tsx (Component: PopOutApp, Functions: claimSession, hydrateSession, Socket event: watch_session)
+const popoutSessionId = new URLSearchParams(window.location.search).get('popout')!;
+
+useEffect(() => {
+  if (!socket || !popoutSessionId || ready) return;
+  claimSession(popoutSessionId);
+  useSessionLifecycleStore.setState({ activeSessionId: popoutSessionId });
+
+  socket.emit('load_sessions', (res: { sessions?: ChatSession[] }) => {
+    if (res.sessions) {
+      const mapped = res.sessions.map((s: ChatSession) => ({ ...s, isTyping: false, isWarmingUp: false }));
+      useSessionLifecycleStore.setState({ sessions: mapped, activeSessionId: popoutSessionId });
+
+      const session = mapped.find((s: ChatSession) => s.id === popoutSessionId);
+      if (session?.acpSessionId) {
+        socket.emit('watch_session', { sessionId: session.acpSessionId });
+        useSessionLifecycleStore.getState().hydrateSession(socket, popoutSessionId);
+      }
+      setReady(true);
+    }
+  });
+}, [socket, popoutSessionId, ready]);
+
+return <ChatHeader />;
+```
+
+Pop-out ownership is coordinated in `frontend/src/lib/sessionOwnership.ts`, while the header only uses the `popout` query key to hide controls.
+
+8. `ChatHeader` reads the three stores and resolves display values.
+
+```typescript
+// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Component: ChatHeader, Stores: useSessionLifecycleStore, useSystemStore, useUIStore)
+const { sessions, activeSessionId } = useSessionLifecycleStore();
+const { setSidebarOpen } = useUIStore();
+const { connected, isEngineReady } = useSystemStore();
+
+const activeSession = sessions.find(s => s.id === activeSessionId);
+const branding = useSystemStore(state => state.getBranding(activeSession?.provider));
+const providerSummary = useSystemStore(state => activeSession?.provider ? state.providersById[activeSession.provider] : undefined);
+const providerName = providerSummary?.branding?.title || providerSummary?.label || activeSession?.provider || '';
+const activeSessionName = activeSession?.name;
+const isPopout = new URLSearchParams(window.location.search).has('popout');
+const cwdLabel = activeSession?.cwd
+  ? useSystemStore.getState().workspaceCwds.find(w => w.path === activeSession.cwd)?.label || null
+  : null;
+```
+
+The lookup order is part of the display contract: provider branding title, provider label, raw provider id, then an empty prefix.
+
+9. `StatusIndicator` converts connection state into text and CSS state.
+
+```tsx
+// FILE: frontend/src/components/Status/StatusIndicator.tsx (Component: StatusIndicator, Props: connected, isEngineReady)
+<div className={`status-dot ${connected ? (isEngineReady ? 'ready' : 'connected') : 'disconnected'}`} />
+<span className="status-text">
+  {!connected ? 'Disconnected' : (isEngineReady ? 'Engine Ready' : 'Warming up...')}
+</span>
+```
+
+`ChatHeader` applies the parent `.header.disconnected` class when `connected` is false, and `StatusIndicator` renders the precise readiness text.
+
+10. The header renders identity, workspace label, and fallback branding.
+
+```tsx
+// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Component: ChatHeader, Child: StatusIndicator)
+<header className={`header ${!connected ? 'disconnected' : ''}`}>
+  <StatusIndicator connected={connected} isEngineReady={isEngineReady} />
+  <h1 className="header-title">
+    {activeSessionName ? (
+      <span className="header-session-name">
+        {providerName && `${providerName}${activeSession?.isSubAgent ? ' Subagent' : ''}: `}
+        {activeSessionName}
+        {cwdLabel && <span className="header-cwd-label"> ({cwdLabel})</span>}
+      </span>
+    ) : (
+      <span className="header-mobile-fallback">{branding.appHeader}</span>
+    )}
+  </h1>
 </header>
 ```
 
-8. Action buttons only dispatch UI toggles; modal internals are owned by separate systems.
+Sub-agent status is a display suffix derived from `ChatSession.isSubAgent`. Workspace text appears only when `ChatSession.cwd` exactly matches a `WorkspaceCwd.path`.
+
+11. Header buttons dispatch UI store toggles and are hidden in pop-out mode.
 
 ```tsx
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Lines 56, 63)
-onClick={() => useUIStore.getState().setFileExplorerOpen(true)}   // LINE 56
-onClick={() => useUIStore.getState().setSystemSettingsOpen(true)} // LINE 63
+// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Component: ChatHeader, Store actions: setSidebarOpen, setFileExplorerOpen, setSystemSettingsOpen)
+{!isPopout && (
+  <button onClick={() => setSidebarOpen(true)} className="mobile-header-menu-btn" title="Open Sidebar">
+    <Menu size={20} />
+  </button>
+)}
+
+{!isPopout && (
+  <div className="header-actions">
+    <button onClick={() => useUIStore.getState().setFileExplorerOpen(true)} className="icon-button" title="File Explorer">
+      <FolderOpen size={18} />
+    </button>
+    <button onClick={() => useUIStore.getState().setSystemSettingsOpen(true)} className="icon-button" title="System Settings">
+      <Settings size={18} />
+    </button>
+  </div>
+)}
 ```
 
-The actual File Explorer and System Settings workflows are documented in:
-- `documents/[Feature Doc] - File Explorer.md`
-- `documents/[Feature Doc] - System Settings Modal.md`
-
-9. Root app renders the corresponding modal components once; header only flips booleans.
-
-```tsx
-// FILE: frontend/src/App.tsx (Lines 248-250)
-<SystemSettingsModal /> // LINE 248
-<NotesModal />          // LINE 249
-<FileExplorer />        // LINE 250
-```
-
-10. Pop-out app still renders `ChatHeader`, but header self-suppresses controls by URL check.
-
-```tsx
-// FILE: frontend/src/PopOutApp.tsx (Lines 26, 110)
-const popoutSessionId = new URLSearchParams(window.location.search).get('popout')!; // LINE 26
-<ChatHeader /> // LINE 110
-```
+The header opens existing surfaces. `App` owns `SystemSettingsModal`, `NotesModal`, and `FileExplorer`; the header does not manage modal internals.
 
 ## Architecture Diagram
 
 ```mermaid
 flowchart LR
   subgraph Backend
-    SI[backend/sockets/index.js]
+    IDX[backend/sockets/index.js\nbuildBrandingPayload\ngetProviderPayloads\nregisterSocketHandlers]
+    WORK[backend/services/workspaceConfig.js\nloadWorkspaces]
   end
 
-  subgraph Frontend Socket Layer
-    US[useSocket.ts listeners]
+  subgraph Socket
+    SOCK[Socket.IO events\nproviders / ready / workspace_cwds / branding]
+  end
+
+  subgraph FrontendSocket
+    US[frontend/src/hooks/useSocket.ts\ngetOrCreateSocket]
   end
 
   subgraph Stores
-    SYS[useSystemStore]
-    SES[useSessionLifecycleStore]
-    UI[useUIStore]
+    SYS[useSystemStore\nprovidersById / branding / workspaceCwds\nconnected / isEngineReady]
+    SES[useSessionLifecycleStore\nsessions / activeSessionId]
+    UI[useUIStore\nsetSidebarOpen\nsetFileExplorerOpen\nsetSystemSettingsOpen]
+  end
+
+  subgraph Roots
+    APP[App.tsx\nactive chat root]
+    POP[PopOutApp.tsx\npopout query root]
+    OWN[sessionOwnership.ts\nclaimSession]
   end
 
   subgraph Header
     CH[ChatHeader.tsx]
     ST[StatusIndicator.tsx]
+    CSS[ChatHeader.css]
   end
 
-  subgraph Root UI
-    APP[App.tsx]
-    FE[FileExplorer]
-    SSM[SystemSettingsModal]
-  end
-
-  SI -->|providers/ready/branding/workspace_cwds| US
+  IDX --> SOCK
+  WORK --> IDX
+  SOCK --> US
   US --> SYS
+  APP --> CH
+  POP --> CH
+  POP --> OWN
   SES --> CH
   SYS --> CH
   CH --> ST
-  CH -->|setFileExplorerOpen true| UI
-  CH -->|setSystemSettingsOpen true| UI
+  CH --> CSS
+  CH --> UI
   UI --> APP
-  APP --> FE
-  APP --> SSM
 ```
 
-Data flow from backend connect payloads to Zustand stores and then to header rendering + UI toggle dispatch.
+## The Critical Contract
 
-## The Critical Contract / Key Concept
+The header depends on a three-store display contract plus a URL mode contract.
 
-The header depends on a three-store contract:
+### Store Contract
+- `useSessionLifecycleStore.activeSessionId` must identify a session in `useSessionLifecycleStore.sessions` when the header should render a chat title.
+- `ChatSession.provider` must match a `useSystemStore.providersById` key to render provider branding title or label.
+- `ChatSession.cwd` must exactly match `WorkspaceCwd.path` to render `WorkspaceCwd.label` in parentheses.
+- `useSystemStore.connected` and `useSystemStore.isEngineReady` must reflect socket and active/default provider readiness for `StatusIndicator`.
+- `useUIStore` must expose `setSidebarOpen`, `setFileExplorerOpen`, and `setSystemSettingsOpen` because the header dispatches those actions directly.
+
+### URL Mode Contract
+- `new URLSearchParams(window.location.search).has('popout')` is the only header-side pop-out check.
+- `PopOutApp` uses `new URLSearchParams(window.location.search).get('popout')` as the session id.
+- `sessionOwnership.openPopout(sessionId)` opens `/?popout=${sessionId}`.
+
+Core display logic:
 
 ```typescript
-// FILE: frontend/src/types.ts (Lines 158-171, 278-301)
+// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Display contract)
+const providerName = providerSummary?.branding?.title || providerSummary?.label || activeSession?.provider || '';
+const cwdLabel = activeSession?.cwd
+  ? useSystemStore.getState().workspaceCwds.find(w => w.path === activeSession.cwd)?.label || null
+  : null;
+const isPopout = new URLSearchParams(window.location.search).has('popout');
+```
+
+If this contract is violated:
+- Provider prefixes fall back to raw provider ids or disappear.
+- Workspace labels disappear when path strings differ by casing, slashes, or normalization.
+- Status text can show the wrong readiness state if `setProviderReady` does not update the active/default provider.
+- Pop-out windows show main-app controls if the `popout` query key changes.
+- Header buttons fail silently if UI store actions are renamed without updating the component.
+
+## Configuration / Provider-Specific Behavior
+
+This feature is provider-agnostic. Providers influence the header only through backend-normalized configuration and socket payloads.
+
+- Provider registry entries from `configuration/providers.json` supply provider ids and optional labels consumed by `getProviderPayloads`.
+- Provider config loaded by `getProvider(providerId)` supplies `branding`, `title`, `models`, `protocolPrefix`, and `supportsAgentSwitching` through `buildBrandingPayload`.
+- `ProviderBranding.appHeader` is the fallback title string when `ChatHeader` is mounted without an active session name.
+- `ProviderBranding.title` is preferred over `ProviderSummary.label` for the provider prefix in active-session titles.
+- Workspace labels come from `configuration/workspaces.json` through `loadWorkspaces`, then `workspace_cwds`, then `useSystemStore.workspaceCwds`.
+- No Chat Header behavior is controlled by environment variables or backend routes beyond the socket events listed in this guide.
+
+Generic provider payload shape:
+
+```typescript
+// FILE: frontend/src/types.ts (Interfaces: ProviderSummary, ProviderBranding, WorkspaceCwd, ChatSession)
 interface ProviderSummary {
-  providerId: string;    // Required identity key
-  label?: string;        // Display name used by ChatHeader
+  providerId: string;
+  label?: string;
+  default?: boolean;
+  ready?: boolean;
   branding: ProviderBranding;
 }
 
+interface ProviderBranding {
+  providerId: string;
+  assistantName: string;
+  appHeader: string;
+  title?: string;
+  // Other branding/model fields are defined in frontend/src/types.ts.
+}
+
 interface WorkspaceCwd {
-  label: string;         // Display label shown as "(label)" in header
-  path: string;          // Must match ChatSession.cwd exactly
+  label: string;
+  path: string;
+  agent?: string;
+  pinned?: boolean;
 }
 
 interface ChatSession {
   id: string;
   name: string;
-  provider?: string | null;
   cwd?: string | null;
   isSubAgent?: boolean;
+  provider?: string | null;
 }
 ```
-
-If this contract is violated:
-- Missing/incorrect `provider` or `providersById` mapping causes blank or fallback provider names.
-- `cwd` path mismatch causes workspace label disappearance.
-- Missing `appHeader` branding causes empty fallback title when no active session.
-- URL pop-out param mismatches can expose controls in detached windows.
-
-## Configuration / Provider-Specific Behavior
-
-This feature is provider-agnostic. Provider behavior surfaces only through generic payload fields.
-
-- A provider must expose branding via the backend `branding` payload (`assistantName`, `appHeader`, optional `title`, etc.).
-- A provider should be included in `providers` payload with a stable `providerId` and optional human label.
-- Header text uses `providerSummary.branding.title` first, then `providerSummary.label`, then `session.provider`, and never hardcodes provider names.
-- Header does not implement provider config itself; it reads resolved system state only.
 
 ## Data Flow / Rendering Pipeline
 
-Raw socket data:
-
-```json
-{
-  "event": "providers",
-  "defaultProviderId": "provider-a",
-  "providers": [
-    {
-      "providerId": "provider-a",
-      "label": "Provider A",
-      "branding": { "appHeader": "Provider A UI" }
-    }
-  ]
-}
-```
-
-Normalized store state:
-
-```typescript
-{
-  providersById: {
-    "provider-a": {
-      providerId: "provider-a",
-      label: "Provider A",
-      branding: { appHeader: "Provider A UI", ... }
-    }
-  },
-  workspaceCwds: [{ label: "Repo", path: "D:\\repo" }],
-  connected: true,
-  isEngineReady: true
-}
-```
-
-Rendered header output:
+### Socket Data to Header Text
 
 ```text
-[status-dot: ready] Engine Ready | Provider A: Session Name (Repo)
+backend/sockets/index.js registerSocketHandlers
+  -> emit providers/defaultProviderId/providerPayloads
+  -> useSocket providers listener
+  -> useSystemStore.setProviders
+  -> useSystemStore.providersById[session.provider]
+  -> ChatHeader providerName fallback chain
+  -> rendered "Provider Title: Session Name"
 ```
 
-Control dispatch (no side effects in header):
+### Branding Fallback
 
-```typescript
-setSidebarOpen(true)
-setFileExplorerOpen(true)
-setSystemSettingsOpen(true)
+```text
+backend/sockets/index.js buildBrandingPayload
+  -> emit branding with providerId
+  -> useSocket branding listener
+  -> useSystemStore.setProviderBranding
+  -> useSystemStore.getBranding(activeSession?.provider)
+  -> ChatHeader renders branding.appHeader when activeSessionName is absent
+```
+
+### Workspace Label
+
+```text
+configuration/workspaces.json
+  -> loadWorkspaces
+  -> emit workspace_cwds
+  -> useSocket workspace_cwds listener
+  -> useSystemStore.setWorkspaceCwds
+  -> ChatHeader exact match: WorkspaceCwd.path === ChatSession.cwd
+  -> rendered "(Workspace Label)"
+```
+
+### Pop-Out Control Gating
+
+```text
+sessionOwnership.openPopout(sessionId)
+  -> window.open('/?popout=' + sessionId)
+  -> PopOutApp reads popoutSessionId
+  -> PopOutApp renders ChatHeader
+  -> ChatHeader isPopout true
+  -> sidebar/file explorer/system settings buttons are not rendered
+```
+
+Rendered examples:
+
+```text
+Connected and ready:     Engine Ready | Provider Title: Test Chat (Repo)
+Connected and warming:   Warming up... | Provider Title: Test Chat
+Disconnected:            Disconnected | Provider Title: Test Chat
+Sub-agent session:        Engine Ready | Provider Title Subagent: Task Worker
+Fallback component path:  Engine Ready | ACP UI
 ```
 
 ## Component Reference
 
-### Frontend
+### Frontend Components and Styles
 
-| File | Key Functions / Symbols | Exact Lines | Purpose |
-|---|---|---:|---|
-| `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, `isPopout`, button handlers | 9-75 | Main header render + control dispatch |
-| `frontend/src/components/ChatHeader/ChatHeader.css` | `.header`, `.disconnected`, `.header-session-name`, `.mobile-header-menu-btn` | 1-240 | Visual states, responsive behavior, disconnected styling |
-| `frontend/src/components/Status/StatusIndicator.tsx` | `StatusIndicator` | 4-15 | Connection and engine text/dot state |
-| `frontend/src/hooks/useSocket.ts` | `'ready'`, `'workspace_cwds'`, `'providers'`, `'branding'` listeners | 31-45, 47-56 | Hydrates store state consumed by header |
-| `frontend/src/store/useSystemStore.ts` | `setProviders`, `setProviderBranding`, `setWorkspaceCwds`, `getBranding` | 114-147, 174, 178-184 | Provider/session display metadata source |
-| `frontend/src/store/useUIStore.ts` | `setSidebarOpen`, `setSystemSettingsOpen`, `setFileExplorerOpen` | 65, 82, 84 | UI action state toggles |
-| `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId` | 44-46, 72-79 | Session selection source |
-| `frontend/src/App.tsx` | `<ChatHeader />`, `<SystemSettingsModal />`, `<FileExplorer />` | 218, 248-250 | Root composition and modal mounting |
-| `frontend/src/PopOutApp.tsx` | `popoutSessionId`, `<ChatHeader />` | 26, 110 | Detached-window context where header hides controls |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Header | `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, `StatusIndicator`, `setSidebarOpen`, `setFileExplorerOpen`, `setSystemSettingsOpen`, `popout` query key | Renders readiness, session title, workspace label, and header actions |
+| Header styles | `frontend/src/components/ChatHeader/ChatHeader.css` | `.header`, `.header.disconnected`, `.header-session-name`, `.header-cwd-label`, `.mobile-header-menu-btn`, `.header-actions` | Layout, truncation, disconnected coloring, responsive sidebar button visibility |
+| Status | `frontend/src/components/Status/StatusIndicator.tsx` | `StatusIndicator`, props `connected`, `isEngineReady`, classes `ready`, `connected`, `disconnected` | Converts socket readiness into dot class and status text |
+| Main root | `frontend/src/App.tsx` | `App`, `ChatHeader`, `SystemSettingsModal`, `FileExplorer`, active-session conditional render | Mounts header for active sessions and owns the toggled modal surfaces |
+| Pop-out root | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `popoutSessionId`, `claimSession`, `load_sessions`, `watch_session`, `hydrateSession`, `ChatHeader` | Loads a single detached session and renders the same header with controls hidden |
+| Pop-out ownership | `frontend/src/lib/sessionOwnership.ts` | `openPopout`, `claimSession`, `releaseSession`, `isSessionPoppedOut`, `setOwnershipChangeCallback`, BroadcastChannel `acpui-session-ownership` | Coordinates session ownership across main and detached windows |
 
-### Backend
+### Frontend Stores and Socket Layer
 
-| File | Key Functions / Symbols | Exact Lines | Purpose |
-|---|---|---:|---|
-| `backend/sockets/index.js` | `socket.emit('providers'/'ready'/'workspace_cwds'/'branding')` | 58-61, 67, 74, 76 | Seeds header-facing frontend state at connect time |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, listeners `connect`, `ready`, `workspace_cwds`, `providers`, `branding`, `disconnect` | Hydrates system state consumed by the header |
+| System store | `frontend/src/store/useSystemStore.ts` | `connected`, `isEngineReady`, `providersById`, `workspaceCwds`, `setProviders`, `setProviderReady`, `setProviderBranding`, `setWorkspaceCwds`, `getBranding` | Source of readiness, provider display data, and workspace labels |
+| Session store | `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId`, `setActiveSessionId`, `handleInitialLoad`, `handleSessionSelect`, `hydrateSession` | Source of active session identity and session path/provider fields |
+| UI store | `frontend/src/store/useUIStore.ts` | `setSidebarOpen`, `setSystemSettingsOpen`, `setFileExplorerOpen`, `isSidebarOpen`, `isSystemSettingsOpen`, `isFileExplorerOpen` | Header action target store |
+| Types | `frontend/src/types.ts` | `ProviderSummary`, `ProviderBranding`, `WorkspaceCwd`, `ChatSession` | Data contracts used by socket hydration and title rendering |
+
+### Backend Inputs
+
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Socket bootstrap | `backend/sockets/index.js` | `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers`, events `providers`, `ready`, `workspace_cwds`, `branding` | Seeds provider, readiness, branding, and workspace state |
+| Workspace config | `backend/services/workspaceConfig.js` | `loadWorkspaces` | Reads workspace labels and paths emitted as `workspace_cwds` |
+| Provider loading | `backend/services/providerLoader.js` | `getProvider` | Supplies provider config and branding to `buildBrandingPayload` |
+| Provider registry | `backend/services/providerRegistry.js` | `getDefaultProviderId`, `getProviderEntries` | Supplies provider ids, labels, defaults, and ordering |
 
 ### Tests
 
-| File | Coverage Focus | Exact Lines |
-|---|---|---:|
-| `frontend/src/test/ChatHeader.test.tsx` | Session name rendering, fallback title, pop-out control hiding, settings/explorer button behavior | 31-72 |
-| `frontend/src/test/App.test.tsx` | Integration presence via mocked header | 16, 80-84 |
-| `frontend/src/test/PopOutApp.test.tsx` | Pop-out integration presence via mocked header | 30, 92-112 |
+| Area | File | Anchors | Purpose |
+|---|---|---|---|
+| Header component | `frontend/src/test/ChatHeader.test.tsx` | `renders provider title and session name correctly`, `handles "System Settings" button click`, `handles "File Explorer" button click`, `renders app header fallback if no active session`, `hides sidebar menu and action buttons in pop-out mode` | Verifies title fallback chain, UI actions, fallback title, and pop-out suppression |
+| Socket hook | `frontend/src/test/useSocket.test.ts` | `handles "ready" event with providerId`, `handles "ready" event without providerId`, `handles "branding" event`, `handles "workspace_cwds" event`, `handles "providers" event`, `handles "disconnect" event` | Verifies socket events that populate header-facing system state |
+| System store | `frontend/src/test/useSystemStore.test.ts`, `frontend/src/test/useSystemStoreExtended.test.ts` | `setProviders calculates active provider and branding`, `setProviderBranding updates branding if provider is active`, `setProviderReady updates isEngineReady state`, `setProviderReady updates isEngineReady if it is the active provider` | Verifies provider branding and readiness state used by the header |
+| UI store | `frontend/src/test/useUIStore.test.ts` | `setSidebarOpen updates state`, `setNotesOpen and setFileExplorerOpen update state` | Verifies store actions used by header controls |
+| Main root | `frontend/src/test/App.test.tsx` | `renders Sidebar and ChatInput`, `switches between sessions and emits watch events`, `toggles sidebar when clicking bubble` | Verifies main root composition and active-session shell behavior around the header |
+| Pop-out root | `frontend/src/test/PopOutApp.test.tsx` | `renders ChatHeader and ChatInput when ready`, `does NOT render Sidebar`, `hydrates session and emits watch_session when ready`, `claims session ownership on mount` | Verifies detached root composition and pop-out session initialization |
+| Ownership | `frontend/src/test/sessionOwnership.test.ts` | `claimSession posts a claim message`, `releaseSession posts a release message`, `openPopout opens a new window`, `claim from another window marks session as popped out` | Verifies BroadcastChannel ownership and `/?popout=` URL creation |
 
 ## Gotchas & Important Notes
 
-1. Pop-out detection is URL-based, not app-state-based.
-   - What breaks: controls appear when they should be hidden if query handling changes.
-   - Why: `new URLSearchParams(window.location.search).has('popout')` drives gating.
-   - Avoid: preserve `popout` query contract for detached windows.
+1. Pop-out gating is URL-based in the header.
+   - What goes wrong: detached windows show sidebar, file explorer, and system settings controls.
+   - Why it happens: `ChatHeader` checks only `window.location.search` for the `popout` key.
+   - How to avoid it: preserve the `/?popout=<sessionId>` URL contract in `sessionOwnership.openPopout` and `PopOutApp`.
 
-2. Header action buttons call store singletons (`useUIStore.getState()`), not captured hook actions.
-   - What breaks: stale closures are less likely, but test mocks that only patch hook return values can miss this path.
-   - Avoid: in tests, assert against store state mutation directly (as current tests do).
+2. Main app empty state bypasses the header.
+   - What goes wrong: fallback `branding.appHeader` behavior is tested directly on `ChatHeader` but is not the main app empty-state UI.
+   - Why it happens: `App` renders an empty-state panel when `activeSessionId` is absent.
+   - How to avoid it: validate fallback title behavior at the component level and empty-state behavior at the `App` level.
 
-3. `cwdLabel` path match is exact-string equality.
-   - What breaks: label disappears when path casing or slash style diverges.
-   - Avoid: keep backend-emitted `cwd` paths normalized to same format as session `cwd`.
+3. Provider readiness and title use different provider lookups.
+   - What goes wrong: status can track the active/default provider while title text follows `activeSession.provider`.
+   - Why it happens: `StatusIndicator` receives `useSystemStore.isEngineReady`, while title rendering reads `providersById[activeSession.provider]`.
+   - How to avoid it: keep `activeProviderId`, `defaultProviderId`, and session provider assignment consistent when changing provider selection behavior.
 
-4. Provider display-name fallback chain matters.
-   - What breaks: empty provider prefix or unexpected raw IDs shown.
-   - Why: header uses `providerSummary.branding.title || providerSummary.label || activeSession.provider || ''`.
-   - Avoid: ensure providers payload includes `branding.title` (preferred) and `label` (fallback).
+4. Workspace labels require exact path equality.
+   - What goes wrong: the workspace label disappears.
+   - Why it happens: `ChatHeader` uses `workspace.path === activeSession.cwd` with no path normalization.
+   - How to avoid it: keep `ChatSession.cwd` and `WorkspaceCwd.path` in the same path format.
 
-5. Branding fallback only appears when no active session name.
-   - What breaks: blank-looking title if `branding.appHeader` is missing.
-   - Avoid: guarantee `appHeader` in provider branding contract.
+5. Header action handlers use `useUIStore.getState()` for two buttons.
+   - What goes wrong: tests that mock only hook return values miss file explorer and system settings behavior.
+   - Why it happens: the file explorer and system settings click handlers call the store singleton.
+   - How to avoid it: assert store state changes or rendered modal effects in tests.
 
-6. Disconnected styling affects multiple nested controls.
-   - What breaks: unreadable text/icons if new classes are added but not included in disconnected selectors.
-   - Avoid: include new header control classes in `.header.disconnected ...` cascade.
+6. Provider display text has a fixed fallback chain.
+   - What goes wrong: raw provider ids appear in the title.
+   - Why it happens: the component uses `branding.title`, then `label`, then `activeSession.provider`.
+   - How to avoid it: keep `ProviderSummary.branding.title` or `ProviderSummary.label` populated in the `providers` payload.
 
-7. Header is mounted in both normal and pop-out roots.
-   - What breaks: mode-specific assumptions if code only tested in `App.tsx`.
-   - Avoid: validate both `App.tsx` and `PopOutApp.tsx` render paths.
+7. Disconnected styling touches nested header controls.
+   - What goes wrong: new header controls can become unreadable on disconnect.
+   - Why it happens: `.header.disconnected` has explicit nested selectors in `ChatHeader.css`.
+   - How to avoid it: add any new header control classes to the disconnected style cascade.
 
-8. File Explorer and System Settings are intentionally shallow here.
-   - What breaks: duplicate logic and drift if header starts managing modal internals.
-   - Avoid: keep header limited to boolean toggles; extend behavior in their own feature areas.
+8. Pop-out ownership is outside `ChatHeader`.
+   - What goes wrong: changes to ownership behavior are incorrectly implemented in the header.
+   - Why it happens: `ChatHeader` only hides controls; `sessionOwnership.ts`, `App`, and `PopOutApp` coordinate window ownership.
+   - How to avoid it: update ownership code and ownership tests for ownership changes, and update header tests only for visible controls.
+
+9. The header is intentionally shallow.
+   - What goes wrong: modal-specific logic drifts into `ChatHeader` and duplicates feature behavior.
+   - Why it happens: header buttons are entry points to separately owned features.
+   - How to avoid it: keep feature internals in File Explorer, System Settings, Sidebar, or pop-out modules.
 
 ## Unit Tests
 
-Backend:
-- None specific to header behavior (header is frontend-rendered).
-
-Frontend:
+### Focused Header Tests
 - `frontend/src/test/ChatHeader.test.tsx`
-  - `renders session name correctly`
+  - `renders provider title and session name correctly`
   - `handles "System Settings" button click`
   - `handles "File Explorer" button click`
   - `renders app header fallback if no active session`
   - `hides sidebar menu and action buttons in pop-out mode`
 
-Integration:
-- `frontend/src/test/App.test.tsx` (header presence in main app composition via mock).
-- `frontend/src/test/PopOutApp.test.tsx` (header presence in detached window composition via mock).
+### Socket and Store Tests
+- `frontend/src/test/useSocket.test.ts`
+  - `handles "ready" event with providerId`
+  - `handles "ready" event without providerId`
+  - `handles "branding" event`
+  - `handles "workspace_cwds" event`
+  - `handles "providers" event`
+  - `handles "disconnect" event`
+- `frontend/src/test/useSystemStore.test.ts`
+  - `setProviders calculates active provider and branding`
+  - `setProviderBranding updates branding if provider is active`
+  - `setProviderReady updates isEngineReady state`
+- `frontend/src/test/useSystemStoreExtended.test.ts`
+  - `setProviders updates nextActiveProviderId and active branding`
+  - `setProviderReady updates isEngineReady if it is the active provider`
+- `frontend/src/test/useUIStore.test.ts`
+  - `setSidebarOpen updates state`
+  - `setNotesOpen and setFileExplorerOpen update state`
+- `frontend/src/test/useSessionLifecycleStoreSync.test.ts`
+  - `syncs activeSessionId to URL when isUrlSyncReady is true`
+  - `does NOT sync to URL if isUrlSyncReady is false`
+
+### Root and Pop-Out Tests
+- `frontend/src/test/App.test.tsx`
+  - `renders Sidebar and ChatInput`
+  - `switches between sessions and emits watch events`
+  - `toggles sidebar when clicking bubble`
+- `frontend/src/test/PopOutApp.test.tsx`
+  - `renders ChatHeader and ChatInput when ready`
+  - `does NOT render Sidebar`
+  - `hydrates session and emits watch_session when ready`
+  - `claims session ownership on mount`
+- `frontend/src/test/sessionOwnership.test.ts`
+  - `claimSession posts a claim message`
+  - `releaseSession posts a release message`
+  - `openPopout opens a new window`
+  - `claim from another window marks session as popped out`
+
+Run focused verification from `frontend`:
+
+```powershell
+npm run test -- src/test/ChatHeader.test.tsx src/test/useSocket.test.ts src/test/useSystemStore.test.ts src/test/useSystemStoreExtended.test.ts src/test/useUIStore.test.ts src/test/useSessionLifecycleStoreSync.test.ts src/test/App.test.tsx src/test/PopOutApp.test.tsx src/test/sessionOwnership.test.ts
+```
 
 ## How to Use This Guide
 
 ### For implementing/extending this feature
-1. Start in `ChatHeader.tsx` and preserve the three-store dependency model.
-2. Validate any new control against pop-out gating (`!isPopout`).
-3. If adding header text fields, source from `useSystemStore`/payload-driven data only.
-4. Add/update `ChatHeader.test.tsx` for the new rendering and click paths.
-5. If you add backend payload requirements, update `backend/sockets/index.js` docs/tests accordingly.
+1. Start in `frontend/src/components/ChatHeader/ChatHeader.tsx` and identify whether the change affects status, title text, workspace label, or controls.
+2. Trace any provider or branding dependency through `backend/sockets/index.js`, `useSocket`, and `useSystemStore`.
+3. Trace any session title dependency through `useSessionLifecycleStore.sessions`, `activeSessionId`, and `ChatSession` fields in `frontend/src/types.ts`.
+4. Gate any new main-app controls with the same `popout` query check.
+5. Keep button actions shallow by dispatching to the owning store or feature surface.
+6. Update `frontend/src/test/ChatHeader.test.tsx` for direct rendering changes and root/pop-out tests for composition changes.
 
 ### For debugging issues with this feature
-1. Confirm socket listeners fired: `providers`, `ready`, `branding`, `workspace_cwds`.
-2. Inspect `useSystemStore` state (`providersById`, `workspaceCwds`, `connected`, `isEngineReady`).
-3. Inspect `useSessionLifecycleStore` (`activeSessionId`, matching session object).
-4. Reproduce with and without `?popout=<sessionId>` in URL.
-5. Check CSS disconnected overrides and truncation styles for visual regressions.
+1. Confirm `useSocket` received and handled `providers`, `ready`, `workspace_cwds`, and `branding`.
+2. Inspect `useSystemStore.providersById`, `readyByProviderId`, `activeProviderId`, `defaultProviderId`, `workspaceCwds`, `connected`, and `isEngineReady`.
+3. Inspect `useSessionLifecycleStore.activeSessionId` and the matching `ChatSession` object, especially `name`, `provider`, `cwd`, and `isSubAgent`.
+4. Check `StatusIndicator` output for the `connected` and `isEngineReady` combination.
+5. Reproduce with `/?popout=<sessionId>` and without the query key.
+6. Check `.header.disconnected`, `.header-session-name`, and `.header-cwd-label` in `ChatHeader.css` for visual regressions.
 
 ## Summary
 
-- Chat Header is a provider-agnostic status + identity + control strip.
-- It composes state from `useSessionLifecycleStore`, `useSystemStore`, and `useUIStore`.
-- Backend connect events seed all visible header metadata.
-- Pop-out mode is URL-param driven and suppresses sidebar/action controls.
-- File Explorer/System Settings interactions are toggle-only here by design.
-- The key contract is consistent session/provider/workspace shape across socket payloads and stores.
-- Most breakages come from store shape drift, path mismatch, or pop-out query regressions.
+- Chat Header is a provider-agnostic status, identity, and control bar.
+- Backend socket bootstrap supplies `providers`, `ready`, `workspace_cwds`, and provider-scoped `branding` events.
+- `useSocket` normalizes those events into `useSystemStore`; `ChatHeader` reads store state only.
+- Active-session title rendering depends on `useSessionLifecycleStore.activeSessionId`, `ChatSession.provider`, provider metadata, and exact workspace path matching.
+- `StatusIndicator` renders `Disconnected`, `Warming up...`, or `Engine Ready` from `connected` and `isEngineReady`.
+- Pop-out mode is keyed by `popout` in `window.location.search` and hides main-app controls.
+- Header buttons only open existing UI surfaces through `useUIStore`; ownership and modal internals stay in their own modules.
+- The critical contract is stable session/provider/workspace state plus the `/?popout=<sessionId>` URL shape.
