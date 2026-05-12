@@ -31,7 +31,8 @@ import {
   isGoogleSearchMcpEnabled,
   isInvokeShellMcpEnabled,
   isIoMcpEnabled,
-  isSubagentsMcpEnabled
+  isSubagentsMcpEnabled,
+  getSubagentsMcpConfig
 } from '../services/mcpConfig.js';
 import { ACP_UX_TOOL_NAMES } from '../services/tools/acpUxTools.js';
 import { createGoogleSearchMcpToolHandlers, createIoMcpToolHandlers } from './ioMcpToolHandlers.js';
@@ -204,6 +205,31 @@ export function createToolHandlers(io) {
     tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
   }
 
+  const runCheckSubagentsInvocation = async ({ invocationId, providerId, waitForCompletion = true, abortSignal }) => {
+    const { statusWaitTimeoutMs, statusPollIntervalMs } = getSubagentsMcpConfig();
+    subAgentInvocationManager.setIo(io);
+    return subAgentInvocationManager.getInvocationStatus({
+      providerId,
+      invocationId,
+      waitTimeoutMs: waitForCompletion === false ? 0 : statusWaitTimeoutMs,
+      pollIntervalMs: statusPollIntervalMs,
+      abortSignal
+    });
+  };
+
+  const runAbortSubagentsInvocation = async ({ invocationId, providerId, abortSignal }) => {
+    const { statusPollIntervalMs } = getSubagentsMcpConfig();
+    subAgentInvocationManager.setIo(io);
+    await subAgentInvocationManager.cancelInvocation(providerId, invocationId);
+    return subAgentInvocationManager.getInvocationStatus({
+      providerId,
+      invocationId,
+      waitTimeoutMs: 0,
+      pollIntervalMs: statusPollIntervalMs,
+      abortSignal
+    });
+  };
+
   /**
    * Counsel tool -- spawns multiple sub-agents with different perspectives to evaluate a question.
    * Reuses the ux_invoke_subagents infrastructure with structured role prompts from counsel.json.
@@ -261,6 +287,11 @@ export function createToolHandlers(io) {
 
   if (isCounselMcpEnabled()) {
     tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
+  }
+
+  if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+    tools[ACP_UX_TOOL_NAMES.checkSubagents] = runCheckSubagentsInvocation;
+    tools[ACP_UX_TOOL_NAMES.abortSubagents] = runAbortSubagentsInvocation;
   }
 
   if (isIoMcpEnabled()) {

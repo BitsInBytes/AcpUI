@@ -63,6 +63,10 @@ function disabledConfig(source, reason) {
       apiKey: '',
       timeoutMs: 15000,
       maxOutputBytes: 262144
+    },
+    subagents: {
+      statusWaitTimeoutMs: 120000,
+      statusPollIntervalMs: 1000
     }
   };
 }
@@ -72,6 +76,7 @@ function normalizeMcpConfig(raw, source) {
   const io = raw?.io || {};
   const webFetch = raw?.webFetch || {};
   const googleSearch = raw?.googleSearch || {};
+  const subagents = raw?.subagents || {};
 
   const googleSearchApiKey = typeof googleSearch.apiKey === 'string'
     ? googleSearch.apiKey.trim()
@@ -111,6 +116,10 @@ function normalizeMcpConfig(raw, source) {
       apiKey: googleSearchApiKey,
       timeoutMs: numberSetting(googleSearch.timeoutMs, 15000),
       maxOutputBytes: numberSetting(googleSearch.maxOutputBytes, 262144)
+    },
+    subagents: {
+      statusWaitTimeoutMs: numberSetting(subagents.statusWaitTimeoutMs, 120000),
+      statusPollIntervalMs: numberSetting(subagents.statusPollIntervalMs, 1000)
     }
   };
 }
@@ -172,4 +181,8 @@ export function getWebFetchMcpConfig(env = process.env) {
 
 export function getGoogleSearchMcpConfig(env = process.env) {
   return getMcpConfig(env).googleSearch;
+}
+
+export function getSubagentsMcpConfig(env = process.env) {
+  return getMcpConfig(env).subagents;
 }

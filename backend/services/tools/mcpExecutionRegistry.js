@@ -93,7 +93,12 @@ function categoryFor(toolName) {
   if (toolName === ACP_UX_TOOL_NAMES.invokeShell) {
     return { toolCategory: 'shell', isShellCommand: true, isFileOperation: false };
   }
-  if (toolName === ACP_UX_TOOL_NAMES.invokeSubagents || toolName === ACP_UX_TOOL_NAMES.invokeCounsel) {
+  if (
+    toolName === ACP_UX_TOOL_NAMES.invokeSubagents ||
+    toolName === ACP_UX_TOOL_NAMES.invokeCounsel ||
+    toolName === ACP_UX_TOOL_NAMES.checkSubagents ||
+    toolName === ACP_UX_TOOL_NAMES.abortSubagents
+  ) {
     return { toolCategory: 'sub_agent', isFileOperation: false };
   }
   return acpUxIoToolConfig(toolName)?.category || {};
@@ -110,6 +115,10 @@ export function describeAcpUxToolExecution(toolName, input = {}, options = {}) {
     title = 'Invoke Subagents';
   } else if (canonicalName === ACP_UX_TOOL_NAMES.invokeCounsel) {
     title = 'Invoke Counsel';
+  } else if (canonicalName === ACP_UX_TOOL_NAMES.checkSubagents) {
+    title = 'Check Subagents';
+  } else if (canonicalName === ACP_UX_TOOL_NAMES.abortSubagents) {
+    title = 'Abort Subagents';
   } else {
     title = acpUiToolTitle(canonicalName, input, { filePath }) || '';
   }
@@ -355,14 +364,17 @@ export class McpExecutionRegistry {
     if (!providerId || !sessionId || !canonicalName) return null;
     const ids = this.bySessionTool.get(cacheKey(providerId, sessionId, canonicalName)) || [];
     const cutoff = nowMs() - RECENT_EXECUTION_TTL_MS;
+    const recentMatches = [];
     for (const id of ids) {
       const record = this.records.get(id);
       if (!record || record.updatedAt < cutoff) continue;
       if (record.toolCallId && toolCallId && record.toolCallId !== toolCallId) continue;
-      return toolCallId ? this.claimToolCallId(record, toolCallId) : record;
+      recentMatches.push(record);
     }
 
-    return null;
+    if (recentMatches.length !== 1) return null;
+    const record = recentMatches[0];
+    return toolCallId ? this.claimToolCallId(record, toolCallId) : record;
   }
 
   prune() {

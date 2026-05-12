@@ -11,7 +11,7 @@ import registerFileExplorerHandlers from './fileExplorerHandlers.js';
 import registerGitHandlers from './gitHandlers.js';
 import registerTerminalHandlers from './terminalHandlers.js';
 import registerShellRunHandlers, { emitShellRunSnapshotsForSession } from './shellRunHandlers.js';
-import { emitSubAgentSnapshotsForSession } from './subAgentHandlers.js';
+import registerSubAgentHandlers, { emitSubAgentSnapshotsForSession } from './subAgentHandlers.js';
 import acpClient from '../services/acpClient.js';
 import providerRuntimeManager from '../services/providerRuntimeManager.js';
 import { loadWorkspaces } from '../services/workspaceConfig.js';
@@ -107,6 +107,7 @@ export default function registerSocketHandlers(io) {
     registerGitHandlers(io, socket);
     registerTerminalHandlers(io, socket);
     registerShellRunHandlers(io, socket);
+    registerSubAgentHandlers(io, socket);
 
     // Room system: clients join session-scoped rooms to receive only relevant streaming events
     socket.on('watch_session', ({ providerId = null, sessionId }) => {

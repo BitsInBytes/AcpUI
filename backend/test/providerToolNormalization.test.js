@@ -69,10 +69,14 @@ describe('providerToolNormalization', () => {
 
     expect(resolveToolNameFromCandidates(candidates, config)).toBe('ux_read_file');
     expect(resolveToolNameFromAcpUiMcpTitle('Read file')).toBe('ux_read_file');
+    expect(resolveToolNameFromAcpUiMcpTitle('Check Subagents')).toBe('ux_check_subagents');
+    expect(resolveToolNameFromAcpUiMcpTitle('Abort Subagents')).toBe('ux_abort_subagents');
   });
 
   it('formats shared provider titles and detail values', () => {
     expect(prettyToolTitle('ux_invoke_shell')).toBe('Invoke Shell');
+    expect(prettyToolTitle('ux_check_subagents')).toBe('Check Subagents');
+    expect(prettyToolTitle('ux_abort_subagents')).toBe('Abort Subagents');
     expect(prettyToolTitle('spawn_helpers')).toBe('Spawn Helpers');
     expect(toolTitleDetailFromInput({ file_path: 'D:/repo/src/app.ts' })).toBe('app.ts');
     expect(toolTitleDetailFromInput({ pattern: 'use[A-Z]' })).toBe('use[A-Z]');

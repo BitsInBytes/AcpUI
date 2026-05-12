@@ -2,6 +2,8 @@ export const ACP_UX_TOOL_NAMES = Object.freeze({
   invokeShell: 'ux_invoke_shell',
   invokeSubagents: 'ux_invoke_subagents',
   invokeCounsel: 'ux_invoke_counsel',
+  checkSubagents: 'ux_check_subagents',
+  abortSubagents: 'ux_abort_subagents',
   readFile: 'ux_read_file',
   writeFile: 'ux_write_file',
   replace: 'ux_replace',
@@ -15,7 +17,9 @@ export const ACP_UX_TOOL_NAMES = Object.freeze({
 export const ACP_UX_CORE_TOOL_NAMES = Object.freeze([
   ACP_UX_TOOL_NAMES.invokeShell,
   ACP_UX_TOOL_NAMES.invokeSubagents,
-  ACP_UX_TOOL_NAMES.invokeCounsel
+  ACP_UX_TOOL_NAMES.invokeCounsel,
+  ACP_UX_TOOL_NAMES.checkSubagents,
+  ACP_UX_TOOL_NAMES.abortSubagents
 ]);
 
 export const ACP_UX_IO_TOOL_CONFIG = Object.freeze({

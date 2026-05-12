@@ -222,7 +222,7 @@ When any of these boundaries drift, AcpUI can show generic tool titles, lose Acp
 
 `providers/gemini/README.md` documents Gemini CLI settings for tool allow/exclude behavior. The relevant Gemini tool patterns are `mcp_AcpUI_*` and concrete names such as `mcp_AcpUI_ux_invoke_shell`. Those names match the provider's `toolIdPattern` after `{mcpName}` resolves to `AcpUI`.
 
-Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, and `ux_invoke_counsel`. Optional IO/search tools are enabled through `configuration/mcp.json` and include `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`, and `ux_google_web_search`.
+Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagents`, `ux_abort_subagents`, and `ux_invoke_counsel`. Optional IO/search tools are enabled through `configuration/mcp.json` and include `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`, and `ux_google_web_search`.
 
 ### Authentication data flow
 
@@ -254,7 +254,7 @@ Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, and `ux_invoke_co
 
 1. Gemini sends a `tool_call` or `tool_call_update` with `toolCallId`, `kind`, `title`, `locations`, and possible argument objects.
 2. `intercept` caches tool input by `toolCallId` and session-scoped key.
-3. `normalizeTool` resolves `toolName` from configured id patterns, MCP server titles, nested `functionCall` metadata, and `KIND_TO_TOOL_NAME`.
+3. `normalizeTool` resolves `toolName` from configured id patterns, MCP server titles, nested `functionCall` metadata, `KIND_TO_TOOL_NAME`, and phrase-only status titles such as `Check sub agents` or `Abort sub agents`.
 4. `extractToolInvocation` returns canonical identity, input, title, file path, and category.
 5. `resolveToolInvocation` merges provider data with `toolCallState` and `mcpExecutionRegistry`.
 6. `applyInvocationToEvent` stamps `toolName`, `canonicalName`, `mcpServer`, `mcpToolName`, `isAcpUxTool`, title, category, and file path onto the emitted `system_event`.
@@ -383,6 +383,7 @@ Key test names:
 - `normalizes optional AcpUI MCP tool titles without server prefixes`
 - `normalizes AcpUI MCP titles from nested Gemini function call args`
 - `resolves AcpUI MCP names from Gemini functionCall metadata when the call id is generic`
+- `normalizes sub-agent status tools from phrase-only titles`
 - `extracts canonical AcpUI MCP invocation metadata`
 - `returns empty title for generic AcpUI tool to allow fallback`
 - `routes ux_invoke_shell to shell category`

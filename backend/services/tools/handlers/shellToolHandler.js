@@ -10,7 +10,9 @@ function shellTitle(description) {
 function applyShellDescriptionTitle(ctx, invocation, event) {
   const description = normalizeText(invocation.input?.description);
   const title = shellTitle(description);
-  if (!title) return event;
+  const shellRunId = invocation.toolSpecific?.shellRunId;
+  const nextEvent = shellRunId ? { ...event, shellRunId } : event;
+  if (!title) return nextEvent;
 
   toolCallState.upsert({
     providerId: ctx.providerId,
@@ -19,7 +21,7 @@ function applyShellDescriptionTitle(ctx, invocation, event) {
     display: { title, titleSource: 'tool_handler' }
   });
 
-  return { ...event, title };
+  return { ...nextEvent, title };
 }
 
 export const shellToolHandler = {
@@ -27,16 +29,30 @@ export const shellToolHandler = {
     const description = normalizeText(invocation.input?.description);
     const command = invocation.input?.command || '';
     const cwd = invocation.input?.cwd || null;
+    const mcpRequestId = invocation.raw?.mcpExecution?.mcpRequestId ?? null;
 
     shellRunManager.setIo?.(ctx.acpClient.io);
-    const prepared = shellRunManager.prepareRun({
+    const existingRun = shellRunManager.findRun?.({
       providerId: ctx.providerId,
       sessionId: ctx.sessionId,
       toolCallId: invocation.toolCallId,
-      description,
+      mcpRequestId,
       command,
-      cwd
+      cwd,
+      statuses: ['pending', 'starting', 'running', 'exiting', 'exited'],
+      allowToolCallIdMismatch: true
     });
+    const prepared = existingRun
+      ? (shellRunManager.snapshot?.(existingRun) || existingRun)
+      : shellRunManager.prepareRun({
+        providerId: ctx.providerId,
+        sessionId: ctx.sessionId,
+        toolCallId: invocation.toolCallId,
+        mcpRequestId,
+        description,
+        command,
+        cwd
+      });
 
     const title = shellTitle(description) || event.title;
     toolCallState.upsert({

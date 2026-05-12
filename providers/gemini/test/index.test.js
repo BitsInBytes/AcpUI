@@ -336,6 +336,15 @@ describe('Gemini Provider', () => {
       expect(normalize('ux_grep_search', { description: 'Find TODOs', pattern: 'TODO' }).title).toBe('Search: Find TODOs');
       expect(normalize('ux_web_fetch', { url: 'https://example.test/docs' }).title).toBe('Fetch: https://example.test/docs');
       expect(normalize('ux_google_web_search', { query: 'latest docs' }).title).toBe('Web Search: latest docs');
+      expect(normalize('ux_check_subagents', { invocationId: 'inv-1' }).title).toBe('Check Subagents');
+      expect(normalize('ux_abort_subagents', { invocationId: 'inv-1' }).title).toBe('Abort Subagents');
+    });
+
+    it('normalizes sub-agent status tools from phrase-only titles', () => {
+      expect(gemini.normalizeTool({ id: 't-check', title: 'Check sub agents' }, {}).toolName).toBe('ux_check_subagents');
+      expect(gemini.normalizeTool({ id: 't-check', title: 'Check sub agents' }, {}).title).toBe('Check Subagents');
+      expect(gemini.normalizeTool({ id: 't-abort', title: 'Abort sub agents' }, {}).toolName).toBe('ux_abort_subagents');
+      expect(gemini.normalizeTool({ id: 't-abort', title: 'Abort sub agents' }, {}).title).toBe('Abort Subagents');
     });
 
     it('normalizes AcpUI MCP titles from nested Gemini function call args', () => {

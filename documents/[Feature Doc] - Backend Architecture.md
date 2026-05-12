@@ -20,7 +20,7 @@ The backend performs these responsibilities:
 - **Prompt execution:** Converts UI prompts and attachments into ACP prompt parts, applies model selection, pairs provider prompt lifecycle hooks, sends `session/prompt`, and persists completion state through `autoSaveTurn`.
 - **Update normalization:** Routes ACP `session/update` and `session/notification` payloads through provider normalization, Tool System V2, socket emissions, provider extensions, and database updates.
 - **MCP tool bridge:** Advertises core and optional MCP tools through `GET /api/mcp/tools`, executes calls through `POST /api/mcp/tool-call`, and records authoritative MCP tool metadata through `mcpExecutionRegistry` and `toolCallState`.
-- **Persistence:** Stores sessions, folders, canvas artifacts, notes, context stats, model state, config options, provider identity, and fork/sub-agent relationships in SQLite.
+- **Persistence:** Stores sessions, folders, canvas artifacts, notes, context stats, model state, config options, provider identity, fork/sub-agent relationships, and async sub-agent invocation state in SQLite.
 
 ### Why This Matters
 
@@ -224,7 +224,7 @@ acpClient.io.to('session:' + sessionId).emit('system_event', event);
 ### 10. MCP Proxy Advertises and Executes Tools
 File: `backend/routes/mcpApi.js` (Function: `createMcpApiRoutes`, Routes: `GET /tools`, `POST /tool-call`)
 File: `backend/mcp/mcpServer.js` (Functions: `getMcpServers`, `createToolHandlers`, `getMaxShellResultLines`)
-File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`)
+File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition`)
 File: `backend/mcp/ioMcpToolDefinitions.js` (Functions: `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions`)
 File: `backend/services/tools/mcpExecutionRegistry.js` (Class: `McpExecutionRegistry`)
 
@@ -235,12 +235,12 @@ File: `backend/services/tools/mcpExecutionRegistry.js` (Class: `McpExecutionRegi
 `createToolHandlers(io)` only registers enabled tools. It wraps all handlers with `mcpExecutionRegistry.begin`, `complete`, and `fail`, so tool executions can be matched later to provider `tool_call` updates and converted into stable UI titles, categories, inputs, file paths, and outputs.
 
 ### 11. SQLite Persists Backend State
-File: `backend/database.js` (Functions: `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `createFolder`, `saveCanvasArtifact`, `saveNotes`)
+File: `backend/database.js` (Functions: `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `createSubAgentInvocation`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, `createFolder`, `saveCanvasArtifact`, `saveNotes`)
 
-`initDb` uses `UI_DATABASE_PATH` or `persistence.db`, creates `sessions`, `folders`, and `canvas_artifacts`, applies additive migrations, and creates provider/ACP lookup indexes. Session rows store UI id, ACP id, provider, model, messages JSON, pinned state, cwd, folder id, notes, fork metadata, sub-agent metadata, context token stats, config options JSON, current model id, and model options JSON.
+`initDb` uses `UI_DATABASE_PATH` or `persistence.db`, creates `sessions`, `subagent_invocations`, `subagent_invocation_agents`, `folders`, and `canvas_artifacts`, applies additive migrations, and creates provider/ACP and sub-agent invocation lookup indexes. Session rows store UI id, ACP id, provider, model, messages JSON, pinned state, cwd, folder id, notes, fork metadata, sub-agent metadata, context token stats, config options JSON, current model id, and model options JSON. Sub-agent invocation rows store async batch status by provider and parent UI session, and agent rows store each spawned ACP session status, result text, error text, and completion timestamps.
 
 ```sql
--- FILE: backend/database.js (Function: initDb, Table: sessions)
+-- FILE: backend/database.js (Function: initDb, Tables: sessions, subagent_invocations, subagent_invocation_agents)
 CREATE TABLE IF NOT EXISTS sessions (
   ui_id TEXT PRIMARY KEY,
   acp_id TEXT,
@@ -254,9 +254,31 @@ CREATE TABLE IF NOT EXISTS sessions (
   model_options_json TEXT,
   provider TEXT
 )
+
+CREATE TABLE IF NOT EXISTS subagent_invocations (
+  invocation_id TEXT PRIMARY KEY,
+  provider TEXT,
+  parent_acp_session_id TEXT,
+  parent_ui_id TEXT,
+  status TEXT,
+  total_count INTEGER DEFAULT 0,
+  completed_count INTEGER DEFAULT 0,
+  status_tool_name TEXT
+)
+
+CREATE TABLE IF NOT EXISTS subagent_invocation_agents (
+  invocation_id TEXT,
+  acp_session_id TEXT,
+  ui_id TEXT,
+  idx INTEGER,
+  status TEXT,
+  result_text TEXT,
+  error_text TEXT,
+  PRIMARY KEY(invocation_id, acp_session_id)
+)
 ```
 
-`saveSession` upserts by `ui_id`, preserves existing stats/model/config fields when an incoming value is empty, and stores normalized model options. `getAllSessions(provider, { providerAliases })` filters by provider plus aliases or unscoped rows. `getSessionByAcpId(provider, acpId)` prefers provider-scoped rows over unscoped rows. `saveConfigOptions` and `saveModelState` accept provider-scoped or unscoped signatures.
+`saveSession` upserts by `ui_id`, preserves existing stats/model/config fields when an incoming value is empty, and stores normalized model options. `getAllSessions(provider, { providerAliases })` filters by provider plus aliases or unscoped rows. `getSessionByAcpId(provider, acpId)` prefers provider-scoped rows over unscoped rows. `saveConfigOptions` and `saveModelState` accept provider-scoped or unscoped signatures. Sub-agent invocation helpers create one active invocation per provider/parent UI session, update aggregate and per-agent status, load status snapshots for `ux_check_subagents`, and delete registry rows when a parent session is deleted or archived.
 
 ### 12. Auto-Save and Pinned Session Warmup Keep Runtime and DB Aligned
 File: `backend/services/sessionManager.js` (Functions: `loadSessionIntoMemory`, `autoLoadPinnedSessions`, `autoSaveTurn`)
@@ -431,7 +453,7 @@ MCP tool calls are authoritative for AcpUI UX tool names, user-facing titles, in
 | `backend/sockets/gitHandlers.js` | `registerGitHandlers`, git events | Git status and staging integration |
 | `backend/sockets/terminalHandlers.js` | `registerTerminalHandlers`, terminal events | PTY terminal tabs |
 | `backend/sockets/shellRunHandlers.js` | `registerShellRunHandlers`, `emitShellRunSnapshotsForSession` | Interactive shell controls and reconnect snapshots |
-| `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession` | Sub-agent reconnect snapshots |
+| `backend/sockets/subAgentHandlers.js` | `registerSubAgentHandlers`, `emitSubAgentSnapshotsForSession`, event `cancel_subagents` | Sub-agent cancellation control and reconnect snapshots |
 | `backend/sockets/systemHandlers.js` | `registerSystemHandlers`, events `get_stats`, `get_logs` | System stats and log access |
 | `backend/sockets/systemSettingsHandlers.js` | `registerSystemSettingsHandlers`, settings events | Environment, workspace, command, and provider config editing |
 | `backend/sockets/voiceHandlers.js` | `registerVoiceHandlers`, voice events | Voice transcription socket flow |
@@ -444,11 +466,11 @@ MCP tool calls are authoritative for AcpUI UX tool names, user-facing titles, in
 | Update handler | `backend/services/acpUpdateHandler.js` | `handleUpdate`, `config_option_update`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `usage_update`, `available_commands_update` | Normalizes daemon updates and emits timeline events |
 | MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `resolveToolContext`, `createToolCallAbortSignal`, `canWriteResponse`, routes `GET /tools`, `POST /tool-call` | Internal HTTP bridge for stdio MCP proxy |
 | MCP handlers | `backend/mcp/mcpServer.js` | `getMcpServers`, `createToolHandlers`, `getMaxShellResultLines`, `buildSubAgentInvocationKey` | MCP server config and tool handler map |
-| MCP definitions | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition` | Core tool schemas |
+| MCP definitions | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition` | Core tool schemas |
 | MCP IO definitions | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions` | Optional IO/search tool schemas |
 | Tool registry | `backend/services/tools/index.js` | `toolRegistry.register`, exports `toolCallState`, `mcpExecutionRegistry`, `resolveToolInvocation`, `applyInvocationToEvent` | Tool System V2 integration point |
 | MCP execution registry | `backend/services/tools/mcpExecutionRegistry.js` | `McpExecutionRegistry`, `begin`, `complete`, `fail`, `find`, `publicMcpToolInput`, `toolCallIdFromMcpContext`, `describeAcpUxToolExecution` | Authoritative MCP execution metadata cache |
-| Database | `backend/database.js` | `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, tables `sessions`, `folders`, `canvas_artifacts`, indexes `idx_sessions_provider_acp`, `idx_sessions_acp` | SQLite schema, migrations, and persistence APIs |
+| Database | `backend/database.js` | `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `createSubAgentInvocation`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, tables `sessions`, `subagent_invocations`, `subagent_invocation_agents`, `folders`, `canvas_artifacts`, indexes `idx_sessions_provider_acp`, `idx_sessions_acp`, `idx_subagent_active_parent` | SQLite schema, migrations, and persistence APIs |
 
 ---
 
@@ -505,7 +527,7 @@ Run backend tests from `backend` with `npx vitest run`. Focused backend architec
 | `backend/test/sessionManager.test.js` | `getMcpServers`, `autoLoadPinnedSessions`, `loadSessionIntoMemory`, `autoSaveTurn`, `should attach _meta when getMcpServerMeta returns a value`, `should perform full hot-load lifecycle` | MCP server config, pinned warmup, hot load, autosave |
 | `backend/test/database-exhaustive.test.js` | `Exhaustive Database Coverage`, `hits all optional field branches in saveSession`, `handles getSessionByAcpId with null provider`, `hits parseProviderScopedArgs 2-arg signature`, `hits parseProviderScopedArgs 3-arg signature` | Persistence shape and provider-scoped helper signatures |
 | `backend/test/mcpApi.test.js` | `MCP API Routes`, route tests for `/tools`, `/tool-call`, abort handling, response write guards | MCP HTTP bridge |
-| `backend/test/mcpServer.test.js` | `mcpServer`, `core MCP feature flags`, `optional IO MCP tools`, `ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel` | Tool advertisement and handler behavior |
+| `backend/test/mcpServer.test.js` | `mcpServer`, `core MCP feature flags`, `optional IO MCP tools`, `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagents`, `ux_abort_subagents`, `ux_invoke_counsel` | Tool advertisement and handler behavior |
 | `backend/test/toolInvocationResolver.test.js` | `uses provider extraction as canonical tool identity`, `reuses cached identity and title for incomplete updates`, `prefers centrally recorded MCP execution details over provider generic titles`, `can claim a recent MCP execution when the provider tool id arrives later` | Tool identity merging |
 | `backend/test/providerToolNormalization.test.js` | `providerToolNormalization` | Provider tool normalization helpers |
 | `backend/test/mcpConfig.test.js` | `MCP config` | MCP feature flag config |

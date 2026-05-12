@@ -118,13 +118,17 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
    if (isInvokeShellMcpEnabled()) toolList.push(getInvokeShellMcpToolDefinition());
    if (isSubagentsMcpEnabled()) toolList.push(getSubagentsMcpToolDefinition({ modelDescription }));
    if (isCounselMcpEnabled()) toolList.push(getCounselMcpToolDefinition());
+   if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+     toolList.push(getCheckSubagentsMcpToolDefinition());
+     toolList.push(getAbortSubagentsMcpToolDefinition());
+   }
    if (isIoMcpEnabled()) toolList.push(...getIoMcpToolDefinitions());
    if (isGoogleSearchMcpEnabled()) toolList.push(...getGoogleSearchMcpToolDefinitions());
    ```
 
 9. **Tool definitions are owned by definition modules**
 
-   File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`)
+   File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition`)
    File: `backend/mcp/ioMcpToolDefinitions.js` (Functions: `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions`)
 
    These modules define MCP names, descriptions, annotations, `_meta`, and JSON Schemas. Route code chooses which definitions to include; definition modules own the schemas.
@@ -147,6 +151,10 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
     if (isInvokeShellMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeShell] = runShellInvocation;
     if (isSubagentsMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
     if (isCounselMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
+    if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+      tools[ACP_UX_TOOL_NAMES.checkSubagents] = runCheckSubagentsInvocation;
+      tools[ACP_UX_TOOL_NAMES.abortSubagents] = runAbortSubagentsInvocation;
+    }
     if (isIoMcpEnabled()) Object.assign(tools, createIoMcpToolHandlers());
     if (isGoogleSearchMcpEnabled()) Object.assign(tools, createGoogleSearchMcpToolHandlers());
     ```
@@ -200,7 +208,7 @@ What breaks when the contract drifts:
 
 ### Config Files
 
-File: `configuration/mcp.json.example` (Config keys: `tools`, `io`, `webFetch`, `googleSearch`)
+File: `configuration/mcp.json.example` (Config keys: `tools`, `subagents`, `io`, `webFetch`, `googleSearch`)
 File: `backend/services/mcpConfig.js` (Constant: `DEFAULT_CONFIG_PATH`, Env var: `MCP_CONFIG`)
 
 The default runtime file is `configuration/mcp.json`. The example file documents the supported structure:
@@ -213,6 +221,10 @@ The default runtime file is `configuration/mcp.json`. The example file documents
     "counsel": { "enabled": true },
     "io": { "enabled": true },
     "googleSearch": { "enabled": false }
+  },
+  "subagents": {
+    "statusWaitTimeoutMs": 120000,
+    "statusPollIntervalMs": 1000
   },
   "io": {
     "autoAllowWorkspaceCwd": true,
@@ -243,8 +255,8 @@ The default runtime file is `configuration/mcp.json`. The example file documents
 
 Supported keys under `tools`:
 - `invokeShell` gates `ux_invoke_shell`.
-- `subagents` gates `ux_invoke_subagents`.
-- `counsel` gates `ux_invoke_counsel`.
+- `subagents` gates `ux_invoke_subagents` and enables `ux_check_subagents` plus `ux_abort_subagents`.
+- `counsel` gates `ux_invoke_counsel` and also enables `ux_check_subagents` plus `ux_abort_subagents`.
 - `io` gates `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, and `ux_web_fetch`.
 - `googleSearch` gates `ux_google_web_search` only when `googleSearch.apiKey` is also non-empty.
 
@@ -322,9 +334,9 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
-| Config example | `configuration/mcp.json.example` | `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch`, `io.*`, `webFetch.*`, `googleSearch.*` | Documents the JSON shape and sample values. |
+| Config example | `configuration/mcp.json.example` | `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch`, `subagents.*`, `io.*`, `webFetch.*`, `googleSearch.*` | Documents the JSON shape and sample values. |
 | Config loader | `backend/services/mcpConfig.js` | `DEFAULT_CONFIG_PATH`, `repoPath`, `boolSetting`, `numberSetting`, `stringArray`, `disabledConfig`, `normalizeMcpConfig`, `buildMcpConfig`, `getMcpConfig`, `resetMcpConfigForTests` | Loads, normalizes, caches, and resets MCP config. |
-| Feature helpers | `backend/services/mcpConfig.js` | `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`, `getIoMcpConfig`, `getWebFetchMcpConfig`, `getGoogleSearchMcpConfig` | Exposes normalized flags and guardrail settings to routes and services. |
+| Feature helpers | `backend/services/mcpConfig.js` | `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`, `getSubagentsMcpConfig`, `getIoMcpConfig`, `getWebFetchMcpConfig`, `getGoogleSearchMcpConfig` | Exposes normalized flags and guardrail settings to routes and services. |
 | Main sessions | `backend/services/sessionManager.js` | `getMcpServers`, `loadSessionIntoMemory`, `autoLoadPinnedSessions` | Builds stdio proxy MCP server configs for main session loading paths. |
 | Socket sessions | `backend/sockets/sessionHandlers.js` | Socket event `create_session`, socket event `fork_session`, `getMcpServers`, `bindMcpProxy`, `getMcpProxyIdFromServers` | Injects MCP server configs into `session/new` and `session/load` requests. |
 | Sub-agent sessions | `backend/mcp/subAgentInvocationManager.js` | `getMcpServersFn`, `runInvocation` | Creates MCP server configs for spawned sub-agent sessions. |
@@ -336,9 +348,9 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 | Server mount | `backend/server.js` | `app.use('/api/mcp', ...)`, `mcpApiRouter`, `createMcpApiRoutes(io)` | Mounts the MCP API before the static route stack. |
 | Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `ListToolsRequestSchema`, `CallToolRequestSchema`, `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID` | Fetches tool definitions and forwards tool calls to the backend API. |
 | MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `resolveToolContext`, `createToolCallAbortSignal`, `GET /tools`, `POST /tool-call` | Advertises enabled tools and dispatches tool calls. |
-| Core definitions | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition` | Defines core MCP tool schemas and metadata. |
+| Core definitions | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition` | Defines core MCP tool schemas and metadata. |
 | IO definitions | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions` | Defines IO, web fetch, and Google search schemas and metadata. |
-| Handler registration | `backend/mcp/mcpServer.js` | `createToolHandlers`, `wrapToolHandlers`, `runShellInvocation`, `runSubagentInvocation`, `runCounselInvocation`, `getMaxShellResultLines` | Registers enabled backend handlers under canonical tool names. |
+| Handler registration | `backend/mcp/mcpServer.js` | `createToolHandlers`, `wrapToolHandlers`, `runShellInvocation`, `runSubagentInvocation`, `runCheckSubagentsInvocation`, `runAbortSubagentsInvocation`, `runCounselInvocation`, `getMaxShellResultLines` | Registers enabled backend handlers under canonical tool names. |
 | IO handlers | `backend/mcp/ioMcpToolHandlers.js` | `createIoMcpToolHandlers`, `createGoogleSearchMcpToolHandlers` | Maps canonical IO/search tool names to service calls. |
 | Canonical names | `backend/services/tools/acpUxTools.js` | `ACP_UX_TOOL_NAMES`, `ACP_UX_CORE_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`, `ACP_UX_IO_TOOL_NAMES`, `isAcpUxToolName` | Provides the stable names used by definitions, handlers, providers, and UI metadata. |
 | Tool execution state | `backend/services/tools/mcpExecutionRegistry.js` | `begin`, `complete`, `fail`, `publicMcpToolInput`, `toolCallIdFromMcpContext` | Tracks MCP tool execution state around wrapped handlers. |

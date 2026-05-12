@@ -12,6 +12,8 @@ import {
   isSubagentsMcpEnabled
 } from '../services/mcpConfig.js';
 import {
+  getAbortSubagentsMcpToolDefinition,
+  getCheckSubagentsMcpToolDefinition,
   getCounselMcpToolDefinition,
   getInvokeShellMcpToolDefinition,
   getSubagentsMcpToolDefinition
@@ -82,6 +84,10 @@ export default function createMcpApiRoutes(io) {
     }
     if (isCounselMcpEnabled()) {
       toolList.push(getCounselMcpToolDefinition());
+    }
+    if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+      toolList.push(getCheckSubagentsMcpToolDefinition());
+      toolList.push(getAbortSubagentsMcpToolDefinition());
     }
     if (isIoMcpEnabled()) {
       toolList.push(...getIoMcpToolDefinitions());

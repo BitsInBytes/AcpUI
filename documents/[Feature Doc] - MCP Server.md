@@ -128,7 +128,7 @@ const { tools, serverName } = await backendFetch(`/api/mcp/tools${query}`);
 6. `GET /api/mcp/tools` returns enabled tool definitions.
 
 File: `backend/routes/mcpApi.js` (Route: `GET /tools`, Function: `resolveToolContext`)
-File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`)
+File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition`)
 File: `backend/mcp/ioMcpToolDefinitions.js` (Functions: `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions`)
 
 The route resolves provider context from the proxy id, uses provider model config to enrich the sub-agent model description, and returns `{ tools, serverName }`. Feature flags from `backend/services/mcpConfig.js` decide which definitions are advertised.
@@ -214,16 +214,20 @@ if (canWriteResponse(res, abortSignal)) res.json(result);
 
 10. `createToolHandlers` builds the executable tool map.
 
-File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`, Handler anchors: `runShellInvocation`, `runSubagentInvocation`, `runCounselInvocation`)
+File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`, Handler anchors: `runShellInvocation`, `runSubagentInvocation`, `runCheckSubagentsInvocation`, `runAbortSubagentsInvocation`, `runCounselInvocation`)
 File: `backend/mcp/ioMcpToolHandlers.js` (Functions: `createIoMcpToolHandlers`, `createGoogleSearchMcpToolHandlers`)
 
-Core tools are registered behind `tools.invokeShell`, `tools.subagents`, and `tools.counsel`. Optional IO and Google search handlers are registered behind `tools.io` and `tools.googleSearch`. Shell execution delegates to `shellRunManager.startPreparedRun`; sub-agents delegate to `subAgentInvocationManager.runInvocation`; counsel builds configured role prompts and delegates through the sub-agent invocation path.
+Core tools are registered behind `tools.invokeShell`, `tools.subagents`, and `tools.counsel`. `ux_check_subagents` and `ux_abort_subagents` are registered whenever sub-agents or counsel are enabled. Optional IO and Google search handlers are registered behind `tools.io` and `tools.googleSearch`. Shell execution delegates to `shellRunManager.startPreparedRun`; sub-agent start calls delegate to `subAgentInvocationManager.runInvocation`; status calls delegate to `subAgentInvocationManager.getInvocationStatus` with `waitForCompletion` deciding whether the configured wait timeout is used; abort calls delegate to `subAgentInvocationManager.cancelInvocation` and then return an immediate status payload; counsel builds configured role prompts and delegates through the sub-agent invocation path.
 
 ```javascript
 // FILE: backend/mcp/mcpServer.js (Function: createToolHandlers)
 if (isInvokeShellMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeShell] = runShellInvocation;
 if (isSubagentsMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
 if (isCounselMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
+if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+  tools[ACP_UX_TOOL_NAMES.checkSubagents] = runCheckSubagentsInvocation;
+  tools[ACP_UX_TOOL_NAMES.abortSubagents] = runAbortSubagentsInvocation;
+}
 if (isIoMcpEnabled()) Object.assign(tools, createIoMcpToolHandlers());
 if (isGoogleSearchMcpEnabled()) Object.assign(tools, createGoogleSearchMcpToolHandlers());
 return wrapToolHandlers(tools, io);
@@ -330,7 +334,7 @@ The MCP server contract has four synchronized layers:
 
 File: `backend/services/sessionManager.js` (Function: `getMcpServers`)
 File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)
-File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`)
+File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `getSubagentsMcpConfig`, `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`)
 
 | Config | Owner | Effect |
 |---|---|---|
@@ -338,8 +342,9 @@ File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `isInvokeShell
 | Provider hook `getMcpServerMeta()` | Provider module | Adds optional server `_meta` to the ACP `mcpServers` entry. |
 | `MCP_CONFIG` | Environment variable | Overrides the default `configuration/mcp.json` path. |
 | `tools.invokeShell` | `configuration/mcp.json` | Advertises and registers `ux_invoke_shell`. |
-| `tools.subagents` | `configuration/mcp.json` | Advertises and registers `ux_invoke_subagents`. |
-| `tools.counsel` | `configuration/mcp.json` | Advertises and registers `ux_invoke_counsel`. |
+| `tools.subagents` | `configuration/mcp.json` | Advertises and registers `ux_invoke_subagents`; also enables `ux_check_subagents` and `ux_abort_subagents`. |
+| `tools.counsel` | `configuration/mcp.json` | Advertises and registers `ux_invoke_counsel`; also enables `ux_check_subagents` and `ux_abort_subagents`. |
+| `subagents.statusWaitTimeoutMs` / `subagents.statusPollIntervalMs` | `configuration/mcp.json` | Controls how long `ux_check_subagents` waits by default and how often it polls before returning partial progress. |
 | `tools.io` | `configuration/mcp.json` | Advertises and registers IO tools. |
 | `tools.googleSearch` plus `googleSearch.apiKey` | `configuration/mcp.json` | Advertises and registers `ux_google_web_search` only when both are configured. |
 | `io.*` | `configuration/mcp.json` | Controls file IO roots, auto-allow behavior, and byte limits used by IO handlers. |
@@ -456,15 +461,15 @@ Tool state projection written by `mcpExecutionRegistry`:
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Tool names | `backend/services/tools/acpUxTools.js` | `ACP_UX_TOOL_NAMES`, `ACP_UX_CORE_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`, `isAcpUxToolName`, `acpUxIoToolConfig` | Defines canonical MCP tool names and UI categories. |
-| Core schemas | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition` | Provides JSON Schema and annotations for core MCP tools. |
+| Core schemas | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition` | Provides JSON Schema and annotations for core MCP tools. |
 | IO schemas | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions` | Provides JSON Schema and annotations for optional IO/search tools. |
 | IO handlers | `backend/mcp/ioMcpToolHandlers.js` | `createIoMcpToolHandlers`, `createGoogleSearchMcpToolHandlers` | Implements optional file, search, and fetch tool behavior. |
-| MCP config | `backend/services/mcpConfig.js` | `getMcpConfig`, `resetMcpConfigForTests`, `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`, `getIoMcpConfig`, `getWebFetchMcpConfig`, `getGoogleSearchMcpConfig` | Loads and normalizes feature flags and per-tool limits. |
+| MCP config | `backend/services/mcpConfig.js` | `getMcpConfig`, `resetMcpConfigForTests`, `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`, `getSubagentsMcpConfig`, `getIoMcpConfig`, `getWebFetchMcpConfig`, `getGoogleSearchMcpConfig` | Loads and normalizes feature flags and per-tool limits. |
 | Execution registry | `backend/services/tools/mcpExecutionRegistry.js` | `McpExecutionRegistry`, `mcpExecutionRegistry`, `begin`, `complete`, `fail`, `find`, `publicMcpToolInput`, `toolCallIdFromMcpContext`, `invocationFromMcpExecution` | Tracks MCP executions and projects canonical tool metadata. |
 | Tool state cache | `backend/services/tools/toolCallState.js` | `upsert`, `get`, `clear` | Stores timeline-visible tool invocation metadata. |
 | Invocation resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider updates with cached MCP execution state. |
 | Shell runner | `backend/services/shellRunManager.js` | `startPreparedRun`, `setIo` | Owns terminal-backed shell execution for `ux_invoke_shell`. |
-| Sub-agent manager | `backend/mcp/subAgentInvocationManager.js` | `runInvocation`, `trackSubAgentParent`, `cancelAllForParent`, `getMcpServersFn`, `bindMcpProxyFn` | Owns sub-agent spawning, idempotency, room joins, and cancellation. |
+| Sub-agent manager | `backend/mcp/subAgentInvocationManager.js` | `runInvocation`, `getInvocationStatus`, `trackSubAgentParent`, `cancelInvocation`, `cancelAllForParent`, `getMcpServersFn`, `bindMcpProxyFn` | Owns async sub-agent start, status polling, idempotency, room joins, and cancellation. |
 | Counsel config | `backend/services/counselConfig.js` | `loadCounselConfig` | Provides role prompts used by `ux_invoke_counsel`. |
 
 ### Tests
@@ -472,11 +477,11 @@ Tool state projection written by `mcpExecutionRegistry`:
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | API routes | `backend/test/mcpApi.test.js` | `MCP API Routes`, `GET /tools returns tool list with JSON Schema`, `GET /tools hides disabled core tools`, `POST /tool-call passes resolved proxy context to handlers`, `POST /tool-call aborts the handler signal when the request fires the "aborted" event`, `POST /tool-call aborts the handler signal when the response closes before completion` | Verifies `/api/mcp/*` definitions, dispatch, context, errors, and abort wiring. |
-| Server helpers | `backend/test/mcpServer.test.js` | `mcpServer`, `getMcpServers returns server config`, `getMcpServers attaches _meta when getMcpServerMeta returns a value`, `core MCP feature flags`, `optional IO MCP tools`, `ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel` | Verifies server config, feature-gated handlers, wrapper projection, shell behavior, and sub-agent behavior. |
+| Server helpers | `backend/test/mcpServer.test.js` | `mcpServer`, `getMcpServers returns server config`, `getMcpServers attaches _meta when getMcpServerMeta returns a value`, `core MCP feature flags`, `optional IO MCP tools`, `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagents`, `ux_abort_subagents`, `ux_invoke_counsel` | Verifies server config, feature-gated handlers, wrapper projection, shell behavior, and sub-agent behavior. |
 | Stdio proxy | `backend/test/stdio-proxy.test.js` | `stdio-proxy`, `runs the proxy lifecycle`, `handles fetch errors with retry`, `handles ListTools and CallTool requests`, `throws error after max retries in backendFetch`, `does not retry when fetch throws an AbortError` | Verifies proxy startup, list/call forwarding, metadata passthrough, retry, and abort behavior. |
 | Proxy registry | `backend/test/mcpProxyRegistry.test.js` | `mcpProxyRegistry`, `creates and resolves a pending proxy binding`, `creates pre-bound proxy bindings for known sessions`, `binds pending proxy bindings after session creation`, `rejects provider mismatches when binding`, `expires only unbound proxy bindings`, `extracts proxy id from MCP server env` | Verifies proxy binding lifecycle and extraction from `mcpServers`. |
 | Session manager | `backend/test/sessionManager.test.js` | `sessionManager`, `getMcpServers`, `should perform full hot-load lifecycle` | Verifies session-manager MCP entries and hot-load proxy binding. |
-| Sub-agent manager | `backend/test/subAgentInvocationManager.test.js` | `SubAgentInvocationManager`, `runs invocation successfully`, `joins an active invocation when the idempotency key repeats`, `aborts and cancels sub-agents when the tool call abort signal fires`, `immediately aborts when abortSignal is already aborted before spawning starts` | Verifies sub-agent session creation, idempotency, and cancellation. |
+| Sub-agent manager | `backend/test/subAgentInvocationManager.test.js` | `SubAgentInvocationManager`, `starts asynchronously and returns completed results through the status call`, `joins an active invocation when the idempotency key repeats`, `reports the active invocation instead of starting another batch for the same parent chat`, `aborts and cancels sub-agents when the tool call abort signal fires` | Verifies async sub-agent session creation, status polling, active-invocation enforcement, idempotency, and cancellation. |
 | Invocation resolver | `backend/test/toolInvocationResolver.test.js` | `toolInvocationResolver`, `prefers centrally recorded MCP execution details over provider generic titles`, `can claim a recent MCP execution when the provider tool id arrives later` | Verifies provider event reconciliation with MCP execution records. |
 | Feature flags | `backend/test/mcpConfig.test.js` | `MCP config`, `disables config-controlled tools when the config is missing`, `disables config-controlled tools when the config is malformed`, `reads enabled tools from configuration/mcp.json shape`, `normalizes IO, web fetch, and Google search settings`, `disables Google search when enabled without an MCP config API key` | Verifies config parsing and fail-closed behavior. |
 | Server route order | `backend/test/server.test.js` | `Express Server & Routes`, `should return 503 for MCP API if not ready` | Verifies lazy MCP API readiness behavior. |

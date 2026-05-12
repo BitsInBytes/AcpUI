@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ChatMessage from '../components/ChatMessage';
 import type { Message, TimelineStep } from '../types';
 import { useCanvasStore } from '../store/useCanvasStore';
+import { useSubAgentStore } from '../store/useSubAgentStore';
 
 
 // More sophisticated mock to allow testing custom components
@@ -35,6 +36,7 @@ vi.mock('react-markdown', () => ({
 describe('ChatMessage', () => {
   beforeEach(() => {
     useCanvasStore.setState({ isCanvasOpen: false });
+    useSubAgentStore.getState().clear();
   });
 
   const createTimeline = (count: number, type: 'tool' | 'thought'): TimelineStep[] => {
@@ -440,6 +442,7 @@ describe('ChatMessage', () => {
 describe('ChatMessage - additional coverage', () => {
   beforeEach(() => {
     useCanvasStore.setState({ isCanvasOpen: false });
+    useSubAgentStore.getState().clear();
   });
 
   it('code block renders language badge', () => {
@@ -668,6 +671,49 @@ describe('ChatMessage - Collapse Fix (Regression)', () => {
 
     // It should STILL be expanded, even though the default for non-streaming is to collapse thoughts
     expect(screen.getByText('thinking 1')).toBeInTheDocument();
+  });
+
+  it('keeps active sub-agent orchestration expanded after remount', () => {
+    useSubAgentStore.getState().startInvocation({
+      invocationId: 'inv-active',
+      providerId: 'test-provider',
+      parentUiId: 'parent-ui',
+      parentSessionId: 'parent-acp',
+      statusToolName: 'ux_check_subagents',
+      totalCount: 1,
+      status: 'prompting'
+    });
+
+    const message: Message = {
+      id: 'msg-subagents',
+      role: 'assistant',
+      content: '',
+      isStreaming: false,
+      timeline: [
+        {
+          type: 'tool',
+          isCollapsed: true,
+          event: {
+            id: 'tool-subagents',
+            title: 'Invoke Subagents',
+            toolName: 'ux_invoke_subagents',
+            canonicalName: 'ux_invoke_subagents',
+            invocationId: 'inv-active',
+            status: 'in_progress',
+            isAcpUxTool: true
+          }
+        } as TimelineStep
+      ]
+    };
+
+    const { unmount } = render(<ChatMessage message={message} />);
+    let header = screen.getByText('Invoke Subagents').closest('button');
+    expect(header?.querySelector('.lucide-chevron-down')).not.toBeNull();
+
+    unmount();
+    render(<ChatMessage message={message} />);
+    header = screen.getByText('Invoke Subagents').closest('button');
+    expect(header?.querySelector('.lucide-chevron-down')).not.toBeNull();
   });
 });
 

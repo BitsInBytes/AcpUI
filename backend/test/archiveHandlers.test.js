@@ -33,6 +33,8 @@ vi.mock('../database.js', () => ({
   saveSession: vi.fn(),
   deleteSession: vi.fn(),
   getAllSessions: vi.fn().mockResolvedValue([]),
+  getActiveSubAgentInvocationForParent: vi.fn().mockResolvedValue(null),
+  deleteSubAgentInvocationsForParent: vi.fn().mockResolvedValue(),
 }));
 
 vi.mock('../services/providerLoader.js', () => ({

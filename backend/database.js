@@ -15,6 +15,9 @@ dotenv.config({ path: path.join(__dirname, '..', '.env'), quiet: true });
 let db = null;
 let dbInitializedPromise = null;
 
+const ACTIVE_SUB_AGENT_INVOCATION_STATUSES = ['spawning', 'prompting', 'running', 'waiting_permission', 'cancelling'];
+const TERMINAL_SUB_AGENT_INVOCATION_STATUSES = ['completed', 'failed', 'cancelled'];
+
 // Initialize the database schema
 export function initDb() {
   if (dbInitializedPromise) return dbInitializedPromise;
@@ -62,7 +65,50 @@ export function initDb() {
       db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_provider_acp ON sessions(provider, acp_id)`, (err) => { if (err) writeLog(`[DB] Index error: ${err.message}`); });
       db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_acp ON sessions(acp_id)`, (err) => { if (err) writeLog(`[DB] Index error: ${err.message}`); });
 
-      // 3. Folders table
+      // 3. Async sub-agent invocation registry
+      db.run(`
+        CREATE TABLE IF NOT EXISTS subagent_invocations (
+          invocation_id TEXT PRIMARY KEY,
+          provider TEXT,
+          parent_acp_session_id TEXT,
+          parent_ui_id TEXT,
+          status TEXT,
+          total_count INTEGER DEFAULT 0,
+          completed_count INTEGER DEFAULT 0,
+          status_tool_name TEXT,
+          created_at INTEGER,
+          updated_at INTEGER,
+          completed_at INTEGER
+        )
+      `, (err) => { if (err) writeLog(`[DB] Table error: ${err.message}`); });
+      db.run(`
+        CREATE TABLE IF NOT EXISTS subagent_invocation_agents (
+          invocation_id TEXT,
+          acp_session_id TEXT,
+          ui_id TEXT,
+          idx INTEGER,
+          name TEXT,
+          prompt TEXT,
+          agent TEXT,
+          model TEXT,
+          status TEXT,
+          result_text TEXT,
+          error_text TEXT,
+          created_at INTEGER,
+          updated_at INTEGER,
+          completed_at INTEGER,
+          PRIMARY KEY(invocation_id, acp_session_id)
+        )
+      `, (err) => { if (err) writeLog(`[DB] Table error: ${err.message}`); });
+      db.run(`CREATE INDEX IF NOT EXISTS idx_subagent_invocations_parent ON subagent_invocations(provider, parent_ui_id)`, (err) => { if (err) writeLog(`[DB] Index error: ${err.message}`); });
+      db.run(`CREATE INDEX IF NOT EXISTS idx_subagent_agents_invocation ON subagent_invocation_agents(invocation_id)`, (err) => { if (err) writeLog(`[DB] Index error: ${err.message}`); });
+      db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_subagent_active_parent
+        ON subagent_invocations(provider, parent_ui_id)
+        WHERE status IN ('spawning', 'prompting', 'running', 'waiting_permission', 'cancelling')
+      `, (err) => { if (err) writeLog(`[DB] Index error: ${err.message}`); });
+
+      // 4. Folders table
       db.run(`
         CREATE TABLE IF NOT EXISTS folders (
           id TEXT PRIMARY KEY,
@@ -75,7 +121,7 @@ export function initDb() {
       `, (err) => { if (err) writeLog(`[DB] Table error: ${err.message}`); });
       db.run(`ALTER TABLE folders ADD COLUMN provider_id TEXT`, (err) => { if (err && !err.message.includes('duplicate')) writeLog(`[DB] Migration skip: ${err.message}`); });
 
-      // 4. Canvas Artifacts table
+      // 5. Canvas Artifacts table
       db.run(`
         CREATE TABLE IF NOT EXISTS canvas_artifacts (
           id TEXT PRIMARY KEY,
@@ -364,6 +410,292 @@ export function deleteSession(uiId) {
     db.run(`DELETE FROM sessions WHERE ui_id = ?`, [uiId], (err) => {
       if (err) reject(err);
       else resolve();
+    });
+  });
+}
+
+export function isSubAgentInvocationActiveStatus(status) {
+  return ACTIVE_SUB_AGENT_INVOCATION_STATUSES.includes(status);
+}
+
+export function isSubAgentInvocationTerminalStatus(status) {
+  return TERMINAL_SUB_AGENT_INVOCATION_STATUSES.includes(status);
+}
+
+function mapSubAgentInvocationRow(row) {
+  if (!row) return null;
+  return {
+    invocationId: row.invocation_id,
+    provider: row.provider || null,
+    parentAcpSessionId: row.parent_acp_session_id || null,
+    parentUiId: row.parent_ui_id || null,
+    status: row.status || null,
+    totalCount: Number(row.total_count || 0),
+    completedCount: Number(row.completed_count || 0),
+    statusToolName: row.status_tool_name || null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    completedAt: row.completed_at || null
+  };
+}
+
+function mapSubAgentInvocationAgentRow(row) {
+  if (!row) return null;
+  return {
+    invocationId: row.invocation_id,
+    acpSessionId: row.acp_session_id,
+    uiId: row.ui_id || null,
+    index: Number(row.idx || 0),
+    name: row.name || null,
+    prompt: row.prompt || '',
+    agent: row.agent || null,
+    model: row.model || null,
+    status: row.status || null,
+    resultText: row.result_text || null,
+    errorText: row.error_text || null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    completedAt: row.completed_at || null
+  };
+}
+
+function providerWhere(providerId, params) {
+  if (providerId) {
+    params.push(providerId);
+    return 'provider = ?';
+  }
+  return 'provider IS NULL';
+}
+
+export function createSubAgentInvocation(record) {
+  const now = Date.now();
+  const createdAt = record.createdAt || now;
+  const updatedAt = record.updatedAt || now;
+  return new Promise((resolve, reject) => {
+    db.run(`
+      INSERT INTO subagent_invocations (
+        invocation_id, provider, parent_acp_session_id, parent_ui_id, status,
+        total_count, completed_count, status_tool_name, created_at, updated_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      record.invocationId,
+      record.provider || null,
+      record.parentAcpSessionId || null,
+      record.parentUiId || null,
+      record.status || 'spawning',
+      Number.isFinite(Number(record.totalCount)) ? Number(record.totalCount) : 0,
+      Number.isFinite(Number(record.completedCount)) ? Number(record.completedCount) : 0,
+      record.statusToolName || 'ux_check_subagents',
+      createdAt,
+      updatedAt,
+      record.completedAt || null
+    ], (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+export function getSubAgentInvocation(providerId, invocationId) {
+  const params = [];
+  const providerClause = providerWhere(providerId, params);
+  params.push(invocationId);
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT * FROM subagent_invocations WHERE ${providerClause} AND invocation_id = ?`, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(mapSubAgentInvocationRow(row));
+    });
+  });
+}
+
+export function getSubAgentInvocationsForParent(providerId, parentUiId) {
+  if (!parentUiId) return Promise.resolve([]);
+  const params = [];
+  const providerClause = providerWhere(providerId, params);
+  params.push(parentUiId);
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT * FROM subagent_invocations
+      WHERE ${providerClause} AND parent_ui_id = ?
+      ORDER BY updated_at DESC
+    `, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve((rows || []).map(mapSubAgentInvocationRow));
+    });
+  });
+}
+
+export function getActiveSubAgentInvocationForParent(providerId, parentUiId) {
+  if (!parentUiId) return Promise.resolve(null);
+  const params = [];
+  const providerClause = providerWhere(providerId, params);
+  params.push(parentUiId, ...ACTIVE_SUB_AGENT_INVOCATION_STATUSES);
+  return new Promise((resolve, reject) => {
+    db.get(`
+      SELECT * FROM subagent_invocations
+      WHERE ${providerClause} AND parent_ui_id = ? AND status IN (${ACTIVE_SUB_AGENT_INVOCATION_STATUSES.map(() => '?').join(', ')})
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(mapSubAgentInvocationRow(row));
+    });
+  });
+}
+
+export function updateSubAgentInvocationStatus(providerId, invocationId, status, counts = {}) {
+  const now = Date.now();
+  const totalCount = Number.isFinite(Number(counts.totalCount)) ? Number(counts.totalCount) : null;
+  const completedCount = Number.isFinite(Number(counts.completedCount)) ? Number(counts.completedCount) : null;
+  const completedAt = counts.completedAt !== undefined
+    ? counts.completedAt
+    : (isSubAgentInvocationTerminalStatus(status) ? now : null);
+  const params = [status, totalCount, completedCount, now, completedAt, completedAt];
+  const providerClause = providerWhere(providerId, params);
+  params.push(invocationId);
+  return new Promise((resolve, reject) => {
+    db.run(`
+      UPDATE subagent_invocations SET
+        status = ?,
+        total_count = COALESCE(?, total_count),
+        completed_count = COALESCE(?, completed_count),
+        updated_at = ?,
+        completed_at = CASE WHEN ? IS NULL THEN completed_at ELSE ? END
+      WHERE ${providerClause} AND invocation_id = ?
+    `, params, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+export function addSubAgentInvocationAgent(record) {
+  const now = Date.now();
+  const createdAt = record.createdAt || now;
+  const updatedAt = record.updatedAt || now;
+  return new Promise((resolve, reject) => {
+    db.run(`
+      INSERT INTO subagent_invocation_agents (
+        invocation_id, acp_session_id, ui_id, idx, name, prompt, agent, model,
+        status, result_text, error_text, created_at, updated_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(invocation_id, acp_session_id) DO UPDATE SET
+        ui_id = excluded.ui_id,
+        idx = excluded.idx,
+        name = excluded.name,
+        prompt = excluded.prompt,
+        agent = excluded.agent,
+        model = excluded.model,
+        status = excluded.status,
+        result_text = COALESCE(excluded.result_text, result_text),
+        error_text = COALESCE(excluded.error_text, error_text),
+        updated_at = excluded.updated_at,
+        completed_at = COALESCE(excluded.completed_at, completed_at)
+    `, [
+      record.invocationId,
+      record.acpSessionId,
+      record.uiId || null,
+      Number.isFinite(Number(record.index)) ? Number(record.index) : 0,
+      record.name || null,
+      record.prompt || '',
+      record.agent || null,
+      record.model || null,
+      record.status || 'spawning',
+      record.resultText || null,
+      record.errorText || null,
+      createdAt,
+      updatedAt,
+      record.completedAt || null
+    ], (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+export function updateSubAgentInvocationAgentStatus(providerId, invocationId, acpSessionId, patch = {}) {
+  const now = Date.now();
+  const completedAt = patch.completedAt !== undefined
+    ? patch.completedAt
+    : (TERMINAL_SUB_AGENT_INVOCATION_STATUSES.includes(patch.status) ? now : null);
+  const params = [
+    patch.status || null,
+    patch.resultText || null,
+    patch.errorText || null,
+    now,
+    completedAt,
+    completedAt,
+    acpSessionId
+  ];
+  const providerClauseParams = [];
+  const providerClause = providerWhere(providerId, providerClauseParams);
+  params.push(...providerClauseParams, invocationId);
+  return new Promise((resolve, reject) => {
+    db.run(`
+      UPDATE subagent_invocation_agents SET
+        status = COALESCE(?, status),
+        result_text = COALESCE(?, result_text),
+        error_text = COALESCE(?, error_text),
+        updated_at = ?,
+        completed_at = CASE WHEN ? IS NULL THEN completed_at ELSE ? END
+      WHERE acp_session_id = ?
+        AND invocation_id IN (SELECT invocation_id FROM subagent_invocations WHERE ${providerClause} AND invocation_id = ?)
+    `, params, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+export function getSubAgentInvocationWithAgents(providerId, invocationId) {
+  return getSubAgentInvocation(providerId, invocationId).then(invocation => {
+    if (!invocation) return null;
+    const params = [invocationId];
+    return new Promise((resolve, reject) => {
+      db.all(`
+        SELECT * FROM subagent_invocation_agents
+        WHERE invocation_id = ?
+        ORDER BY idx ASC
+      `, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve({ ...invocation, agents: (rows || []).map(mapSubAgentInvocationAgentRow) });
+      });
+    });
+  });
+}
+
+export function deleteSubAgentInvocation(providerId, invocationId) {
+  const params = [];
+  const providerClause = providerWhere(providerId, params);
+  params.push(invocationId);
+  return new Promise((resolve, reject) => {
+    db.run(`DELETE FROM subagent_invocation_agents WHERE invocation_id = ?`, [invocationId], (agentErr) => {
+      if (agentErr) { reject(agentErr); return; }
+      db.run(`DELETE FROM subagent_invocations WHERE ${providerClause} AND invocation_id = ?`, params, (invErr) => {
+        if (invErr) reject(invErr);
+        else resolve();
+      });
+    });
+  });
+}
+
+export function deleteSubAgentInvocationsForParent(providerId, parentUiId) {
+  if (!parentUiId) return Promise.resolve();
+  const params = [];
+  const providerClause = providerWhere(providerId, params);
+  params.push(parentUiId);
+  return new Promise((resolve, reject) => {
+    db.run(`
+      DELETE FROM subagent_invocation_agents
+      WHERE invocation_id IN (
+        SELECT invocation_id FROM subagent_invocations WHERE ${providerClause} AND parent_ui_id = ?
+      )
+    `, params, (agentErr) => {
+      if (agentErr) { reject(agentErr); return; }
+      db.run(`DELETE FROM subagent_invocations WHERE ${providerClause} AND parent_ui_id = ?`, params, (invErr) => {
+        if (invErr) reject(invErr);
+        else resolve();
+      });
     });
   });
 }

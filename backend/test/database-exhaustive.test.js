@@ -54,6 +54,134 @@ describe('Exhaustive Database Coverage', () => {
     expect(true).toBe(true);
   });
 
+  it('persists and scopes sub-agent invocation lifecycle rows', async () => {
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const parentUiId = `parent-${suffix}`;
+    const providerAInvocationId = `inv-a-${suffix}`;
+    const providerBInvocationId = `inv-b-${suffix}`;
+    const agentOneId = `sub-a-1-${suffix}`;
+    const agentTwoId = `sub-a-2-${suffix}`;
+
+    expect(db.isSubAgentInvocationActiveStatus('running')).toBe(true);
+    expect(db.isSubAgentInvocationActiveStatus('completed')).toBe(false);
+    expect(db.isSubAgentInvocationTerminalStatus('failed')).toBe(true);
+    expect(db.isSubAgentInvocationTerminalStatus('prompting')).toBe(false);
+
+    await db.createSubAgentInvocation({
+      invocationId: providerAInvocationId,
+      provider: 'provider-a',
+      parentAcpSessionId: `parent-acp-${suffix}`,
+      parentUiId,
+      status: 'running',
+      totalCount: 2,
+      completedCount: 0,
+      statusToolName: 'ux_check_subagents',
+      createdAt: 1000,
+      updatedAt: 1000
+    });
+    await db.createSubAgentInvocation({
+      invocationId: providerBInvocationId,
+      provider: 'provider-b',
+      parentUiId,
+      status: 'running',
+      totalCount: 1,
+      completedCount: 0
+    });
+
+    expect(await db.getActiveSubAgentInvocationForParent('provider-a', parentUiId)).toEqual(expect.objectContaining({
+      invocationId: providerAInvocationId,
+      provider: 'provider-a',
+      parentUiId,
+      status: 'running',
+      totalCount: 2,
+      completedCount: 0,
+      statusToolName: 'ux_check_subagents'
+    }));
+    expect(await db.getActiveSubAgentInvocationForParent('provider-b', parentUiId)).toEqual(expect.objectContaining({
+      invocationId: providerBInvocationId,
+      provider: 'provider-b'
+    }));
+    expect(await db.getSubAgentInvocationsForParent('provider-a', parentUiId)).toHaveLength(1);
+
+    await db.addSubAgentInvocationAgent({
+      invocationId: providerAInvocationId,
+      acpSessionId: agentTwoId,
+      uiId: `ui-${agentTwoId}`,
+      index: 1,
+      name: 'Second',
+      prompt: 'second prompt',
+      agent: 'dev',
+      model: 'fast',
+      status: 'running',
+      createdAt: 1001,
+      updatedAt: 1001
+    });
+    await db.addSubAgentInvocationAgent({
+      invocationId: providerAInvocationId,
+      acpSessionId: agentOneId,
+      uiId: `ui-${agentOneId}`,
+      index: 0,
+      name: 'First',
+      prompt: 'first prompt',
+      agent: 'dev',
+      model: 'fast',
+      status: 'prompting',
+      createdAt: 1002,
+      updatedAt: 1002
+    });
+
+    await db.updateSubAgentInvocationAgentStatus('provider-a', providerAInvocationId, agentOneId, {
+      status: 'completed',
+      resultText: 'first result',
+      completedAt: 1200
+    });
+    await db.updateSubAgentInvocationAgentStatus('provider-a', providerAInvocationId, agentTwoId, {
+      status: 'failed',
+      errorText: 'second error',
+      completedAt: 1201
+    });
+    await db.updateSubAgentInvocationStatus('provider-a', providerAInvocationId, 'failed', {
+      totalCount: 2,
+      completedCount: 1,
+      completedAt: 1300
+    });
+
+    const snapshot = await db.getSubAgentInvocationWithAgents('provider-a', providerAInvocationId);
+    expect(snapshot).toEqual(expect.objectContaining({
+      invocationId: providerAInvocationId,
+      provider: 'provider-a',
+      parentUiId,
+      status: 'failed',
+      totalCount: 2,
+      completedCount: 1,
+      completedAt: 1300
+    }));
+    expect(snapshot.agents.map(agent => agent.acpSessionId)).toEqual([agentOneId, agentTwoId]);
+    expect(snapshot.agents[0]).toEqual(expect.objectContaining({
+      index: 0,
+      status: 'completed',
+      resultText: 'first result',
+      completedAt: 1200
+    }));
+    expect(snapshot.agents[1]).toEqual(expect.objectContaining({
+      index: 1,
+      status: 'failed',
+      errorText: 'second error',
+      completedAt: 1201
+    }));
+    expect(await db.getActiveSubAgentInvocationForParent('provider-a', parentUiId)).toBeNull();
+    expect(await db.getSubAgentInvocationWithAgents('provider-b', providerAInvocationId)).toBeNull();
+
+    await db.deleteSubAgentInvocationsForParent('provider-a', parentUiId);
+    expect(await db.getSubAgentInvocationWithAgents('provider-a', providerAInvocationId)).toBeNull();
+    expect(await db.getSubAgentInvocationWithAgents('provider-b', providerBInvocationId)).toEqual(expect.objectContaining({
+      invocationId: providerBInvocationId
+    }));
+
+    await db.deleteSubAgentInvocation('provider-b', providerBInvocationId);
+    expect(await db.getSubAgentInvocationWithAgents('provider-b', providerBInvocationId)).toBeNull();
+  });
+
   it('hits all error paths using mock injection', async () => {
     const mockDb = {
       run: vi.fn((_q, _p, cb) => (cb ? cb(new Error('fail')) : null)),

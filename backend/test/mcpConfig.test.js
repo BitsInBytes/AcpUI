@@ -6,6 +6,7 @@ import {
   getGoogleSearchMcpConfig,
   getIoMcpConfig,
   getMcpConfig,
+  getSubagentsMcpConfig,
   getWebFetchMcpConfig,
   isCounselMcpEnabled,
   isGoogleSearchMcpEnabled,
@@ -40,6 +41,10 @@ describe('MCP config', () => {
     expect(isCounselMcpEnabled()).toBe(false);
     expect(isIoMcpEnabled()).toBe(false);
     expect(isGoogleSearchMcpEnabled()).toBe(false);
+    expect(getSubagentsMcpConfig()).toEqual({
+      statusWaitTimeoutMs: 120000,
+      statusPollIntervalMs: 1000
+    });
   });
 
   it('disables config-controlled tools when the config is malformed', () => {
@@ -75,7 +80,7 @@ describe('MCP config', () => {
     expect(isGoogleSearchMcpEnabled()).toBe(false);
   });
 
-  it('normalizes IO, web fetch, and Google search settings', () => {
+  it('normalizes IO, web fetch, Google search, and sub-agent status settings', () => {
     writeTempConfig({
       tools: { io: true },
       io: {
@@ -99,6 +104,10 @@ describe('MCP config', () => {
         apiKey: 'configured-key',
         timeoutMs: 48,
         maxOutputBytes: 49
+      },
+      subagents: {
+        statusWaitTimeoutMs: 50,
+        statusPollIntervalMs: 51
       }
     });
 
@@ -123,6 +132,25 @@ describe('MCP config', () => {
       apiKey: 'configured-key',
       timeoutMs: 48,
       maxOutputBytes: 49
+    });
+    expect(getSubagentsMcpConfig()).toEqual({
+      statusWaitTimeoutMs: 50,
+      statusPollIntervalMs: 51
+    });
+  });
+
+  it('uses default sub-agent status settings when omitted or invalid', () => {
+    writeTempConfig({
+      tools: { subagents: true },
+      subagents: {
+        statusWaitTimeoutMs: 'invalid',
+        statusPollIntervalMs: null
+      }
+    });
+
+    expect(getSubagentsMcpConfig()).toEqual({
+      statusWaitTimeoutMs: 120000,
+      statusPollIntervalMs: 1000
     });
   });
 

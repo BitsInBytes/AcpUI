@@ -262,11 +262,11 @@ Breaking this contract causes duplicated model controls, missing slash commands,
 
 AcpUI MCP tools are controlled by `configuration/mcp.json` or the file referenced by `MCP_CONFIG`.
 
-- Core tools: `ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`.
+- Core tools: `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagents`, `ux_abort_subagents`, `ux_invoke_counsel`.
 - Optional IO tools: `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`.
 - Optional Google search tool: `ux_google_web_search`.
 
-Codex sees enabled tools through the `AcpUI` MCP stdio server. The provider extracts identity from `AcpUI/<toolName>` titles and `rawInput.invocation`; backend handlers record authoritative titles and categories for enabled tools.
+Codex sees enabled tools through the `AcpUI` MCP stdio server. The provider extracts identity from `AcpUI/<toolName>` titles and `rawInput.invocation`; backend handlers record authoritative titles and categories for enabled tools. Codex display titles use `Run Subagents` for `ux_invoke_subagents`, `Check Subagents` for `ux_check_subagents`, `Abort Subagents` for `ux_abort_subagents`, and `Run Counsel` for `ux_invoke_counsel`. `ux_invoke_subagents` and `ux_invoke_counsel` return after spawn and include instructions to call `ux_check_subagents` for status/results or `ux_abort_subagents` to stop running agents; pass `waitForCompletion: false` to check status without waiting.
 
 ## Data Flow / Rendering Pipeline
 

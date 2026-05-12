@@ -70,7 +70,7 @@ AcpUI injects core MCP tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invo
 
 AcpUI's versions of these tools provide a superior user experience:
 - **`ux_invoke_shell`** — Live colored shell output with real-time streaming, interactive terminal with user input
-- **`ux_invoke_subagents`** — Agent orchestration view showing parallel agent execution with live progress
+- **`ux_invoke_subagents`** — Async agent orchestration view showing parallel agent execution with live progress, status polling through `ux_check_subagents`, immediate check-ins with `waitForCompletion: false`, and parent-agent aborts through `ux_abort_subagents`
 - **`ux_invoke_counsel`** — Multi-perspective evaluation with Advocate, Critic, Pragmatist, and domain experts
 - **Optional IO/Search MCP tools** — Available only when enabled in `configuration/mcp.json` before creating the session
 
@@ -98,7 +98,7 @@ Codex's LLM benefits from explicit instructions on which tools to use and when. 
 
 > **Known issue (upstream):** `codex-acp` currently has a bug where some MCP tool calls can time out around the 2-minute mark. Track status here: https://github.com/zed-industries/codex-acp/issues/277
 
-`ux_invoke_subagents` and `ux_invoke_counsel` are guarded in AcpUI against duplicate Codex MCP retries: repeated calls with the same provider/session/tool/MCP request identity return the active or recently completed result instead of spawning another batch. Keep sub-agent work bounded anyway, because upstream timeout behavior can still affect when Codex receives the final tool result.
+`ux_invoke_subagents` and `ux_invoke_counsel` are guarded in AcpUI against duplicate Codex MCP retries: repeated calls with the same provider/session/tool/MCP request identity return the active invocation instead of spawning another batch. These tools return after the sub-agents are spawned, with instructions to call `ux_check_subagents` for status/results or `ux_abort_subagents` to stop the running agents. `ux_check_subagents` waits up to the configured `subagents.statusWaitTimeoutMs` by default; pass `waitForCompletion: false` to check current status immediately while the parent agent continues other work.
 
 **Example AGENTS.md:**
 

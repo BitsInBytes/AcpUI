@@ -633,6 +633,15 @@ describe('Codex Provider', () => {
       expect(event.toolName).toBe('ux_invoke_shell');
       expect(event.title).toBe('Run shell command: npm test');
       expect(codex.categorizeToolCall(event)).toEqual({ category: 'shell', isShellCommand: true });
+
+      const normalizeCore = (tool) => codex.normalizeTool(
+        { type: 'tool_start', id: `t-${tool}`, title: `Tool: AcpUI/${tool}` },
+        { title: `Tool: AcpUI/${tool}`, rawInput: { invocation: { server: 'AcpUI', tool, arguments: {} } } }
+      );
+      expect(normalizeCore('ux_invoke_subagents').title).toBe('Run Subagents');
+      expect(normalizeCore('ux_check_subagents').title).toBe('Check Subagents');
+      expect(normalizeCore('ux_abort_subagents').title).toBe('Abort Subagents');
+      expect(normalizeCore('ux_invoke_counsel').title).toBe('Run Counsel');
     });
 
     it('normalizes optional AcpUI MCP tool titles without server prefixes', () => {

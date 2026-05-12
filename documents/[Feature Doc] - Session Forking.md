@@ -272,18 +272,21 @@ socket.on('merge_message', (data: { sessionId: string; text: string }) => {
 13. Deleting a parent cascades through descendants
 
 File: `backend/sockets/sessionHandlers.js` (Socket event: `delete_session`, Helper: `collectDescendants`)
+File: `backend/database.js` (Functions: `getActiveSubAgentInvocationForParent`, `deleteSubAgentInvocationsForParent`)
+File: `backend/mcp/subAgentInvocationManager.js` (Method: `cancelInvocation`)
 File: `frontend/src/components/Sidebar.tsx` (Handler: `handleRemoveSession`)
 
-The backend removes the requested session, scans `db.getAllSessions()` for recursive `forkedFrom` descendants, then cleans each descendant's ACP files, attachment directory, and DB row. The sidebar also removes the same descendant tree from local state immediately after a delete/archive action.
+The backend cancels any active sub-agent invocation rooted at the requested parent, deletes that parent's invocation registry rows, removes the requested session, scans `db.getAllSessions()` for recursive `forkedFrom` descendants, then cleans each descendant's ACP files, attachment directory, and DB row. The sidebar also removes the same descendant tree from local state immediately after a delete/archive action.
 
 ```js
 // FILE: backend/sockets/sessionHandlers.js (Socket event: delete_session)
+const activeInvocation = await db.getActiveSubAgentInvocationForParent(pid, uiId);
+if (activeInvocation) await subAgentInvocationManager.cancelInvocation(pid, activeInvocation.invocationId);
+await db.deleteSubAgentInvocationsForParent(pid, uiId);
+
 const collectDescendants = (parentId) => {
   for (const s of allSessions) {
-    if (s.forkedFrom === parentId) {
-      descendants.push(s);
-      collectDescendants(s.id);
-    }
+    if (s.forkedFrom === parentId) { descendants.push(s); collectDescendants(s.id); }
   }
 };
 ```
@@ -380,7 +383,7 @@ Merge-back depends on `StreamController.statsCaptures` being set before the fork
 
 ### Delete Contract
 
-Cascade delete is implemented by application code in `delete_session`, not by SQLite foreign keys. Any code path that deletes session rows directly must handle descendant cleanup itself or call the socket lifecycle path.
+Cascade delete is implemented by application code in `delete_session`, not by SQLite foreign keys. Any code path that deletes session rows directly must handle descendant cleanup and clear `subagent_invocations` / `subagent_invocation_agents` rows for the parent, or call the socket lifecycle path.
 
 ---
 

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { render, screen, act, fireEvent } from '@testing-library/react';
 import SubAgentPanel from '../components/SubAgentPanel';
 import { useSubAgentStore } from '../store/useSubAgentStore';
 import type { SubAgentEntry } from '../store/useSubAgentStore';
@@ -26,10 +26,12 @@ const makeAgent = (overrides: Partial<SubAgentEntry> = {}): SubAgentEntry => ({
 describe('SubAgentPanel', () => {
   beforeEach(() => {
     act(() => {
-      useSubAgentStore.setState({ agents: [] });
+      useSubAgentStore.getState().clear();
       useSystemStore.setState({ socket: null });
-      useSessionLifecycleStore.setState({ sessions: [{ id: 's1', name: 'Test', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, acpSessionId: 'parent-1' }],
-        activeSessionId: 's1', });
+      useSessionLifecycleStore.setState({
+        sessions: [{ id: 's1', name: 'Test', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, acpSessionId: 'parent-1' }],
+        activeSessionId: 's1',
+      });
     });
   });
 
@@ -77,11 +79,11 @@ describe('SubAgentPanel', () => {
         ],
       });
     });
-    render(<SubAgentPanel invocationId="inv-test-1" />);
+    const { container } = render(<SubAgentPanel invocationId="inv-test-1" />);
     expect(screen.getByText(/Research/)).toBeInTheDocument();
     expect(screen.getByText(/Implement/)).toBeInTheDocument();
-    expect(screen.getByText('🔄')).toBeInTheDocument();
-    expect(screen.getByText('✅')).toBeInTheDocument();
+    expect(container.querySelector('.sub-agent-status.running svg')).toBeInTheDocument();
+    expect(container.querySelector('.sub-agent-status.completed svg')).toBeInTheDocument();
   });
 
   it('renders tool steps', () => {
@@ -95,11 +97,37 @@ describe('SubAgentPanel', () => {
         })],
       });
     });
-    render(<SubAgentPanel invocationId="inv-test-1" />);
+    const { container } = render(<SubAgentPanel invocationId="inv-test-1" />);
     expect(screen.getByText('Read file')).toBeInTheDocument();
     expect(screen.getByText('Write file')).toBeInTheDocument();
-    expect(screen.getByText('⏳')).toBeInTheDocument();
-    expect(screen.getByText('✓')).toBeInTheDocument();
+    expect(container.querySelector('.sub-agent-tool.in_progress svg')).toBeInTheDocument();
+    expect(container.querySelector('.sub-agent-tool.done svg')).toBeInTheDocument();
+  });
+
+  it('emits cancel_subagents and marks active invocation as cancelling', () => {
+    const socket = { emit: vi.fn() };
+    act(() => {
+      useSystemStore.setState({ socket: socket as any });
+      useSubAgentStore.getState().startInvocation({
+        invocationId: 'inv-test-1',
+        providerId: 'provider-a',
+        parentUiId: 'parent-ui',
+        parentSessionId: 'parent-1',
+        statusToolName: 'ux_check_subagents',
+        totalCount: 1,
+        status: 'running'
+      });
+      useSubAgentStore.setState({ agents: [makeAgent()] });
+    });
+
+    render(<SubAgentPanel invocationId="inv-test-1" />);
+    fireEvent.click(screen.getByRole('button', { name: /stop/i }));
+
+    expect(socket.emit).toHaveBeenCalledWith('cancel_subagents', {
+      providerId: 'provider-a',
+      invocationId: 'inv-test-1'
+    });
+    expect(useSubAgentStore.getState().invocations[0].status).toBe('cancelling');
   });
 
   it('renders permission buttons', () => {
@@ -122,5 +150,43 @@ describe('SubAgentPanel', () => {
     expect(screen.getByText(/Execute shell/)).toBeInTheDocument();
     expect(screen.getByText('Allow')).toBeInTheDocument();
     expect(screen.getByText('Deny')).toBeInTheDocument();
+  });
+
+  it('emits permission responses with the invocation provider and clears local permission', () => {
+    const socket = { emit: vi.fn() };
+    act(() => {
+      useSystemStore.setState({ socket: socket as any });
+      useSubAgentStore.getState().startInvocation({
+        invocationId: 'inv-test-1',
+        providerId: 'provider-a',
+        parentUiId: 'parent-ui',
+        parentSessionId: 'parent-1',
+        statusToolName: 'ux_check_subagents',
+        totalCount: 1,
+        status: 'running'
+      });
+      useSubAgentStore.setState({
+        agents: [makeAgent({
+          permission: {
+            id: 42,
+            sessionId: 'acp-1',
+            options: [{ optionId: 'allow', name: 'Allow', kind: 'allow' }],
+            toolCall: { title: 'Execute shell', toolCallId: 'tool-1' },
+          },
+        })],
+      });
+    });
+
+    render(<SubAgentPanel invocationId="inv-test-1" />);
+    fireEvent.click(screen.getByText('Allow'));
+
+    expect(socket.emit).toHaveBeenCalledWith('respond_permission', {
+      providerId: 'provider-a',
+      id: 42,
+      sessionId: 'acp-1',
+      optionId: 'allow',
+      toolCallId: 'tool-1'
+    });
+    expect(useSubAgentStore.getState().agents[0].permission).toBeNull();
   });
 });

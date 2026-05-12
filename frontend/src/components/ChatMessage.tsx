@@ -1,13 +1,14 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Copy, Check, Archive, Layout } from 'lucide-react';
-import type { Message } from '../types';
+import type { Message, TimelineStep } from '../types';
 import './ChatMessage.css';
 
 import { useSystemStore } from '../store/useSystemStore';
 import { useCanvasStore } from '../store/useCanvasStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
+import { useSubAgentStore } from '../store/useSubAgentStore';
 import UserMessage from './UserMessage';
 import AssistantMessage from './AssistantMessage';
 
@@ -40,6 +41,19 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
   document.body.removeChild(textArea);
   return success;
 };
+
+const SUB_AGENT_TOOL_NAMES = new Set(['ux_invoke_subagents', 'ux_invoke_counsel']);
+const ACTIVE_SUB_AGENT_STATUSES = new Set(['spawning', 'prompting', 'running', 'waiting_permission', 'cancelling']);
+
+function isSubAgentTimelineStep(step: TimelineStep) {
+  if (step.type !== 'tool') return false;
+  const toolName = step.event.canonicalName || step.event.toolName || step.event.mcpToolName;
+  return Boolean(toolName && SUB_AGENT_TOOL_NAMES.has(toolName));
+}
+
+function isActiveSubAgentTimelineStep(step: TimelineStep, activeInvocationIds: ReadonlySet<string>) {
+  return isSubAgentTimelineStep(step) && Boolean(step.type === 'tool' && step.event.invocationId && activeInvocationIds.has(step.event.invocationId));
+}
 
 const CodeBlock = ({ language, value }: { language: string; value: string }) => {
   const [copied, setCopied] = useState(false);
@@ -100,6 +114,20 @@ const CodeBlock = ({ language, value }: { language: string; value: string }) => 
 const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, providerId }) => {
   const [localCollapsed, setLocalCollapsed] = useState<Record<number, boolean>>({});
   const manuallyToggled = useRef<Set<number>>(new Set());
+  const activeSubAgentInvocationIds = useSubAgentStore(state => {
+    const activeIds = new Set<string>();
+    for (const invocation of state.invocations) {
+      if (ACTIVE_SUB_AGENT_STATUSES.has(invocation.status)) activeIds.add(invocation.invocationId);
+    }
+    for (const agent of state.agents) {
+      if (ACTIVE_SUB_AGENT_STATUSES.has(agent.status)) activeIds.add(agent.invocationId);
+    }
+    return Array.from(activeIds).sort().join('|');
+  });
+  const activeSubAgentInvocationSet = useMemo(
+    () => new Set(activeSubAgentInvocationIds ? activeSubAgentInvocationIds.split('|') : []),
+    [activeSubAgentInvocationIds]
+  );
   const { role, timeline, isStreaming } = message || {};
 
   useEffect(() => {
@@ -109,7 +137,9 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
     if (!isStreaming) {
       timeline.forEach((step, idx) => {
         if (manuallyToggled.current.has(idx)) return;
-        if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
+        if (isActiveSubAgentTimelineStep(step, activeSubAgentInvocationSet)) updates[idx] = false;
+        else if (isSubAgentTimelineStep(step)) updates[idx] = true;
+        else if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
         else if (step.type === 'tool') updates[idx] = true;
         else if (step.type === 'thought') updates[idx] = true;
         else if (step.type === 'text') updates[idx] = false;
@@ -122,7 +152,9 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
 
       timeline.forEach((step, idx) => {
         if (manuallyToggled.current.has(idx)) return;
-        if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
+        if (isActiveSubAgentTimelineStep(step, activeSubAgentInvocationSet)) updates[idx] = false;
+        else if (isSubAgentTimelineStep(step)) updates[idx] = true;
+        else if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
         else if (step.type === 'tool') updates[idx] = !last3Tools.includes(idx);
         else if (step.type === 'thought') updates[idx] = !last3Thoughts.includes(idx);
         else if (step.type === 'text') updates[idx] = false;
@@ -134,7 +166,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
       Object.keys(updates).some(key => updates[Number(key)] !== localCollapsed[Number(key)]);
     if (hasChanged) setLocalCollapsed(updates);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeline, isStreaming]);
+  }, [timeline, isStreaming, activeSubAgentInvocationIds]);
 
   if (!message) return null;
 

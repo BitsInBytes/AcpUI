@@ -103,6 +103,8 @@ describe('MCP API Routes', () => {
         expect.objectContaining({ name: 'ux_invoke_shell', inputSchema: expect.objectContaining({ type: 'object' }) }),
         expect.objectContaining({ name: 'ux_invoke_subagents', inputSchema: expect.objectContaining({ type: 'object' }) }),
         expect.objectContaining({ name: 'ux_invoke_counsel', inputSchema: expect.objectContaining({ type: 'object' }) }),
+        expect.objectContaining({ name: 'ux_check_subagents', inputSchema: expect.objectContaining({ type: 'object' }) }),
+        expect.objectContaining({ name: 'ux_abort_subagents', inputSchema: expect.objectContaining({ type: 'object' }) }),
       ])
     }));
   });
@@ -118,8 +120,32 @@ describe('MCP API Routes', () => {
     expect(names).toEqual(expect.arrayContaining([
       'ux_invoke_shell',
       'ux_invoke_subagents',
-      'ux_invoke_counsel'
+      'ux_invoke_counsel',
+      'ux_check_subagents',
+      'ux_abort_subagents'
     ]));
+  });
+
+  it('GET /tools describes sub-agent status and abort controls', () => {
+    useMcpConfig();
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'get', '/tools');
+    const res = { json: vi.fn() };
+    route.route.stack[0].handle({}, res, vi.fn());
+
+    const tools = res.json.mock.calls[0][0].tools;
+    const checkTool = tools.find(tool => tool.name === 'ux_check_subagents');
+    const abortTool = tools.find(tool => tool.name === 'ux_abort_subagents');
+
+    expect(checkTool.annotations.title).toBe('Check Subagents');
+    expect(checkTool.inputSchema.properties.waitForCompletion).toEqual(expect.objectContaining({
+      type: 'boolean',
+      default: true
+    }));
+    expect(abortTool.annotations).toEqual(expect.objectContaining({
+      title: 'Abort Subagents',
+      destructiveHint: true
+    }));
   });
 
   it('GET /tools hides disabled core tools', () => {
@@ -141,6 +167,8 @@ describe('MCP API Routes', () => {
     expect(names).not.toContain('ux_invoke_shell');
     expect(names).not.toContain('ux_invoke_subagents');
     expect(names).not.toContain('ux_invoke_counsel');
+    expect(names).not.toContain('ux_check_subagents');
+    expect(names).not.toContain('ux_abort_subagents');
   });
 
   it('GET /tools describes ux_invoke_shell as an interactive terminal-backed shell replacement', () => {

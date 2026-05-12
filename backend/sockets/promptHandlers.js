@@ -190,7 +190,8 @@ export default function registerPromptHandlers(io, socket) {
     acpClient.transport.sendNotification('session/cancel', { sessionId });
 
     // Abort ALL in-flight invocations for this provider
-    subAgentInvocationManager.cancelAllForParent(sessionId, resolvedProviderId);
+    void Promise.resolve(subAgentInvocationManager.cancelAllForParent(sessionId, resolvedProviderId))
+      .catch(err => writeLog(`[CANCEL ERR] Failed to cancel sub-agent invocations: ${err.message}`));
   });
 
   // ACP pauses execution on permission_request; this forwards the user's allow/deny

@@ -8,9 +8,23 @@ import { create } from 'zustand';
  * and permission requests independently from useChatStore, which only holds
  * the lightweight ChatSession shell for sub-agents.
  *
- * Lifecycle: parent calls clearForParent → addAgent per sub-agent → tokens/events
- * stream in → completeAgent when done.
+ * Lifecycle: parent calls clearForParent -> startInvocation -> addAgent per
+ * sub-agent -> tokens/events stream in -> completeAgent and completeInvocation.
  */
+export type SubAgentStatus = 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+
+export interface SubAgentInvocationEntry {
+  invocationId: string;
+  providerId: string;
+  parentUiId: string | null;
+  parentSessionId: string | null;
+  statusToolName: string;
+  totalCount: number;
+  status: SubAgentStatus;
+  startedAt: number;
+  completedAt?: number | null;
+}
+
 export interface SubAgentEntry {
   providerId: string;
   acpSessionId: string;
@@ -23,7 +37,7 @@ export interface SubAgentEntry {
   name: string;
   prompt: string;
   agent: string;
-  status: 'spawning' | 'prompting' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status: SubAgentStatus;
   tokens: string;
   thoughts: string;
   toolSteps: { id: string; title: string; status: string; output?: string }[];
@@ -31,10 +45,16 @@ export interface SubAgentEntry {
 }
 
 interface SubAgentState {
+  invocations: SubAgentInvocationEntry[];
   agents: SubAgentEntry[];
+  startInvocation: (entry: Omit<SubAgentInvocationEntry, 'status' | 'startedAt'> & { status?: SubAgentStatus; startedAt?: number }) => void;
+  setInvocationStatus: (invocationId: string, status: SubAgentStatus) => void;
+  completeInvocation: (invocationId: string, status: Extract<SubAgentStatus, 'completed' | 'failed' | 'cancelled'>) => void;
+  isInvocationActive: (invocationId?: string | null) => boolean;
+  clearInvocationsForParent: (parentUiIdOrSessionId: string) => void;
   addAgent: (entry: Omit<SubAgentEntry, 'status' | 'tokens' | 'thoughts' | 'toolSteps' | 'permission'>) => void;
-  setStatus: (acpSessionId: string, status: SubAgentEntry['status']) => void;
-  completeAgent: (acpSessionId: string) => void;
+  setStatus: (acpSessionId: string, status: SubAgentStatus) => void;
+  completeAgent: (acpSessionId: string, status?: SubAgentStatus) => void;
   appendToken: (acpSessionId: string, text: string) => void;
   appendThought: (acpSessionId: string, text: string) => void;
   addToolStep: (acpSessionId: string, id: string, title: string) => void;
@@ -45,17 +65,74 @@ interface SubAgentState {
   clear: () => void;
 }
 
-export const useSubAgentStore = create<SubAgentState>((set) => ({
+const ACTIVE_STATUSES = new Set<SubAgentStatus>(['spawning', 'prompting', 'running', 'waiting_permission', 'cancelling']);
+const TERMINAL_STATUSES = new Set<SubAgentStatus>(['completed', 'failed', 'cancelled']);
+
+function invocationStatusFromAgents(agents: SubAgentEntry[], invocationId: string): SubAgentStatus {
+  const scoped = agents.filter(a => a.invocationId === invocationId);
+  if (scoped.length === 0) return 'running';
+  if (scoped.some(a => ACTIVE_STATUSES.has(a.status))) return 'running';
+  if (scoped.some(a => a.status === 'failed')) return 'failed';
+  if (scoped.some(a => a.status === 'cancelled')) return 'cancelled';
+  return 'completed';
+}
+
+export const useSubAgentStore = create<SubAgentState>((set, get) => ({
+  invocations: [],
   agents: [],
+  startInvocation: (entry) => set(state => {
+    const next: SubAgentInvocationEntry = {
+      ...entry,
+      status: entry.status || 'spawning',
+      startedAt: entry.startedAt || Date.now(),
+      completedAt: null
+    };
+    return {
+      invocations: [next, ...state.invocations.filter(inv => inv.invocationId !== next.invocationId)]
+    };
+  }),
+  setInvocationStatus: (invocationId, status) => set(state => ({
+    invocations: state.invocations.map(inv => inv.invocationId === invocationId
+      ? { ...inv, status, completedAt: TERMINAL_STATUSES.has(status) ? Date.now() : inv.completedAt }
+      : inv)
+  })),
+  completeInvocation: (invocationId, status) => set(state => ({
+    invocations: state.invocations.map(inv => inv.invocationId === invocationId
+      ? { ...inv, status, completedAt: Date.now() }
+      : inv)
+  })),
+  isInvocationActive: (invocationId) => {
+    if (!invocationId) return false;
+    const invocation = get().invocations.find(inv => inv.invocationId === invocationId);
+    if (invocation && ACTIVE_STATUSES.has(invocation.status)) return true;
+    return get().agents.some(agent => agent.invocationId === invocationId && ACTIVE_STATUSES.has(agent.status));
+  },
+  clearInvocationsForParent: (parentUiIdOrSessionId) => set(state => ({
+    invocations: state.invocations.filter(inv => inv.parentUiId !== parentUiIdOrSessionId && inv.parentSessionId !== parentUiIdOrSessionId)
+  })),
   addAgent: (entry) => set(state => ({
-    agents: [...state.agents, { ...entry, status: 'spawning', tokens: '', thoughts: '', toolSteps: [], permission: null }]
+    agents: [...state.agents.filter(a => a.acpSessionId !== entry.acpSessionId), { ...entry, status: 'spawning', tokens: '', thoughts: '', toolSteps: [], permission: null }]
   })),
-  setStatus: (acpSessionId, status) => set(state => ({
-    agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, status } : a)
-  })),
-  completeAgent: (acpSessionId) => set(state => ({
-    agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, status: 'completed' } : a)
-  })),
+  setStatus: (acpSessionId, status) => set(state => {
+    const agents = state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, status } : a);
+    const changedAgent = agents.find(a => a.acpSessionId === acpSessionId);
+    const invocations = changedAgent
+      ? state.invocations.map(inv => inv.invocationId === changedAgent.invocationId
+        ? { ...inv, status: invocationStatusFromAgents(agents, inv.invocationId), completedAt: TERMINAL_STATUSES.has(invocationStatusFromAgents(agents, inv.invocationId)) ? Date.now() : inv.completedAt }
+        : inv)
+      : state.invocations;
+    return { agents, invocations };
+  }),
+  completeAgent: (acpSessionId, status = 'completed') => set(state => {
+    const agents = state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, status } : a);
+    const changedAgent = agents.find(a => a.acpSessionId === acpSessionId);
+    const invocations = changedAgent
+      ? state.invocations.map(inv => inv.invocationId === changedAgent.invocationId
+        ? { ...inv, status: invocationStatusFromAgents(agents, inv.invocationId), completedAt: TERMINAL_STATUSES.has(invocationStatusFromAgents(agents, inv.invocationId)) ? Date.now() : inv.completedAt }
+        : inv)
+      : state.invocations;
+    return { agents, invocations };
+  }),
   appendToken: (acpSessionId, text) => set(state => ({
     agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, tokens: a.tokens + text } : a)
   })),
@@ -73,13 +150,14 @@ export const useSubAgentStore = create<SubAgentState>((set) => ({
       : a)
   })),
   setPermission: (acpSessionId, permission) => set(state => ({
-    agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, permission } : a)
+    agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, permission, status: permission ? 'waiting_permission' : a.status } : a)
   })),
   clearPermission: (acpSessionId) => set(state => ({
-    agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, permission: null } : a)
+    agents: state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, permission: null, status: a.status === 'waiting_permission' ? 'running' : a.status } : a)
   })),
   clearForParent: (parentSessionId) => set(state => ({
-    agents: state.agents.filter(a => a.parentSessionId !== parentSessionId)
+    agents: state.agents.filter(a => a.parentSessionId !== parentSessionId),
+    invocations: state.invocations.filter(inv => inv.parentSessionId !== parentSessionId && inv.parentUiId !== parentSessionId)
   })),
-  clear: () => set({ agents: [] }),
+  clear: () => set({ invocations: [], agents: [] }),
 }));

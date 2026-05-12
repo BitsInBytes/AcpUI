@@ -20,6 +20,14 @@ describe('useChatManager hook', () => {
     act(() => {
       useSystemStore.setState({ socket: mockSocket as any, connected: true });
       useSessionLifecycleStore.setState({ sessions: [], activeSessionId: null, handleInitialLoad: vi.fn() });
+      useStreamStore.setState({
+        streamQueues: {},
+        activeMsgIdByAcp: {},
+        isProcessActiveByAcp: {},
+        displayedContentByMsg: {},
+        settledLengthByMsg: {},
+        typewriterInterval: null
+      });
       useShellRunStore.getState().reset();
     });
   });
@@ -126,10 +134,116 @@ describe('useChatManager hook', () => {
 
     const toolStep = (useSessionLifecycleStore.getState().sessions[0].messages[0] as any).timeline[0];
     expect(toolStep.event.shellState).toBe('exited');
+    expect(toolStep.event.status).toBe('completed');
     expect(toolStep.event.title).toBe('Invoke Shell: Run test suite');
     expect(toolStep.event.command).toBe('npm test');
     expect(toolStep.event.cwd).toBe('D:/repo');
     expect(toolStep.event.output).toBe('PASS');
+    expect(toolStep.event.endTime).toBeDefined();
+  });
+
+  it('creates a Shell V2 tool step from shell lifecycle events when provider tool_start is missing', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          name: 'Session',
+          messages: [],
+          isTyping: true,
+          isWarmingUp: false,
+          model: 'balanced',
+          provider: 'provider-a'
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
+
+    act(() => {
+      handlers.shell_run_started({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-missing-start',
+        status: 'running',
+        description: 'Sync check',
+        command: 'node -p "sync"',
+        cwd: 'D:/repo',
+        transcript: '$ node -p "sync"\n'
+      });
+      handlers.shell_run_output({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-missing-start',
+        chunk: 'sync\n'
+      });
+      handlers.shell_run_exit({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-missing-start',
+        exitCode: 0,
+        reason: 'completed',
+        finalText: 'sync'
+      });
+    });
+
+    const session = useSessionLifecycleStore.getState().sessions[0];
+    expect(session.messages).toHaveLength(1);
+    const toolStep = session.messages[0].timeline?.[0] as any;
+    expect(toolStep.type).toBe('tool');
+    expect(toolStep.event.shellRunId).toBe('shell-run-missing-start');
+    expect(toolStep.event.status).toBe('completed');
+    expect(toolStep.event.title).toBe('Invoke Shell: Sync check');
+    expect(toolStep.event.output).toBe('sync');
+  });
+
+  it('marks Shell V2 tool steps failed on non-zero shell exits', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          name: 'Session',
+          messages: [],
+          isTyping: true,
+          isWarmingUp: false,
+          model: 'balanced',
+          provider: 'provider-a'
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
+
+    act(() => {
+      handlers.shell_run_started({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-failed',
+        status: 'running',
+        description: 'Failing command',
+        command: 'exit 1',
+        cwd: 'D:/repo'
+      });
+      handlers.shell_run_exit({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-failed',
+        exitCode: 1,
+        reason: 'failed',
+        finalText: 'failed'
+      });
+    });
+
+    const toolStep = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline?.[0] as any;
+    expect(toolStep.event.status).toBe('failed');
+    expect(toolStep.event.shellState).toBe('exited');
+    expect(toolStep.event.endTime).toBeDefined();
+    expect(toolStep.event.output).toBe('failed');
   });
 
   it('routes parallel Shell V2 output by shellRunId without claiming legacy shell steps', async () => {
@@ -162,8 +276,10 @@ describe('useChatManager hook', () => {
   });
 
   it('handles "sub_agents_starting" — clears old sidebar sessions immediately', async () => {
+    const { useSubAgentStore } = await import('../store/useSubAgentStore');
     const setState = vi.spyOn(useSessionLifecycleStore, 'setState');
     act(() => {
+      useSubAgentStore.getState().clear();
       useSessionLifecycleStore.setState({
         sessions: [
           {
@@ -185,7 +301,7 @@ describe('useChatManager hook', () => {
     const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agents_starting')[1];
 
     act(() => {
-      handler({ invocationId: 'inv-abc', parentUiId: 'parent-ui', providerId: 'provider-a', count: 2 });
+      handler({ invocationId: 'inv-abc', parentAcpSessionId: 'parent-acp', parentUiId: 'parent-ui', providerId: 'provider-a', count: 2, statusToolName: 'ux_check_subagents' });
     });
 
     // Old sidebar sub-agent session should be deleted
@@ -197,6 +313,15 @@ describe('useChatManager hook', () => {
     expect(sessions.find((s: any) => s.id === 'sub-old')).toBeUndefined();
     // The parent session should still be there (only sub-agents are removed)
     expect(sessions.find((s: any) => s.id === 'parent-ui')).toBeDefined();
+    expect(useSubAgentStore.getState().invocations[0]).toEqual(expect.objectContaining({
+      invocationId: 'inv-abc',
+      providerId: 'provider-a',
+      parentUiId: 'parent-ui',
+      parentSessionId: 'parent-acp',
+      statusToolName: 'ux_check_subagents',
+      totalCount: 2,
+      status: 'spawning'
+    }));
   });
 
   it('handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0', async () => {
@@ -329,6 +454,126 @@ describe('useChatManager hook', () => {
     expect(setState).toHaveBeenCalled();
   });
 
+  it('handles "sub_agent_invocation_status" event', async () => {
+    const { useSubAgentStore } = await import('../store/useSubAgentStore');
+    act(() => {
+      useSubAgentStore.getState().clear();
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_invocation_status')[1];
+
+    act(() => {
+      handler({
+        invocationId: 'inv-status',
+        providerId: 'provider-a',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: 'parent-ui',
+        statusToolName: 'ux_check_subagents',
+        totalCount: 3,
+        status: 'running'
+      });
+    });
+
+    expect(useSubAgentStore.getState().invocations[0]).toEqual(expect.objectContaining({
+      invocationId: 'inv-status',
+      providerId: 'provider-a',
+      parentUiId: 'parent-ui',
+      parentSessionId: 'parent-acp',
+      totalCount: 3,
+      status: 'running'
+    }));
+
+    act(() => {
+      handler({
+        invocationId: 'inv-status',
+        providerId: 'provider-a',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: 'parent-ui',
+        status: 'completed'
+      });
+    });
+
+    expect(useSubAgentStore.getState().invocations[0].status).toBe('completed');
+    expect(useSubAgentStore.getState().isInvocationActive('inv-status')).toBe(false);
+  });
+
+  it('handles "sub_agent_status" with invocationId by updating agent and invocation state', async () => {
+    const { useSubAgentStore } = await import('../store/useSubAgentStore');
+    act(() => {
+      useSubAgentStore.setState({
+        invocations: [{
+          invocationId: 'inv-agent-status',
+          providerId: 'provider-a',
+          parentUiId: 'parent-ui',
+          parentSessionId: 'parent-acp',
+          statusToolName: 'ux_check_subagents',
+          totalCount: 1,
+          status: 'running',
+          startedAt: Date.now(),
+          completedAt: null
+        }],
+        agents: [{
+          providerId: 'provider-a',
+          acpSessionId: 'sub-acp-status',
+          parentSessionId: 'parent-acp',
+          invocationId: 'inv-agent-status',
+          index: 0,
+          name: 'Agent',
+          prompt: 'p',
+          agent: 'a',
+          status: 'running',
+          tokens: '',
+          thoughts: '',
+          toolSteps: [],
+          permission: null
+        }]
+      } as any);
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_status')[1];
+
+    act(() => {
+      handler({ acpSessionId: 'sub-acp-status', invocationId: 'inv-agent-status', status: 'completed' });
+    });
+
+    expect(useSubAgentStore.getState().agents[0].status).toBe('completed');
+    expect(useSubAgentStore.getState().invocations[0].status).toBe('completed');
+  });
+
+  it('moves waiting sub-agents back to running on token events', async () => {
+    const { useSubAgentStore } = await import('../store/useSubAgentStore');
+    act(() => {
+      useSubAgentStore.setState({
+        agents: [{
+          providerId: 'provider-a',
+          acpSessionId: 'sub-waiting',
+          parentSessionId: 'parent-acp',
+          invocationId: 'inv-waiting',
+          index: 0,
+          name: 'Agent',
+          prompt: 'p',
+          agent: 'a',
+          status: 'waiting_permission',
+          tokens: '',
+          thoughts: '',
+          toolSteps: [],
+          permission: null
+        }]
+      } as any);
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'token')[1];
+
+    act(() => {
+      handler({ sessionId: 'sub-waiting', text: 'continuing' });
+    });
+
+    expect(useSubAgentStore.getState().agents[0].status).toBe('running');
+  });
+
   it('handles "sub_agent_completed" event', async () => {
     const { useSubAgentStore } = await import('../store/useSubAgentStore');
     const completeAgent = vi.fn();
@@ -347,10 +592,25 @@ describe('useChatManager hook', () => {
     const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_completed')[1];
     act(() => { handler({ acpSessionId: 'sub-acp' }); });
 
-    expect(completeAgent).toHaveBeenCalledWith('sub-acp');
+    expect(completeAgent).toHaveBeenCalledWith('sub-acp', 'completed');
     const session = useSessionLifecycleStore.getState().sessions.find((s: any) => s.acpSessionId === 'sub-acp') as any;
     expect(session.isTyping).toBe(false);
     expect(session.messages[0].isStreaming).toBe(false);
+  });
+
+  it('passes terminal sub-agent completion statuses through to the store', async () => {
+    const { useSubAgentStore } = await import('../store/useSubAgentStore');
+    const completeAgent = vi.fn();
+    act(() => {
+      useSubAgentStore.setState({ completeAgent });
+      useSessionLifecycleStore.setState({ sessions: [] });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_completed')[1];
+    act(() => { handler({ acpSessionId: 'sub-acp-failed', status: 'failed' }); });
+
+    expect(completeAgent).toHaveBeenCalledWith('sub-acp-failed', 'failed');
   });
 
   it('routes system_event tool_start/tool_end to sub-agent store', async () => {

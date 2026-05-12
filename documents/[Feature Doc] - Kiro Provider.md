@@ -115,7 +115,7 @@ Architectural role: backend provider adapter with frontend effects through norma
 
 7. **Initial agent selection is drain-aware**
 
-   Files: `backend/sockets/sessionHandlers.js` (Socket event: `create_session`), `backend/mcp/subAgentInvocationManager.js` (Method: `runInvocation`), `providers/kiro/index.js` (Function: `setInitialAgent`), `providers/kiro/provider.json` (Keys: `supportsAgentSwitching`, `defaultSystemAgentName`), `providers/kiro/user.json` (Key: `defaultSubAgentName`)
+   Files: `backend/sockets/sessionHandlers.js` (Socket event: `create_session`), `backend/mcp/subAgentInvocationManager.js` (Methods: `runInvocation`, `startInvocation`), `providers/kiro/index.js` (Function: `setInitialAgent`), `providers/kiro/provider.json` (Keys: `supportsAgentSwitching`, `defaultSystemAgentName`), `providers/kiro/user.json` (Key: `defaultSubAgentName`)
 
    When a requested agent differs from Kiro's baseline agent, the backend calls `setInitialAgent`. Kiro begins stream draining, sends `/agent <agentName>` as `session/prompt`, waits for drain completion, and resumes normal streaming so the agent-switch confirmation stays out of the chat timeline. Sub-agent creation uses `defaultSubAgentName` when the MCP request omits `agent` and calls `setInitialAgent` when the selected agent differs from `defaultSystemAgentName`.
 
@@ -269,9 +269,9 @@ File: `providers/kiro/branding.json` (Keys: `title`, `assistantName`, `busyText`
 
 ### AcpUI MCP Tool Advertisement
 
-Files: `configuration/mcp.json.example` (Keys: `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch`), `backend/services/mcpConfig.js` (Functions: `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`), `backend/mcp/mcpServer.js` (Function: `createToolHandlers`), `backend/mcp/stdio-proxy.js` (Function: `runProxy`)
+Files: `configuration/mcp.json.example` (Keys: `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch`, `subagents.statusWaitTimeoutMs`, `subagents.statusPollIntervalMs`), `backend/services/mcpConfig.js` (Functions: `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`, `getSubagentsMcpConfig`), `backend/mcp/mcpServer.js` (Function: `createToolHandlers`), `backend/mcp/stdio-proxy.js` (Function: `runProxy`)
 
-Kiro sees AcpUI tools through the injected MCP server named `AcpUI`. Core tools and optional IO/search tools are advertised by backend MCP config, then Kiro refers to them with the `@AcpUI/<toolName>` shape. Agent files can allow all AcpUI tools with `@AcpUI/*` or specific tools such as `@AcpUI/ux_invoke_shell`.
+Kiro sees AcpUI tools through the injected MCP server named `AcpUI`. Core tools and optional IO/search tools are advertised by backend MCP config; `ux_check_subagents` and `ux_abort_subagents` are also advertised when either `tools.subagents` or `tools.counsel` is enabled. Kiro refers to these tools with the `@AcpUI/<toolName>` shape. Agent files can allow all AcpUI tools with `@AcpUI/*` or specific tools such as `@AcpUI/ux_invoke_shell`.
 
 ### Extension Data Flow
 
@@ -357,7 +357,7 @@ const KIRO_HOOK_MAP = {
 | Session Manager | `backend/services/sessionManager.js` | `getMcpServers`, `loadSessionIntoMemory`, `setSessionModel`, `setProviderConfigOption`, `reapplySavedConfigOptions`, `autoLoadPinnedSessions` | MCP injection, hot-load, and session state reapply |
 | JSONL | `backend/services/jsonlParser.js` | `parseJsonlSession` | Provider-owned history parser dispatch |
 | Hooks | `backend/services/hookRunner.js` | `runHooks` | Backend-managed hook execution and `cliManagedHooks` skip |
-| Sub-agents | `backend/mcp/subAgentInvocationManager.js` | `runInvocation`, `trackSubAgentParent`, `cancelAllForParent` | Kiro sub-agent creation, default agent selection, and cancellation |
+| Sub-agents | `backend/mcp/subAgentInvocationManager.js` | `runInvocation`, `startInvocation`, `trackSubAgentParent`, `cancelAllForParent` | Kiro sub-agent creation, default agent selection, async status, and cancellation |
 | MCP Proxy | `backend/mcp/mcpProxyRegistry.js` | `createMcpProxyBinding`, `bindMcpProxy`, `getMcpProxyIdFromServers` | Session-scoped MCP proxy binding |
 | Tool Resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Canonical invocation merge and event enrichment |
 | Tool Patterns | `backend/services/tools/toolIdPattern.js` | `toolIdPatternToRegex`, `matchToolIdPattern`, `replaceToolIdPattern` | Provider-configurable MCP tool ID parsing |
@@ -383,7 +383,7 @@ const KIRO_HOOK_MAP = {
 | Local Config Template | `providers/kiro/user.json.example` | `command`, `args`, `defaultSubAgentName`, `paths`, `models` | Placeholder shape for Kiro user config |
 | Protocol Reference | `providers/kiro/ACP_PROTOCOL_SAMPLES.md` | Sections `initialize`, `session/new`, `session/prompt - Agent Switch`, `session/set_model`, `session/load`, `Extension Notifications`, `Unsupported Methods` | Kiro wire-format reference |
 | Operational Notes | `providers/kiro/README.md` | Sections `Configuring Agents and Tool Permissions`, `Extension Protocol`, `Dynamic Models`, `Session Files`, `Agent Switching`, `Hooks` | Kiro-specific operator-facing notes |
-| MCP Config | `configuration/mcp.json.example` | `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch` | Controls AcpUI MCP tool advertisement |
+| MCP Config | `configuration/mcp.json.example` | `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch`, `subagents.statusWaitTimeoutMs`, `subagents.statusPollIntervalMs` | Controls AcpUI MCP tool advertisement and sub-agent status polling behavior |
 
 ## Gotchas
 
@@ -493,7 +493,7 @@ const KIRO_HOOK_MAP = {
   - `skips hooks listed in cliManagedHooks`
   - `passes agentName and hookType to getHooksForAgent`
 - `backend/test/subAgentInvocationManager.test.js`
-  - `runs invocation successfully`
+  - `starts asynchronously and returns completed results through the status call`
   - `cancelAllForParent cascades through nested sub-agent invocations`
 - `backend/test/mcpServer.test.js`
   - `passes defaultSubAgentName into session/new when request omits agent`

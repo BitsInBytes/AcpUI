@@ -24,6 +24,8 @@ const { mockFs, mockDb, mockAcpClient, mockProviderModule } = vi.hoisted(() => (
         getSessionByAcpId: vi.fn().mockResolvedValue(null),
         getAllSessions: vi.fn().mockResolvedValue([]),
         deleteSession: vi.fn().mockResolvedValue(undefined),
+        getActiveSubAgentInvocationForParent: vi.fn().mockResolvedValue(null),
+        deleteSubAgentInvocationsForParent: vi.fn().mockResolvedValue(undefined),
         updateSession: vi.fn().mockResolvedValue(undefined),
         saveConfigOptions: vi.fn().mockResolvedValue(undefined),
         saveModelState: vi.fn().mockResolvedValue(undefined),

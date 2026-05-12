@@ -190,10 +190,12 @@ This feature spans the frontend modal, Zustand stores, Socket.IO session handler
     - `frontend/src/components/SessionSettingsModal.tsx` (Handler: `handleDelete`, State: `showConfirmDelete`)
     - `frontend/src/store/useSessionLifecycleStore.ts` (Action: `handleDeleteSession`)
     - `backend/sockets/sessionHandlers.js` (Socket event: `delete_session`)
+    - `backend/database.js` (Functions: `getActiveSubAgentInvocationForParent`, `deleteSubAgentInvocationsForParent`, `deleteSession`)
+    - `backend/mcp/subAgentInvocationManager.js` (Method: `cancelInvocation`)
     - `backend/mcp/acpCleanup.js` (Function: `cleanupAcpSession`)
     - Provider modules (Function: `deleteSessionFiles`)
 
-    The Delete tab requires two user actions. `handleDelete()` calls `handleDeleteSession(socket, session.id, true)`, forcing permanent delete instead of archive behavior. The frontend removes the session locally. The backend deletes attachment directories, calls `cleanupAcpSession()` for the ACP session and descendants, deletes DB rows, and traverses descendants using `forkedFrom`.
+    The Delete tab requires two user actions. `handleDelete()` calls `handleDeleteSession(socket, session.id, true)`, forcing permanent delete instead of archive behavior. The frontend removes the session locally. The backend cancels any active sub-agent invocation rooted at the deleted UI session, deletes its invocation registry rows, deletes attachment directories, calls `cleanupAcpSession()` for the ACP session and descendants, deletes DB rows, and traverses descendants using `forkedFrom`.
 
 ## Architecture Diagram
 
@@ -375,7 +377,7 @@ export interface ChatSession {
 | JSONL parser | `backend/services/jsonlParser.js` | `parseJsonlSession` | Loads provider JSONL paths and delegates parsing. |
 | Model utilities | `backend/services/modelOptions.js` | `resolveModelSelection`, `extractModelState`, `mergeModelOptions`, `modelOptionsFromProviderConfig`, `normalizeModelOptions` | Resolves backend model ids and option catalogs. |
 | Config utilities | `backend/services/configOptions.js` | `normalizeConfigOptions`, `applyConfigOptionsChange`, `mergeConfigOptions` | Normalizes and merges provider config options. |
-| Persistence | `backend/database.js` | `saveSession`, `getSession`, `getAllSessions`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `deleteSession` | Persists settings, messages, model state, config state, and deletes DB rows. |
+| Persistence | `backend/database.js` | `saveSession`, `getSession`, `getAllSessions`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `deleteSession`, `getActiveSubAgentInvocationForParent`, `deleteSubAgentInvocationsForParent` | Persists settings, messages, model state, config state, delete rows, and sub-agent invocation cleanup. |
 | Cleanup | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | Delegates provider session-file deletion to `deleteSessionFiles`. |
 | Attachments | `backend/services/attachmentVault.js` | `getAttachmentsRoot` | Supplies attachment roots for export and delete. |
 | Runtime | `backend/services/providerRuntimeManager.js` | `getClient`, `getRuntime` | Resolves provider-specific ACP clients. |
@@ -431,9 +433,9 @@ export interface ChatSession {
 
    The modal passes `forcePermanent = true` to `handleDeleteSession()`. This emits `delete_session` even when the global sidebar delete mode would archive a session.
 
-10. **Permanent delete cascades descendants after deleting the parent DB row**
+10. **Permanent delete cleans invocation rows before cascading descendants**
 
-    `delete_session` deletes the parent, reads all sessions, collects descendants by `forkedFrom`, and then deletes each child. Tests must include `db.getAllSessions()` data for descendant behavior.
+    `delete_session` cancels any active sub-agent invocation for the parent UI session and deletes linked invocation registry rows before removing the parent. It then reads all sessions, collects descendants by `forkedFrom`, and deletes each child. Tests must include `db.getAllSessions()` data for descendant behavior.
 
 ## Unit Tests
 
@@ -460,7 +462,7 @@ export interface ChatSession {
 | `backend/test/sessionHandlers.test.js` | `handles set_session_model`; `set_session_model updates metadata when meta exists`; `set_session_model logs error when sendRequest throws` | Model switching, metadata update, error logging. |
 | `backend/test/sessionHandlers.test.js` | `handles set_session_option`; `set_session_option merges configOptions returned by provider`; `set_session_option returns early when session not found`; `set_session_option routes through provider contract setConfigOption`; `set_session_option updates sessionMetadata when meta exists`; `set_session_option logs error when setConfigOption throws` | Provider config option mutation and persistence. |
 | `backend/test/sessionHandlers.test.js` | `handles export_session successfully`; `handles export_session when session not found` | Export folder/session JSON behavior and missing-session error. |
-| `backend/test/sessionHandlers.test.js` | `handles delete_session`; `handles delete_session with cascading child sessions` | Permanent delete and descendant cleanup. |
+| `backend/test/sessionHandlers.test.js` | `handles delete_session`; `handles delete_session with cascading child sessions`; delete-session invocation registry cleanup coverage | Permanent delete, sub-agent invocation cleanup, and descendant cleanup. |
 | `backend/test/jsonlParser.test.js` | `parses simple prompt/response pair`; `delegates parsing to providerModule`; `returns null on malformed JSON`; `returns null and logs when provider lacks parseSessionHistory` | JSONL parser delegation and null-return behavior. |
 | `backend/test/sessionManager.test.js` | `loadSessionIntoMemory` tests covering `emitCachedContext`, `normalizeModelState`, `saveModelState` | Session-load model/context support that feeds modal state. |
 | `backend/test/persistence.test.js` | `saveConfigOptions returns immediately if nothing to change`; `saveModelState handles null provider path`; `handles saveModelState with modelOptions and 3-arg signature`; `handles saveConfigOptions with 4-arg signature`; `handles saveConfigOptions with invalid existing JSON` | SQLite persistence for model/config settings. |

@@ -10,24 +10,35 @@ This area is easy to misread because it uses three different IDs at once: parent
 
 ### What It Does
 
-- Advertises `ux_invoke_subagents` and `ux_invoke_counsel` through the MCP proxy when the MCP config enables them.
+- Advertises `ux_invoke_subagents`, `ux_invoke_counsel`, `ux_check_subagents`, and `ux_abort_subagents` through the MCP proxy when MCP config enables sub-agents or counsel.
 - Receives MCP tool calls through `backend/mcp/stdio-proxy.js` and `POST /api/mcp/tool-call`.
 - Records AcpUI MCP tool metadata through `mcpExecutionRegistry` and `toolCallState` so the parent ToolStep has stable identity and title data.
-- Spawns one ACP session per sub-agent request through `SubAgentInvocationManager.runInvocation`.
-- Persists each sub-agent as a `sessions` row with `is_sub_agent = 1` and `forked_from = parentUiId`.
-- Emits Socket.IO lifecycle events: `sub_agents_starting`, `sub_agent_started`, `sub_agent_status`, `sub_agent_completed`, and `sub_agent_snapshot`.
-- Renders each batch in `SubAgentPanel` and each produced conversation as a read-only sidebar session.
+- Starts one async invocation through `SubAgentInvocationManager.runInvocation`, then returns an invocation ID and instructions to call `ux_check_subagents` for status/results or `ux_abort_subagents` to stop the running agents.
+- Persists the invocation and each agent in SQL registry tables, and persists each spawned sub-agent as a `sessions` row with `is_sub_agent = 1` and `forked_from = parentUiId`.
+- Emits Socket.IO lifecycle events: `sub_agents_starting`, `sub_agent_started`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`, and `sub_agent_snapshot`.
+- Renders each active batch in `SubAgentPanel` until every agent is terminal, with an explicit Stop action.
 - Routes sub-agent permission requests to the panel while parent-session permissions stay in the main timeline.
 
 ### Why This Matters
 
-- Sub-agent tool calls create ACP sessions as a side effect, so retry handling and cancellation must be precise.
+- Sub-agent tool calls create ACP sessions as a side effect, so retry handling, active-invocation enforcement, and cancellation must be precise.
+- The initial tool call must return quickly for providers with long-running tool limits; result collection moves to `ux_check_subagents`.
 - The UI shows the same sub-agent activity in two places: a compact panel for orchestration and sidebar sessions for full inspection.
 - Parent-child linkage uses both ACP IDs and UI IDs, and mixing them breaks room routing, cancellation, or sidebar nesting.
-- `invocationId` is required so each parent ToolStep shows only the agents spawned by that tool call.
+- `invocationId` is required so each parent ToolStep shows only the agents spawned by that tool call and so the status tool can find the registry row.
 - The feature is provider-agnostic; provider-specific behavior is limited to config keys and provider module hooks.
 
 Architectural role: backend MCP tool, backend session orchestrator, Socket.IO lifecycle, SQLite persistence, frontend Zustand state, and React rendering.
+
+### Async Tool Contract
+
+1. `ux_invoke_subagents` or `ux_invoke_counsel` validates the request, creates the SQL registry row, spawns the requested ACP sessions, and returns a text result containing `invocationId` and `statusToolName: ux_check_subagents`.
+2. The parent agent should not call `ux_invoke_subagents` again for the same work. It should call `ux_check_subagents({ "invocationId": "..." })` to wait for results.
+3. `ux_check_subagents` waits up to `subagents.statusWaitTimeoutMs`, checking at `subagents.statusPollIntervalMs`, then returns completed results plus failed, aborted, or still-running agents unless `waitForCompletion` is false.
+4. `ux_check_subagents({ "invocationId": "...", "waitForCompletion": false })` returns the current status immediately without waiting so the parent agent can keep working in parallel.
+5. `ux_abort_subagents({ "invocationId": "..." })` aborts active agents for the invocation, then returns the same status/result payload shape as `ux_check_subagents`.
+6. If any agents are still active, the status result includes the same invocation ID and tells the parent agent to call `ux_check_subagents` again.
+7. A parent chat/provider can have only one active sub-agent invocation. A second invocation request returns the active invocation instructions instead of spawning another batch.
 
 ---
 
@@ -36,10 +47,10 @@ Architectural role: backend MCP tool, backend session orchestrator, Socket.IO li
 ### 1. MCP Tool Definitions Are Advertised
 
 File: `backend/routes/mcpApi.js` (Route: `GET /tools`, Function: `createMcpApiRoutes`)
-File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`)
-File: `backend/services/mcpConfig.js` (Config keys: `tools.subagents`, `tools.counsel`)
+File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition`)
+File: `backend/services/mcpConfig.js` (Config keys: `tools.subagents`, `tools.counsel`, `subagents.statusWaitTimeoutMs`, `subagents.statusPollIntervalMs`)
 
-The backend builds the tool list from `configuration/mcp.json`. `ux_invoke_subagents` appears only when `isSubagentsMcpEnabled()` returns true. `ux_invoke_counsel` is controlled by `isCounselMcpEnabled()` and uses the same invocation manager.
+The backend builds the tool list from `configuration/mcp.json`. `ux_invoke_subagents` appears only when `isSubagentsMcpEnabled()` returns true. `ux_invoke_counsel` is controlled by `isCounselMcpEnabled()` and uses the same invocation manager. `ux_check_subagents` and `ux_abort_subagents` are advertised whenever either sub-agents or counsel are enabled.
 
 ```javascript
 // FILE: backend/routes/mcpApi.js (Route: GET /tools)
@@ -48,6 +59,10 @@ if (isSubagentsMcpEnabled()) {
 }
 if (isCounselMcpEnabled()) {
   toolList.push(getCounselMcpToolDefinition());
+}
+if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+  toolList.push(getCheckSubagentsMcpToolDefinition());
+  toolList.push(getAbortSubagentsMcpToolDefinition());
 }
 ```
 
@@ -147,8 +162,8 @@ For sub-agents, the public input is the caller-provided `requests` and `model`; 
 
 ### 5. The Handler Builds an Idempotency Key and Delegates
 
-File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`, Helpers: `buildSubAgentInvocationKey`, `runSubagentInvocation`, `runCounselInvocation`)
-File: `backend/services/tools/acpUxTools.js` (Constants: `ACP_UX_TOOL_NAMES.invokeSubagents`, `ACP_UX_TOOL_NAMES.invokeCounsel`)
+File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`, Helpers: `buildSubAgentInvocationKey`, `runSubagentInvocation`, `runCheckSubagentsInvocation`, `runAbortSubagentsInvocation`, `runCounselInvocation`)
+File: `backend/services/tools/acpUxTools.js` (Constants: `ACP_UX_TOOL_NAMES.invokeSubagents`, `ACP_UX_TOOL_NAMES.checkSubagents`, `ACP_UX_TOOL_NAMES.abortSubagents`, `ACP_UX_TOOL_NAMES.invokeCounsel`)
 
 `runSubagentInvocation` builds an idempotency key scoped by provider, parent ACP session or proxy ID, tool name, and the best available request identity. It prefers `mcpRequestId`, then tool-call metadata from `requestMeta`, then a stable hash of `{ requests, model }`.
 
@@ -178,32 +193,43 @@ return subAgentInvocationManager.runInvocation({
 
 ### 6. The Invocation Manager Resolves Parent, Model, and Batch State
 
-File: `backend/mcp/subAgentInvocationManager.js` (Class: `SubAgentInvocationManager`, Methods: `runInvocation`, `executeInvocation`, `pruneCompletedInvocations`)
-File: `backend/database.js` (Function: `getSessionByAcpId`)
+File: `backend/mcp/subAgentInvocationManager.js` (Class: `SubAgentInvocationManager`, Methods: `runInvocation`, `startInvocation`, `executeStartInvocation`, `getInvocationStatus`, `cancelInvocation`)
+File: `backend/database.js` (Functions: `getSessionByAcpId`, `createSubAgentInvocation`, `getActiveSubAgentInvocationForParent`, `deleteSubAgentInvocationsForParent`)
 File: `backend/services/modelOptions.js` (Functions: `modelOptionsFromProviderConfig`, `resolveModelSelection`)
 
-`runInvocation` validates that Socket.IO and the provider runtime are available. It resolves the parent ACP session by preferring the explicit MCP session context and falling back to `acpClient.lastSubAgentParentAcpId`.
+`runInvocation` validates that Socket.IO and the provider runtime are available, then delegates to the async start path. It resolves the parent ACP session by preferring the explicit MCP session context and falling back to `acpClient.lastSubAgentParentAcpId`.
 
-Active idempotency records return the active promise. Completed idempotency records return the cached result until their TTL expires.
+Active idempotency records return the active start-result promise. Completed idempotency records return the cached start result. If the parent UI session already has an active SQL invocation, the manager returns instructions for that invocation instead of spawning another batch.
 
-`executeInvocation` resolves the model from `model`, `models.subAgent`, then provider model defaults through `resolveModelSelection`. It resolves `parentUiId` with `getSessionByAcpId(providerId, parentAcpSessionId)` and emits `sub_agents_starting` before session spawn timers run.
+`executeStartInvocation` resolves the model from `model`, `models.subAgent`, then provider model defaults through `resolveModelSelection`. It resolves `parentUiId` with `getSessionByAcpId(providerId, parentAcpSessionId)`, removes old terminal sub-agent sidebar sessions only after a new invocation is accepted, creates the SQL invocation row, and emits `sub_agents_starting` before session spawn timers run.
 
 ```javascript
-// FILE: backend/mcp/subAgentInvocationManager.js (Method: executeInvocation)
+// FILE: backend/mcp/subAgentInvocationManager.js (Method: executeStartInvocation)
 const modelId = this.resolveModelSelectionFn(model || models.subAgent, models, quickModelOptions).modelId;
 const invocationId = `inv-${this.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+await this.db.createSubAgentInvocation({
+  invocationId,
+  provider: resolvedProviderId,
+  parentAcpSessionId,
+  parentUiId,
+  status: 'spawning',
+  totalCount: requests.length,
+  statusToolName: ACP_UX_TOOL_NAMES.checkSubagents
+});
 
 this.io.emit('sub_agents_starting', {
   invocationId,
   parentUiId,
   providerId: resolvedProviderId,
-  count: requests.length
+  count: requests.length,
+  statusToolName: ACP_UX_TOOL_NAMES.checkSubagents
 });
 ```
 
 ### 7. Each Sub-Agent ACP Session Is Created and Persisted
 
-File: `backend/mcp/subAgentInvocationManager.js` (Method: `executeInvocation`, Helpers: `trackSubAgentParent`, `subAgentParentKey`)
+File: `backend/mcp/subAgentInvocationManager.js` (Method: `spawnAgent`, Helpers: `trackSubAgentParent`, `subAgentParentKey`)
 File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)
 File: `backend/mcp/mcpProxyRegistry.js` (Function: `bindMcpProxy`, Helper: `getMcpProxyIdFromServers`)
 File: `backend/database.js` (Function: `saveSession`, Table: `sessions`)
@@ -211,7 +237,7 @@ File: `backend/database.js` (Function: `saveSession`, Table: `sessions`)
 The manager starts one timer per request with `i * 1000` delay. For each request it resolves `agentName`, `cwd`, provider spawn params, and MCP server config, then sends `session/new`.
 
 ```javascript
-// FILE: backend/mcp/subAgentInvocationManager.js (Method: executeInvocation)
+// FILE: backend/mcp/subAgentInvocationManager.js (Method: spawnAgent)
 const providerModule = await this.getProviderModuleFn(resolvedProviderId);
 const sessionParams = providerModule.buildSessionParams(agentName);
 const mcpServers = this.getMcpServersFn(resolvedProviderId);
@@ -221,10 +247,10 @@ this.trackSubAgentParent(resolvedProviderId, subAcpId, parentAcpSessionId);
 this.bindMcpProxyFn(getMcpProxyIdFromServers(mcpServers), { providerId: resolvedProviderId, acpSessionId: subAcpId });
 ```
 
-The sub-agent is saved as a sidebar-capable session. The UI ID is `sub-${subAcpId}`. `forkedFrom` stores the parent UI ID so Sidebar and FolderItem can render the nested tree.
+The sub-agent is saved as a sidebar-capable session and as a row in `subagent_invocation_agents`. The UI ID is `sub-${subAcpId}`. `forkedFrom` stores the parent UI ID so Sidebar and FolderItem can render the nested tree, while the invocation-agent row stores status, result text, error text, and completion timestamps for `ux_check_subagents`.
 
 ```javascript
-// FILE: backend/mcp/subAgentInvocationManager.js (Method: executeInvocation)
+// FILE: backend/mcp/subAgentInvocationManager.js (Method: spawnAgent)
 await this.db.saveSession({
   id: uiId,
   acpSessionId: subAcpId,
@@ -244,12 +270,12 @@ If a model resolves, the manager sends `session/set_model`. It also seeds `acpCl
 
 ### 8. Socket Rooms and `sub_agent_started` Are Emitted
 
-File: `backend/mcp/subAgentInvocationManager.js` (Method: `executeInvocation`, Socket event: `sub_agent_started`)
+File: `backend/mcp/subAgentInvocationManager.js` (Method: `spawnAgent`, Socket event: `sub_agent_started`)
 
 When the parent ACP session is known, only sockets already watching `session:${parentAcpSessionId}` are joined to the sub-agent room. If parent context is unavailable, the manager joins all connected sockets as a fallback.
 
 ```javascript
-// FILE: backend/mcp/subAgentInvocationManager.js (Method: executeInvocation)
+// FILE: backend/mcp/subAgentInvocationManager.js (Method: spawnAgent)
 const parentRoom = `session:${parentAcpSessionId}`;
 const sockets = await this.io.fetchSockets();
 for (const s of sockets) {
@@ -272,27 +298,32 @@ this.io.emit('sub_agent_started', {
 
 After the event, `setInitialAgent(acpClient, subAcpId, agentName)` runs when `agentName` differs from `provider.config.defaultSystemAgentName`.
 
-### 9. Prompts Run and the Summary Is Returned
+### 9. Prompts Run in the Background and Results Are Polled
 
-File: `backend/mcp/subAgentInvocationManager.js` (Method: `executeInvocation`, ACP request: `session/prompt`, Socket events: `sub_agent_status`, `sub_agent_completed`)
+File: `backend/mcp/subAgentInvocationManager.js` (Methods: `startAgentPrompt`, `setAgentStatus`, `refreshInvocationCompletion`, `getInvocationStatus`, Socket events: `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`)
 File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Socket events: `token`, `thought`, `system_event`, `stats_push`)
 File: `backend/mcp/acpCleanup.js` (Function: `cleanupAcpSession`)
 
-After all setup promises resolve, the manager emits `sub_agent_status` with `status: 'prompting'` and sends the request prompt to each sub-agent ACP session.
+After all setup promises resolve, `executeStartInvocation` starts each prompt in the background and immediately returns an instructional MCP result containing the invocation ID and `ux_check_subagents` tool name.
 
-ACP update routing is the same as any session: message chunks emit `token`, thoughts emit `thought`, tool calls emit `system_event`, and permissions emit `permission_request`. The manager reads each response from `acpClient.sessionMetadata.get(subAcpId).lastResponseBuffer` when `session/prompt` completes.
+ACP update routing is the same as any session: message chunks emit `token`, thoughts emit `thought`, tool calls emit `system_event`, and permissions emit `permission_request`. The manager reads each response from `acpClient.sessionMetadata.get(subAcpId).lastResponseBuffer` when `session/prompt` completes, writes it to `subagent_invocation_agents.result_text`, and emits terminal status updates.
 
-Completed sub-agents emit `sub_agent_completed`, call `cleanupAcpSession(subAcpId, providerId)`, and remove in-memory session metadata. The returned MCP tool result is a text summary separated by `---` sections.
+`ux_check_subagents` calls `getInvocationStatus`. It reads the SQL snapshot, waits until every agent is terminal or the configured timeout expires, then returns completed results plus failed, aborted, and still-running agents. Passing `waitForCompletion: false` returns the current snapshot immediately. Status-call aborts stop waiting but do not cancel the agents.
 
 ```javascript
-// FILE: backend/mcp/subAgentInvocationManager.js (Method: executeInvocation)
-const summary = results.map((r, i) => {
-  const header = `## Agent ${i + 1}`;
-  if (r.error) return `${header}\nError: ${r.error}`;
-  return `${header}\n${r.response}`;
-}).join('\n\n---\n\n');
-
-return { content: [{ type: 'text', text: summary }] };
+// FILE: backend/mcp/subAgentInvocationManager.js (Method: buildStatusResult)
+if (completedAgents.length) {
+  lines.push('Completed results:');
+  for (const agent of completedAgents) {
+    lines.push(`## Agent ${agent.index + 1}: ${agent.name || 'Sub-agent'}`);
+    lines.push(agent.resultText || '(no response)');
+  }
+}
+if (activeAgents.length) {
+  lines.push(`Call ${statusToolName}({ "invocationId": "${snapshot.invocationId}" }) again to continue waiting.`);
+  lines.push(`Call ${statusToolName}({ "invocationId": "${snapshot.invocationId}", "waitForCompletion": false }) to check status without waiting.`);
+  lines.push(`Call ${abortToolName}({ "invocationId": "${snapshot.invocationId}" }) to abort the running agents.`);
+}
 ```
 
 ### 10. Cancellation Cascades Through Nested Sub-Agents
@@ -301,7 +332,7 @@ File: `backend/sockets/promptHandlers.js` (Socket event: `cancel_prompt`)
 File: `backend/routes/mcpApi.js` (Function: `createToolCallAbortSignal`)
 File: `backend/mcp/subAgentInvocationManager.js` (Methods: `cancelAllForParent`, `collectDescendantAcpSessionIds`, `cancelInvocationRecord`)
 
-Cancellation can arrive from the UI through `cancel_prompt` or from the MCP HTTP route through `abortSignal`. Both paths call the invocation manager.
+Cancellation can arrive from the UI through `cancel_prompt`, the orchestration panel's `cancel_subagents` socket event, the parent agent's `ux_abort_subagents` tool call, or from the initial spawn MCP HTTP route through `abortSignal`. These paths call the invocation manager. A `ux_check_subagents` request abort only stops the wait for that status call and does not cancel the agents.
 
 `collectDescendantAcpSessionIds` starts from the parent ACP session and walks `subAgentParentLinks` plus active invocation agents. `cancelInvocationRecord` calls the record abort function, marks agents `cancelled`, sends ACP `session/cancel` notifications, and rejects matching pending JSON-RPC requests.
 
@@ -310,7 +341,7 @@ Cancellation can arrive from the UI through `cancel_prompt` or from the MCP HTTP
 const descendantAcpSessionIds = this.collectDescendantAcpSessionIds(parentAcpSessionId, providerId);
 for (const inv of this.invocations.values()) {
   if (inv.providerId === providerId && descendantAcpSessionIds.has(inv.parentAcpSessionId)) {
-    this.cancelInvocationRecord(inv);
+    await this.cancelInvocationRecord(inv);
   }
 }
 ```
@@ -341,13 +372,13 @@ socket.emit('sub_agent_snapshot', {
 
 ### 12. Frontend Listeners Register Agents and Sidebar Sessions
 
-File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket events: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_completed`)
-File: `frontend/src/store/useSubAgentStore.ts` (Store actions: `addAgent`, `setStatus`, `completeAgent`)
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket events: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`)
+File: `frontend/src/store/useSubAgentStore.ts` (Store actions: `startInvocation`, `setInvocationStatus`, `completeInvocation`, `addAgent`, `setStatus`, `completeAgent`, `isInvocationActive`)
 File: `frontend/src/store/useSessionLifecycleStore.ts` (State: `sessions`)
 
-`sub_agents_starting` removes existing sub-agent sidebar sessions for the same parent UI ID and emits `delete_session` for each removed session.
+`sub_agents_starting` creates invocation-level store state, removes existing sub-agent sidebar sessions for the same parent UI ID, and emits `delete_session` for each removed session. This event is only emitted after the backend accepts the new invocation, so an active-invocation rejection does not clear the old sidebar agents.
 
-`sub_agent_started` adds the agent to `useSubAgentStore`, records a pending sidebar session in `pendingSubAgents`, and stamps the batch `invocationId` onto the in-progress parent ToolStep when `index === 0`.
+`sub_agent_started` adds the agent to `useSubAgentStore`, records a pending sidebar session in `pendingSubAgents`, and stamps the batch `invocationId` onto the in-progress parent ToolStep when `index === 0`. `sub_agent_invocation_status` updates invocation-level status so the active ToolStep knows when it can collapse.
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Socket event: sub_agent_started)
@@ -416,7 +447,7 @@ if (subAgent) {
 }
 ```
 
-`SubAgentPanel` sends `respond_permission` with the permission ID, selected option ID, sub-agent session ID, and the active session provider. The backend uses the provider runtime's `PermissionManager.respond` to write the ACP JSON-RPC permission result.
+`SubAgentPanel` resolves `providerId` from the invocation provider first, then the agent provider, then the active session provider, and sends `respond_permission` with the permission ID, selected option ID, sub-agent session ID, and resolved provider. The backend uses the provider runtime's `PermissionManager.respond` to write the ACP JSON-RPC permission result.
 
 ### 15. The UI Renders Panel and Sidebar Views
 
@@ -428,18 +459,19 @@ File: `frontend/src/components/SessionItem.tsx` (Component: `SessionItem`)
 File: `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`)
 File: `frontend/src/components/AssistantMessage.tsx` (Component: `AssistantMessage`)
 
-`ToolStep` renders `SubAgentPanel` when the tool identity is `ux_invoke_subagents` or `ux_invoke_counsel`. It passes `step.event.invocationId` so the panel can filter the store to the correct batch.
+`ToolStep` renders `SubAgentPanel` when the tool identity is `ux_invoke_subagents` or `ux_invoke_counsel`. It passes `step.event.invocationId` so the panel can filter the store to the correct batch. The start tools intentionally hide successful instructional MCP output because the orchestration panel is the visible surface; failed start output still renders for diagnosis. `ux_check_subagents` and `ux_abort_subagents` remain ordinary output-only status/result tools. `AssistantMessage` and `useStreamStore` keep an active sub-agent orchestration ToolStep expanded until all agents are terminal, unless the user manually collapses it.
 
 ```typescript
 // FILE: frontend/src/components/ToolStep.tsx (Component: ToolStep)
 const toolIdentity = step.event.canonicalName || step.event.toolName;
+const isSubAgentOrchestrationTool = toolIdentity === 'ux_invoke_subagents' || toolIdentity === 'ux_invoke_counsel';
+const shouldRenderOutput = !isSubAgentOrchestrationTool || step.event.status === 'failed';
 
-{(toolIdentity === 'ux_invoke_subagents' || toolIdentity === 'ux_invoke_counsel') && (
-  <SubAgentPanel invocationId={step.event.invocationId} />
-)}
+{shouldRenderOutput && renderToolOutput(...)}
+{isSubAgentOrchestrationTool && <SubAgentPanel invocationId={step.event.invocationId} />}
 ```
 
-`Sidebar` and `FolderItem` render sub-agents with `isSubAgent && forkedFrom === parentId`. `SessionItem` shows a bot icon and a delete button only after the sub-agent stops typing. `ChatInput` renders a read-only footer for sub-agent sessions. `AssistantMessage` hides fork controls for sub-agent sessions.
+`SubAgentPanel` shows invocation status and a Stop button while the invocation is active; the button emits `cancel_subagents` with `providerId` and `invocationId`. `Sidebar` and `FolderItem` render sub-agents with `isSubAgent && forkedFrom === parentId`. `SessionItem` shows a bot icon and a delete button only after the sub-agent stops typing. `ChatInput` renders a read-only footer for sub-agent sessions. `AssistantMessage` hides fork controls for sub-agent sessions.
 
 ---
 
@@ -550,19 +582,23 @@ If this contract is broken:
 
 ### MCP Configuration
 
-File: `configuration/mcp.json.example` (Config keys: `tools.subagents`, `tools.counsel`)
-File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`)
+File: `configuration/mcp.json.example` (Config keys: `tools.subagents`, `tools.counsel`, `subagents.statusWaitTimeoutMs`, `subagents.statusPollIntervalMs`)
+File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `getSubagentsMcpConfig`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`)
 
 ```json
 {
   "tools": {
     "subagents": { "enabled": true },
     "counsel": { "enabled": true }
+  },
+  "subagents": {
+    "statusWaitTimeoutMs": 120000,
+    "statusPollIntervalMs": 1000
   }
 }
 ```
 
-The `MCP_CONFIG` environment variable can point to a different JSON file. If config loading fails, core tools are disabled by `disabledConfig`.
+The `MCP_CONFIG` environment variable can point to a different JSON file. If config loading fails, core tools are disabled by `disabledConfig`. `statusWaitTimeoutMs` is the maximum time a single `ux_check_subagents` call waits before returning partial progress when `waitForCompletion` is true or omitted, and `statusPollIntervalMs` is the poll/wait interval used while agents are still active.
 
 ### Provider Configuration
 
@@ -599,6 +635,33 @@ MCP tool input:
     { "name": "Research", "agent": "agent-name", "cwd": "D:/work/project", "prompt": "Investigate the issue" }
   ]
 }
+```
+
+Async start result JSON block:
+
+```json
+{
+  "invocationId": "inv-timestamp-token",
+  "statusToolName": "ux_check_subagents",
+  "abortToolName": "ux_abort_subagents",
+  "status": "running",
+  "completed": 0,
+  "total": 2
+}
+```
+
+Status tool input:
+
+```json
+{ "invocationId": "inv-timestamp-token", "waitForCompletion": true }
+```
+
+Set `waitForCompletion` to `false` to return current status immediately without waiting.
+
+Abort tool input:
+
+```json
+{ "invocationId": "inv-timestamp-token" }
 ```
 
 Backend `sub_agent_started` payload:
@@ -659,47 +722,48 @@ model/current_model_id/model_options_json = resolved model state
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| MCP definitions | `backend/mcp/coreMcpToolDefinitions.js` | `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition` | JSON schema and descriptions for core MCP tools |
-| MCP handler map | `backend/mcp/mcpServer.js` | `getMcpServers`, `createToolHandlers`, `buildSubAgentInvocationKey`, `runSubagentInvocation`, `runCounselInvocation`, `wrapToolHandlers` | Proxy setup, feature-flagged tool handlers, idempotency, registry wrapping |
+| MCP definitions | `backend/mcp/coreMcpToolDefinitions.js` | `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition` | JSON schema and descriptions for core MCP tools |
+| MCP handler map | `backend/mcp/mcpServer.js` | `getMcpServers`, `createToolHandlers`, `buildSubAgentInvocationKey`, `runSubagentInvocation`, `runCheckSubagentsInvocation`, `runAbortSubagentsInvocation`, `runCounselInvocation`, `wrapToolHandlers` | Proxy setup, feature-flagged tool handlers, idempotency, registry wrapping |
 | MCP route | `backend/routes/mcpApi.js` | `GET /tools`, `POST /tool-call`, `resolveToolContext`, `createToolCallAbortSignal` | Tool advertisement, proxy context resolution, abort propagation |
 | Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `CallToolRequestSchema` handler | ACP-facing MCP server process and backend forwarding |
 | Proxy bindings | `backend/mcp/mcpProxyRegistry.js` | `createMcpProxyBinding`, `bindMcpProxy`, `resolveMcpProxy`, `getMcpProxyIdFromServers` | Provider/session context for parent and sub-agent MCP tool calls |
-| Invocation manager | `backend/mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager`, `runInvocation`, `executeInvocation`, `trackSubAgentParent`, `collectDescendantAcpSessionIds`, `cancelAllForParent`, `getSnapshotsForParent` | Spawn, prompt, status, cancellation, reconnect snapshots, result summaries |
+| Invocation manager | `backend/mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager`, `runInvocation`, `executeStartInvocation`, `spawnAgent`, `startAgentPrompt`, `getInvocationStatus`, `cancelInvocation`, `cancelAllForParent`, `getSnapshotsForParent` | Async start, prompt backgrounding, SQL-backed status, cancellation, reconnect snapshots, result polling |
 | Tool handler | `backend/services/tools/handlers/subAgentToolHandler.js` | `subAgentToolHandler.onStart` | Parent ACP session tracking and canonical event title |
 | Counsel handler | `backend/services/tools/handlers/counselToolHandler.js` | `counselToolHandler.onStart` | Parent ACP session tracking and canonical counsel event title |
-| Tool registry | `backend/services/tools/index.js` | `toolRegistry.register`, `ACP_UX_TOOL_NAMES.invokeSubagents`, `ACP_UX_TOOL_NAMES.invokeCounsel` | Registers tool-specific Tool System handlers |
+| Status handler | `backend/services/tools/handlers/subAgentStatusToolHandler.js` | `subAgentStatusToolHandler.onStart` | Canonical titles and categories for status and abort tool calls |
+| Tool registry | `backend/services/tools/index.js` | `toolRegistry.register`, `ACP_UX_TOOL_NAMES.invokeSubagents`, `ACP_UX_TOOL_NAMES.checkSubagents`, `ACP_UX_TOOL_NAMES.abortSubagents`, `ACP_UX_TOOL_NAMES.invokeCounsel`, `subAgentStatusToolHandler` | Registers tool-specific Tool System handlers |
 | MCP execution registry | `backend/services/tools/mcpExecutionRegistry.js` | `McpExecutionRegistry.begin`, `complete`, `fail`, `describeAcpUxToolExecution`, `publicMcpToolInput` | Sticky AcpUI MCP metadata and parent ToolStep updates |
 | Invocation resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider identity, cached state, and MCP execution records |
 | ACP updates | `backend/services/acpUpdateHandler.js` | `handleUpdate`, ACP updates `tool_call`, `tool_call_update`, `agent_message_chunk`, `agent_thought_chunk` | Normalizes streams and emits frontend timeline events |
-| Prompt socket | `backend/sockets/promptHandlers.js` | Socket events `cancel_prompt`, `respond_permission` | Cancels parent and sub-agent trees, forwards permission responses |
+| Prompt/socket cancellation | `backend/sockets/promptHandlers.js`, `backend/sockets/subAgentHandlers.js` | Socket events `cancel_prompt`, `cancel_subagents`, `respond_permission` | Cancels parent and sub-agent trees, stops active invocations, forwards permission responses |
 | Socket bootstrap | `backend/sockets/index.js` | Socket event `watch_session` | Joins rooms and emits sub-agent snapshots |
 | Snapshot socket | `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession`, Socket event `sub_agent_snapshot` | Reconnect hydration for active sub-agents |
 | Permission manager | `backend/services/permissionManager.js` | `handleRequest`, `respond` | Emits permission requests and writes ACP permission results |
-| Persistence | `backend/database.js` | `initDb`, `saveSession`, `getAllSessions`, `getSession`, `getSessionByAcpId`, `deleteSession`, Table `sessions` | Stores and loads sub-agent sidebar session metadata |
+| Persistence | `backend/database.js` | `initDb`, `saveSession`, `getSessionByAcpId`, `createSubAgentInvocation`, `updateSubAgentInvocationStatus`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, Tables `sessions`, `subagent_invocations`, `subagent_invocation_agents` | Stores sidebar sessions, async invocation state, status counts, results, errors, and cleanup rows |
 | Cleanup | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | Removes ephemeral ACP session files after completion or deletion |
 
 ### Frontend
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Socket dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `pendingSubAgents`, Socket events `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_completed`, `permission_request`, `system_event`, `token` | Registers sub-agent lifecycle, permissions, lazy sidebar creation, and panel tool-step routing |
-| Sub-agent store | `frontend/src/store/useSubAgentStore.ts` | `SubAgentEntry`, `addAgent`, `setStatus`, `completeAgent`, `addToolStep`, `updateToolStep`, `setPermission`, `clearPermission`, `clearForParent` | Orchestration-panel state independent from full chat timeline state |
+| Socket dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `pendingSubAgents`, Socket events `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`, `permission_request`, `system_event`, `token` | Registers sub-agent lifecycle, permissions, lazy sidebar creation, and panel tool-step routing |
+| Sub-agent store | `frontend/src/store/useSubAgentStore.ts` | `SubAgentInvocation`, `SubAgentEntry`, `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `completeAgent`, `addToolStep`, `updateToolStep`, `setPermission`, `clearPermission`, `clearForParent` | Invocation-level and agent-level orchestration-panel state independent from full chat timeline state |
 | Tool rendering | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `SubAgentPanel` child | Renders inline panel for `ux_invoke_subagents` and `ux_invoke_counsel` |
-| Panel rendering | `frontend/src/components/SubAgentPanel.tsx` | `SubAgentPanel`, `handlePermission`, prop `invocationId` | Filters agents by invocation and renders status, tool steps, and permission buttons |
+| Panel rendering | `frontend/src/components/SubAgentPanel.tsx` | `SubAgentPanel`, `handlePermission`, `handleStop`, prop `invocationId` | Filters agents by invocation and renders invocation status, Stop, tool steps, and permission buttons |
 | Sidebar tree | `frontend/src/components/Sidebar.tsx` | `getSubAgentsOf`, `renderChildren`, `handleRemoveSession` | Nests sub-agent sessions under parent sessions and deletes them permanently |
 | Folder tree | `frontend/src/components/FolderItem.tsx` | `getSubAgentsOf`, `renderForkTree` | Nests sub-agents under sessions inside folders |
 | Session row | `frontend/src/components/SessionItem.tsx` | `SessionItem`, `session.isSubAgent` branch | Bot icon, fork arrow, delete-only actions for completed sub-agent sessions |
 | Chat input | `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput`, `activeSession?.isSubAgent` branch | Displays read-only footer for sub-agent sessions |
 | Assistant message | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `activeSessionId`, `isSubAgent` branch | Hides fork button in sub-agent sessions |
 | Type contracts | `frontend/src/types.ts` | `SystemEvent.invocationId`, `ChatSession.isSubAgent`, `ChatSession.parentAcpSessionId`, `ChatSession.forkedFrom` | Shared frontend shapes used by panel and sidebar rendering |
-| Stream store | `frontend/src/store/useStreamStore.ts` | `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer` | Full conversation timeline for lazily created sub-agent sessions |
+| Stream store | `frontend/src/store/useStreamStore.ts` | `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`, `collapseForNewTimelineStep` | Full conversation timeline for lazily created sub-agent sessions and active-sub-agent auto-collapse guard |
 
 ### Configuration
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| MCP config | `configuration/mcp.json.example` | `tools.subagents`, `tools.counsel` | Enables core sub-agent and counsel tools |
-| MCP config loader | `backend/services/mcpConfig.js` | `getMcpConfig`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `MCP_CONFIG` | Reads MCP feature flags and exposes booleans |
+| MCP config | `configuration/mcp.json.example` | `tools.subagents`, `tools.counsel`, `subagents.statusWaitTimeoutMs`, `subagents.statusPollIntervalMs` | Enables core sub-agent/counsel tools and status wait settings |
+| MCP config loader | `backend/services/mcpConfig.js` | `getMcpConfig`, `getSubagentsMcpConfig`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `MCP_CONFIG` | Reads MCP feature flags and exposes booleans/status wait settings |
 | Counsel config | `backend/services/counselConfig.js` | `loadCounselConfig` | Loads counsel role prompts |
 | Provider config | `providers/<provider>/provider.json` and provider user config | `mcpName`, `defaultSubAgentName`, `defaultSystemAgentName`, `models.subAgent`, `models.default`, `models.quickAccess` | Supplies provider-specific spawn, MCP, and model values |
 | Provider module | `providers/<provider>/index.js` | `buildSessionParams`, `setInitialAgent`, `getMcpServerMeta` | Injects provider-specific spawn params and runtime agent selection |
@@ -781,7 +845,7 @@ model/current_model_id/model_options_json = resolved model state
   - `registers core handlers when MCP config enables them`
   - `omits subagents handler when MCP config disables it`
   - `passes abortSignal through to the sub-agent invocation manager`
-  - `spawns sub-agents and aggregates summaries`
+  - `starts sub-agents asynchronously and returns status instructions`
   - `deduplicates repeated MCP request ids for the same parent session`
   - `deduplicates by tool call metadata when MCP request id is absent`
   - `deduplicates by scoped input fingerprint when request ids are absent`
@@ -801,10 +865,10 @@ model/current_model_id/model_options_json = resolved model state
   - `runs counsel through the sub-agent invocation pipeline when the subagents tool is hidden`
 
 - `backend/test/subAgentInvocationManager.test.js`
-  - `runs invocation successfully`
+  - `starts asynchronously and returns completed results through the status call`
   - `joins an active invocation when the idempotency key repeats`
   - `returns a cached result when a completed invocation key repeats`
-  - `prunes expired completed invocation results before replay lookup`
+  - `reports the active invocation instead of starting another batch for the same parent chat`
   - `cleans active idempotency state when invocation setup rejects`
   - `uses explicit parent ACP session before stale client parent tracking`
   - `cancelAllForParent calls abortFn and sends session/cancel to sub-agents`
@@ -820,6 +884,8 @@ model/current_model_id/model_options_json = resolved model state
 - `backend/test/subAgentHandlers.test.js`
   - `emits sub_agent_snapshot for each running sub-agent matching parentAcpSessionId`
   - `does not emit when sessionId is null`
+  - `registers cancel_subagents handler and resolves provider runtime before cancelling`
+  - `ignores cancel_subagents without invocationId`
 
 - `backend/test/acpUpdateHandler.test.js`
   - `assigns lastSubAgentParentAcpId for sub-agent spawning tools`
@@ -829,10 +895,10 @@ model/current_model_id/model_options_json = resolved model state
   - Covers `respond_permission` forwarding permission choices through the provider runtime.
 
 - `backend/test/sessionHandlers.test.js`
-  - Covers deleting sessions with descendant relationships through `forkedFrom`.
+  - Covers deleting sessions with descendant relationships through `forkedFrom` and deleting/cancelling linked sub-agent invocation registry rows.
 
-- `backend/test/database-exhaustive.test.js`
-  - Covers `isSubAgent` storage and retrieval fields.
+- `backend/test/database-exhaustive.test.js` and `backend/test/persistence.test.js`
+  - Cover `isSubAgent` storage/retrieval fields and SQL persistence behavior.
 
 ### Frontend Tests
 
@@ -840,17 +906,25 @@ model/current_model_id/model_options_json = resolved model state
   - `handles "permission_request" for sub-agent`
   - `handles "sub_agents_starting" - clears old sidebar sessions immediately`
   - `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`
+  - `handles "sub_agent_invocation_status" event`
+  - `handles "sub_agent_status" with invocationId by updating agent and invocation state`
+  - `moves waiting sub-agents back to running on token events`
+  - `passes terminal sub-agent completion statuses through to the store`
   - `creates lazy sub-agent session with provider on first token`
   - `creates lazy sub-agent session with provider on first system_event`
   - `handles "sub_agent_completed" event`
   - `routes system_event tool_start/tool_end to sub-agent store`
 
 - `frontend/src/test/useSubAgentStore.test.ts`
+  - `tracks invocation lifecycle and derives status from agents`
+  - `updates permission state and active status for waiting agents`
+  - `deduplicates agents and invocations by identifier`
+  - `clears invocations by parent ui id or parent session id`
   - `addAgent and completeAgent manage lifecycle`
   - `appendToken and appendThought update content`
   - `manage tool steps`
   - `manage permissions`
-  - `clearForParent removes only specific agents`
+  - `clearForParent removes only specific agents and matching invocations`
 
 - `frontend/src/test/SubAgentPanel.test.tsx`
   - `renders nothing when no agents`
@@ -860,12 +934,25 @@ model/current_model_id/model_options_json = resolved model state
   - `renders agent cards with status and name`
   - `renders tool steps`
   - `renders permission buttons`
+  - `emits cancel_subagents and marks active invocation as cancelling`
+  - `emits permission responses with the invocation provider and clears local permission`
+
+- `frontend/src/test/ChatMessage.test.tsx`
+  - `keeps active sub-agent orchestration expanded after remount`
+
+- `frontend/src/test/useStreamStore.test.ts`
+  - `keeps active sub-agent orchestration steps expanded when new timeline steps arrive`
+  - `collapses inactive sub-agent orchestration steps when new timeline steps arrive`
 
 - `frontend/src/test/ToolStep.test.tsx`
   - `passes invocationId to SubAgentPanel for ux_invoke_subagents`
   - `uses canonicalName to render SubAgentPanel when provider toolName is generic`
   - `passes invocationId to SubAgentPanel for ux_invoke_counsel`
   - `does not render SubAgentPanel for regular tool calls`
+  - `suppresses instructional output for sub-agent start tools`
+  - `keeps failure output visible for sub-agent start tools`
+  - `keeps output visible for ux_check_subagents`
+  - `returns undefined for sub-agent status tools even when a file path is present`
 
 - `frontend/src/test/SessionItem.test.tsx`
   - `shows only delete button for sub-agent when not typing`
@@ -911,12 +998,15 @@ model/current_model_id/model_options_json = resolved model state
 
 ## Summary
 
-- `ux_invoke_subagents` is a feature-flagged AcpUI MCP tool that spawns visible ACP sessions from a parent tool call.
-- `ux_invoke_counsel` maps configured counsel roles into the same sub-agent invocation pipeline.
+- `ux_invoke_subagents` is a feature-flagged AcpUI MCP tool that starts visible ACP-backed sub-agent sessions asynchronously from a parent tool call and returns an invocation ID.
+- `ux_check_subagents` is the paired status/result tool; it waits up to the configured timeout by default, can return immediately with `waitForCompletion: false`, returns completed results plus still-active agents, and can be called repeatedly with the same `invocationId`.
+- `ux_abort_subagents` aborts active agents for an invocation and returns the same status/result payload shape without waiting.
+- `ux_invoke_counsel` maps configured counsel roles into the same async sub-agent invocation pipeline.
 - `mcpExecutionRegistry` and `toolCallState` preserve canonical AcpUI MCP identity for the parent ToolStep.
-- `SubAgentInvocationManager` owns spawning, model selection, persistence, socket lifecycle, prompt execution, summaries, idempotency, snapshots, and cancellation.
+- `SubAgentInvocationManager` owns async start, model selection, SQL registry persistence, socket lifecycle, background prompt execution, status polling, idempotency, snapshots, and cancellation.
 - Sub-agent sessions inherit the parent provider and are linked through `parentAcpSessionId` for transport/cancellation and `forkedFrom = parentUiId` for sidebar nesting.
-- `invocationId` is the critical rendering contract that ties a parent ToolStep to the exact batch of agents it spawned.
+- `invocationId` is the critical rendering contract that ties a parent ToolStep and status calls to the exact batch of agents they reference.
 - Sidebar chat sessions are created lazily on the first token or tool event and are read-only once selected.
 - Permission requests from sub-agents render in `SubAgentPanel` and are answered through the provider runtime's permission manager.
+- Active orchestration ToolSteps stay expanded until every agent is terminal unless the user manually collapses them; the panel Stop action emits `cancel_subagents`.
 - Changing this feature requires updating backend MCP tests, manager tests, socket tests, frontend hook tests, store tests, and component rendering tests that cover the same contract.

@@ -3,6 +3,7 @@ import { useStreamStore } from '../store/useStreamStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSystemStore } from '../store/useSystemStore';
 import { useShellRunStore } from '../store/useShellRunStore';
+import { useSubAgentStore } from '../store/useSubAgentStore';
 import { act } from 'react';
 
 describe('useStreamStore (Pure Logic)', () => {
@@ -25,6 +26,7 @@ describe('useStreamStore (Pure Logic)', () => {
       });
       useSystemStore.setState({ compactingBySession: {}, branding: { models: {} } } as any);
       useShellRunStore.getState().reset();
+      useSubAgentStore.getState().clear();
     });
   });
 
@@ -128,6 +130,102 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(timeline[1].isCollapsed).toBe(false); // Current tool open
   });
 
+  it('keeps active sub-agent orchestration steps expanded when new timeline steps arrive', () => {
+    act(() => {
+      useSubAgentStore.getState().startInvocation({
+        invocationId: 'inv-active',
+        providerId: 'p1',
+        parentUiId: 's1',
+        parentSessionId: 'a1',
+        statusToolName: 'ux_check_subagents',
+        totalCount: 1,
+        status: 'running'
+      });
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      const msgId = useStreamStore.getState().activeMsgIdByAcp['a1'];
+      useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.map(s => ({
+          ...s,
+          messages: [{
+            id: msgId,
+            role: 'assistant',
+            timeline: [
+              {
+                type: 'tool',
+                isCollapsed: false,
+                event: {
+                  id: 'subagent-tool',
+                  title: 'Invoke Subagents',
+                  toolName: 'ux_invoke_subagents',
+                  canonicalName: 'ux_invoke_subagents',
+                  invocationId: 'inv-active'
+                }
+              },
+              { type: 'thought', content: 'thinking', isCollapsed: false }
+            ]
+          }] as any
+        }))
+      }));
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'next-tool',
+        title: 'Next tool'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline[0].isCollapsed).toBe(false);
+    expect(timeline[1].isCollapsed).toBe(true);
+    expect(timeline[2].isCollapsed).toBe(false);
+  });
+
+  it('collapses inactive sub-agent orchestration steps when new timeline steps arrive', () => {
+    act(() => {
+      useSubAgentStore.getState().startInvocation({
+        invocationId: 'inv-complete',
+        providerId: 'p1',
+        parentUiId: 's1',
+        parentSessionId: 'a1',
+        statusToolName: 'ux_check_subagents',
+        totalCount: 1,
+        status: 'completed'
+      });
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      const msgId = useStreamStore.getState().activeMsgIdByAcp['a1'];
+      useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.map(s => ({
+          ...s,
+          messages: [{
+            id: msgId,
+            role: 'assistant',
+            timeline: [{
+              type: 'tool',
+              isCollapsed: false,
+              event: {
+                id: 'subagent-tool',
+                title: 'Invoke Subagents',
+                toolName: 'ux_invoke_subagents',
+                canonicalName: 'ux_invoke_subagents',
+                invocationId: 'inv-complete'
+              }
+            }]
+          }] as any
+        }))
+      }));
+
+      useStreamStore.getState().onStreamThought({ sessionId: 'a1', text: 'new thought' });
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline[0].isCollapsed).toBe(true);
+    expect(timeline[1].type).toBe('thought');
+    expect(timeline[1].isCollapsed).toBe(false);
+  });
+
   it('hydrates queued shell tool_start from an existing shell snapshot', () => {
     act(() => {
       useShellRunStore.getState().upsertSnapshot({
@@ -158,6 +256,86 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(tool.event.command).toBe('git status --short');
     expect(tool.event.cwd).toBe('D:\\Git\\AcpUI');
     expect(tool.event.shellState).toBe('running');
+  });
+
+  it('merges duplicate shell tool_start events by shellRunId', () => {
+    act(() => {
+      useShellRunStore.getState().upsertSnapshot({
+        providerId: 'gemini',
+        sessionId: 'a1',
+        runId: 'shell-run-1',
+        status: 'exited',
+        description: 'Check working tree status',
+        command: 'git status --short --branch',
+        cwd: 'D:\\Git\\AcpUI',
+        transcript: '$ git status --short --branch\n M file.ts\n'
+      });
+
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'mcp-tool-id',
+        title: 'Invoke Shell: Check working tree status',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_end',
+        id: 'mcp-tool-id',
+        status: 'completed'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'provider-tool-id',
+        title: 'Invoke Shell',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline).toHaveLength(1);
+    const tool = timeline[0] as any;
+    expect(tool.event.id).toBe('provider-tool-id');
+    expect(tool.event.status).toBe('completed');
+    expect(tool.event.title).toBe('Invoke Shell: Check working tree status');
+    expect(tool.event.shellRunId).toBe('shell-run-1');
+  });
+
+  it('merges shell tool_end events by shellRunId when tool ids differ', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'mcp-tool-id',
+        title: 'Invoke Shell: Run tests',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_end',
+        id: 'provider-tool-id',
+        status: 'completed',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline).toHaveLength(1);
+    expect((timeline[0] as any).event.status).toBe('completed');
   });
 
   it('onStreamEvent merges tool titles correctly', () => {

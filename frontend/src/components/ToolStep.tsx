@@ -20,7 +20,12 @@ const getFilePathFromEvent = (event: SystemEvent): string | undefined => {
   // UI-owned tools — checked here before asking the provider
   if (event.isAcpUxTool && !event.isFileOperation) return undefined;
   if (toolIdentity === 'ux_invoke_shell') return undefined;
-  if (toolIdentity === 'ux_invoke_subagents') return undefined;
+  if (
+    toolIdentity === 'ux_invoke_subagents' ||
+    toolIdentity === 'ux_invoke_counsel' ||
+    toolIdentity === 'ux_check_subagents' ||
+    toolIdentity === 'ux_abort_subagents'
+  ) return undefined;
 
   // Provider-categorized tools
   if (event.isShellCommand) return undefined;
@@ -78,6 +83,8 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
   const filePath = getFilePathFromEvent(step.event);
   const toolIdentity = step.event.canonicalName || step.event.toolName;
   const isAcpUxTool = step.event.isAcpUxTool === true;
+  const isSubAgentOrchestrationTool = toolIdentity === 'ux_invoke_subagents' || toolIdentity === 'ux_invoke_counsel';
+  const shouldRenderOutput = !isSubAgentOrchestrationTool || step.event.status === 'failed';
   const elapsed = useElapsed(step.event.startTime, step.event.endTime);
   const outputContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -126,7 +133,7 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
           >
             {step.event.shellRunId ? (
               <ShellToolTerminal event={step.event} />
-            ) : (step.event.output || step.event.status === 'failed') && (
+            ) : shouldRenderOutput && (step.event.output || step.event.status === 'failed') && (
               <div className="tool-output-details-unified">
                 <div className="tool-output-container" ref={outputContainerRef}>
                   {renderToolOutput(step.event.output, markdownComponents, step.event.filePath)}
@@ -136,7 +143,7 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
             {/* SubAgentPanel renders inline for tools that spawn sub-agents.
                 invocationId is stamped onto the SystemEvent by the sub_agents_starting handler
                 so this ToolStep always shows its own specific batch of agents. */}
-            {(toolIdentity === 'ux_invoke_subagents' || toolIdentity === 'ux_invoke_counsel') && (
+            {isSubAgentOrchestrationTool && (
               <SubAgentPanel invocationId={step.event.invocationId} />
             )}
           </motion.div>

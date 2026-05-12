@@ -101,7 +101,7 @@ Example `providers.json`:
 
 The `.env` file at the project root controls global settings. See `.env.example` for a template and full list of available variables.
 
-MCP tool availability is controlled by the JSON file referenced by `MCP_CONFIG`, which defaults to `configuration/mcp.json`. Core tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) are enabled there by default. Optional IO tools (`ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`) and `ux_google_web_search` are disabled by default. `ux_google_web_search` requires `googleSearch.apiKey` in the MCP config before it is advertised.
+MCP tool availability is controlled by the JSON file referenced by `MCP_CONFIG`, which defaults to `configuration/mcp.json`. Core tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) are enabled there by default; when sub-agents or counsel are enabled, `ux_check_subagents` and `ux_abort_subagents` are also advertised for async status/result polling and parent-agent aborts. Optional IO tools (`ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`) and `ux_google_web_search` are disabled by default. `ux_google_web_search` requires `googleSearch.apiKey` in the MCP config before it is advertised. Sub-agent status waiting is configured with `subagents.statusWaitTimeoutMs` and `subagents.statusPollIntervalMs`.
 
 ### 5. Configure SSL
 
@@ -220,7 +220,7 @@ Access at `https://localhost:3005`.
 When setting up the system and your custom agents, for the best experience **agents must be configured without their built-in `Bash`, `PowerShell`, `Shell`, and sub-agent commands**. Some providers allow you to do this on a per-agent basis while others require their global settings file to be changed. Each provider in this repo contains a README that will have information on how to do this or will contain information on how this is done automatically for you. The AcpUI-specific tools that will be used instead are:
 
 - **`ux_invoke_shell`** — Execute shell commands through AcpUI in a real terminal-backed tool step with live output, user stdin, resize, stop controls, and separate terminals for concurrent shell calls.
-- **`ux_invoke_subagents`** — Spawn parallel AI agents with live streaming, sidebar nesting under parent chat, and permission controls. This provides the full agent coordination within AcpUI with full transparency and a global overview.
+- **`ux_invoke_subagents`** — Spawn parallel AI agents asynchronously with live streaming, sidebar nesting under parent chat, permission controls, status/result follow-up through `ux_check_subagents`, and parent-agent aborts through `ux_abort_subagents`. This provides the full agent coordination within AcpUI with full transparency and a global overview.
 
 The MCP server name that exposes these tools is defined in the provider's `provider.json` file and defaults to `AcpUI`, each provider README will also cover how to allow these tools if you don't want to see permission requests when these are used. This ensures all agent execution (shell commands, sub-agent spawning, and tool calls) flows through the AcpUI's unified timeline, maintains proper session context, respects permissions, and integrates with the UI's canvas, terminal, and diff viewer.
 
@@ -283,10 +283,10 @@ The MCP server name that exposes these tools is defined in the provider's `provi
 
 ### Other
 - **Stdio MCP proxy** — Stdio MCP proxy spawned per ACP session — exposes enabled UI-specific tools via /api/mcp/tool-call
-- **MCP tool config** — `configuration/mcp.json` controls `ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`, optional IO tools, and optional Google search
+- **MCP tool config** — `configuration/mcp.json` controls `ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`, `ux_check_subagents`, `ux_abort_subagents`, optional IO tools, optional Google search, and sub-agent status wait settings
 - **Optional IO MCP tools** — `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, and `ux_web_fetch`
 - **Optional Google search MCP tool** — `ux_google_web_search` uses `googleSearch.apiKey` from `configuration/mcp.json`
-- **Sub-agent system** — `ux_invoke_subagents` spawns parallel AI agents with live streaming, sidebar nesting under parent chat, and permission inheritance
+- **Sub-agent system** — `ux_invoke_subagents` starts parallel AI agents asynchronously; `ux_check_subagents` can wait or return immediately for status/results; `ux_abort_subagents` stops running agents while the UI keeps live streaming, sidebar nesting, and permission inheritance
 - **Multi-perspective counsel** — `ux_invoke_counsel` spawns Advocate, Critic, Pragmatist + optional domain experts to evaluate decisions
 - **Shell execution** — `ux_invoke_shell` with interactive terminal interaction
 - **Tool & turn timers** — live elapsed time on each tool call and assistant turn

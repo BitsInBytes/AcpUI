@@ -4,6 +4,7 @@ import { writeLog } from '../services/logger.js';
 import * as db from '../database.js';
 import { getProvider, getProviderModule } from '../services/providerLoader.js';
 import { getAttachmentsRoot } from '../services/attachmentVault.js';
+import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
 
 export default function registerArchiveHandlers(io, socket) {
   socket.on('archive_session', async ({ uiId }) => {
@@ -15,6 +16,10 @@ export default function registerArchiveHandlers(io, socket) {
       if (!archivePath || !session) return;
 
       const providerModule = await getProviderModule(providerId);
+
+      const activeInvocation = await db.getActiveSubAgentInvocationForParent(provider.id, uiId);
+      if (activeInvocation) await subAgentInvocationManager.cancelInvocation(provider.id, activeInvocation.invocationId);
+      await db.deleteSubAgentInvocationsForParent(provider.id, uiId);
 
       // Delete all descendants (forks + sub-agents) recursively before archiving parent
       const allSessions = await db.getAllSessions();

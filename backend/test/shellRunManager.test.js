@@ -155,6 +155,119 @@ describe('shellRunManager', () => {
     }));
   });
 
+  it('does not start an unmatched stale pending run', async () => {
+    const stale = manager.prepareRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      command: 'node -p "first"',
+      cwd: 'D:/repo',
+      maxLines: 10
+    });
+
+    const promise = manager.startPreparedRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      command: 'node -p "second"',
+      cwd: 'D:/repo',
+      maxLines: 10
+    });
+
+    expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      '$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; node -p "second"'
+    ], expect.objectContaining({ cwd: 'D:/repo' }));
+
+    ptyMock.proc.dataCb('second\n');
+    ptyMock.proc.exitCb({ exitCode: 0 });
+
+    await expect(promise).resolves.toEqual({
+      content: [{ type: 'text', text: 'second' }]
+    });
+    expect(manager.snapshot(stale.runId)).toEqual(expect.objectContaining({
+      status: 'pending',
+      command: 'node -p "first"',
+      transcript: ''
+    }));
+  });
+
+  it('matches shell runs by command and cwd across tool id mismatch only when unambiguous', () => {
+    const current = manager.prepareRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'mcp-request-id',
+      command: 'npm test',
+      cwd: 'D:/repo'
+    });
+
+    expect(manager.findRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'provider-tool-id',
+      command: 'npm test',
+      cwd: 'D:/repo',
+      statuses: ['pending']
+    })).toBeNull();
+
+    expect(manager.findRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'provider-tool-id',
+      command: 'npm test',
+      cwd: 'D:/repo',
+      statuses: ['pending'],
+      allowToolCallIdMismatch: true
+    })).toEqual(expect.objectContaining({ runId: current.runId }));
+
+    now += 10;
+    manager.prepareRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'second-mcp-request-id',
+      command: 'npm test',
+      cwd: 'D:/repo'
+    });
+
+    expect(manager.findRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'provider-tool-id',
+      command: 'npm test',
+      cwd: 'D:/repo',
+      statuses: ['pending'],
+      allowToolCallIdMismatch: true
+    })).toBeNull();
+  });
+
+  it('matches shell runs by MCP request id before command fallback', () => {
+    manager.prepareRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'tool-1',
+      mcpRequestId: 101,
+      command: 'npm test',
+      cwd: 'D:/repo'
+    });
+    now += 10;
+    const current = manager.prepareRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      toolCallId: 'tool-2',
+      mcpRequestId: 102,
+      command: 'npm test',
+      cwd: 'D:/repo'
+    });
+
+    expect(manager.findRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      mcpRequestId: '102',
+      command: 'npm test',
+      cwd: 'D:/repo',
+      statuses: ['pending']
+    })).toEqual(expect.objectContaining({ runId: current.runId }));
+  });
+
   it('streams sanitized PowerShell startup output after the injected prompt', async () => {
     const prepared = manager.prepareRun({
       providerId: 'provider-a',

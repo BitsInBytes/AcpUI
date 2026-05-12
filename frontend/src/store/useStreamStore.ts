@@ -3,7 +3,8 @@ import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSystemStore } from './useSystemStore';
 import { useShellRunStore } from './useShellRunStore';
 import type { Socket } from 'socket.io-client';
-import type { StreamTokenData, StreamEventData, StreamDoneData, Message } from '../types';
+import { useSubAgentStore } from './useSubAgentStore';
+import type { StreamTokenData, StreamEventData, StreamDoneData, Message, TimelineStep } from '../types';
 
 function isShellDescriptionTitle(title?: string) {
   return /^Invoke Shell:\s*\S/i.test(title || '');
@@ -19,6 +20,25 @@ function shellRunPatch(shellRunId?: string) {
     ...(snapshot.cwd ? { cwd: snapshot.cwd } : {}),
     ...(snapshot.description ? { title: `Invoke Shell: ${snapshot.description}` } : {})
   };
+}
+
+const SUB_AGENT_TOOL_NAMES = new Set(['ux_invoke_subagents', 'ux_invoke_counsel']);
+
+function isActiveSubAgentToolStep(step?: TimelineStep) {
+  if (!step || step.type !== 'tool') return false;
+  const event = step.event;
+  const toolName = event.canonicalName || event.toolName || event.mcpToolName;
+  return Boolean(
+    toolName &&
+    SUB_AGENT_TOOL_NAMES.has(toolName) &&
+    event.invocationId &&
+    useSubAgentStore.getState().isInvocationActive(event.invocationId)
+  );
+}
+
+function collapseForNewTimelineStep(step: TimelineStep): TimelineStep {
+  if (isActiveSubAgentToolStep(step)) return { ...step, isCollapsed: false };
+  return { ...step, isCollapsed: true };
 }
 
 /**
@@ -265,20 +285,48 @@ export const useStreamStore = create<StreamState>((set, get) => ({
               const t = [...(msg.timeline || [])];
               if (type === 'permission_request') t.push({ type: 'permission', request: action.data, isCollapsed: false });
               else if (type === 'tool_start') {
-                for (let i = 0; i < t.length; i++) t[i] = { ...t[i], isCollapsed: true };
-                if (t[0]?.type === 'thought' && t[0].content === '_Thinking..._') t.shift();
-                t.push({
-                  type: 'tool',
-                  event: {
-                    ...action.data,
-                    ...shellRunPatch(action.data.shellRunId),
-                    status: 'in_progress',
-                    startTime: Date.now()
-                  },
-                  isCollapsed: false
-                });
+                const shellPatch = shellRunPatch(action.data.shellRunId) as Partial<StreamEventData>;
+                const existingShellIdx = action.data.shellRunId
+                  ? t.findLastIndex(s => s.type === 'tool' && s.event.shellRunId === action.data.shellRunId)
+                  : -1;
+
+                if (existingShellIdx !== -1) {
+                  const existingStep = t[existingShellIdx];
+                  if (existingStep.type === 'tool') {
+                    const terminalStatus = existingStep.event.status === 'completed' || existingStep.event.status === 'failed';
+                    const existingTitle = existingStep.event.title || '';
+                    const incomingTitle = shellPatch.title || action.data.title || existingTitle;
+                    const title = isShellDescriptionTitle(existingTitle) && !shellPatch.title ? existingTitle : incomingTitle;
+
+                    t[existingShellIdx] = {
+                      ...existingStep,
+                      event: {
+                        ...existingStep.event,
+                        ...action.data,
+                        ...shellPatch,
+                        title,
+                        status: terminalStatus ? existingStep.event.status : 'in_progress',
+                        startTime: existingStep.event.startTime || Date.now()
+                      },
+                      isCollapsed: terminalStatus ? existingStep.isCollapsed : false
+                    };
+                  }
+                } else {
+                  for (let i = 0; i < t.length; i++) t[i] = collapseForNewTimelineStep(t[i]);
+                  if (t[0]?.type === 'thought' && t[0].content === '_Thinking..._') t.shift();
+                  t.push({
+                    type: 'tool',
+                    event: {
+                      ...action.data,
+                      ...shellPatch,
+                      status: 'in_progress',
+                      startTime: Date.now()
+                    },
+                    isCollapsed: false
+                  });
+                }
               } else if (type === 'tool_end' || type === 'tool_update') {
-                const idx = t.findLastIndex(s => s.type === 'tool' && s.event.id === id);
+                const idx = t.findLastIndex(s => s.type === 'tool' && (s.event.id === id || (action.data.shellRunId && s.event.shellRunId === action.data.shellRunId)));
                 if (idx !== -1) {
                   const existingStep = t[idx];
                   if (existingStep.type === 'tool') {
@@ -406,7 +454,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
           if (last?.type === 'thought' && !last.isCollapsed) {
             t[t.length - 1] = { ...last, content: last.content + thoughtNextChars };
           } else {
-            for (let i = 0; i < t.length; i++) t[i] = { ...t[i], isCollapsed: true };
+            for (let i = 0; i < t.length; i++) t[i] = collapseForNewTimelineStep(t[i]);
             t.push({ type: 'thought', content: thoughtNextChars, isCollapsed: false });
           }
           return { ...msg, timeline: t } as Message;
@@ -441,7 +489,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
             const last = t[t.length - 1];
             if (last?.type === 'text') t[t.length - 1] = { ...last, content: last.content + nextChars };
             else {
-              for (let i = 0; i < t.length; i++) t[i] = { ...t[i], isCollapsed: true };
+              for (let i = 0; i < t.length; i++) t[i] = collapseForNewTimelineStep(t[i]);
               t.push({ type: 'text', content: nextChars });
             }
             return { ...msg, content: newContent, timeline: t } as Message;

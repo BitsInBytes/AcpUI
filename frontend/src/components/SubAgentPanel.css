@@ -107,3 +107,78 @@
 .sub-agent-perm-btn:hover {
   background: rgba(255, 255, 255, 0.1);
 }
+
+.sub-agent-panel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.sub-agent-panel-status {
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 0.78em;
+  font-weight: 600;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.sub-agent-stop-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(248, 113, 113, 0.38);
+  border-radius: 6px;
+  background: rgba(127, 29, 29, 0.18);
+  color: rgba(254, 226, 226, 0.95);
+  cursor: pointer;
+  font-size: 0.78em;
+  font-weight: 600;
+}
+
+.sub-agent-stop-btn:hover {
+  background: rgba(127, 29, 29, 0.28);
+}
+
+.sub-agent-status,
+.sub-agent-tool-icon,
+.sub-agent-permission-title {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.sub-agent-status.spawning svg,
+.sub-agent-status.prompting svg,
+.sub-agent-status.running svg,
+.sub-agent-status.cancelling svg,
+.sub-agent-tool.in_progress .sub-agent-tool-icon svg {
+  animation: sub-agent-spin 1s linear infinite;
+}
+
+.sub-agent-status.completed {
+  color: rgb(74, 222, 128);
+}
+
+.sub-agent-status.failed {
+  color: rgb(248, 113, 113);
+}
+
+.sub-agent-status.cancelled {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.sub-agent-status.waiting_permission {
+  color: rgb(250, 204, 21);
+}
+
+.sub-agent-permission-title {
+  gap: 6px;
+}
+
+@keyframes sub-agent-spin {
+  to { transform: rotate(360deg); }
+}

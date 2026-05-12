@@ -28,6 +28,7 @@ import {
   normalizeProviderConfigOptions
 } from '../services/sessionManager.js';
 import { bindMcpProxy, getMcpProxyIdFromServers } from '../mcp/mcpProxyRegistry.js';
+import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
 
 async function saveModelState(sessionId, modelState) {
   if (typeof db.saveModelState === 'function') {
@@ -170,6 +171,10 @@ export default function registerSessionHandlers(io, socket) {
       const session = await db.getSession(uiId);
       if (!session) return;
       const pid = session.provider || getProvider().id;
+
+      const activeInvocation = await db.getActiveSubAgentInvocationForParent(pid, uiId);
+      if (activeInvocation) await subAgentInvocationManager.cancelInvocation(pid, activeInvocation.invocationId);
+      await db.deleteSubAgentInvocationsForParent(pid, uiId);
 
       const sessionDir = path.join(getAttachmentsRoot(pid), uiId);
       if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });

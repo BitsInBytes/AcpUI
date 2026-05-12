@@ -171,6 +171,53 @@ describe('ToolStep', () => {
     expect(panel.getAttribute('data-invocation-id')).toBe('inv-canonical');
   });
 
+  it('suppresses instructional output for sub-agent start tools', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({
+      toolName: 'ux_invoke_subagents',
+      canonicalName: 'ux_invoke_subagents',
+      invocationId: 'inv-test-42',
+      output: 'Sub-agents have been started asynchronously. Call ux_check_subagents next.',
+      status: 'completed'
+    });
+
+    render(<ToolStep {...props} />);
+
+    expect(screen.getByTestId('sub-agent-panel')).toBeInTheDocument();
+    expect(screen.queryByText(/Sub-agents have been started asynchronously/)).not.toBeInTheDocument();
+  });
+
+  it('keeps failure output visible for sub-agent start tools', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({
+      toolName: 'ux_invoke_subagents',
+      canonicalName: 'ux_invoke_subagents',
+      invocationId: 'inv-failed',
+      output: 'Failed to start sub-agents',
+      status: 'failed'
+    });
+
+    render(<ToolStep {...props} />);
+
+    expect(screen.getByTestId('sub-agent-panel')).toBeInTheDocument();
+    expect(screen.getByText('Failed to start sub-agents')).toBeInTheDocument();
+  });
+
+  it('keeps output visible for ux_check_subagents', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({
+      toolName: 'ux_check_subagents',
+      canonicalName: 'ux_check_subagents',
+      output: 'Completed sub-agent results',
+      status: 'completed'
+    });
+
+    render(<ToolStep {...props} />);
+
+    expect(screen.queryByTestId('sub-agent-panel')).not.toBeInTheDocument();
+    expect(screen.getByText('Completed sub-agent results')).toBeInTheDocument();
+  });
+
   it('passes invocationId to SubAgentPanel for ux_invoke_counsel', () => {
     const props = defaultProps();
     props.step.event = makeEvent({ toolName: 'ux_invoke_counsel', invocationId: 'inv-counsel-7' });
@@ -243,6 +290,17 @@ describe('ToolStep - getFilePathFromEvent extraction', () => {
       canonicalName: 'ux_web_fetch',
       filePath: '/src/app.ts',
       title: 'Fetch: https://example.test'
+    });
+    const { container } = render(<ToolStep {...props} />);
+    expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();
+  });
+
+  it('returns undefined for sub-agent status tools even when a file path is present', () => {
+    const props = defaultProps();
+    props.step.event = makeEvent({
+      canonicalName: 'ux_abort_subagents',
+      filePath: '/src/app.ts',
+      title: 'Abort Subagents'
     });
     const { container } = render(<ToolStep {...props} />);
     expect(container.querySelector('.canvas-hoist-btn')).not.toBeInTheDocument();

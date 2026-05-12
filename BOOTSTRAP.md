@@ -9,7 +9,6 @@ You are reading it now. This file defines rules, standards, and the documentatio
 
 ### Step 2: Load Core Architecture Docs
 After reading this file, the agent **must** load and parse the following files to establish a complete understanding of the system:
-- `README.md` (Root) — High-level overview.
 - `documents/[Feature Doc] - Backend Architecture.md` — Backend architecture and service map.
 - `documents/[Feature Doc] - Frontend Architecture.md` — Frontend architecture and store map.
 

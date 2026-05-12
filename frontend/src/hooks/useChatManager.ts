@@ -61,19 +61,10 @@ export function useChatManager(
   useEffect(() => {
     if (!socket) return;
 
-    const patchShellRunToolStep = (runId: string, patch: Partial<SystemEvent>) => {
-      useSessionLifecycleStore.setState(state => ({
-        sessions: state.sessions.map(session => ({
-          ...session,
-          messages: session.messages.map(message => ({
-            ...message,
-            timeline: message.timeline?.map(entry => {
-              if (entry.type !== 'tool' || entry.event.shellRunId !== runId) return entry;
-              return { ...entry, event: { ...entry.event, ...patch } };
-            }) || message.timeline
-          }))
-        }))
-      }));
+    const shellEventStatus = (snapshot: ShellRunSnapshot, patch: Partial<SystemEvent>): SystemEvent['status'] => {
+      if (patch.status) return patch.status;
+      if ((patch.shellState || snapshot.status) !== 'exited') return 'in_progress';
+      return snapshot.reason === 'completed' || snapshot.exitCode === 0 ? 'completed' : 'failed';
     };
 
     const shellRunSnapshotPatch = (snapshot: ShellRunSnapshot, status = snapshot.status): Partial<SystemEvent> => ({
@@ -83,6 +74,80 @@ export function useChatManager(
       cwd: snapshot.cwd,
       ...(snapshot.description ? { title: `Invoke Shell: ${snapshot.description}` } : {})
     });
+
+    const buildShellRunToolEvent = (snapshot: ShellRunSnapshot, patch: Partial<SystemEvent>): SystemEvent => ({
+      id: snapshot.toolCallId || snapshot.runId,
+      title: patch.title || (snapshot.description ? `Invoke Shell: ${snapshot.description}` : 'Invoke Shell'),
+      status: shellEventStatus(snapshot, patch),
+      providerId: snapshot.providerId,
+      sessionId: snapshot.sessionId,
+      toolName: 'ux_invoke_shell',
+      canonicalName: 'ux_invoke_shell',
+      mcpServer: 'AcpUI',
+      mcpToolName: 'ux_invoke_shell',
+      isAcpUxTool: true,
+      toolCategory: 'shell',
+      isShellCommand: true,
+      isFileOperation: false,
+      titleSource: snapshot.description ? 'mcp_handler' : 'tool_handler',
+      startTime: Date.now(),
+      shellRunId: snapshot.runId,
+      shellInteractive: true,
+      shellState: snapshot.status,
+      ...(snapshot.command ? { command: snapshot.command } : {}),
+      ...(snapshot.cwd ? { cwd: snapshot.cwd } : {}),
+      ...patch
+    });
+
+    const ensureShellRunToolStep = (snapshot: ShellRunSnapshot, patch: Partial<SystemEvent>) => {
+      if (!snapshot.sessionId || !snapshot.runId) return;
+      useStreamStore.getState().ensureAssistantMessage(snapshot.sessionId);
+      const activeMsgId = useStreamStore.getState().activeMsgIdByAcp[snapshot.sessionId];
+      if (!activeMsgId) return;
+
+      useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.map(session => {
+          if (session.acpSessionId !== snapshot.sessionId) return session;
+          return {
+            ...session,
+            messages: session.messages.map(message => {
+              if (message.id !== activeMsgId) return message;
+              const timeline = message.timeline || [];
+              const existing = timeline.some(entry =>
+                entry.type === 'tool' &&
+                (entry.event.shellRunId === snapshot.runId || (!entry.event.shellRunId && snapshot.toolCallId && entry.event.id === snapshot.toolCallId))
+              );
+              if (existing) return message;
+              return {
+                ...message,
+                timeline: [...timeline, { type: 'tool', event: buildShellRunToolEvent(snapshot, patch), isCollapsed: false }]
+              };
+            })
+          };
+        })
+      }));
+    };
+
+    const patchShellRunToolStep = (runId: string, patch: Partial<SystemEvent>, snapshot?: ShellRunSnapshot) => {
+      let matched = false;
+      useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.map(session => ({
+          ...session,
+          messages: session.messages.map(message => ({
+            ...message,
+            timeline: message.timeline?.map(entry => {
+              if (entry.type !== 'tool') return entry;
+              const sameRun = entry.event.shellRunId === runId;
+              const sameToolCall = !entry.event.shellRunId && snapshot?.toolCallId && entry.event.id === snapshot.toolCallId;
+              if (!sameRun && !sameToolCall) return entry;
+              matched = true;
+              return { ...entry, event: { ...entry.event, ...patch, shellRunId: runId } };
+            }) || message.timeline
+          }))
+        }))
+      }));
+      if (!matched && snapshot) ensureShellRunToolStep(snapshot, patch);
+    };
 
     // Pending sub-agents — session created lazily on first token
     const pendingSubAgents = new Map<string, { providerId: string; acpSessionId: string; uiId: string; index: number; name: string; prompt: string; agent: string; parentSessionId: string; parentUiId: string; model: string }>();
@@ -111,7 +176,7 @@ export function useChatManager(
       
       const agents = useSubAgentStore.getState().agents;
       const subAgent = agents.find(a => a.acpSessionId === data.sessionId);
-      if (subAgent && (subAgent.status === 'spawning' || subAgent.status === 'prompting')) {
+      if (subAgent && (subAgent.status === 'spawning' || subAgent.status === 'prompting' || subAgent.status === 'waiting_permission')) {
         useSubAgentStore.getState().setStatus(data.sessionId, 'running');
       }
 
@@ -191,36 +256,41 @@ export function useChatManager(
     socket.on('shell_run_prepared', (snapshot: ShellRunSnapshot) => {
       if (!snapshot?.runId) return;
       useShellRunStore.getState().upsertSnapshot(snapshot);
-      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot));
+      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot), snapshot);
     });
 
     socket.on('shell_run_snapshot', (snapshot: ShellRunSnapshot) => {
       if (!snapshot?.runId) return;
       useShellRunStore.getState().upsertSnapshot(snapshot);
-      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot));
+      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot), snapshot);
     });
 
     socket.on('shell_run_started', (snapshot: ShellRunSnapshot) => {
       if (!snapshot?.runId) return;
       const started = { ...snapshot, status: snapshot.status || 'running' } as ShellRunSnapshot;
       useShellRunStore.getState().markStarted(started);
-      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(started, started.status));
+      patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(started, started.status), started);
     });
 
     socket.on('shell_run_output', (data: { providerId: string; sessionId: string; runId: string; chunk: string; maxLines?: number }) => {
       if (!data?.runId) return;
       useShellRunStore.getState().appendOutput(data);
+      const snapshot = useShellRunStore.getState().runs[data.runId];
       // Ensure the step is updated if it wasn't already
-      patchShellRunToolStep(data.runId, { shellState: 'running' });
+      patchShellRunToolStep(data.runId, { shellState: 'running' }, snapshot);
     });
 
     socket.on('shell_run_exit', (data: { providerId: string; sessionId: string; runId: string; exitCode?: number | null; reason?: string | null; finalText?: string }) => {
       if (!data?.runId) return;
       useShellRunStore.getState().markExited(data);
+      const snapshot = useShellRunStore.getState().runs[data.runId];
+      const status: SystemEvent['status'] = data.reason === 'completed' || data.exitCode === 0 ? 'completed' : 'failed';
       patchShellRunToolStep(data.runId, {
         shellState: 'exited',
+        status,
+        endTime: Date.now(),
         ...(data.finalText !== undefined ? { output: data.finalText } : {})
-      });
+      }, snapshot);
     });
 
     // Sub-agent events
@@ -228,10 +298,25 @@ export function useChatManager(
     // sub_agents_starting fires immediately when ux_invoke_subagents begins (before the
     // 1-second stagger), so the UI clears stale sidebar sessions right away instead of
     // waiting for the first sub_agent_started event (fixes the "flash of old agents" bug).
-    socket.on('sub_agents_starting', (data: { invocationId: string; parentUiId: string | null; providerId: string; count: number }) => {
+    socket.on('sub_agents_starting', (data: { invocationId: string; parentAcpSessionId?: string | null; parentUiId: string | null; providerId: string; count: number; statusToolName?: string }) => {
       const parentUiId = data.parentUiId || 'unknown';
+      const parentSession = useSessionLifecycleStore.getState().sessions.find(s => s.id === parentUiId);
+      const parentSessionId = data.parentAcpSessionId || parentSession?.acpSessionId || 'unknown';
 
-      // Immediately remove old sub-agent sidebar sessions for this parent
+      useSubAgentStore.getState().clearForParent(parentSessionId);
+      useSubAgentStore.getState().clearInvocationsForParent(parentUiId);
+      useSubAgentStore.getState().startInvocation({
+        invocationId: data.invocationId,
+        providerId: data.providerId,
+        parentUiId,
+        parentSessionId,
+        statusToolName: data.statusToolName || 'ux_check_subagents',
+        totalCount: data.count,
+        status: 'spawning'
+      });
+
+      // This event only fires after the backend accepts a new invocation. It is safe
+      // to remove old completed sub-agent sidebar sessions for this parent here.
       const oldSubAgents = useSessionLifecycleStore.getState().sessions.filter(
         s => s.isSubAgent && s.forkedFrom === parentUiId
       );
@@ -243,10 +328,10 @@ export function useChatManager(
       }));
     });
 
-    socket.on('sub_agent_started', (data: { providerId: string; acpSessionId: string; uiId: string; parentUiId: string | null; index: number; name: string; prompt: string; agent: string; model?: string; invocationId: string }) => {
+    socket.on('sub_agent_started', (data: { providerId: string; acpSessionId: string; uiId: string; parentAcpSessionId?: string | null; parentUiId: string | null; index: number; name: string; prompt: string; agent: string; model?: string; invocationId: string }) => {
       const parentUiId = data.parentUiId || 'unknown';
       const parentSession = useSessionLifecycleStore.getState().sessions.find(s => s.id === parentUiId);
-      const parentSessionId = parentSession?.acpSessionId || 'unknown';
+      const parentSessionId = data.parentAcpSessionId || parentSession?.acpSessionId || 'unknown';
       useSubAgentStore.getState().addAgent({ ...data, parentSessionId });
       pendingSubAgents.set(data.acpSessionId, { ...data, parentSessionId, parentUiId, model: data.model || 'balanced' });
 
@@ -281,7 +366,7 @@ export function useChatManager(
 
     socket.on('sub_agent_snapshot', (data: {
       providerId: string; acpSessionId: string; uiId: string;
-      parentUiId: string | null; invocationId: string; index: number;
+      parentAcpSessionId?: string | null; parentUiId: string | null; invocationId: string; index: number;
       name: string; prompt: string; agent: string; model?: string; status: string;
     }) => {
       const existing = useSubAgentStore.getState().agents.find(a => a.acpSessionId === data.acpSessionId);
@@ -289,10 +374,19 @@ export function useChatManager(
 
       const parentUiId = data.parentUiId || 'unknown';
       const parentSession = useSessionLifecycleStore.getState().sessions.find(s => s.id === parentUiId);
-      const parentSessionId = parentSession?.acpSessionId || 'unknown';
+      const parentSessionId = data.parentAcpSessionId || parentSession?.acpSessionId || 'unknown';
 
+      useSubAgentStore.getState().startInvocation({
+        invocationId: data.invocationId,
+        providerId: data.providerId,
+        parentUiId,
+        parentSessionId,
+        statusToolName: 'ux_check_subagents',
+        totalCount: 1,
+        status: data.status as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled'
+      });
       useSubAgentStore.getState().addAgent({ ...data, parentSessionId });
-      useSubAgentStore.getState().setStatus(data.acpSessionId, data.status as 'spawning' | 'prompting' | 'running' | 'completed' | 'failed' | 'cancelled');
+      useSubAgentStore.getState().setStatus(data.acpSessionId, data.status as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled');
 
       const sidebarExists = useSessionLifecycleStore.getState().sessions.some(s => s.id === data.uiId);
       if (!sidebarExists) {
@@ -302,12 +396,28 @@ export function useChatManager(
       }
     });
 
-    socket.on('sub_agent_status', (data: { acpSessionId: string; status: string }) => {
-      useSubAgentStore.getState().setStatus(data.acpSessionId, data.status as 'spawning' | 'prompting' | 'running' | 'completed' | 'failed' | 'cancelled');
+    socket.on('sub_agent_status', (data: { acpSessionId: string; invocationId?: string; status: string }) => {
+      const status = data.status as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+      useSubAgentStore.getState().setStatus(data.acpSessionId, status);
+      if (data.invocationId) useSubAgentStore.getState().setInvocationStatus(data.invocationId, status);
     });
 
-    socket.on('sub_agent_completed', (data: { acpSessionId: string }) => {
-      useSubAgentStore.getState().completeAgent(data.acpSessionId);
+    socket.on('sub_agent_invocation_status', (data: { invocationId: string; providerId: string; parentAcpSessionId?: string | null; parentUiId?: string | null; statusToolName?: string; totalCount?: number; status: string }) => {
+      const status = data.status as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+      useSubAgentStore.getState().startInvocation({
+        invocationId: data.invocationId,
+        providerId: data.providerId,
+        parentUiId: data.parentUiId || null,
+        parentSessionId: data.parentAcpSessionId || null,
+        statusToolName: data.statusToolName || 'ux_check_subagents',
+        totalCount: data.totalCount || 0,
+        status
+      });
+      useSubAgentStore.getState().setInvocationStatus(data.invocationId, status);
+    });
+
+    socket.on('sub_agent_completed', (data: { acpSessionId: string; status?: string }) => {
+      useSubAgentStore.getState().completeAgent(data.acpSessionId, (data.status || 'completed') as 'completed' | 'failed' | 'cancelled');
       useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => {
           if (s.acpSessionId !== data.acpSessionId) return s;
           // Mark as done and ensure last message isn't stuck as streaming
@@ -361,6 +471,7 @@ export function useChatManager(
       socket.off('sub_agent_started');
       socket.off('sub_agent_snapshot');
       socket.off('sub_agent_status');
+      socket.off('sub_agent_invocation_status');
       socket.off('sub_agent_completed');
     };
   }, [socket, setSessions, onStreamThought, onStreamToken, onStreamEvent, onStreamDone]);

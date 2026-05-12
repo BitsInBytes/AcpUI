@@ -9,6 +9,10 @@ export const ACP_UX_MCP_TITLE_TO_TOOL_NAME = Object.freeze({
   'run shell command': ACP_UX_TOOL_NAMES.invokeShell,
   'invoke subagents': ACP_UX_TOOL_NAMES.invokeSubagents,
   'invoke sub agents': ACP_UX_TOOL_NAMES.invokeSubagents,
+  'check subagents': ACP_UX_TOOL_NAMES.checkSubagents,
+  'check sub agents': ACP_UX_TOOL_NAMES.checkSubagents,
+  'abort subagents': ACP_UX_TOOL_NAMES.abortSubagents,
+  'abort sub agents': ACP_UX_TOOL_NAMES.abortSubagents,
   'invoke counsel': ACP_UX_TOOL_NAMES.invokeCounsel,
   'read file': ACP_UX_TOOL_NAMES.readFile,
   'write file': ACP_UX_TOOL_NAMES.writeFile,
@@ -25,7 +29,9 @@ export const ACP_UX_MCP_TITLE_TO_TOOL_NAME = Object.freeze({
 const ACP_UX_CORE_TOOL_TITLES = Object.freeze({
   [ACP_UX_TOOL_NAMES.invokeShell]: 'Invoke Shell',
   [ACP_UX_TOOL_NAMES.invokeSubagents]: 'Invoke Subagents',
-  [ACP_UX_TOOL_NAMES.invokeCounsel]: 'Invoke Counsel'
+  [ACP_UX_TOOL_NAMES.invokeCounsel]: 'Invoke Counsel',
+  [ACP_UX_TOOL_NAMES.checkSubagents]: 'Check Subagents',
+  [ACP_UX_TOOL_NAMES.abortSubagents]: 'Abort Subagents'
 });
 
 const ACP_UX_INPUT_KEYS = new Set([
@@ -35,6 +41,8 @@ const ACP_UX_INPUT_KEYS = new Set([
   'cwd',
   'model',
   'requests',
+  'invocationId',
+  'waitForCompletion',
   'question',
   'architect',
   'performance',

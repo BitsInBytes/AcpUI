@@ -22,6 +22,8 @@ const { mockProviderModule, mockShellRunManager } = vi.hoisted(() => ({
     },
     mockShellRunManager: {
       setIo: vi.fn(),
+      findRun: vi.fn(),
+      snapshot: vi.fn(),
       prepareRun: vi.fn()
     }
 }));
@@ -81,6 +83,8 @@ describe('acpUpdateHandler', () => {
     mockProviderModule.categorizeToolCall.mockReturnValue(undefined);
     mockProviderModule.extractToolInvocation.mockReturnValue(null);
     mockProviderModule.normalizeConfigOptions.mockImplementation(options => Array.isArray(options) ? options : []);
+    mockShellRunManager.findRun.mockReturnValue(null);
+    mockShellRunManager.snapshot.mockImplementation(run => run);
     mockShellRunManager.prepareRun.mockReturnValue({
       runId: 'shell-run-test',
       status: 'pending',
@@ -175,6 +179,7 @@ describe('acpUpdateHandler', () => {
         providerId: 'test-provider',
         sessionId: sid,
         toolCallId: 't1',
+        mcpRequestId: null,
         description: 'Run test suite',
         command: 'npm test',
         cwd: 'D:/repo'
@@ -188,6 +193,50 @@ describe('acpUpdateHandler', () => {
         command: 'npm test',
         cwd: 'D:/repo',
         title: 'Invoke Shell: Run test suite'
+      }));
+  });
+
+  it('reuses an already-started shell run for late ux_invoke_shell tool starts', async () => {
+      client.providerId = 'test-provider';
+      mockShellRunManager.findRun.mockReturnValue({
+        runId: 'shell-run-live',
+        status: 'running',
+        toolCallId: 'mcp-request-id',
+        command: 'npm test',
+        cwd: 'D:/repo'
+      });
+      mockProviderModule.normalizeTool.mockImplementation(e => ({ ...e, toolName: 'ux_invoke_shell' }));
+      mockProviderModule.extractToolInvocation.mockReturnValue({
+        canonicalName: 'ux_invoke_shell',
+        mcpServer: 'AcpUI',
+        mcpToolName: 'ux_invoke_shell',
+        input: { description: 'Run test suite', command: 'npm test', cwd: 'D:/repo' },
+        title: 'Invoke Shell: Run test suite'
+      });
+
+      await handleUpdate(client, sid, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 't1',
+        title: 'Tool: AcpUI/ux_invoke_shell'
+      });
+
+      expect(mockShellRunManager.findRun).toHaveBeenCalledWith({
+        providerId: 'test-provider',
+        sessionId: sid,
+        toolCallId: 't1',
+        mcpRequestId: null,
+        command: 'npm test',
+        cwd: 'D:/repo',
+        statuses: ['pending', 'starting', 'running', 'exiting', 'exited'],
+        allowToolCallIdMismatch: true
+      });
+      expect(mockShellRunManager.prepareRun).not.toHaveBeenCalled();
+      expect(client.io.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({
+        type: 'tool_start',
+        shellRunId: 'shell-run-live',
+        shellState: 'running',
+        command: 'npm test',
+        cwd: 'D:/repo'
       }));
   });
 
@@ -232,6 +281,7 @@ describe('acpUpdateHandler', () => {
       expect(lastEmit).toEqual(expect.objectContaining({
         type: 'tool_end',
         isAcpUxTool: true,
+        shellRunId: 'shell-run-test',
         title: 'Invoke Shell: Run test suite'
       }));
   });
@@ -440,6 +490,25 @@ describe('acpUpdateHandler', () => {
     const update = { sessionUpdate: 'tool_call', title: 'Invoke Subagents', toolCallId: 't1' };
     await handleUpdate(client, sid, update);
     expect(client.lastSubAgentParentAcpId).toBe(sid);
+  });
+
+  it('uses pretty titles for sub-agent status tools', async () => {
+    mockProviderModule.normalizeTool.mockImplementation(e => ({ ...e, toolName: 'ux_check_subagents' }));
+    mockProviderModule.extractToolInvocation.mockReturnValue({
+      canonicalName: 'ux_check_subagents',
+      mcpServer: 'AcpUI',
+      mcpToolName: 'ux_check_subagents',
+      title: 'Tool: AcpUI/ux_check_subagents'
+    });
+
+    await handleUpdate(client, sid, { sessionUpdate: 'tool_call', title: 'Tool: AcpUI/ux_check_subagents', toolCallId: 't-check' });
+
+    const systemEvents = client.io.emit.mock.calls.filter(c => c[0] === 'system_event');
+    expect(systemEvents.at(-1)[1]).toEqual(expect.objectContaining({
+      toolName: 'ux_check_subagents',
+      canonicalName: 'ux_check_subagents',
+      title: 'Check Subagents'
+    }));
   });
 
   it('ignores empty tool_call_update', async () => {

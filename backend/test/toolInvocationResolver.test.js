@@ -163,4 +163,28 @@ describe('toolInvocationResolver', () => {
       display: expect.objectContaining({ title: 'Glob: Find docs', titleSource: 'mcp_handler' })
     }));
   });
+
+  it('does not claim recent MCP execution details when tool-name fallback is ambiguous', () => {
+    mcpExecutionRegistry.begin({
+      providerId: 'p',
+      sessionId: 's',
+      mcpRequestId: 101,
+      toolName: 'ux_invoke_shell',
+      input: { description: 'First shell', command: 'node -p "one"' }
+    });
+    mcpExecutionRegistry.begin({
+      providerId: 'p',
+      sessionId: 's',
+      mcpRequestId: 102,
+      toolName: 'ux_invoke_shell',
+      input: { description: 'Second shell', command: 'node -p "two"' }
+    });
+
+    expect(mcpExecutionRegistry.find({
+      providerId: 'p',
+      sessionId: 's',
+      toolCallId: 'provider-shell',
+      toolName: 'ux_invoke_shell'
+    })).toBeNull();
+  });
 });

@@ -9,7 +9,8 @@ vi.mock('../services/attachmentVault.js', () => ({
   },
   handleUpload: (req, res) => {
     res.json({ success: true, files: req.files.map(f => ({ name: f.originalname })) });
-  }
+  },
+  getAttachmentsRoot: () => '/tmp/test-attachments'
 }));
 
 vi.mock('../services/acpClient.js', () => ({

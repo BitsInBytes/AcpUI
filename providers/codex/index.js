@@ -564,8 +564,10 @@ function titleForTool(toolName, event, update) {
     const command = args.command || commandFromRaw(update.rawInput);
     return command ? `Run shell command: ${command}` : 'Run shell command';
   }
-  if (toolName === 'ux_invoke_subagents') return 'Run subagents';
-  if (toolName === 'ux_invoke_counsel') return 'Run counsel';
+  if (toolName === 'ux_invoke_subagents') return 'Run Subagents';
+  if (toolName === 'ux_check_subagents') return 'Check Subagents';
+  if (toolName === 'ux_abort_subagents') return 'Abort Subagents';
+  if (toolName === 'ux_invoke_counsel') return 'Run Counsel';
   if (toolName === 'shell' || toolName === 'execute') {
     const command = commandFromRaw(update.rawInput);
     return command ? `Run command: ${command}` : 'Run command';

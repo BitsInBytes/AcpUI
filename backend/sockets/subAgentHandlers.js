@@ -1,4 +1,18 @@
 import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
+import { writeLog } from '../services/logger.js';
+import providerRuntimeManager from '../services/providerRuntimeManager.js';
+
+export default function registerSubAgentHandlers(_io, socket) {
+  socket.on('cancel_subagents', async ({ providerId, invocationId }) => {
+    if (!invocationId) return;
+    try {
+      const runtime = providerRuntimeManager.getRuntime(providerId);
+      await subAgentInvocationManager.cancelInvocation(runtime.providerId, invocationId);
+    } catch (err) {
+      writeLog(`[SUB-AGENT CANCEL ERR] ${err.message}`);
+    }
+  });
+}
 
 export function emitSubAgentSnapshotsForSession(socket, { sessionId, providerId = null }) {
   if (!sessionId) return;
@@ -8,6 +22,7 @@ export function emitSubAgentSnapshotsForSession(socket, { sessionId, providerId 
       providerId: entry.providerId,
       acpSessionId: entry.acpId,
       uiId: entry.uiId,
+      parentAcpSessionId: entry.parentAcpSessionId,
       parentUiId: entry.parentUiId,
       invocationId: entry.invocationId,
       index: entry.index,

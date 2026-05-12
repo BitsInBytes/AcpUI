@@ -100,8 +100,16 @@ vi.mock('../services/providerRuntimeManager.js', () => ({
 
 vi.mock('../database.js', () => ({
     getSessionByAcpId: vi.fn().mockResolvedValue(null),
+    getAllSessions: vi.fn().mockResolvedValue([]),
     saveSession: vi.fn().mockResolvedValue(),
-    deleteSession: vi.fn().mockResolvedValue()
+    deleteSession: vi.fn().mockResolvedValue(),
+    getActiveSubAgentInvocationForParent: vi.fn().mockResolvedValue(null),
+    createSubAgentInvocation: vi.fn().mockResolvedValue(),
+    addSubAgentInvocationAgent: vi.fn().mockResolvedValue(),
+    updateSubAgentInvocationStatus: vi.fn().mockResolvedValue(),
+    updateSubAgentInvocationAgentStatus: vi.fn().mockResolvedValue(),
+    getSubAgentInvocationWithAgents: vi.fn().mockResolvedValue(null),
+    deleteSubAgentInvocationsForParent: vi.fn().mockResolvedValue()
 }));
 vi.mock('../mcp/subAgentRegistry.js', () => ({
     registerSubAgent: vi.fn(),
@@ -273,6 +281,8 @@ describe('mcpServer', () => {
       expect(handlers.ux_invoke_shell).toBeTypeOf('function');
       expect(handlers.ux_invoke_subagents).toBeTypeOf('function');
       expect(handlers.ux_invoke_counsel).toBeTypeOf('function');
+      expect(handlers.ux_check_subagents).toBeTypeOf('function');
+      expect(handlers.ux_abort_subagents).toBeTypeOf('function');
     });
 
     it('omits invoke shell handler when MCP config disables it', () => {
@@ -283,6 +293,8 @@ describe('mcpServer', () => {
       expect(handlers.ux_invoke_shell).toBeUndefined();
       expect(handlers.ux_invoke_subagents).toBeTypeOf('function');
       expect(handlers.ux_invoke_counsel).toBeTypeOf('function');
+      expect(handlers.ux_check_subagents).toBeTypeOf('function');
+      expect(handlers.ux_abort_subagents).toBeTypeOf('function');
     });
 
     it('omits subagents handler when MCP config disables it', () => {
@@ -293,6 +305,8 @@ describe('mcpServer', () => {
       expect(handlers.ux_invoke_shell).toBeTypeOf('function');
       expect(handlers.ux_invoke_subagents).toBeUndefined();
       expect(handlers.ux_invoke_counsel).toBeTypeOf('function');
+      expect(handlers.ux_check_subagents).toBeTypeOf('function');
+      expect(handlers.ux_abort_subagents).toBeTypeOf('function');
     });
 
     it('omits counsel handler when MCP config disables it', () => {
@@ -303,6 +317,19 @@ describe('mcpServer', () => {
       expect(handlers.ux_invoke_shell).toBeTypeOf('function');
       expect(handlers.ux_invoke_subagents).toBeTypeOf('function');
       expect(handlers.ux_invoke_counsel).toBeUndefined();
+      expect(handlers.ux_check_subagents).toBeTypeOf('function');
+      expect(handlers.ux_abort_subagents).toBeTypeOf('function');
+    });
+
+    it('omits sub-agent status handlers when subagents and counsel are disabled', () => {
+      useMcpConfig({ tools: { subagents: false, counsel: false } });
+
+      const handlers = createToolHandlers(mockIo);
+
+      expect(handlers.ux_invoke_subagents).toBeUndefined();
+      expect(handlers.ux_invoke_counsel).toBeUndefined();
+      expect(handlers.ux_check_subagents).toBeUndefined();
+      expect(handlers.ux_abort_subagents).toBeUndefined();
     });
   });
 
@@ -641,6 +668,59 @@ describe('mcpServer', () => {
     });
   });
 
+  describe('ux_check_subagents and ux_abort_subagents', () => {
+    it('waits by default and supports immediate status checks', async () => {
+      useMcpConfig();
+      const handlers = createToolHandlers(mockIo);
+      const spy = vi.spyOn(subAgentInvocationManager, 'getInvocationStatus')
+        .mockResolvedValue({ content: [{ type: 'text', text: 'status' }] });
+
+      try {
+        await handlers.ux_check_subagents({ providerId: 'provider-a', invocationId: 'inv-1' });
+        expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({
+          providerId: 'provider-a',
+          invocationId: 'inv-1',
+          waitTimeoutMs: 120000,
+          pollIntervalMs: 1000
+        }));
+
+        await handlers.ux_check_subagents({ providerId: 'provider-a', invocationId: 'inv-1', waitForCompletion: false });
+        expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({
+          providerId: 'provider-a',
+          invocationId: 'inv-1',
+          waitTimeoutMs: 0,
+          pollIntervalMs: 1000
+        }));
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('aborts the invocation and returns an immediate status payload', async () => {
+      useMcpConfig();
+      const handlers = createToolHandlers(mockIo);
+      const cancelSpy = vi.spyOn(subAgentInvocationManager, 'cancelInvocation').mockResolvedValue();
+      const statusSpy = vi.spyOn(subAgentInvocationManager, 'getInvocationStatus')
+        .mockResolvedValue({ content: [{ type: 'text', text: 'aborted status' }] });
+
+      try {
+        const result = await handlers.ux_abort_subagents({ providerId: 'provider-a', invocationId: 'inv-1' });
+
+        expect(cancelSpy).toHaveBeenCalledWith('provider-a', 'inv-1');
+        expect(statusSpy).toHaveBeenCalledWith(expect.objectContaining({
+          providerId: 'provider-a',
+          invocationId: 'inv-1',
+          waitTimeoutMs: 0,
+          pollIntervalMs: 1000
+        }));
+        expect(result.content[0].text).toBe('aborted status');
+      } finally {
+        cancelSpy.mockRestore();
+        statusSpy.mockRestore();
+      }
+    });
+  });
+
   describe('ux_invoke_subagents', () => {
     /** Helper: run ux_invoke_subagents to completion and return the result. */
     async function runInvokeSubAgents(handlers, args) {
@@ -678,7 +758,7 @@ describe('mcpServer', () => {
       }
     });
 
-    it('spawns sub-agents and aggregates summaries', async () => {
+    it('starts sub-agents asynchronously and returns status instructions', async () => {
       const handlers = createToolHandlers(mockIo);
       const subId = 'unique-sub-acp';
 
@@ -696,7 +776,8 @@ describe('mcpServer', () => {
         requests: [{ name: 'Agent 1', prompt: 'Do thing', agent: 'dev' }]
       });
 
-      expect(result.content[0].text).toContain('Sub response');
+      expect(result.content[0].text).toContain('Sub-agents have been started asynchronously');
+      expect(result.content[0].text).toContain('ux_check_subagents');
     });
 
     it('deduplicates repeated MCP request ids for the same parent session', async () => {
@@ -726,8 +807,8 @@ describe('mcpServer', () => {
       const [firstResult, secondResult] = await Promise.all([first, second]);
       vi.useRealTimers();
 
-      expect(firstResult.content[0].text).toContain('Deduped response');
-      expect(secondResult.content[0].text).toContain('Deduped response');
+      expect(firstResult.content[0].text).toContain('ux_check_subagents');
+      expect(secondResult.content[0].text).toContain('ux_check_subagents');
       expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
     });
 
@@ -758,8 +839,8 @@ describe('mcpServer', () => {
       const [firstResult, secondResult] = await Promise.all([first, second]);
       vi.useRealTimers();
 
-      expect(firstResult.content[0].text).toContain('Metadata deduped response');
-      expect(secondResult.content[0].text).toContain('Metadata deduped response');
+      expect(firstResult.content[0].text).toContain('ux_check_subagents');
+      expect(secondResult.content[0].text).toContain('ux_check_subagents');
       expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
     });
 
@@ -793,8 +874,8 @@ describe('mcpServer', () => {
       const [firstResult, secondResult] = await Promise.all([first, second]);
       vi.useRealTimers();
 
-      expect(firstResult.content[0].text).toContain('Fingerprint deduped response');
-      expect(secondResult.content[0].text).toContain('Fingerprint deduped response');
+      expect(firstResult.content[0].text).toContain('ux_check_subagents');
+      expect(secondResult.content[0].text).toContain('ux_check_subagents');
       expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
     });
 
@@ -812,7 +893,8 @@ describe('mcpServer', () => {
         requests: [{ name: 'Agent A', prompt: 'Work', agent: 'dev' }, { name: 'Agent B', prompt: 'Work too', agent: 'dev' }]
       });
 
-      // sub_agents_starting must be emitted synchronously / before any timers fire
+      // sub_agents_starting is emitted after registry setup but before stagger timers fire.
+      for (let i = 0; i < 5; i += 1) await Promise.resolve();
       expect(mockIo.emit).toHaveBeenCalledWith('sub_agents_starting', expect.objectContaining({
         invocationId: expect.stringMatching(/^inv-/),
         providerId: 'provider-a',
@@ -853,7 +935,8 @@ describe('mcpServer', () => {
       const result = await runInvokeSubAgents(handlers, {
         requests: [{ prompt: 'Do thing' }]
       });
-      expect(result.content[0].text).toContain('Error: creation failed');
+      expect(result.content[0].text).toContain('ux_check_subagents');
+      expect(result.content[0].text).toContain('failed');
     });
 
     it('handles prompt timeouts and aborts', async () => {
@@ -868,7 +951,11 @@ describe('mcpServer', () => {
       const result = await runInvokeSubAgents(handlers, {
         requests: [{ prompt: 'Do thing' }]
       });
-      expect(result.content[0].text).toContain('Error: Aborted');
+      expect(result.content[0].text).toContain('ux_check_subagents');
+      expect(mockIo.emit).toHaveBeenCalledWith('sub_agent_completed', expect.objectContaining({
+        status: 'failed',
+        error: 'Aborted'
+      }));
     });
 
     it('passes defaultSubAgentName into session/new when request omits agent', async () => {

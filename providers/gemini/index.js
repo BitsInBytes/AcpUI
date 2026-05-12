@@ -552,6 +552,10 @@ export function normalizeTool(event, update) {
     toolName = patternMatch.toolName;
   } else if (lowerTitle.includes('invoke sub agents') || lowerTitle === ACP_UX_TOOL_NAMES.invokeSubagents) {
     toolName = ACP_UX_TOOL_NAMES.invokeSubagents;
+  } else if (lowerTitle.includes('check sub agents') || lowerTitle === ACP_UX_TOOL_NAMES.checkSubagents) {
+    toolName = ACP_UX_TOOL_NAMES.checkSubagents;
+  } else if (lowerTitle.includes('abort sub agents') || lowerTitle === ACP_UX_TOOL_NAMES.abortSubagents) {
+    toolName = ACP_UX_TOOL_NAMES.abortSubagents;
   } else if (lowerTitle === ACP_UX_TOOL_NAMES.invokeCounsel) {
     toolName = ACP_UX_TOOL_NAMES.invokeCounsel;
   } else if (lowerTitle.startsWith('running:')) {
@@ -572,6 +576,10 @@ export function normalizeTool(event, update) {
   // Custom override for UI-owned tools to ensure the frontend trigger matches
   if (toolName === ACP_UX_TOOL_NAMES.invokeSubagents) {
     title = 'Invoke Subagents';
+  } else if (toolName === ACP_UX_TOOL_NAMES.checkSubagents) {
+    title = 'Check Subagents';
+  } else if (toolName === ACP_UX_TOOL_NAMES.abortSubagents) {
+    title = 'Abort Subagents';
   } else if (toolName === ACP_UX_TOOL_NAMES.invokeCounsel) {
     title = 'Invoke Counsel';
   } else if (toolName === ACP_UX_TOOL_NAMES.invokeShell) {

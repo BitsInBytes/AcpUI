@@ -110,6 +110,10 @@ function normalizeDescription(description) {
   return typeof description === 'string' ? description.replace(/\s+/g, ' ').trim() : '';
 }
 
+function isSameMcpRequestId(a, b) {
+  return a !== undefined && a !== null && b !== undefined && b !== null && String(a) === String(b);
+}
+
 export class ShellRunManager {
   constructor({
     io = null,
@@ -144,7 +148,7 @@ export class ShellRunManager {
     this.io = io;
   }
 
-  prepareRun({ providerId, sessionId, toolCallId = null, description = '', command = '', cwd = null, maxLines = getMaxShellResultLines() }) {
+  prepareRun({ providerId, sessionId, toolCallId = null, mcpRequestId = null, description = '', command = '', cwd = null, maxLines = getMaxShellResultLines() }) {
     if (!providerId) throw new Error('providerId is required to prepare a shell run');
     if (!sessionId) throw new Error('sessionId is required to prepare a shell run');
 
@@ -153,7 +157,7 @@ export class ShellRunManager {
       providerId,
       sessionId,
       toolCallId,
-      mcpRequestId: null,
+      mcpRequestId,
       description: normalizeDescription(description),
       command,
       cwd: cwd,
@@ -192,9 +196,9 @@ export class ShellRunManager {
     maxLines = getMaxShellResultLines()
   }) {
     const resolvedSessionId = sessionId || acpSessionId;
-    let run = this.findPreparedRun({ providerId, sessionId: resolvedSessionId, toolCallId, command, cwd });
+    let run = this.findPreparedRun({ providerId, sessionId: resolvedSessionId, toolCallId, mcpRequestId, command, cwd });
     if (!run) {
-      const prepared = this.prepareRun({ providerId, sessionId: resolvedSessionId, toolCallId, description, command, cwd, maxLines });
+      const prepared = this.prepareRun({ providerId, sessionId: resolvedSessionId, toolCallId, mcpRequestId, description, command, cwd, maxLines });
       run = this.runs.get(prepared.runId);
     }
 
@@ -207,28 +211,46 @@ export class ShellRunManager {
     return this.startRun(run);
   }
 
-  findPreparedRun({ providerId, sessionId, toolCallId = null, command = null, cwd = null }) {
+  findRun({ providerId, sessionId, toolCallId = null, mcpRequestId = null, command = null, cwd = null, statuses = null, allowToolCallIdMismatch = false }) {
     const normalizedCwd = cwd ? normalizeCwd(cwd) : null;
-    const candidates = [...this.runs.values()].filter(run =>
-      run.status === 'pending' &&
-      run.providerId === providerId &&
-      run.sessionId === sessionId
-    );
+    const allowedStatuses = Array.isArray(statuses) && statuses.length > 0
+      ? new Set(statuses)
+      : null;
+    const candidates = [...this.runs.values()]
+      .filter(run =>
+        (!allowedStatuses || allowedStatuses.has(run.status)) &&
+        run.providerId === providerId &&
+        run.sessionId === sessionId
+      )
+      .sort((a, b) => (b.startedAt || b.createdAt || 0) - (a.startedAt || a.createdAt || 0));
 
     if (toolCallId) {
       const byToolCall = candidates.find(run => run.toolCallId === toolCallId);
       if (byToolCall) return byToolCall;
     }
 
-    if (command) {
-      const byCommand = candidates.find(run =>
-        run.command === command &&
-        (!normalizedCwd || !run.cwd || normalizeCwd(run.cwd) === normalizedCwd)
-      );
-      if (byCommand) return byCommand;
+    if (mcpRequestId !== undefined && mcpRequestId !== null) {
+      const byRequest = candidates.find(run => isSameMcpRequestId(run.mcpRequestId, mcpRequestId));
+      if (byRequest) return byRequest;
     }
 
-    return candidates[0] || null;
+    if (command) {
+      const byCommand = candidates.filter(run =>
+        run.command === command &&
+        (!normalizedCwd || !run.cwd || normalizeCwd(run.cwd) === normalizedCwd) &&
+        (allowToolCallIdMismatch || !toolCallId || !run.toolCallId || run.toolCallId === toolCallId)
+      );
+      if (byCommand.length === 1) return byCommand[0];
+    }
+
+    return null;
+  }
+
+  findPreparedRun(args) {
+    // Do not claim an arbitrary pending run here. Late ACP tool-start events can
+    // leave stale pending runs behind, and starting one would return the previous
+    // command's output for the current MCP invocation.
+    return this.findRun({ ...args, statuses: ['pending'] });
   }
 
   startRun(run) {

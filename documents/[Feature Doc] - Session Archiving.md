@@ -90,20 +90,22 @@ socket.on('archive_session', async ({ uiId }) => {
 
 Files:
 - `backend/sockets/archiveHandlers.js` (Socket event: `archive_session`, local helper: `collectDescendants`)
-- `backend/database.js` (Functions: `getAllSessions`, `deleteSession`)
+- `backend/database.js` (Functions: `getAllSessions`, `deleteSession`, `getActiveSubAgentInvocationForParent`, `deleteSubAgentInvocationsForParent`)
+- `backend/mcp/subAgentInvocationManager.js` (Method: `cancelInvocation`)
 
-The archive handler loads all sessions and recursively collects descendants by matching `forkedFrom` to the parent UI id. Each descendant is permanently removed through the same provider module used for the parent archive, its attachment directory is removed, and its SQLite row is deleted.
+Before descendant deletion, the archive handler cancels any active sub-agent invocation rooted at the parent UI session and removes its SQL invocation registry rows. It then loads all sessions and recursively collects descendants by matching `forkedFrom` to the parent UI id. Each descendant is permanently removed through the same provider module used for the parent archive, its attachment directory is removed, and its SQLite row is deleted.
 
 ```javascript
 // FILE: backend/sockets/archiveHandlers.js (Socket event: archive_session)
+const activeInvocation = await db.getActiveSubAgentInvocationForParent(provider.id, uiId);
+if (activeInvocation) await subAgentInvocationManager.cancelInvocation(provider.id, activeInvocation.invocationId);
+await db.deleteSubAgentInvocationsForParent(provider.id, uiId);
+
 const allSessions = await db.getAllSessions();
 const descendants = [];
 const collectDescendants = (parentId) => {
   for (const s of allSessions) {
-    if (s.forkedFrom === parentId) {
-      descendants.push(s);
-      collectDescendants(s.id);
-    }
+    if (s.forkedFrom === parentId) { descendants.push(s); collectDescendants(s.id); }
   }
 };
 collectDescendants(uiId);
@@ -116,7 +118,7 @@ for (const child of descendants) {
 }
 ```
 
-`parentAcpSessionId` is stored in the database for sub-agent relationships, but this archive cascade follows `forkedFrom` only.
+`parentAcpSessionId` is stored in the database for sub-agent relationships, but the archive cascade still follows `forkedFrom` for session row descendants.
 
 ### 5. Backend Builds the Archive Folder and Delegates Provider Files
 
@@ -480,8 +482,10 @@ The archive system uses these helpers:
 - `getAllSessions(provider, options)` returns lightweight metadata for descendant scans and frontend lists.
 - `saveSession(session)` creates the restored row.
 - `deleteSession(uiId)` deletes one row by `ui_id`.
+- `getActiveSubAgentInvocationForParent(providerId, parentUiId)` finds an active invocation rooted at the parent.
+- `deleteSubAgentInvocationsForParent(providerId, parentUiId)` removes invocation and agent registry rows for the parent.
 
-The `sessions` table stores relationship fields used by archive and sidebar state: `forked_from`, `fork_point`, `is_sub_agent`, `parent_acp_session_id`, plus provider and model/config fields. Archive cascade uses `forkedFrom`, which is the normalized frontend/db object field for `forked_from`.
+The `sessions` table stores relationship fields used by archive and sidebar state: `forked_from`, `fork_point`, `is_sub_agent`, `parent_acp_session_id`, plus provider and model/config fields. Archive cascade uses `forkedFrom`, which is the normalized frontend/db object field for `forked_from`. Sub-agent invocation registry rows are cleaned before the session-row cascade.
 
 ### Attachment Flow
 
@@ -497,9 +501,10 @@ Archive copies `getAttachmentsRoot()/uiId` to `archiveDir/attachments` and remov
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Socket handlers | `backend/sockets/archiveHandlers.js` | `registerArchiveHandlers`, socket events `archive_session`, `list_archives`, `restore_archive`, `delete_archive` | Main archive, list, restore, and permanent archive deletion orchestration. |
+| Socket handlers | `backend/sockets/archiveHandlers.js` | `registerArchiveHandlers`, socket events `archive_session`, `list_archives`, `restore_archive`, `delete_archive` | Main archive, list, restore, invocation cleanup, and permanent archive deletion orchestration. |
 | Permanent session delete | `backend/sockets/sessionHandlers.js` | Socket events `delete_session`, `load_sessions`; local helper `collectDescendants` | Removes active sessions permanently and reloads sessions after restore. |
-| Database | `backend/database.js` | `sessions` table, `saveSession`, `getSession`, `getAllSessions`, `deleteSession` | Persists active sessions and relationship fields. |
+| Sub-agent manager | `backend/mcp/subAgentInvocationManager.js` | `cancelInvocation` | Cancels active sub-agent invocation work before archive cleanup. |
+| Database | `backend/database.js` | `sessions` table, `subagent_invocations` table, `subagent_invocation_agents` table, `saveSession`, `getSession`, `getAllSessions`, `deleteSession`, `getActiveSubAgentInvocationForParent`, `deleteSubAgentInvocationsForParent` | Persists active sessions, relationship fields, and sub-agent invocation registry rows. |
 | Provider loader | `backend/services/providerLoader.js` | `DEFAULT_MODULE`, `getProvider`, `getProviderModule`, `runWithProvider` | Resolves provider config and binds provider hooks to provider context. |
 | Attachments | `backend/services/attachmentVault.js` | `getAttachmentsRoot`, `getAttachmentsDir` provider hook | Resolves attachment storage roots and ensures roots exist. |
 | Cleanup helper | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | Permanent delete path delegates provider file deletion through `deleteSessionFiles`. |
