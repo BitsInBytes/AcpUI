@@ -3,9 +3,9 @@ import { ChevronDown, ChevronRight, Settings, Layout, PlugZap } from 'lucide-rea
 import { motion, AnimatePresence } from 'framer-motion';
 import type { SystemEvent } from '../types';
 import { renderToolOutput } from './renderToolOutput';
-import SubAgentPanel from './SubAgentPanel';
 import ShellToolTerminal from './ShellToolTerminal';
 import { useElapsed } from '../utils/timer';
+import { isAcpUxShellToolName, isAcpUxSubAgentStartToolName, isAcpUxSubAgentToolName } from '../utils/acpUxTools';
 
 interface ToolStepProps {
   step: { type: 'tool'; event: SystemEvent };
@@ -19,13 +19,7 @@ const getFilePathFromEvent = (event: SystemEvent): string | undefined => {
   const toolIdentity = event.canonicalName || event.toolName;
   // UI-owned tools — checked here before asking the provider
   if (event.isAcpUxTool && !event.isFileOperation) return undefined;
-  if (toolIdentity === 'ux_invoke_shell') return undefined;
-  if (
-    toolIdentity === 'ux_invoke_subagents' ||
-    toolIdentity === 'ux_invoke_counsel' ||
-    toolIdentity === 'ux_check_subagents' ||
-    toolIdentity === 'ux_abort_subagents'
-  ) return undefined;
+  if (isAcpUxShellToolName(toolIdentity) || isAcpUxSubAgentToolName(toolIdentity)) return undefined;
 
   // Provider-categorized tools
   if (event.isShellCommand) return undefined;
@@ -83,7 +77,7 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
   const filePath = getFilePathFromEvent(step.event);
   const toolIdentity = step.event.canonicalName || step.event.toolName;
   const isAcpUxTool = step.event.isAcpUxTool === true;
-  const isSubAgentOrchestrationTool = toolIdentity === 'ux_invoke_subagents' || toolIdentity === 'ux_invoke_counsel';
+  const isSubAgentOrchestrationTool = isAcpUxSubAgentStartToolName(toolIdentity);
   const shouldRenderOutput = !isSubAgentOrchestrationTool || step.event.status === 'failed';
   const elapsed = useElapsed(step.event.startTime, step.event.endTime);
   const outputContainerRef = useRef<HTMLDivElement | null>(null);
@@ -139,12 +133,6 @@ const ToolStep: React.FC<ToolStepProps> = ({ step, isCollapsed, onToggle, onOpen
                   {renderToolOutput(step.event.output, markdownComponents, step.event.filePath)}
                 </div>
               </div>
-            )}
-            {/* SubAgentPanel renders inline for tools that spawn sub-agents.
-                invocationId is stamped onto the SystemEvent by the sub_agents_starting handler
-                so this ToolStep always shows its own specific batch of agents. */}
-            {isSubAgentOrchestrationTool && (
-              <SubAgentPanel invocationId={step.event.invocationId} />
             )}
           </motion.div>
         )}

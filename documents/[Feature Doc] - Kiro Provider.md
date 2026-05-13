@@ -362,7 +362,7 @@ const KIRO_HOOK_MAP = {
 | Tool Resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Canonical invocation merge and event enrichment |
 | Tool Patterns | `backend/services/tools/toolIdPattern.js` | `toolIdPatternToRegex`, `matchToolIdPattern`, `replaceToolIdPattern` | Provider-configurable MCP tool ID parsing |
 | Tool Normalization | `backend/services/tools/providerToolNormalization.js` | `inputFromToolUpdate`, `resolvePatternToolName`, `prettyToolTitle` | Shared provider-side tool input/name helpers |
-| Tool Titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `basenameForToolPath` | AcpUI MCP tool display titles |
+| Tool Titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `subAgentCheckToolTitle`, `basenameForToolPath` | AcpUI MCP tool display titles, including wait-vs-quick sub-agent status titles |
 | Tool Registry | `backend/services/tools/index.js` | `toolRegistry`, `toolCallState`, `mcpExecutionRegistry` | Registered AcpUI handlers and sticky tool state |
 
 ### Frontend Integration
@@ -483,6 +483,7 @@ const KIRO_HOOK_MAP = {
   - `reuses cached identity and title for incomplete updates`
   - `marks registered AcpUI UX tool names without relying on a ux prefix`
   - `prefers centrally recorded MCP execution details over provider generic titles`
+  - `records sub-agent check title from waitForCompletion input`
   - `can claim a recent MCP execution when the provider tool id arrives later`
 - `backend/test/providerToolNormalization.test.js`
   - `builds input from standard update fields and optional deep values`

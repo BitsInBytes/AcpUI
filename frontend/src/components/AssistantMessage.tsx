@@ -1,16 +1,19 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Copy, Check, Archive, Brain, ChevronDown, ChevronRight, GitFork } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import MemoizedMarkdown from './MemoizedMarkdown';
 import { Settings } from 'lucide-react';
 import ToolStep from './ToolStep';
 import PermissionStep from './PermissionStep';
+import SubAgentPanel from './SubAgentPanel';
 import type { Message, TimelineStep } from '../types';
 import { useSystemStore } from '../store/useSystemStore';
 import { useCanvasStore } from '../store/useCanvasStore';
 import { useElapsed } from '../utils/timer';
 import { useChatStore } from '../store/useChatStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
+import { useSubAgentStore } from '../store/useSubAgentStore';
+import { isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
 
 interface AssistantMessageProps {
   message: Message;
@@ -47,6 +50,122 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
   return success;
 };
 
+function getPinnedSubAgentInvocationIds(timeline?: TimelineStep[]): string[] {
+  if (!timeline) return [];
+  const invocationIds: string[] = [];
+  const seen = new Set<string>();
+
+  for (const step of timeline) {
+    if (step.type !== 'tool') continue;
+    const invocationId = step.event.invocationId;
+    if (!invocationId || !isAcpUxSubAgentStartToolEvent(step.event) || seen.has(invocationId)) continue;
+    seen.add(invocationId);
+    invocationIds.push(invocationId);
+  }
+
+  return invocationIds;
+}
+
+const TERMINAL_SUB_AGENT_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const PINNED_SUB_AGENT_AUTO_COLLAPSE_MS = 2000;
+
+function isTerminalSubAgentStatus(status?: string | null) {
+  return TERMINAL_SUB_AGENT_STATUSES.has(String(status || ''));
+}
+
+const PinnedSubAgentPanel: React.FC<{ invocationId: string }> = ({ invocationId }) => {
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const manuallyToggledRef = useRef(false);
+  const autoCollapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const invocations = useSubAgentStore(state => state.invocations);
+  const allAgents = useSubAgentStore(state => state.agents);
+  const isInvocationActive = useSubAgentStore(state => state.isInvocationActive(invocationId));
+
+  const invocation = useMemo(
+    () => invocations.find(inv => inv.invocationId === invocationId),
+    [invocationId, invocations]
+  );
+  const agents = useMemo(
+    () => allAgents.filter(agent => agent.invocationId === invocationId),
+    [allAgents, invocationId]
+  );
+
+  const terminalCount = agents.filter(agent => isTerminalSubAgentStatus(agent.status)).length;
+  const isTerminal = agents.length > 0
+    && !isInvocationActive
+    && (isTerminalSubAgentStatus(invocation?.status) || terminalCount === agents.length);
+
+  useEffect(() => {
+    if (autoCollapseTimerRef.current) {
+      clearTimeout(autoCollapseTimerRef.current);
+      autoCollapseTimerRef.current = null;
+    }
+
+    if (!isTerminal) return;
+
+    if (!manuallyToggledRef.current && !isCollapsed) {
+      autoCollapseTimerRef.current = setTimeout(() => {
+        setIsCollapsed(true);
+        autoCollapseTimerRef.current = null;
+      }, PINNED_SUB_AGENT_AUTO_COLLAPSE_MS);
+    }
+
+    return () => {
+      if (autoCollapseTimerRef.current) {
+        clearTimeout(autoCollapseTimerRef.current);
+        autoCollapseTimerRef.current = null;
+      }
+    };
+  }, [isTerminal, isCollapsed]);
+
+  const toggleCollapsed = () => {
+    manuallyToggledRef.current = true;
+    if (autoCollapseTimerRef.current) {
+      clearTimeout(autoCollapseTimerRef.current);
+      autoCollapseTimerRef.current = null;
+    }
+    setIsCollapsed(value => !value);
+  };
+
+  if (agents.length === 0) return null;
+
+  const statusText = invocation?.status || (isInvocationActive ? 'running' : 'completed');
+  const countText = agents.length > 0 ? `${terminalCount}/${agents.length}` : '';
+
+  return (
+    <div className={`sub-agent-pinned-panel ${isCollapsed ? 'collapsed' : 'expanded'}`}>
+      <div className="sub-agent-pinned-header">
+        <div className="sub-agent-pinned-heading">
+          <span className="sub-agent-pinned-title">Subagents</span>
+          <span className="sub-agent-pinned-status">{statusText}{countText ? ` ${countText}` : ''}</span>
+        </div>
+        <button
+          className="sub-agent-pinned-toggle"
+          type="button"
+          aria-label={isCollapsed ? 'Show sub-agents' : 'Hide sub-agents'}
+          aria-expanded={!isCollapsed}
+          onClick={toggleCollapsed}
+          title={isCollapsed ? 'Show sub-agents' : 'Hide sub-agents'}
+        >
+          {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+        </button>
+      </div>
+      <AnimatePresence initial={false}>
+        {!isCollapsed && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="sub-agent-pinned-body"
+          >
+            <SubAgentPanel invocationId={invocationId} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
 const AssistantMessage: React.FC<AssistantMessageProps> = ({
   message, acpSessionId, providerId, isStreaming, timeline, localCollapsed, toggleCollapse, markdownComponents  
 }) => {
@@ -63,6 +182,7 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
 
   const { content, isArchived } = message;
   const turnElapsed = useElapsed(message.turnStartTime, message.turnEndTime ?? (isStreaming ? undefined : message.turnStartTime));
+  const pinnedSubAgentInvocationIds = useMemo(() => getPinnedSubAgentInvocationIds(timeline), [timeline]);
 
   const handleCopyAll = async () => {
     const cleanContent = content.replace(/\n*:::RESPONSE_DIVIDER:::\n*/g, '\n\n');
@@ -204,6 +324,14 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
         {content && (!timeline || !timeline.some(s => s.type === 'text')) && (
           <div className="message-content response-tab-content fallback-content markdown-body">     
             {renderContentWithErrors(content)}
+          </div>
+        )}
+
+        {pinnedSubAgentInvocationIds.length > 0 && (
+          <div className="sub-agent-pinned-panels">
+            {pinnedSubAgentInvocationIds.map(invocationId => (
+              <PinnedSubAgentPanel key={invocationId} invocationId={invocationId} />
+            ))}
           </div>
         )}
       </div>

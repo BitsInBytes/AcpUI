@@ -454,7 +454,7 @@ Session create/load
 | Tool State | `backend/services/tools/toolCallState.js` | `ToolCallState`, `upsert`, `get`, `clearSession`, `shouldUseTitle` | Preserves sticky tool metadata across lifecycle phases |
 | Tool Registry | `backend/services/tools/index.js` | `toolRegistry`, registered handlers for AcpUI UX tools | Dispatches canonical tool lifecycle events to handlers |
 | Tool Pattern | `backend/services/tools/toolIdPattern.js` | `toolIdPatternToRegex`, `matchToolIdPattern`, `replaceToolIdPattern` | Parses provider-configured `{mcpName}` and `{toolName}` patterns |
-| Tool Normalization Helpers | `backend/services/tools/providerToolNormalization.js` | `inputFromToolUpdate`, `resolveToolNameFromCandidates`, `mcpInvocationFromRaw`, `prettyToolTitle`, `toolTitleDetailFromInput` | Shared parsing helpers for provider adapters |
+| Tool Normalization Helpers | `backend/services/tools/providerToolNormalization.js` | `inputFromToolUpdate`, `resolveToolNameFromCandidates`, `resolveToolNameFromAcpUiMcpTitle`, `mcpInvocationFromRaw`, `prettyToolTitle`, `toolTitleDetailFromInput` | Shared parsing helpers for provider adapters, including full-title and colon-prefix AcpUI MCP title recovery |
 | MCP Proxy Registry | `backend/mcp/mcpProxyRegistry.js` | `createMcpProxyBinding`, `bindMcpProxy`, `getMcpProxyIdFromServers`, `resolveMcpProxy` | Correlates stdio MCP proxy instances with provider/session context |
 
 ### Files, Archives, Hooks, and Status
@@ -613,6 +613,7 @@ Session create/load
   - `reuses cached identity and title for incomplete updates`
   - `marks registered AcpUI UX tool names without relying on a ux prefix`
   - `prefers centrally recorded MCP execution details over provider generic titles`
+  - `records sub-agent check title from waitForCompletion input`
   - `can claim a recent MCP execution when the provider tool id arrives later`
 
 - `backend/test/providerToolNormalization.test.js`

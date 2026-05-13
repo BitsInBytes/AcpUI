@@ -12,7 +12,7 @@ vi.mock('framer-motion', () => ({
   AnimatePresence: ({ children }: any) => <>{children}</>,
 }));
 
-// Mock SubAgentPanel to capture props passed by ToolStep
+// Mock SubAgentPanel so tests fail if ToolStep accidentally renders it inline again.
 vi.mock('../components/SubAgentPanel', () => ({
   default: ({ invocationId }: { invocationId?: string }) => (
     <div data-testid="sub-agent-panel" data-invocation-id={invocationId ?? ''} />
@@ -153,22 +153,18 @@ describe('ToolStep', () => {
     expect(props.onToggle).toHaveBeenCalled();
   });
 
-  it('passes invocationId to SubAgentPanel for ux_invoke_subagents', () => {
+  it('does not render SubAgentPanel inline for ux_invoke_subagents', () => {
     const props = defaultProps();
     props.step.event = makeEvent({ toolName: 'ux_invoke_subagents', invocationId: 'inv-test-42' });
     render(<ToolStep {...props} />);
-    const panel = screen.getByTestId('sub-agent-panel');
-    expect(panel).toBeInTheDocument();
-    expect(panel.getAttribute('data-invocation-id')).toBe('inv-test-42');
+    expect(screen.queryByTestId('sub-agent-panel')).not.toBeInTheDocument();
   });
 
-  it('uses canonicalName to render SubAgentPanel when provider toolName is generic', () => {
+  it('does not render SubAgentPanel inline when canonicalName is a sub-agent tool', () => {
     const props = defaultProps();
     props.step.event = makeEvent({ toolName: 'tooluse_123', canonicalName: 'ux_invoke_subagents', invocationId: 'inv-canonical' });
     render(<ToolStep {...props} />);
-    const panel = screen.getByTestId('sub-agent-panel');
-    expect(panel).toBeInTheDocument();
-    expect(panel.getAttribute('data-invocation-id')).toBe('inv-canonical');
+    expect(screen.queryByTestId('sub-agent-panel')).not.toBeInTheDocument();
   });
 
   it('suppresses instructional output for sub-agent start tools', () => {
@@ -183,7 +179,7 @@ describe('ToolStep', () => {
 
     render(<ToolStep {...props} />);
 
-    expect(screen.getByTestId('sub-agent-panel')).toBeInTheDocument();
+    expect(screen.queryByTestId('sub-agent-panel')).not.toBeInTheDocument();
     expect(screen.queryByText(/Sub-agents have been started asynchronously/)).not.toBeInTheDocument();
   });
 
@@ -199,7 +195,7 @@ describe('ToolStep', () => {
 
     render(<ToolStep {...props} />);
 
-    expect(screen.getByTestId('sub-agent-panel')).toBeInTheDocument();
+    expect(screen.queryByTestId('sub-agent-panel')).not.toBeInTheDocument();
     expect(screen.getByText('Failed to start sub-agents')).toBeInTheDocument();
   });
 
@@ -218,13 +214,11 @@ describe('ToolStep', () => {
     expect(screen.getByText('Completed sub-agent results')).toBeInTheDocument();
   });
 
-  it('passes invocationId to SubAgentPanel for ux_invoke_counsel', () => {
+  it('does not render SubAgentPanel inline for ux_invoke_counsel', () => {
     const props = defaultProps();
     props.step.event = makeEvent({ toolName: 'ux_invoke_counsel', invocationId: 'inv-counsel-7' });
     render(<ToolStep {...props} />);
-    const panel = screen.getByTestId('sub-agent-panel');
-    expect(panel).toBeInTheDocument();
-    expect(panel.getAttribute('data-invocation-id')).toBe('inv-counsel-7');
+    expect(screen.queryByTestId('sub-agent-panel')).not.toBeInTheDocument();
   });
 
   it('does not render SubAgentPanel for regular tool calls', () => {

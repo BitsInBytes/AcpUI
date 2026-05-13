@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProvider } from '../../backend/services/providerLoader.js';
-import { acpUiToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
+import { acpUiToolTitle, subAgentCheckToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
 import { ACP_UX_TOOL_NAMES, isAcpUxToolName } from '../../backend/services/tools/acpUxTools.js';
 import {
   collectToolNameCandidates,
@@ -577,7 +577,7 @@ export function normalizeTool(event, update) {
   if (toolName === ACP_UX_TOOL_NAMES.invokeSubagents) {
     title = 'Invoke Subagents';
   } else if (toolName === ACP_UX_TOOL_NAMES.checkSubagents) {
-    title = 'Check Subagents';
+    title = subAgentCheckToolTitle(input);
   } else if (toolName === ACP_UX_TOOL_NAMES.abortSubagents) {
     title = 'Abort Subagents';
   } else if (toolName === ACP_UX_TOOL_NAMES.invokeCounsel) {

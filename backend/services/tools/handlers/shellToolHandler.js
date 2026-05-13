@@ -27,7 +27,8 @@ function applyShellDescriptionTitle(ctx, invocation, event) {
 export const shellToolHandler = {
   onStart(ctx, invocation, event) {
     const description = normalizeText(invocation.input?.description);
-    const command = invocation.input?.command || '';
+    const command = typeof invocation.input?.command === 'string' ? invocation.input.command : '';
+    const hasCommand = normalizeText(command) !== '';
     const cwd = invocation.input?.cwd || null;
     const mcpRequestId = invocation.raw?.mcpExecution?.mcpRequestId ?? null;
 
@@ -44,25 +45,42 @@ export const shellToolHandler = {
     });
     const prepared = existingRun
       ? (shellRunManager.snapshot?.(existingRun) || existingRun)
-      : shellRunManager.prepareRun({
-        providerId: ctx.providerId,
-        sessionId: ctx.sessionId,
-        toolCallId: invocation.toolCallId,
-        mcpRequestId,
-        description,
-        command,
-        cwd
-      });
+      : hasCommand
+        ? shellRunManager.prepareRun({
+          providerId: ctx.providerId,
+          sessionId: ctx.sessionId,
+          toolCallId: invocation.toolCallId,
+          mcpRequestId,
+          description,
+          command,
+          cwd
+        })
+        : null;
 
     const title = shellTitle(description) || event.title;
-    toolCallState.upsert({
+    const resolvedCommand = prepared?.command || command;
+    const resolvedCwd = prepared?.cwd || cwd;
+    const input = { description };
+    if (resolvedCommand) input.command = resolvedCommand;
+    if (resolvedCwd) input.cwd = resolvedCwd;
+    const stateUpdate = {
       providerId: ctx.providerId,
       sessionId: ctx.sessionId,
       toolCallId: invocation.toolCallId,
-      input: { description, command: prepared.command, cwd: prepared.cwd },
-      display: { title, titleSource: title === event.title ? 'provider' : 'tool_handler' },
-      toolSpecific: { shellRunId: prepared.runId }
-    });
+      input,
+      display: { title, titleSource: title === event.title ? 'provider' : 'tool_handler' }
+    };
+    if (prepared?.runId) stateUpdate.toolSpecific = { shellRunId: prepared.runId };
+    toolCallState.upsert(stateUpdate);
+
+    if (!prepared?.runId) {
+      return {
+        ...event,
+        ...(resolvedCommand ? { command: resolvedCommand } : {}),
+        ...(resolvedCwd ? { cwd: resolvedCwd } : {}),
+        title
+      };
+    }
 
     return {
       ...event,

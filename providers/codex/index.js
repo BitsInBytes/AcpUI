@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { getProvider } from '../../backend/services/providerLoader.js';
-import { acpUiToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
+import { acpUiToolTitle, subAgentCheckToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
 import {
   commandFromRawInput,
   inputFromToolUpdate,
@@ -565,7 +565,7 @@ function titleForTool(toolName, event, update) {
     return command ? `Run shell command: ${command}` : 'Run shell command';
   }
   if (toolName === 'ux_invoke_subagents') return 'Run Subagents';
-  if (toolName === 'ux_check_subagents') return 'Check Subagents';
+  if (toolName === 'ux_check_subagents') return subAgentCheckToolTitle(args);
   if (toolName === 'ux_abort_subagents') return 'Abort Subagents';
   if (toolName === 'ux_invoke_counsel') return 'Run Counsel';
   if (toolName === 'shell' || toolName === 'execute') {

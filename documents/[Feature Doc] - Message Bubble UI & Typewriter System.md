@@ -242,25 +242,27 @@ Token chunks update both `message.content` and the latest `text` timeline step. 
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Helper: patchShellRunToolStep)
+const activeMsgId = snapshot?.sessionId ? useStreamStore.getState().activeMsgIdByAcp[snapshot.sessionId] : undefined;
 timeline: message.timeline?.map(entry => {
   if (entry.type !== 'tool') return entry;
   const sameRun = entry.event.shellRunId === runId;
   const sameToolCall = !entry.event.shellRunId && snapshot?.toolCallId && entry.event.id === snapshot.toolCallId;
-  if (!sameRun && !sameToolCall) return entry;
+  const sameDescription = !entry.event.shellRunId && message.id === activeMsgId && matchesShellDescription(entry.event, snapshot);
+  if (!sameRun && !sameToolCall && !sameDescription) return entry;
   matched = true;
   return { ...entry, event: { ...entry.event, ...patch, shellRunId: runId } };
 }) || message.timeline;
 if (!matched && snapshot) ensureShellRunToolStep(snapshot, patch);
 ```
 
-Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message timeline receives status and display metadata patches without scanning tool titles; if no matching tool step or matching provider tool-call ID exists yet, shell lifecycle events create a fallback shell tool step for the active assistant message.
+Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message timeline receives status and display metadata patches by `shellRunId`, tool-call ID, or the active shell description title. If no matching rendered step exists yet, shell lifecycle events queue a fallback `tool_start` through `useStreamStore.onStreamEvent` so it stays ordered behind pending thought chunks. Provider shell starts that arrive before `shellRunId` exists merge by provider tool id, preventing duplicate no-run-id shell cards from later becoming duplicate terminals for one run. Active shell tool steps stay expanded when later parallel shell starts arrive, so running sibling terminals do not spawn collapsed. Completed shell steps stay open briefly so the terminal-to-read-only transition can settle, then ChatMessage auto-collapses them unless the user manually toggled that step. Once a terminal shell step has auto-collapsed, later timeline updates preserve that local collapsed state instead of reopening the step from stale `isCollapsed: false` stream metadata.
 
 15. Sub-agent events coordinate panel rendering and child sessions
 - File: `frontend/src/hooks/useChatManager.ts` (Handlers: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`, `subAgentSystemHandler`)
 - File: `frontend/src/store/useSubAgentStore.ts` (Actions: `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent`)
 - File: `frontend/src/components/SubAgentPanel.tsx` (Component: `SubAgentPanel`, Prop: `invocationId`, Handler: `handleStop`)
 
-`sub_agent_started` stores agent metadata and stamps `invocationId` onto the in-progress `ux_invoke_subagents` or `ux_invoke_counsel` tool step. `ToolStep` passes that `invocationId` to `SubAgentPanel`, which filters visible agents to the invocation that created the panel. The start tools hide successful instructional output in the timeline; `ux_check_subagents` and `ux_abort_subagents` keep normal output rendering for status and results. Active invocation state also prevents automatic collapse of the orchestration step until every agent is terminal unless the user manually collapses it.
+`sub_agent_started` stores agent metadata and stamps `invocationId` onto the in-progress `ux_invoke_subagents` or `ux_invoke_counsel` tool step. `AssistantMessage` finds those stamped timeline steps and passes each `invocationId` to a bottom-pinned `SubAgentPanel`, which filters visible agents to the invocation that created the panel. The start tools hide successful instructional output in the timeline; `ux_check_subagents` and `ux_abort_subagents` keep normal output rendering for status and results. Active invocation state also prevents automatic collapse of the orchestration step until every agent is terminal unless the user manually collapses it. The bottom-pinned panel auto-collapses after the invocation reaches a terminal state unless the user manually toggles the panel.
 
 16. Message rendering flows through message-list components
 - File: `frontend/src/components/MessageList/MessageList.tsx` (Component: `MessageList`)
@@ -279,6 +281,7 @@ Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message ti
 if (!isStreaming) {
   if (isActiveSubAgentTimelineStep(step, activeSubAgentInvocationSet)) updates[idx] = false;
   else if (isSubAgentTimelineStep(step)) updates[idx] = true;
+  else if (isTerminalShellTimelineStep(step) && localCollapsed[idx] === true) updates[idx] = true;
   else if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
   else if (step.type === 'tool') updates[idx] = true;
   else if (step.type === 'thought') updates[idx] = true;
@@ -287,13 +290,14 @@ if (!isStreaming) {
   const last3Thoughts = thoughtIndices.slice(-3);
   if (isActiveSubAgentTimelineStep(step, activeSubAgentInvocationSet)) updates[idx] = false;
   else if (isSubAgentTimelineStep(step)) updates[idx] = true;
+  else if (isTerminalShellTimelineStep(step) && localCollapsed[idx] === true) updates[idx] = true;
   else if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
   else if (step.type === 'tool') updates[idx] = !last3Tools.includes(idx);
   else if (step.type === 'thought') updates[idx] = !last3Thoughts.includes(idx);
 }
 ```
 
-Explicit `step.isCollapsed` values from the stream store take priority unless the user toggles that index. While streaming, the last three tools and thoughts stay expanded by default. After streaming, tools and thoughts collapse by default, text and permissions stay expanded. Active sub-agent orchestration tool steps stay expanded until the invocation is terminal unless the user manually collapses them.
+Explicit `step.isCollapsed` values from the stream store take priority unless the user toggles that index, except terminal shell steps keep an existing local `true` collapse state so completed shells do not reopen during later stream updates. While streaming, the last three tools and thoughts stay expanded by default. After streaming, tools and thoughts collapse by default, text and permissions stay expanded. Active sub-agent orchestration tool steps stay expanded until the invocation is terminal unless the user manually collapses them.
 
 18. Assistant timeline steps render by type
 - File: `frontend/src/components/AssistantMessage.tsx` (Component: `AssistantMessage`, Function: `renderContentWithErrors`)
@@ -306,7 +310,7 @@ if (step.type === 'permission') return <PermissionStep step={step} onRespond={..
 if (step.type === 'tool') return <ToolStep step={step} ... />;
 ```
 
-`AssistantMessage` renders text, tool, permission, and thought steps in timeline order. It also exposes copy-all, fork-from-message, archive, hook-running, elapsed-turn, and fork-overlay UI states.
+`AssistantMessage` renders text, tool, permission, and thought steps in timeline order. After the timeline and fallback content, it pins any sub-agent orchestration panels to the bottom of the response bubble by scanning sub-agent start tool steps for `invocationId`. It also exposes copy-all, fork-from-message, archive, hook-running, elapsed-turn, and fork-overlay UI states.
 
 19. Markdown renders settled blocks and an active tail
 - File: `frontend/src/components/MemoizedMarkdown.tsx` (Component: `MemoizedMarkdown`, Function: `splitIntoBlocks`, Memoized component: `MemoizedBlock`)
@@ -322,13 +326,12 @@ const { settled, active } = useMemo(
 
 Streaming content is parsed into top-level mdast blocks. All blocks except the last one render through `MemoizedBlock`; the last block renders in `.streaming-block`. Completed messages render as a single markdown document.
 
-20. Tool steps route specialized panels and output formatting
+20. Tool steps route specialized terminals and output formatting
 - File: `frontend/src/components/ToolStep.tsx` (Component: `ToolStep`, Function: `getFilePathFromEvent`)
 - File: `frontend/src/components/ShellToolTerminal.tsx` (Component: `ShellToolTerminal`)
-- File: `frontend/src/components/SubAgentPanel.tsx` (Component: `SubAgentPanel`)
 - File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutput`)
 
-`ToolStep` renders AcpUI UX tool branding when `isAcpUxTool` is true, a timer from `useElapsed`, an optional canvas hoist button from `getFilePathFromEvent`, `ShellToolTerminal` for `shellRunId`, `SubAgentPanel` for `ux_invoke_subagents` and `ux_invoke_counsel`, and `renderToolOutput` for non-shell output. Successful output from sub-agent start tools is suppressed because the panel is the visible orchestration surface; failed start output and `ux_check_subagents` / `ux_abort_subagents` status/result output still render normally.
+`ToolStep` renders AcpUI UX tool branding when `isAcpUxTool` is true, a timer from `useElapsed`, an optional canvas hoist button from `getFilePathFromEvent`, `ShellToolTerminal` for `shellRunId`, and `renderToolOutput` for non-shell output. Successful output from sub-agent start tools is suppressed because the bottom-pinned panel is the visible orchestration surface owned by `AssistantMessage`; failed start output and `ux_check_subagents` / `ux_abort_subagents` status/result output still render normally.
 
 ---
 
@@ -361,8 +364,8 @@ flowchart LR
   AMSG --> MD[MemoizedMarkdown]
   AMSG --> TOOL[ToolStep]
   AMSG --> PERMSTEP[PermissionStep]
+  AMSG --> SP[SubAgentPanel]
   TOOL --> TERM[ShellToolTerminal]
-  TOOL --> SP
   TOOL --> OUT[renderToolOutput]
 ```
 
@@ -387,7 +390,7 @@ export type TimelineStep =
 Rules:
 1. Every stream payload targets the ACP session in `sessionId`; queue keys are ACP session IDs, not UI session IDs.
 2. `ensureAssistantMessage` owns the mapping from `activeMsgIdByAcp[acpSessionId]` to the active assistant placeholder.
-3. `tool_update` and `tool_end` merge into the latest tool step whose `event.id` matches `StreamEventData.id`; shell events may also merge by matching `shellRunId`.
+3. `tool_update` and `tool_end` merge into the latest tool step whose `event.id` matches `StreamEventData.id`; shell events may also merge by `shellRunId`, tool-call ID, or active shell description title.
 4. Tool merges preserve sticky metadata fields when an update omits them.
 5. Shell-run output is owned by `useShellRunStore` when `SystemEvent.shellRunId` exists; generic tool-end output does not overwrite that transcript path.
 6. `message.content` and the latest `text` timeline step stay synchronized during token drains.
@@ -476,8 +479,9 @@ backend handleUpdate(tool_call or tool_call_update)
 -> useStreamStore.onStreamEvent
 -> processBuffer event phase
 -> TimelineStep.tool append or merge by event.id
--> ToolStep
--> ShellToolTerminal, SubAgentPanel, or renderToolOutput
+-> AssistantMessage
+-> ToolStep plus bottom-pinned SubAgentPanel for sub-agent invocations
+-> ToolStep routes shell steps to ShellToolTerminal and visible non-shell output to renderToolOutput
 ```
 
 ### Shell-run pipeline
@@ -485,7 +489,7 @@ backend handleUpdate(tool_call or tool_call_update)
 socket shell_run_prepared/shell_run_snapshot/shell_run_started/shell_run_output/shell_run_exit
 -> useChatManager shell-run handlers
 -> useShellRunStore.upsertSnapshot/markStarted/appendOutput/markExited
--> useChatManager.patchShellRunToolStep by shellRunId
+-> useChatManager.patchShellRunToolStep by shellRunId, tool-call ID, or active shell description title
 -> ToolStep sees event.shellRunId
 -> ShellToolTerminal renders live xterm or read-only terminal output
 ```
@@ -540,11 +544,12 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Socket wiring | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `wrappedOnStreamToken`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, `subAgentSystemHandler`, socket events `thought`, `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes socket events into stream, shell-run, sub-agent, notification, and session stores. |
-| Stream engine | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`, `shellRunPatch`, `isShellDescriptionTitle` | Owns stream queues, adaptive typewriter mutation, event merge logic, and active assistant message mapping. |
+| Stream engine | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`, `shellRunPatch`, `isShellDescriptionTitle`, `isShellToolData`, `isTerminalToolStatus`, `isSameShellDescriptionTitle` | Owns stream queues, adaptive typewriter mutation, event merge logic, and active assistant message mapping. |
 | Shell run state | `frontend/src/store/useShellRunStore.ts` | `ShellRunSnapshot`, `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`, `trimShellTranscript`, `pruneShellRuns` | Stores live shell transcripts and shell-run metadata by `runId`. |
 | Permission response | `frontend/src/store/useChatStore.ts` | `handleRespondPermission`, socket event `respond_permission`, socket event `save_snapshot` | Updates permission timeline responses and emits ACP permission selections. |
 | Session state | `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId`, `setSessions`, `fetchStats` | Holds `ChatSession.messages` and active-session state used by message rendering. |
 | Sub-agent state | `frontend/src/store/useSubAgentStore.ts` | `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent` | Stores invocation state, sub-agent cards, tool steps, and permission state for `SubAgentPanel`. |
+| AcpUI UX tool identity | `frontend/src/utils/acpUxTools.ts` | `ACP_UX_TOOL_NAMES`, `ACP_UX_RESULT_TYPES`, `isAcpUxShellToolEvent`, `isAcpUxSubAgentStartToolEvent`, `isAcpUxSubAgentToolName` | Centralizes frontend AcpUI UX tool-name and structured-result discriminators used by stream and renderer branches. |
 
 ### Frontend Components
 | Area | File | Anchors | Purpose |
@@ -552,14 +557,14 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 | Message list | `frontend/src/components/MessageList/MessageList.tsx` | `MessageList`, `visibleCount`, `HistoryList` | Selects active session messages, supports lazy visible-count expansion, and renders the chat scroll area. |
 | Message iteration | `frontend/src/components/HistoryList.tsx` | `HistoryList`, `React.memo`, `ChatMessage` | Memoized mapping from `Message[]` to `ChatMessage` components. |
 | Message router | `frontend/src/components/ChatMessage.tsx` | `ChatMessage`, `CodeBlock`, `copyToClipboard`, `localCollapsed`, `manuallyToggled`, `markdownComponents` | Routes message roles, computes collapse defaults, renders code-block copy/canvas controls, and passes markdown overrides. |
-| Assistant renderer | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `renderContentWithErrors`, `handleCopyAll`, `handleFork` | Renders timeline steps, provider branding, copy, fork, archive, hook-running, elapsed-turn, and fallback content states. |
+| Assistant renderer | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `getPinnedSubAgentInvocationIds`, `renderContentWithErrors`, `handleCopyAll`, `handleFork` | Renders timeline steps, bottom-pinned sub-agent panels, provider branding, copy, fork, archive, hook-running, elapsed-turn, and fallback content states. |
 | Markdown renderer | `frontend/src/components/MemoizedMarkdown.tsx` | `MemoizedMarkdown`, `splitIntoBlocks`, `MemoizedBlock` | Parses markdown to mdast, memoizes settled streaming blocks, and renders active markdown tails. |
-| Tool renderer | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `ShellToolTerminal`, `SubAgentPanel`, `renderToolOutput` | Renders tool headers, collapse content, canvas hoist buttons, shell terminals, sub-agent panels, and formatted output. |
+| Tool renderer | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `ShellToolTerminal`, `renderToolOutput` | Renders tool headers, collapse content, canvas hoist buttons, shell terminals, sub-agent start output suppression, and formatted output. |
 | Permission renderer | `frontend/src/components/PermissionStep.tsx` | `PermissionStep`, `onRespond`, `PermissionTimelineStep` | Renders permission options and disables buttons when a response is recorded. |
 | Shell terminal | `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal`, `fallbackRunFromEvent`, `getReadOnlyTerminalHtml`, `getTranscriptWritePlan`, `emitResize`, `stopRun` | Renders live xterm sessions, read-only terminal output, stdin, paste, resize, and kill controls. |
 | Output formatting | `frontend/src/components/renderToolOutput.tsx` | `renderToolOutput`, `tryExtractShellOutput`, `tryParseJsonObject`, `isWebFetchResult`, `isGrepSearchResult`, `renderHighlightedMatch`, `getLangFromPath` | Converts raw tool output into diff, ANSI, structured, syntax-highlighted, JSON, or plain output. |
 | Sub-agent panel | `frontend/src/components/SubAgentPanel.tsx` | `SubAgentPanel`, `invocationId` | Displays only sub-agents associated with the invoking tool step. |
-| Styling | `frontend/src/components/ChatMessage.css` | `.unified-timeline`, `.timeline-step`, `.response-divider`, `.system-event`, `.tool-output-container`, `.permission-step`, `.shell-tool-terminal` | Defines message bubble, timeline, divider, tool, permission, and terminal presentation. |
+| Styling | `frontend/src/components/ChatMessage.css` | `.unified-timeline`, `.sub-agent-pinned-panels`, `.timeline-step`, `.response-divider`, `.system-event`, `.tool-output-container`, `.permission-step`, `.shell-tool-terminal` | Defines message bubble, bottom-pinned sub-agent panel area, timeline, divider, tool, permission, and terminal presentation. |
 
 ### Types and Contracts
 | Area | File | Anchors | Purpose |
@@ -616,10 +621,10 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
    - Why it happens: `handleRespondPermission` filters sessions by `acpSessionId` and emits `respond_permission` with `sessionId`.
    - How to avoid it: pass `acpSessionId` from `AssistantMessage` to `handleRespondPermission`.
 
-10. Sub-agent panels filter by invocation ID and active panels stay expanded.
-    - What goes wrong: a tool step displays agents from another invocation or the live orchestration panel collapses while agents are still running.
-    - Why it happens: `SubAgentPanel` filters by `invocationId`, `useChatManager` stamps that field onto the in-progress tool step, and collapse policy checks `useSubAgentStore.isInvocationActive`.
-    - How to avoid it: keep `sub_agent_started` invocation stamping, pass `step.event.invocationId` from `ToolStep`, and preserve the active-invocation collapse guard.
+10. Sub-agent panels filter by invocation ID and active panels stay visible.
+    - What goes wrong: a response bubble displays agents from another invocation, the panel stays attached to an early tool call and gets lost below later work, or the live orchestration step collapses while agents are still running.
+    - Why it happens: `SubAgentPanel` filters by `invocationId`, `useChatManager` stamps that field onto the in-progress tool step, `AssistantMessage` pins matching panels at the response bottom, and collapse policy checks `useSubAgentStore.isInvocationActive`.
+    - How to avoid it: keep `sub_agent_started` invocation stamping, keep `AssistantMessage.getPinnedSubAgentInvocationIds` aligned with sub-agent tool identities, and preserve the active-invocation collapse guard.
 
 ---
 
@@ -649,6 +654,10 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `should isolate stats capture buffers between sessions`
 
 ### Stream store and socket wiring
+- `frontend/src/test/acpUxTools.test.ts`
+  - `centralizes known AcpUI UX tool names`
+  - `normalizes direct tool name checks`
+  - `resolves tool identity from normalized event fields`
 - `frontend/src/test/useStreamStore.test.ts`
   - `ensureAssistantMessage creates a placeholder message`
   - `onStreamToken queues text and triggers typewriter`
@@ -657,7 +666,10 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `processBuffer flushes large buffers immediately`
   - `onStreamEvent handles tool_start and collapses previous steps`
   - `hydrates queued shell tool_start from an existing shell snapshot`
+  - `keeps active parallel shell tool starts expanded while later shell steps arrive`
   - `merges duplicate shell tool_start events by shellRunId`
+  - `merges provider shell tool_start without run id into an existing shell run by description`
+  - `merges duplicate provider shell tool_start events before a shell run id is attached`
   - `merges shell tool_end events by shellRunId when tool ids differ`
   - `prefers MCP handler titles over longer raw provider titles`
   - `preserves Shell V2 terminal output on tool_end by shellRunId`
@@ -699,8 +711,11 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 - `frontend/src/test/ChatMessage.test.tsx`
   - `renders assistant message correctly with interleaved timeline`
   - `collapses tool calls and thought bubbles when streaming is finished`
+  - `auto-collapses completed shell tool steps after a short settling delay`
+  - `keeps auto-collapsed terminal shell steps collapsed while later shell steps stream`
   - `respects explicit thought collapse state from the streaming timeline`
   - `keeps only the last 3 tool calls and last 3 thought bubbles expanded while streaming`
+  - `pins active sub-agent orchestration to the bottom after later parent work`
   - `keeps active sub-agent orchestration expanded after remount`
   - `renders response dividers`
   - `respects manual toggle during timeline updates while streaming`
@@ -740,9 +755,9 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `shows output when expanded and output exists`
   - `auto-scrolls live shell output to the bottom when output changes`
   - `shows canvas button when filePath exists`
-  - `passes invocationId to SubAgentPanel for ux_invoke_subagents`
-  - `uses canonicalName to render SubAgentPanel when provider toolName is generic`
-  - `passes invocationId to SubAgentPanel for ux_invoke_counsel`
+  - `does not render SubAgentPanel inline for ux_invoke_subagents`
+  - `does not render SubAgentPanel inline when canonicalName is a sub-agent tool`
+  - `does not render SubAgentPanel inline for ux_invoke_counsel`
   - `renders ShellToolTerminal for Shell V2 tool steps`
   - `suppresses instructional output for sub-agent start tools`
   - `keeps failure output visible for sub-agent start tools`
@@ -766,6 +781,7 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `paces xterm writes until the previous write callback completes`
   - `splits large transcript writes into bounded xterm chunks`
   - `renders completed runs as read-only text without creating xterm`
+  - `settles read-only output at terminal height before compacting after exit`
   - `prefers colored stored transcript over plain final output after exit`
   - `sends input only while running`
   - `sends clipboard paste through shell_run_input`

@@ -1,4 +1,4 @@
-import { acpUiToolTitle } from './acpUiToolTitles.js';
+import { acpUiToolTitle, subAgentCheckToolTitle } from './acpUiToolTitles.js';
 import {
   ACP_UX_TOOL_NAMES,
   acpUxIoToolConfig,
@@ -116,7 +116,7 @@ export function describeAcpUxToolExecution(toolName, input = {}, options = {}) {
   } else if (canonicalName === ACP_UX_TOOL_NAMES.invokeCounsel) {
     title = 'Invoke Counsel';
   } else if (canonicalName === ACP_UX_TOOL_NAMES.checkSubagents) {
-    title = 'Check Subagents';
+    title = subAgentCheckToolTitle(input);
   } else if (canonicalName === ACP_UX_TOOL_NAMES.abortSubagents) {
     title = 'Abort Subagents';
   } else {

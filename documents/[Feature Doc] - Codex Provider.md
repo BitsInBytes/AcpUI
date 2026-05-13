@@ -161,7 +161,7 @@ Architectural role: provider-specific backend adapter for Codex ACP, integrated 
 
     `wrapToolHandlers()` records public MCP tool input in `mcpExecutionRegistry.begin()`, completes/fails the record after handler execution, and lets `resolveToolInvocation()` prefer handler-known title/category/file metadata over generic provider titles.
 
-    Shared IO/Search title behavior comes from `backend/services/tools/acpUiToolTitles.js` (`acpUiToolTitle`) and `backend/services/tools/acpUxTools.js` (`ACP_UX_IO_TOOL_CONFIG`):
+    Shared AcpUI title behavior comes from `backend/services/tools/acpUiToolTitles.js` (`acpUiToolTitle`, `subAgentCheckToolTitle`) and `backend/services/tools/acpUxTools.js` (`ACP_UX_IO_TOOL_CONFIG`):
 
     | Tool | Title pattern | Category source |
     |---|---|---|
@@ -266,7 +266,7 @@ AcpUI MCP tools are controlled by `configuration/mcp.json` or the file reference
 - Optional IO tools: `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`.
 - Optional Google search tool: `ux_google_web_search`.
 
-Codex sees enabled tools through the `AcpUI` MCP stdio server. The provider extracts identity from `AcpUI/<toolName>` titles and `rawInput.invocation`; backend handlers record authoritative titles and categories for enabled tools. Codex display titles use `Run Subagents` for `ux_invoke_subagents`, `Check Subagents` for `ux_check_subagents`, `Abort Subagents` for `ux_abort_subagents`, and `Run Counsel` for `ux_invoke_counsel`. `ux_invoke_subagents` and `ux_invoke_counsel` return after spawn and include instructions to call `ux_check_subagents` for status/results or `ux_abort_subagents` to stop running agents; pass `waitForCompletion: false` to check status without waiting.
+Codex sees enabled tools through the `AcpUI` MCP stdio server. The provider extracts identity from `AcpUI/<toolName>` titles and `rawInput.invocation`; backend handlers record authoritative titles and categories for enabled tools. Codex display titles use `Run Subagents` for `ux_invoke_subagents`, `Check Subagents: Waiting for agents to finish` for default `ux_check_subagents`, `Check Subagents: Quick status check` when `waitForCompletion: false`, `Abort Subagents` for `ux_abort_subagents`, and `Run Counsel` for `ux_invoke_counsel`. `ux_invoke_subagents` and `ux_invoke_counsel` return after spawn and include instructions to call `ux_check_subagents` for status/results or `ux_abort_subagents` to stop running agents; pass `waitForCompletion: false` to check status without waiting.
 
 ## Data Flow / Rendering Pipeline
 
@@ -377,7 +377,7 @@ Codex rollout JSONL
 | Tool Resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider extraction, sticky state, and MCP execution metadata. |
 | MCP Execution | `backend/services/tools/mcpExecutionRegistry.js` | `begin`, `complete`, `fail`, `describeAcpUxToolExecution`, `invocationFromMcpExecution` | Tracks public input and authoritative display metadata. |
 | Tool Names | `backend/services/tools/acpUxTools.js` | `ACP_UX_TOOL_NAMES`, `ACP_UX_CORE_TOOL_NAMES`, `ACP_UX_IO_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`, `isAcpUxToolName` | Shared core and optional AcpUI MCP tool registry. |
-| Tool Titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `basenameForToolPath` | Shared optional IO/Search title builder. |
+| Tool Titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `subAgentCheckToolTitle`, `basenameForToolPath` | Shared optional IO/Search titles and wait-vs-quick sub-agent status titles. |
 | Provider Tool Helpers | `backend/services/tools/providerToolNormalization.js` | `mcpInvocationFromRaw`, `inputFromToolUpdate`, `resolvePatternToolName`, `commandFromRawInput`, `stripToolTitlePrefix` | Shared provider parsing helpers. |
 | IO Tool Handler | `backend/services/tools/handlers/ioToolHandler.js` | `onStart`, `onUpdate`, `onEnd` | Applies optional IO/Search categories, titles, and file paths. |
 
@@ -393,7 +393,7 @@ Codex rollout JSONL
 | MCP Config | `configuration/mcp.json.example` | `tools.invokeShell.enabled`, `tools.subagents.enabled`, `tools.counsel.enabled`, `tools.io.enabled`, `tools.googleSearch.enabled`, `googleSearch.apiKey` | Tool advertisement and handler availability. |
 | Codex Provider Tests | `providers/codex/test/index.test.js` | `Codex Provider`, `performHandshake`, `prepareAcpEnvironment`, `quota status`, `prompt lifecycle hooks`, `intercept`, `normalizeModelState`, `setConfigOption`, `tool helpers`, `getMcpServerMeta`, `session file operations` | Codex behavior coverage. |
 | Contract Tests | `backend/test/providerContract.test.js` | `every provider explicitly exports every contract function` | Required provider exports. |
-| Tool Resolver Tests | `backend/test/toolInvocationResolver.test.js` | `uses provider extraction as canonical tool identity`, `prefers centrally recorded MCP execution details over provider generic titles`, `can claim a recent MCP execution when the provider tool id arrives later` | Tool System V2 merge behavior. |
+| Tool Resolver Tests | `backend/test/toolInvocationResolver.test.js` | `uses provider extraction as canonical tool identity`, `prefers centrally recorded MCP execution details over provider generic titles`, `records sub-agent check title from waitForCompletion input`, `can claim a recent MCP execution when the provider tool id arrives later` | Tool System V2 merge behavior. |
 | Tool Normalization Tests | `backend/test/providerToolNormalization.test.js` | `extracts Codex-style MCP invocation metadata and command text`, `resolves AcpUI tool names from nested candidates and human MCP titles` | Shared parsing helpers. |
 | MCP Server Tests | `backend/test/mcpServer.test.js` | `createToolHandlers`, optional IO/Search handler cases, idempotent subagent/counsel cases | MCP handler registration and execution wrapping. |
 | MCP API Tests | `backend/test/mcpApi.test.js` | `GET /api/mcp/tools`, `POST /api/mcp/tool-call` | Tool advertisement and execution route behavior. |
@@ -463,7 +463,7 @@ Important test groups and cases:
 
 - `backend/test/providerContract.test.js` (Test: `every provider explicitly exports every contract function`)
 - `backend/test/providerToolNormalization.test.js` (Tests: `extracts Codex-style MCP invocation metadata and command text`, `resolves AcpUI tool names from nested candidates and human MCP titles`)
-- `backend/test/toolInvocationResolver.test.js` (Tests: `uses provider extraction as canonical tool identity`, `prefers centrally recorded MCP execution details over provider generic titles`, `can claim a recent MCP execution when the provider tool id arrives later`)
+- `backend/test/toolInvocationResolver.test.js` (Tests: `uses provider extraction as canonical tool identity`, `prefers centrally recorded MCP execution details over provider generic titles`, `records sub-agent check title from waitForCompletion input`, `can claim a recent MCP execution when the provider tool id arrives later`)
 - `backend/test/mcpServer.test.js` (Anchors: `createToolHandlers`, optional IO/Search registration, subagent/counsel idempotency)
 - `backend/test/mcpApi.test.js` (Routes: `GET /api/mcp/tools`, `POST /api/mcp/tool-call`)
 

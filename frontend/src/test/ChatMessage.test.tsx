@@ -30,6 +30,12 @@ vi.mock('react-markdown', () => ({
   }
 }));
 
+vi.mock('../components/ShellToolTerminal', () => ({
+  default: ({ event }: { event: { shellRunId?: string } }) => (
+    <div data-testid="shell-tool-terminal" data-run-id={event.shellRunId ?? ''} />
+  ),
+}));
+
 // Mock Lucide icons for easier testing if needed, though they render SVG by default
 // The current environment handles SVGs fine via class selectors.
 
@@ -96,6 +102,162 @@ describe('ChatMessage', () => {
     expect(headers[0].querySelector('.lucide-chevron-right')).not.toBeNull();
     // Tool step (index 1) is collapsed (isCollapsed=true)
     expect(headers[1].querySelector('.lucide-chevron-right')).not.toBeNull();
+  });
+
+  it('auto-collapses completed shell tool steps after a short settling delay', () => {
+    vi.useFakeTimers();
+    try {
+      const message: Message = {
+        id: '3-shell',
+        role: 'assistant',
+        content: 'done',
+        isStreaming: true,
+        timeline: [
+          {
+            type: 'tool',
+            isCollapsed: false,
+            event: {
+              id: 'shell-tool-1',
+              title: 'Invoke Shell: Sync check',
+              status: 'completed',
+              shellRunId: 'shell-run-1',
+              shellState: 'exited',
+              output: 'sync'
+            }
+          }
+        ]
+      };
+
+      render(<ChatMessage message={message} />);
+      let header = screen.getByRole('button', { name: /Invoke Shell: Sync check/i });
+      expect(header.querySelector('.lucide-chevron-down')).not.toBeNull();
+
+      act(() => {
+        vi.advanceTimersByTime(950);
+      });
+
+      header = screen.getByRole('button', { name: /Invoke Shell: Sync check/i });
+      expect(header.querySelector('.lucide-chevron-right')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps auto-collapsed terminal shell steps collapsed while later shell steps stream', () => {
+    vi.useFakeTimers();
+    try {
+      const message: Message = {
+        id: '3-shell-streaming',
+        role: 'assistant',
+        content: 'done',
+        isStreaming: true,
+        timeline: [
+          {
+            type: 'tool',
+            isCollapsed: false,
+            event: {
+              id: 'shell-tool-1',
+              title: 'Invoke Shell: Sync check',
+              status: 'completed',
+              shellRunId: 'shell-run-1',
+              shellState: 'exited',
+              output: 'sync'
+            }
+          }
+        ]
+      };
+
+      const { rerender } = render(<ChatMessage message={message} />);
+      let completedHeader = screen.getByRole('button', { name: /Invoke Shell: Sync check/i });
+      expect(completedHeader.querySelector('.lucide-chevron-down')).not.toBeNull();
+
+      act(() => {
+        vi.advanceTimersByTime(950);
+      });
+
+      completedHeader = screen.getByRole('button', { name: /Invoke Shell: Sync check/i });
+      expect(completedHeader.querySelector('.lucide-chevron-right')).not.toBeNull();
+
+      rerender(<ChatMessage message={{
+        ...message,
+        timeline: [
+          ...(message.timeline || []),
+          {
+            type: 'tool',
+            event: {
+              id: 'shell-tool-2',
+              title: 'Invoke Shell: Next check',
+              status: 'in_progress',
+              shellRunId: 'shell-run-2',
+              shellState: 'running'
+            }
+          }
+        ]
+      }} />);
+
+      completedHeader = screen.getByRole('button', { name: /Invoke Shell: Sync check/i });
+      expect(completedHeader.querySelector('.lucide-chevron-right')).not.toBeNull();
+      const activeHeader = screen.getByRole('button', { name: /Invoke Shell: Next check/i });
+      expect(activeHeader.querySelector('.lucide-chevron-down')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('auto-collapses the completed shell step, not a new preceding shell step, when indices shift before timeout', () => {
+    vi.useFakeTimers();
+    try {
+      const message: Message = {
+        id: '3-shell-index-shift',
+        role: 'assistant',
+        content: 'done',
+        isStreaming: true,
+        timeline: [
+          {
+            type: 'tool',
+            isCollapsed: false,
+            event: {
+              id: 'shell-tool-old',
+              title: 'Invoke Shell: Completed check',
+              status: 'completed',
+              shellRunId: 'shell-run-old',
+              shellState: 'exited',
+              output: 'done'
+            }
+          }
+        ]
+      };
+
+      const { rerender } = render(<ChatMessage message={message} />);
+      rerender(<ChatMessage message={{
+        ...message,
+        timeline: [
+          {
+            type: 'tool',
+            isCollapsed: false,
+            event: {
+              id: 'shell-tool-new',
+              title: 'Invoke Shell: Active check',
+              status: 'in_progress',
+              shellRunId: 'shell-run-new',
+              shellState: 'running'
+            }
+          },
+          ...(message.timeline || [])
+        ]
+      }} />);
+
+      act(() => {
+        vi.advanceTimersByTime(950);
+      });
+
+      const activeHeader = screen.getByRole('button', { name: /Invoke Shell: Active check/i });
+      const completedHeader = screen.getByRole('button', { name: /Invoke Shell: Completed check/i });
+      expect(activeHeader.querySelector('.lucide-chevron-down')).not.toBeNull();
+      expect(completedHeader.querySelector('.lucide-chevron-right')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('respects explicit thought collapse state from the streaming timeline', () => {
@@ -592,6 +754,10 @@ describe('ChatMessage - additional coverage', () => {
 });
 
 describe('ChatMessage - Collapse Fix (Regression)', () => {
+  beforeEach(() => {
+    useSubAgentStore.getState().clear();
+  });
+
   it('respects manual toggle during timeline updates while streaming', async () => {
     const initialTimeline: TimelineStep[] = [
       { type: 'thought', content: 'thinking 1', isCollapsed: true },
@@ -671,6 +837,184 @@ describe('ChatMessage - Collapse Fix (Regression)', () => {
 
     // It should STILL be expanded, even though the default for non-streaming is to collapse thoughts
     expect(screen.getByText('thinking 1')).toBeInTheDocument();
+  });
+
+  it('pins active sub-agent orchestration to the bottom after later parent work', () => {
+    useSubAgentStore.getState().startInvocation({
+      invocationId: 'inv-pinned',
+      providerId: 'test-provider',
+      parentUiId: 'parent-ui',
+      parentSessionId: 'parent-acp',
+      statusToolName: 'ux_check_subagents',
+      totalCount: 1,
+      status: 'running'
+    });
+    useSubAgentStore.getState().addAgent({
+      providerId: 'test-provider',
+      acpSessionId: 'sub-acp-1',
+      parentSessionId: 'parent-acp',
+      invocationId: 'inv-pinned',
+      index: 0,
+      name: 'Research',
+      prompt: 'Inspect the issue',
+      agent: 'test-agent'
+    });
+    useSubAgentStore.getState().setStatus('sub-acp-1', 'running');
+
+    const message: Message = {
+      id: 'msg-pinned-subagents',
+      role: 'assistant',
+      content: 'Parent continued after spawning agents',
+      isStreaming: true,
+      timeline: [
+        {
+          type: 'tool',
+          event: {
+            id: 'tool-subagents',
+            title: 'Invoke Subagents',
+            toolName: 'ux_invoke_subagents',
+            canonicalName: 'ux_invoke_subagents',
+            invocationId: 'inv-pinned',
+            status: 'in_progress',
+            isAcpUxTool: true
+          }
+        } as TimelineStep,
+        { type: 'text', content: 'Parent continued after spawning agents' },
+        { type: 'tool', event: { id: 'tool-parent-work', title: 'Parent follow-up tool', status: 'completed' } }
+      ]
+    };
+
+    const { container } = render(<ChatMessage message={message} />);
+
+    const pinnedPanel = container.querySelector('.sub-agent-pinned-panels');
+    expect(pinnedPanel).toBeInTheDocument();
+    expect(screen.getByText(/1: Research/)).toBeInTheDocument();
+    expect(screen.getByText('Invoke Subagents').closest('.timeline-step')?.querySelector('.sub-agent-panel')).toBeNull();
+
+    const followUpTool = screen.getByText('Parent follow-up tool').closest('.timeline-step');
+    expect(followUpTool).not.toBeNull();
+    expect(Boolean(followUpTool!.compareDocumentPosition(pinnedPanel!) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
+  });
+
+  it('auto-collapses bottom-pinned sub-agent orchestration two seconds after completion', () => {
+    vi.useFakeTimers();
+    try {
+      useSubAgentStore.getState().startInvocation({
+        invocationId: 'inv-auto-collapse',
+        providerId: 'test-provider',
+        parentUiId: 'parent-ui',
+        parentSessionId: 'parent-acp',
+        statusToolName: 'ux_check_subagents',
+        totalCount: 1,
+        status: 'running'
+      });
+      useSubAgentStore.getState().addAgent({
+        providerId: 'test-provider',
+        acpSessionId: 'sub-acp-auto',
+        parentSessionId: 'parent-acp',
+        invocationId: 'inv-auto-collapse',
+        index: 0,
+        name: 'Research',
+        prompt: 'Inspect the issue',
+        agent: 'test-agent'
+      });
+      useSubAgentStore.getState().setStatus('sub-acp-auto', 'running');
+
+      const message: Message = {
+        id: 'msg-auto-collapse-subagents',
+        role: 'assistant',
+        content: 'Parent continued after spawning agents',
+        isStreaming: true,
+        timeline: [
+          {
+            type: 'tool',
+            event: {
+              id: 'tool-subagents-auto',
+              title: 'Invoke Subagents',
+              toolName: 'ux_invoke_subagents',
+              canonicalName: 'ux_invoke_subagents',
+              invocationId: 'inv-auto-collapse',
+              status: 'in_progress',
+              isAcpUxTool: true
+            }
+          } as TimelineStep
+        ]
+      };
+
+      render(<ChatMessage message={message} />);
+      expect(screen.getByText(/1: Research/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /hide sub-agents/i })).toHaveAttribute('aria-expanded', 'true');
+
+      act(() => {
+        useSubAgentStore.getState().completeAgent('sub-acp-auto', 'completed');
+      });
+      expect(screen.getByText(/1: Research/)).toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(1999);
+      });
+      expect(screen.getByRole('button', { name: /hide sub-agents/i })).toHaveAttribute('aria-expanded', 'true');
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(screen.getByRole('button', { name: /show sub-agents/i })).toHaveAttribute('aria-expanded', 'false');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('allows the bottom-pinned sub-agent orchestration to be manually opened and closed', () => {
+    useSubAgentStore.getState().startInvocation({
+      invocationId: 'inv-manual-toggle',
+      providerId: 'test-provider',
+      parentUiId: 'parent-ui',
+      parentSessionId: 'parent-acp',
+      statusToolName: 'ux_check_subagents',
+      totalCount: 1,
+      status: 'running'
+    });
+    useSubAgentStore.getState().addAgent({
+      providerId: 'test-provider',
+      acpSessionId: 'sub-acp-manual',
+      parentSessionId: 'parent-acp',
+      invocationId: 'inv-manual-toggle',
+      index: 0,
+      name: 'Research',
+      prompt: 'Inspect the issue',
+      agent: 'test-agent'
+    });
+    useSubAgentStore.getState().setStatus('sub-acp-manual', 'running');
+
+    const message: Message = {
+      id: 'msg-manual-toggle-subagents',
+      role: 'assistant',
+      content: 'Parent continued after spawning agents',
+      isStreaming: true,
+      timeline: [
+        {
+          type: 'tool',
+          event: {
+            id: 'tool-subagents-manual',
+            title: 'Invoke Subagents',
+            toolName: 'ux_invoke_subagents',
+            canonicalName: 'ux_invoke_subagents',
+            invocationId: 'inv-manual-toggle',
+            status: 'in_progress',
+            isAcpUxTool: true
+          }
+        } as TimelineStep
+      ]
+    };
+
+    render(<ChatMessage message={message} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /hide sub-agents/i }));
+    expect(screen.getByRole('button', { name: /show sub-agents/i })).toHaveAttribute('aria-expanded', 'false');
+
+    fireEvent.click(screen.getByRole('button', { name: /show sub-agents/i }));
+    expect(screen.getByRole('button', { name: /hide sub-agents/i })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText(/1: Research/)).toBeInTheDocument();
   });
 
   it('keeps active sub-agent orchestration expanded after remount', () => {

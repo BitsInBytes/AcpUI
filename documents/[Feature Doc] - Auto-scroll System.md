@@ -491,8 +491,8 @@ React commit or syntax-highlighted/code/tool content grows .chat-content
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Tool output panes | `frontend/src/components/ToolStep.tsx` | local output container scroll effect, `ShellToolTerminal`, `SubAgentPanel` | Inner tool-pane scrolling, separate from the chat container auto-scroll gate |
-| Message rendering | `frontend/src/components/HistoryList.tsx`, `frontend/src/components/ChatMessage.tsx`, `frontend/src/components/AssistantMessage.tsx` | `HistoryList`, `ChatMessage`, `AssistantMessage` | Content rendered inside `.chat-content`; content growth can trigger the observer |
+| Tool output panes | `frontend/src/components/ToolStep.tsx` | local output container scroll effect, `ShellToolTerminal` | Inner tool-pane scrolling, separate from the chat container auto-scroll gate |
+| Message rendering | `frontend/src/components/HistoryList.tsx`, `frontend/src/components/ChatMessage.tsx`, `frontend/src/components/AssistantMessage.tsx` | `HistoryList`, `ChatMessage`, `AssistantMessage`, `.sub-agent-pinned-panels` | Content rendered inside `.chat-content`, including bottom-pinned sub-agent panels; content growth can trigger the observer |
 
 ---
 

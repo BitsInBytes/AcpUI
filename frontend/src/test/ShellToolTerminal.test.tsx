@@ -381,6 +381,30 @@ describe('ShellToolTerminal', () => {
     expect(screen.getByTitle('Stop command')).toBeDisabled();
   });
 
+  it('settles read-only output at terminal height before compacting after exit', () => {
+    useShellRunStore.getState().upsertSnapshot({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      runId: 'shell-run-1',
+      status: 'running',
+      transcript: '$ node -p "sync"\nsync\n'
+    });
+    const { container, rerender } = render(<ShellToolTerminal event={baseEvent()} />);
+
+    act(() => {
+      useShellRunStore.getState().markExited({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-1' });
+    });
+    rerender(<ShellToolTerminal event={baseEvent({ shellState: 'exited', status: 'completed', output: 'sync' })} />);
+
+    expect(container.querySelector('.shell-tool-terminal-readonly')?.classList.contains('is-settling')).toBe(true);
+
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(container.querySelector('.shell-tool-terminal-readonly')?.classList.contains('is-settling')).toBe(false);
+  });
+
   it('focuses xterm when terminal is running and session is active', () => {
     useShellRunStore.getState().upsertSnapshot({
       providerId: 'provider-a',

@@ -96,7 +96,9 @@ export function prettyToolTitle(toolName, fallback = 'Tool') {
 }
 
 export function resolveToolNameFromAcpUiMcpTitle(title) {
-  return ACP_UX_MCP_TITLE_TO_TOOL_NAME[titleLookupKey(title)] || '';
+  const key = titleLookupKey(title);
+  const prefixKey = titleLookupKey(String(title || '').split(':')[0]);
+  return ACP_UX_MCP_TITLE_TO_TOOL_NAME[key] || ACP_UX_MCP_TITLE_TO_TOOL_NAME[prefixKey] || '';
 }
 
 export function collectDeepInputValues(value, output = {}, seen = new Set()) {

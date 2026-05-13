@@ -7,6 +7,7 @@ import { useStreamStore } from '../store/useStreamStore';
 import { useVoiceStore } from '../store/useVoiceStore';
 import { useSubAgentStore } from '../store/useSubAgentStore';
 import { useShellRunStore, type ShellRunSnapshot } from '../store/useShellRunStore';
+import { ACP_UX_TOOL_NAMES, isAcpUxShellToolEvent, isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
 
 /**
  * Central socket event dispatcher. Wires socket.io events to the appropriate stores.
@@ -81,10 +82,10 @@ export function useChatManager(
       status: shellEventStatus(snapshot, patch),
       providerId: snapshot.providerId,
       sessionId: snapshot.sessionId,
-      toolName: 'ux_invoke_shell',
-      canonicalName: 'ux_invoke_shell',
+      toolName: ACP_UX_TOOL_NAMES.invokeShell,
+      canonicalName: ACP_UX_TOOL_NAMES.invokeShell,
       mcpServer: 'AcpUI',
-      mcpToolName: 'ux_invoke_shell',
+      mcpToolName: ACP_UX_TOOL_NAMES.invokeShell,
       isAcpUxTool: true,
       toolCategory: 'shell',
       isShellCommand: true,
@@ -99,52 +100,97 @@ export function useChatManager(
       ...patch
     });
 
+    const isShellToolEvent = (event: Partial<SystemEvent | StreamEventData>) => (
+      isAcpUxShellToolEvent(event) || event.isShellCommand === true || event.toolCategory === 'shell'
+    );
+
+    const matchesShellDescription = (event: Partial<SystemEvent | StreamEventData>, snapshot?: ShellRunSnapshot) => {
+      if (!snapshot?.description || !isShellToolEvent(event)) return false;
+      return event.title === `Invoke Shell: ${snapshot.description}`;
+    };
+
+    const upsertQueuedShellRunToolEvent = (
+      snapshot: ShellRunSnapshot,
+      event: StreamEventData & Partial<SystemEvent>
+    ) => {
+      const queue = useStreamStore.getState().streamQueues[snapshot.sessionId] || [];
+      const candidates = queue
+        .map((item, index) => ({
+          index,
+          data: item?.data as (StreamEventData & Partial<SystemEvent>) | undefined,
+          type: item?.type
+        }))
+        .filter(item => item.type === 'event' && item.data?.type === 'tool_start');
+      const runMatch = candidates.find(item => item.data?.shellRunId === snapshot.runId);
+      const toolCallMatch = candidates.find(item => !item.data?.shellRunId && snapshot.toolCallId && item.data?.id === snapshot.toolCallId);
+      const descriptionMatches = candidates.filter(item => !item.data?.shellRunId && matchesShellDescription(item.data || {}, snapshot));
+      const queuedIndex = runMatch?.index ?? toolCallMatch?.index ?? (descriptionMatches.length === 1 ? descriptionMatches[0].index : -1);
+
+      if (queuedIndex === -1) return false;
+
+      useStreamStore.setState(state => {
+        const nextQueue = [...(state.streamQueues[snapshot.sessionId] || [])];
+        const item = nextQueue[queuedIndex];
+        if (!item?.data) return {};
+        const existingData = item.data as StreamEventData & Partial<SystemEvent>;
+        nextQueue[queuedIndex] = {
+          ...item,
+          data: {
+            ...existingData,
+            ...event,
+            id: existingData.id || event.id,
+            title: event.title || existingData.title,
+            status: event.status || existingData.status,
+            startTime: existingData.startTime || event.startTime,
+            output: event.output ?? existingData.output,
+            endTime: event.endTime ?? existingData.endTime
+          }
+        };
+        return {
+          isProcessActiveByAcp: { ...state.isProcessActiveByAcp, [snapshot.sessionId]: true },
+          streamQueues: { ...state.streamQueues, [snapshot.sessionId]: nextQueue }
+        };
+      });
+      return true;
+    };
+
     const ensureShellRunToolStep = (snapshot: ShellRunSnapshot, patch: Partial<SystemEvent>) => {
       if (!snapshot.sessionId || !snapshot.runId) return;
-      useStreamStore.getState().ensureAssistantMessage(snapshot.sessionId);
-      const activeMsgId = useStreamStore.getState().activeMsgIdByAcp[snapshot.sessionId];
-      if (!activeMsgId) return;
-
-      useSessionLifecycleStore.setState(state => ({
-        sessions: state.sessions.map(session => {
-          if (session.acpSessionId !== snapshot.sessionId) return session;
-          return {
-            ...session,
-            messages: session.messages.map(message => {
-              if (message.id !== activeMsgId) return message;
-              const timeline = message.timeline || [];
-              const existing = timeline.some(entry =>
-                entry.type === 'tool' &&
-                (entry.event.shellRunId === snapshot.runId || (!entry.event.shellRunId && snapshot.toolCallId && entry.event.id === snapshot.toolCallId))
-              );
-              if (existing) return message;
-              return {
-                ...message,
-                timeline: [...timeline, { type: 'tool', event: buildShellRunToolEvent(snapshot, patch), isCollapsed: false }]
-              };
-            })
-          };
-        })
-      }));
+      const event = {
+        ...buildShellRunToolEvent(snapshot, patch),
+        type: 'tool_start'
+      } as StreamEventData & Partial<SystemEvent>;
+      if (upsertQueuedShellRunToolEvent(snapshot, event)) return;
+      useStreamStore.getState().onStreamEvent(event);
     };
 
     const patchShellRunToolStep = (runId: string, patch: Partial<SystemEvent>, snapshot?: ShellRunSnapshot) => {
       let matched = false;
+      const activeMsgId = snapshot?.sessionId ? useStreamStore.getState().activeMsgIdByAcp[snapshot.sessionId] : undefined;
       useSessionLifecycleStore.setState(state => ({
-        sessions: state.sessions.map(session => ({
-          ...session,
-          messages: session.messages.map(message => ({
-            ...message,
-            timeline: message.timeline?.map(entry => {
-              if (entry.type !== 'tool') return entry;
-              const sameRun = entry.event.shellRunId === runId;
-              const sameToolCall = !entry.event.shellRunId && snapshot?.toolCallId && entry.event.id === snapshot.toolCallId;
-              if (!sameRun && !sameToolCall) return entry;
-              matched = true;
-              return { ...entry, event: { ...entry.event, ...patch, shellRunId: runId } };
-            }) || message.timeline
-          }))
-        }))
+        sessions: state.sessions.map(session => {
+          if (snapshot?.sessionId && session.acpSessionId && session.acpSessionId !== snapshot.sessionId) return session;
+          return {
+            ...session,
+            messages: session.messages.map(message => {
+              const descriptionMatches = message.id === activeMsgId
+                ? (message.timeline || []).filter(entry => entry.type === 'tool' && !entry.event.shellRunId && matchesShellDescription(entry.event, snapshot))
+                : [];
+              return {
+                ...message,
+                timeline: message.timeline?.map(entry => {
+                  if (entry.type !== 'tool') return entry;
+                  const sameRun = entry.event.shellRunId === runId;
+                  const sameToolCall = !entry.event.shellRunId && snapshot?.toolCallId && entry.event.id === snapshot.toolCallId;
+                  const sameDescription = descriptionMatches.length === 1 && descriptionMatches[0] === entry;
+                  if (!sameRun && !sameToolCall && !sameDescription) return entry;
+                  matched = true;
+                  return { ...entry, event: { ...entry.event, ...patch, shellRunId: runId } };
+                }) || message.timeline
+              };
+            })
+          };
+        })
       }));
       if (!matched && snapshot) ensureShellRunToolStep(snapshot, patch);
     };
@@ -295,7 +341,7 @@ export function useChatManager(
 
     // Sub-agent events
     //
-    // sub_agents_starting fires immediately when ux_invoke_subagents begins (before the
+    // sub_agents_starting fires immediately when the sub-agent start tool begins (before the
     // 1-second stagger), so the UI clears stale sidebar sessions right away instead of
     // waiting for the first sub_agent_started event (fixes the "flash of old agents" bug).
     socket.on('sub_agents_starting', (data: { invocationId: string; parentAcpSessionId?: string | null; parentUiId: string | null; providerId: string; count: number; statusToolName?: string }) => {
@@ -310,7 +356,7 @@ export function useChatManager(
         providerId: data.providerId,
         parentUiId,
         parentSessionId,
-        statusToolName: data.statusToolName || 'ux_check_subagents',
+        statusToolName: data.statusToolName || ACP_UX_TOOL_NAMES.checkSubagents,
         totalCount: data.count,
         status: 'spawning'
       });
@@ -335,8 +381,8 @@ export function useChatManager(
       useSubAgentStore.getState().addAgent({ ...data, parentSessionId });
       pendingSubAgents.set(data.acpSessionId, { ...data, parentSessionId, parentUiId, model: data.model || 'balanced' });
 
-      // Stamp the invocationId onto the in-progress ux_invoke_subagents / ux_invoke_counsel
-      // ToolStep on the first agent (index 0).  We defer to here rather than sub_agents_starting
+      // Stamp the invocationId onto the in-progress sub-agent start ToolStep
+      // on the first agent (index 0).  We defer to here rather than sub_agents_starting
       // because the ToolStep is processed asynchronously through the stream queue/typewriter —
       // by the time sub_agent_started[0] arrives (after at least one RPC roundtrip, 100ms+),
       // the ToolStep is guaranteed to be in useSessionLifecycleStore.
@@ -351,7 +397,7 @@ export function useChatManager(
               if (
                 entry.type === 'tool' &&
                 entry.event.status === 'in_progress' &&
-                (entry.event.toolName === 'ux_invoke_subagents' || entry.event.toolName === 'ux_invoke_counsel')
+                isAcpUxSubAgentStartToolEvent(entry.event)
               ) {
                 return { ...entry, event: { ...entry.event, invocationId: data.invocationId } };
               }
@@ -381,7 +427,7 @@ export function useChatManager(
         providerId: data.providerId,
         parentUiId,
         parentSessionId,
-        statusToolName: 'ux_check_subagents',
+        statusToolName: ACP_UX_TOOL_NAMES.checkSubagents,
         totalCount: 1,
         status: data.status as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled'
       });
@@ -409,7 +455,7 @@ export function useChatManager(
         providerId: data.providerId,
         parentUiId: data.parentUiId || null,
         parentSessionId: data.parentAcpSessionId || null,
-        statusToolName: data.statusToolName || 'ux_check_subagents',
+        statusToolName: data.statusToolName || ACP_UX_TOOL_NAMES.checkSubagents,
         totalCount: data.totalCount || 0,
         status
       });

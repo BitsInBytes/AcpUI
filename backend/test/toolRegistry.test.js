@@ -29,11 +29,29 @@ describe('ToolRegistry', () => {
   it('titles sub-agent status tools by canonical identity', () => {
     expect(subAgentStatusToolHandler.onStart(
       {},
-      { identity: { canonicalName: ACP_UX_TOOL_NAMES.checkSubagents } },
+      { identity: { canonicalName: ACP_UX_TOOL_NAMES.checkSubagents }, input: {} },
       { toolName: ACP_UX_TOOL_NAMES.checkSubagents }
     )).toEqual(expect.objectContaining({
       canonicalName: ACP_UX_TOOL_NAMES.checkSubagents,
-      title: 'Check Subagents'
+      title: 'Check Subagents: Waiting for agents to finish'
+    }));
+
+    expect(subAgentStatusToolHandler.onStart(
+      {},
+      { identity: { canonicalName: ACP_UX_TOOL_NAMES.checkSubagents }, input: { waitForCompletion: false } },
+      { toolName: ACP_UX_TOOL_NAMES.checkSubagents }
+    )).toEqual(expect.objectContaining({
+      canonicalName: ACP_UX_TOOL_NAMES.checkSubagents,
+      title: 'Check Subagents: Quick status check'
+    }));
+
+    expect(subAgentStatusToolHandler.onStart(
+      {},
+      { identity: { canonicalName: ACP_UX_TOOL_NAMES.checkSubagents }, input: {} },
+      { toolName: ACP_UX_TOOL_NAMES.checkSubagents, title: 'Check Subagents: Quick status check' }
+    )).toEqual(expect.objectContaining({
+      canonicalName: ACP_UX_TOOL_NAMES.checkSubagents,
+      title: 'Check Subagents: Quick status check'
     }));
 
     expect(subAgentStatusToolHandler.onStart(

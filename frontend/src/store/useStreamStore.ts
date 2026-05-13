@@ -4,10 +4,34 @@ import { useSystemStore } from './useSystemStore';
 import { useShellRunStore } from './useShellRunStore';
 import type { Socket } from 'socket.io-client';
 import { useSubAgentStore } from './useSubAgentStore';
-import type { StreamTokenData, StreamEventData, StreamDoneData, Message, TimelineStep } from '../types';
+import { isAcpUxShellToolEvent, isAcpUxShellToolName, isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
+import type { StreamTokenData, StreamEventData, StreamDoneData, Message, TimelineStep, SystemEvent } from '../types';
 
 function isShellDescriptionTitle(title?: string) {
   return /^Invoke Shell:\s*\S/i.test(title || '');
+}
+
+function isShellToolData(event: Partial<StreamEventData & SystemEvent>) {
+  return isAcpUxShellToolEvent(event) || event.isShellCommand === true || event.toolCategory === 'shell';
+}
+
+function isTerminalToolStatus(status?: string) {
+  return status === 'completed' || status === 'failed';
+}
+
+function isActiveShellToolStep(step?: TimelineStep) {
+  return step?.type === 'tool' && isShellToolData(step.event) && !isTerminalToolStatus(step.event.status);
+}
+
+function isSameShellDescriptionTitle(existingTitle?: string, incomingTitle?: string) {
+  return Boolean(existingTitle && incomingTitle && isShellDescriptionTitle(existingTitle) && existingTitle === incomingTitle);
+}
+
+function uniqueShellDescriptionMatchIndex(timeline: TimelineStep[], incomingTitle?: string) {
+  const matches = timeline
+    .map((step, index) => ({ step, index }))
+    .filter(({ step }) => step.type === 'tool' && isShellToolData(step.event) && isSameShellDescriptionTitle(step.event.title, incomingTitle));
+  return matches.length === 1 ? matches[0].index : -1;
 }
 
 function shellRunPatch(shellRunId?: string) {
@@ -22,22 +46,18 @@ function shellRunPatch(shellRunId?: string) {
   };
 }
 
-const SUB_AGENT_TOOL_NAMES = new Set(['ux_invoke_subagents', 'ux_invoke_counsel']);
-
 function isActiveSubAgentToolStep(step?: TimelineStep) {
   if (!step || step.type !== 'tool') return false;
   const event = step.event;
-  const toolName = event.canonicalName || event.toolName || event.mcpToolName;
   return Boolean(
-    toolName &&
-    SUB_AGENT_TOOL_NAMES.has(toolName) &&
+    isAcpUxSubAgentStartToolEvent(event) &&
     event.invocationId &&
     useSubAgentStore.getState().isInvocationActive(event.invocationId)
   );
 }
 
 function collapseForNewTimelineStep(step: TimelineStep): TimelineStep {
-  if (isActiveSubAgentToolStep(step)) return { ...step, isCollapsed: false };
+  if (isActiveShellToolStep(step) || isActiveSubAgentToolStep(step)) return { ...step, isCollapsed: false };
   return { ...step, isCollapsed: true };
 }
 
@@ -285,15 +305,32 @@ export const useStreamStore = create<StreamState>((set, get) => ({
               const t = [...(msg.timeline || [])];
               if (type === 'permission_request') t.push({ type: 'permission', request: action.data, isCollapsed: false });
               else if (type === 'tool_start') {
-                const shellPatch = shellRunPatch(action.data.shellRunId) as Partial<StreamEventData>;
+                const shellPatch = shellRunPatch(action.data.shellRunId) as Partial<StreamEventData & SystemEvent>;
+                const incomingTerminalStatus = isTerminalToolStatus(action.data.status);
+                const incomingStatus = incomingTerminalStatus ? action.data.status : 'in_progress';
+                const uniqueDescriptionIdx = uniqueShellDescriptionMatchIndex(t, action.data.title);
                 const existingShellIdx = action.data.shellRunId
-                  ? t.findLastIndex(s => s.type === 'tool' && s.event.shellRunId === action.data.shellRunId)
-                  : -1;
+                  ? t.findLastIndex((s, index) => {
+                    if (s.type !== 'tool') return false;
+                    if (s.event.shellRunId === action.data.shellRunId) return true;
+                    if (s.event.shellRunId || !isShellToolData(s.event)) return false;
+                    return Boolean(action.data.id && s.event.id === action.data.id) || index === uniqueDescriptionIdx;
+                  })
+                  : isShellToolData(action.data)
+                    ? t.findLastIndex((s, index) => {
+                      if (s.type !== 'tool' || !isShellToolData(s.event)) return false;
+                      if (s.event.shellRunId) {
+                        return Boolean(action.data.id && s.event.id === action.data.id) || index === uniqueDescriptionIdx;
+                      }
+                      return Boolean(action.data.id && s.event.id === action.data.id);
+                    })
+                    : -1;
 
                 if (existingShellIdx !== -1) {
                   const existingStep = t[existingShellIdx];
                   if (existingStep.type === 'tool') {
-                    const terminalStatus = existingStep.event.status === 'completed' || existingStep.event.status === 'failed';
+                    const existingTerminalStatus = isTerminalToolStatus(existingStep.event.status);
+                    const terminalStatus = existingTerminalStatus || incomingTerminalStatus;
                     const existingTitle = existingStep.event.title || '';
                     const incomingTitle = shellPatch.title || action.data.title || existingTitle;
                     const title = isShellDescriptionTitle(existingTitle) && !shellPatch.title ? existingTitle : incomingTitle;
@@ -305,8 +342,10 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                         ...action.data,
                         ...shellPatch,
                         title,
-                        status: terminalStatus ? existingStep.event.status : 'in_progress',
-                        startTime: existingStep.event.startTime || Date.now()
+                        status: terminalStatus ? (incomingTerminalStatus ? action.data.status : existingStep.event.status) : 'in_progress',
+                        output: action.data.output ?? existingStep.event.output,
+                        startTime: existingStep.event.startTime || action.data.startTime || Date.now(),
+                        endTime: action.data.endTime || existingStep.event.endTime
                       },
                       isCollapsed: terminalStatus ? existingStep.isCollapsed : false
                     };
@@ -319,8 +358,9 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                     event: {
                       ...action.data,
                       ...shellPatch,
-                      status: 'in_progress',
-                      startTime: Date.now()
+                      status: incomingStatus,
+                      startTime: action.data.startTime || Date.now(),
+                      endTime: action.data.endTime
                     },
                     isCollapsed: false
                   });
@@ -359,7 +399,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                       bestTitle = existingTitle;
                       bestTitleSource = existingTitleSource;
                     } else if (
-                      (existingStep.event.canonicalName || existingStep.event.toolName) === 'ux_invoke_shell' &&
+                      isAcpUxShellToolName(existingStep.event.canonicalName || existingStep.event.toolName) &&
                       isShellDescriptionTitle(existingTitle)
                     ) {
                       bestTitle = existingTitle;

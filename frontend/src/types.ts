@@ -205,11 +205,11 @@ export interface SystemEvent {
   _fallbackOutput?: string;
   startTime?: number;
   endTime?: number;
-  /** Set by the sub_agents_starting event handler to correlate this ux_invoke_subagents
+  /** Set by the sub_agents_starting event handler to correlate this sub-agent start
    *  ToolStep with the specific batch of sub-agents it spawned. Enables per-invocation
    *  filtering in SubAgentPanel so historical turns show their own agents. */
   invocationId?: string;
-  /** Shell run id assigned by the backend before ux_invoke_shell starts.
+  /** Shell run id assigned by the backend before shell execution starts.
    *  Used for terminal stdin, resize, kill, snapshot replay, and output routing. */
   shellRunId?: string;
   shellInteractive?: boolean;

@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 
 /**
- * Parallel UI state for sub-agent sessions spawned by ux_invoke_subagents.
+ * Parallel UI state for spawned sub-agent sessions.
  *
  * Sub-agents have their own ACP sessions but are rendered in a compact panel
  * (not full chat tabs). This store tracks their streaming output, tool steps,
@@ -29,7 +29,7 @@ export interface SubAgentEntry {
   providerId: string;
   acpSessionId: string;
   parentSessionId: string;
-  /** Unique ID for the specific ux_invoke_subagents call that spawned this agent.
+  /** Unique ID for the specific sub-agent start call that spawned this agent.
    *  Correlates agents to the ToolStep that owns them, enabling per-invocation
    *  filtering so historical turns each show their own agents. */
   invocationId: string;

@@ -392,7 +392,7 @@ Service errors:
 | Tool registry | `backend/services/tools/index.js` | `toolRegistry.register`, `ACP_UX_IO_TOOL_NAMES` loop | Registers the generic IO handler for all AcpUI IO tools, including Google search |
 | Execution metadata | `backend/services/tools/mcpExecutionRegistry.js` | `publicMcpToolInput`, `begin`, `describeAcpUxToolExecution`, `invocationFromMcpExecution`, `emitMcpToolUpdate` | Records execution identity/input/output and emits timeline metadata |
 | Invocation resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider extraction, cached tool state, and central MCP execution data |
-| Tool title normalization | `backend/services/tools/providerToolNormalization.js` | `ACP_UX_MCP_TITLE_TO_TOOL_NAME`, `resolveToolNameFromAcpUiMcpTitle` | Maps MCP titles such as `Google web search` to canonical tool names |
+| Tool title normalization | `backend/services/tools/providerToolNormalization.js` | `ACP_UX_MCP_TITLE_TO_TOOL_NAME`, `resolveToolNameFromAcpUiMcpTitle` | Maps full MCP titles or prefixes such as `Google web search` before `: <detail>` suffixes to canonical tool names |
 | Service tests | `backend/test/ioMcpGoogleSearch.test.js` | `IO MCP googleWebSearch` | Covers config key requirement, empty output, citations/sources, SDK errors, API key loading, truncation |
 | Config tests | `backend/test/mcpConfig.test.js` | `MCP config` | Covers Google search config normalization and effective gating |
 | API tests | `backend/test/mcpApi.test.js` | `MCP API Routes` | Covers tool advertisement, hidden states, POST context augmentation, abort behavior, error envelopes |

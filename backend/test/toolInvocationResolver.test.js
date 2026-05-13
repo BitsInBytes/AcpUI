@@ -131,6 +131,33 @@ describe('toolInvocationResolver', () => {
     expect(event.isAcpUxTool).toBe(true);
   });
 
+  it('records sub-agent check title from waitForCompletion input', () => {
+    mcpExecutionRegistry.begin({
+      providerId: 'p',
+      sessionId: 's',
+      mcpRequestId: 'mcp_AcpUI_ux_check_subagents-1',
+      toolName: 'ux_check_subagents',
+      input: { invocationId: 'inv-1', waitForCompletion: false }
+    });
+
+    const invocation = resolveToolInvocation({
+      providerId: 'p',
+      sessionId: 's',
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'mcp_AcpUI_ux_check_subagents-1',
+        title: 'Tool: AcpUI/ux_check_subagents'
+      },
+      event: { id: 'mcp_AcpUI_ux_check_subagents-1', type: 'tool_start', title: 'Tool: AcpUI/ux_check_subagents' },
+      providerModule: { extractToolInvocation: () => null },
+      acpUiMcpServerName: 'AcpUI'
+    });
+
+    const event = applyInvocationToEvent({ id: 'mcp_AcpUI_ux_check_subagents-1' }, invocation);
+    expect(event.title).toBe('Check Subagents: Quick status check');
+    expect(event.isAcpUxTool).toBe(true);
+  });
+
   it('can claim a recent MCP execution when the provider tool id arrives later', () => {
     mcpExecutionRegistry.begin({
       providerId: 'p',

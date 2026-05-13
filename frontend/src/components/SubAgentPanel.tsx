@@ -6,7 +6,7 @@ import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import './SubAgentPanel.css';
 
 interface SubAgentPanelProps {
-  /** The invocationId from the parent ux_invoke_subagents ToolStep's SystemEvent.
+  /** The invocationId from the parent sub-agent start ToolStep's SystemEvent.
    *  Filters the store to only the agents spawned by that specific tool call,
    *  ensuring historical turns each show their own batch of agents. */
   invocationId?: string;
@@ -33,7 +33,7 @@ function renderToolStatusIcon(status: string) {
 
 /**
  * Displays sub-agent tool steps and permission prompts only -- no streaming text.
- * Embedded inside the parent's ux_invoke_subagents ToolStep when expanded.
+ * Embedded inside the parent's sub-agent start ToolStep when expanded.
  * Agents are filtered by invocationId so each ToolStep shows only its own agents.
  */
 const SubAgentPanel: React.FC<SubAgentPanelProps> = ({ invocationId }) => {

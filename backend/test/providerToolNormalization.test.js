@@ -70,6 +70,7 @@ describe('providerToolNormalization', () => {
     expect(resolveToolNameFromCandidates(candidates, config)).toBe('ux_read_file');
     expect(resolveToolNameFromAcpUiMcpTitle('Read file')).toBe('ux_read_file');
     expect(resolveToolNameFromAcpUiMcpTitle('Check Subagents')).toBe('ux_check_subagents');
+    expect(resolveToolNameFromAcpUiMcpTitle('Check Subagents: Quick status check')).toBe('ux_check_subagents');
     expect(resolveToolNameFromAcpUiMcpTitle('Abort Subagents')).toBe('ux_abort_subagents');
   });
 

@@ -258,6 +258,46 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(tool.event.shellState).toBe('running');
   });
 
+  it('keeps active parallel shell tool starts expanded while later shell steps arrive', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'shell-tool-1',
+        title: 'Invoke Shell: Check Node.js version (1 of 3)',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'shell-tool-2',
+        title: 'Invoke Shell: Check Node.js version (2 of 3)',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-2'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'shell-tool-3',
+        title: 'Invoke Shell: Check Node.js version (3 of 3)',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-3'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline).toHaveLength(3);
+    expect(timeline.map(step => step.isCollapsed)).toEqual([false, false, false]);
+  });
+
   it('merges duplicate shell tool_start events by shellRunId', () => {
     act(() => {
       useShellRunStore.getState().upsertSnapshot({
@@ -308,6 +348,122 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(tool.event.status).toBe('completed');
     expect(tool.event.title).toBe('Invoke Shell: Check working tree status');
     expect(tool.event.shellRunId).toBe('shell-run-1');
+  });
+
+  it('merges provider shell tool_start without run id into an existing shell run by description', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'shell-fallback-id',
+        title: 'Invoke Shell: Check Node.js version',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-node-version',
+        command: 'node --version'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'provider-tool-id',
+        title: 'Invoke Shell: Check Node.js version',
+        toolName: 'ux_invoke_shell'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline).toHaveLength(1);
+    const tool = timeline[0] as any;
+    expect(tool.event.id).toBe('provider-tool-id');
+    expect(tool.event.shellRunId).toBe('shell-run-node-version');
+    expect(tool.event.command).toBe('node --version');
+  });
+
+  it('does not merge same-title shell starts when description matching is ambiguous', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'shell-fallback-a',
+        title: 'Invoke Shell: Run sync check',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-a',
+        command: 'node --version'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'shell-fallback-b',
+        title: 'Invoke Shell: Run sync check',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-b',
+        command: 'npm --version'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'provider-tool-id',
+        title: 'Invoke Shell: Run sync check',
+        toolName: 'ux_invoke_shell'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline).toHaveLength(3);
+    expect((timeline[0] as any).event.shellRunId).toBe('shell-run-a');
+    expect((timeline[1] as any).event.shellRunId).toBe('shell-run-b');
+    expect((timeline[2] as any).event.id).toBe('provider-tool-id');
+    expect((timeline[2] as any).event.shellRunId).toBeUndefined();
+  });
+
+  it('merges duplicate provider shell tool_start events before a shell run id is attached', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'provider-tool-id',
+        title: 'Invoke Shell: Check Node.js version (1 of 3)',
+        toolName: 'ux_invoke_shell'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'provider-tool-id',
+        title: 'Invoke Shell: Check Node.js version (1 of 3)',
+        toolName: 'ux_invoke_shell'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 'shell-fallback-id',
+        title: 'Invoke Shell: Check Node.js version (1 of 3)',
+        toolName: 'ux_invoke_shell',
+        shellRunId: 'shell-run-node-version',
+        command: 'node --version'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline).toHaveLength(1);
+    const tool = timeline[0] as any;
+    expect(tool.event.id).toBe('shell-fallback-id');
+    expect(tool.event.shellRunId).toBe('shell-run-node-version');
+    expect(tool.event.command).toBe('node --version');
   });
 
   it('merges shell tool_end events by shellRunId when tool ids differ', () => {

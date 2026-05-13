@@ -42,6 +42,7 @@ const PROMPT_ANSI_RESETS_AND_BLANK_ROWS = /^(\$ [^\n]*\n)((?:\x1b\[[0-9;]*m)*)(?
 const XTERM_WRITE_CHUNK_SIZE = 64 * 1024;
 const TRANSCRIPT_OVERLAP_SCAN_LIMIT = 64 * 1024;
 const MIN_TRIM_OVERLAP = 32;
+const READONLY_SETTLE_MS = 260;
 
 function getSuffixPrefixOverlap(previous: string, next: string) {
   if (!previous || !next) return 0;
@@ -161,6 +162,7 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
   const writeInFlightRef = useRef(false);
   const writeGenerationRef = useRef(0);
   const drainWriteQueueRef = useRef<() => void>(() => undefined);
+  const wasInteractiveRef = useRef(false);
   const isRunning = run?.status === 'running';
   const isInteractiveTerminal = Boolean(run && run.status !== 'exited');
   const canStop = Boolean(run && run.status !== 'exited');
@@ -171,6 +173,28 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
     () => getReadOnlyTerminalHtml(run, event),
     [event, run]
   );
+
+  useLayoutEffect(() => {
+    if (isInteractiveTerminal) {
+      wasInteractiveRef.current = true;
+      return;
+    }
+
+    if (!wasInteractiveRef.current) return;
+    const readOnly = readOnlyRef.current;
+    if (!readOnly) return;
+
+    readOnly.classList.add('is-settling');
+    const timer = setTimeout(() => {
+      readOnly.classList.remove('is-settling');
+      wasInteractiveRef.current = false;
+    }, READONLY_SETTLE_MS);
+
+    return () => {
+      clearTimeout(timer);
+      readOnly.classList.remove('is-settling');
+    };
+  }, [isInteractiveTerminal, readOnlyHtml]);
 
   useEffect(() => {
     runRef.current = run;
@@ -375,7 +399,11 @@ const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
       {isInteractiveTerminal ? (
         <div ref={containerRef} className="shell-tool-terminal-surface" />
       ) : (
-        <pre ref={readOnlyRef} className="shell-tool-terminal-readonly" dangerouslySetInnerHTML={{ __html: readOnlyHtml }} />
+        <pre
+          ref={readOnlyRef}
+          className="shell-tool-terminal-readonly"
+          dangerouslySetInnerHTML={{ __html: readOnlyHtml }}
+        />
       )}
     </div>
   );

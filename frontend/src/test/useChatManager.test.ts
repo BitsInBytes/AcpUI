@@ -32,6 +32,17 @@ describe('useChatManager hook', () => {
     });
   });
 
+  const flushStreamBuffer = () => {
+    act(() => {
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+    const interval = useStreamStore.getState().typewriterInterval;
+    if (interval) {
+      clearTimeout(interval);
+      act(() => useStreamStore.setState({ typewriterInterval: null }));
+    }
+  };
+
   it('sets up listeners and calls handleInitialLoad', () => {
     const handleInitialLoad = vi.fn();
     act(() => {
@@ -188,6 +199,7 @@ describe('useChatManager hook', () => {
         finalText: 'sync'
       });
     });
+    flushStreamBuffer();
 
     const session = useSessionLifecycleStore.getState().sessions[0];
     expect(session.messages).toHaveLength(1);
@@ -197,6 +209,240 @@ describe('useChatManager hook', () => {
     expect(toolStep.event.status).toBe('completed');
     expect(toolStep.event.title).toBe('Invoke Shell: Sync check');
     expect(toolStep.event.output).toBe('sync');
+  });
+
+  it('attaches shell lifecycle to a queued provider shell start instead of adding a duplicate', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          name: 'Session',
+          messages: [{ id: 'assistant-1', role: 'assistant', content: '', timeline: [], isStreaming: true }],
+          isTyping: true,
+          isWarmingUp: false,
+          model: 'balanced',
+          provider: 'provider-a'
+        } as any]
+      });
+      useStreamStore.setState({
+        activeMsgIdByAcp: { 'acp-1': 'assistant-1' },
+        streamQueues: {
+          'acp-1': [{
+            type: 'event',
+            data: {
+              sessionId: 'acp-1',
+              type: 'tool_start',
+              id: 'provider-tool-1',
+              title: 'Invoke Shell: Check Node.js version',
+              status: 'in_progress',
+              toolName: 'ux_invoke_shell',
+              canonicalName: 'ux_invoke_shell'
+            }
+          }]
+        }
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
+
+    act(() => {
+      handlers.shell_run_started({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-node-version',
+        status: 'running',
+        description: 'Check Node.js version',
+        command: 'node --version',
+        cwd: 'D:/repo'
+      });
+    });
+
+    flushStreamBuffer();
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0].event.shellRunId).toBe('shell-run-node-version');
+    expect(timeline[0].event.command).toBe('node --version');
+  });
+
+  it('does not attach shell lifecycle to ambiguous queued provider shell starts with the same description', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          name: 'Session',
+          messages: [{ id: 'assistant-1', role: 'assistant', content: '', timeline: [], isStreaming: true }],
+          isTyping: true,
+          isWarmingUp: false,
+          model: 'balanced',
+          provider: 'provider-a'
+        } as any]
+      });
+      useStreamStore.setState({
+        activeMsgIdByAcp: { 'acp-1': 'assistant-1' },
+        streamQueues: {
+          'acp-1': [
+            {
+              type: 'event',
+              data: {
+                sessionId: 'acp-1',
+                type: 'tool_start',
+                id: 'provider-tool-1',
+                title: 'Invoke Shell: Run sync check',
+                status: 'in_progress',
+                toolName: 'ux_invoke_shell',
+                canonicalName: 'ux_invoke_shell'
+              }
+            },
+            {
+              type: 'event',
+              data: {
+                sessionId: 'acp-1',
+                type: 'tool_start',
+                id: 'provider-tool-2',
+                title: 'Invoke Shell: Run sync check',
+                status: 'in_progress',
+                toolName: 'ux_invoke_shell',
+                canonicalName: 'ux_invoke_shell'
+              }
+            }
+          ]
+        }
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
+
+    act(() => {
+      handlers.shell_run_started({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-ambiguous',
+        status: 'running',
+        description: 'Run sync check',
+        command: 'node --version',
+        cwd: 'D:/repo'
+      });
+    });
+
+    flushStreamBuffer();
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline).toHaveLength(3);
+    expect(timeline[0].event.shellRunId).toBeUndefined();
+    expect(timeline[1].event.shellRunId).toBeUndefined();
+    expect(timeline[2].event.shellRunId).toBe('shell-run-ambiguous');
+  });
+
+  it('attaches shell lifecycle to an existing provider shell step by description', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          name: 'Session',
+          messages: [{
+            id: 'assistant-1',
+            role: 'assistant',
+            content: '',
+            timeline: [{
+              type: 'tool',
+              event: {
+                id: 'provider-tool-1',
+                title: 'Invoke Shell: Check Node.js version',
+                status: 'in_progress',
+                toolName: 'ux_invoke_shell',
+                canonicalName: 'ux_invoke_shell'
+              }
+            }],
+            isStreaming: true
+          }],
+          isTyping: true,
+          isWarmingUp: false,
+          model: 'balanced',
+          provider: 'provider-a'
+        } as any]
+      });
+      useStreamStore.setState({ activeMsgIdByAcp: { 'acp-1': 'assistant-1' } });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
+
+    act(() => {
+      handlers.shell_run_started({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-existing-step',
+        status: 'running',
+        description: 'Check Node.js version',
+        command: 'node --version',
+        cwd: 'D:/repo'
+      });
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0].event.shellRunId).toBe('shell-run-existing-step');
+    expect(timeline[0].event.command).toBe('node --version');
+    expect(useStreamStore.getState().streamQueues['acp-1']).toBeUndefined();
+  });
+
+  it('queues fallback shell starts without splitting an active thought step', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          name: 'Session',
+          messages: [{
+            id: 'assistant-1',
+            role: 'assistant',
+            content: '',
+            timeline: [{ type: 'thought', content: 'nod', isCollapsed: false }],
+            isStreaming: true
+          }],
+          isTyping: true,
+          isWarmingUp: false,
+          model: 'balanced',
+          provider: 'provider-a'
+        } as any]
+      });
+      useStreamStore.setState({
+        activeMsgIdByAcp: { 'acp-1': 'assistant-1' },
+        streamQueues: { 'acp-1': [{ type: 'thought', data: 'e -v`.' }] }
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
+
+    act(() => {
+      handlers.shell_run_started({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-with-thought',
+        status: 'running',
+        description: 'Check Node.js version',
+        command: 'node --version',
+        cwd: 'D:/repo'
+      });
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0].type).toBe('thought');
+    const queue = useStreamStore.getState().streamQueues['acp-1'];
+    expect(queue.map(item => item.type)).toEqual(['thought', 'event']);
+    expect(queue[1].data.shellRunId).toBe('shell-run-with-thought');
   });
 
   it('marks Shell V2 tool steps failed on non-zero shell exits', async () => {
@@ -238,6 +484,7 @@ describe('useChatManager hook', () => {
         finalText: 'failed'
       });
     });
+    flushStreamBuffer();
 
     const toolStep = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline?.[0] as any;
     expect(toolStep.event.status).toBe('failed');

@@ -115,7 +115,7 @@ This feature is a backend provider adapter plus provider-specific file/session l
 
 7. **Tool identity becomes canonical before AcpUI tool dispatch**
 
-   Files: `providers/gemini/index.js` (Exports: `normalizeTool`, `extractToolInvocation`, `categorizeToolCall`), `backend/services/tools/providerToolNormalization.js` (Functions: `inputFromToolUpdate`, `collectToolNameCandidates`, `resolveToolNameFromCandidates`, `resolveToolNameFromAcpUiMcpTitle`), `backend/services/tools/toolIdPattern.js` (Function: `matchToolIdPattern`), `backend/services/tools/toolInvocationResolver.js` (Functions: `resolveToolInvocation`, `applyInvocationToEvent`), `backend/services/tools/acpUiToolTitles.js` (Function: `acpUiToolTitle`), `backend/services/tools/acpUxTools.js` (Constants: `ACP_UX_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`).
+   Files: `providers/gemini/index.js` (Exports: `normalizeTool`, `extractToolInvocation`, `categorizeToolCall`), `backend/services/tools/providerToolNormalization.js` (Functions: `inputFromToolUpdate`, `collectToolNameCandidates`, `resolveToolNameFromCandidates`, `resolveToolNameFromAcpUiMcpTitle`), `backend/services/tools/toolIdPattern.js` (Function: `matchToolIdPattern`), `backend/services/tools/toolInvocationResolver.js` (Functions: `resolveToolInvocation`, `applyInvocationToEvent`), `backend/services/tools/acpUiToolTitles.js` (Functions: `acpUiToolTitle`, `subAgentCheckToolTitle`), `backend/services/tools/acpUxTools.js` (Constants: `ACP_UX_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`).
 
    Gemini can expose AcpUI MCP tool identity through tool ids, titles, nested `functionCall` metadata, JSON description strings, or cached arguments. The provider resolves those candidates, derives a canonical tool name, formats the UI title, and returns a tool invocation object. The backend resolver merges provider identity with sticky tool state and MCP execution registry details, then `toolRegistry` dispatches AcpUI-owned handlers.
 
@@ -222,7 +222,7 @@ When any of these boundaries drift, AcpUI can show generic tool titles, lose Acp
 
 `providers/gemini/README.md` documents Gemini CLI settings for tool allow/exclude behavior. The relevant Gemini tool patterns are `mcp_AcpUI_*` and concrete names such as `mcp_AcpUI_ux_invoke_shell`. Those names match the provider's `toolIdPattern` after `{mcpName}` resolves to `AcpUI`.
 
-Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagents`, `ux_abort_subagents`, and `ux_invoke_counsel`. Optional IO/search tools are enabled through `configuration/mcp.json` and include `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`, and `ux_google_web_search`.
+Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagents`, `ux_abort_subagents`, and `ux_invoke_counsel`. Optional IO/search tools are enabled through `configuration/mcp.json` and include `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`, and `ux_google_web_search`. Gemini status titles use `Check Subagents: Waiting for agents to finish` for default `ux_check_subagents` calls and `Check Subagents: Quick status check` when `waitForCompletion: false`.
 
 ### Authentication data flow
 
@@ -309,7 +309,7 @@ Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagen
 | Tool id pattern | `backend/services/tools/toolIdPattern.js` | `matchToolIdPattern`, `toolIdPatternToRegex`, `replaceToolIdPattern` | Matches `mcp_{mcpName}_{toolName}` against Gemini tool ids and titles. |
 | Tool identity | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider extraction with cached tool state and MCP execution details. |
 | Tool definitions | `backend/services/tools/acpUxTools.js` | `ACP_UX_TOOL_NAMES`, `ACP_UX_CORE_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`, `isAcpUxToolName` | Central AcpUI MCP tool names and category metadata. |
-| Tool titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `basenameForToolPath` | Formats visible AcpUI MCP tool titles. |
+| Tool titles | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `subAgentCheckToolTitle`, `basenameForToolPath` | Formats visible AcpUI MCP tool titles, including wait-vs-quick sub-agent status checks. |
 | MCP server | `backend/mcp/mcpServer.js` | `getMcpServers`, `createToolHandlers`, `wrapToolHandlers` | Advertises and executes core/optional AcpUI MCP tools. |
 | MCP config | `backend/services/mcpConfig.js` | `getMcpConfig`, `isInvokeShellMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled` | Controls which AcpUI MCP tools Gemini can discover. |
 | MCP config example | `configuration/mcp.json.example` | `tools`, `io`, `webFetch`, `googleSearch` | Reference shape for MCP feature flags and IO/search limits. |
@@ -401,7 +401,7 @@ Files and important tests:
 - `backend/test/providerContract.test.js` - `every provider explicitly exports every contract function`
 - `backend/test/providerToolNormalization.test.js` - `builds input from Gemini-style args and JSON description fields`; `resolves AcpUI tool names from nested candidates and human MCP titles`
 - `backend/test/toolIdPattern.test.js` - `matches provider-configured Gemini ids without numeric suffixes`
-- `backend/test/toolInvocationResolver.test.js` - `uses provider extraction as canonical tool identity`; `prefers centrally recorded MCP execution details over provider generic titles`; `can claim a recent MCP execution when the provider tool id arrives later`
+- `backend/test/toolInvocationResolver.test.js` - `uses provider extraction as canonical tool identity`; `prefers centrally recorded MCP execution details over provider generic titles`; `records sub-agent check title from waitForCompletion input`; `can claim a recent MCP execution when the provider tool id arrives later`
 - `backend/test/acpUpdateHandler.test.js` - `prepares shell run metadata for ux_invoke_shell tool starts`; `preserves a shell description title after provider normalization on updates`; `updates shell title when provider exposes description after tool start`
 - `backend/test/mcpConfig.test.js` - MCP feature flag loading and optional Google search gating
 - `backend/test/mcpServer.test.js` - MCP server advertisement and handler behavior for core and optional AcpUI tools

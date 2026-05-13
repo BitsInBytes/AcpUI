@@ -322,7 +322,7 @@ wrapToolHandlers begin
 | Tool execution metadata | `backend/services/tools/mcpExecutionRegistry.js` | `begin`, `complete`, `fail`, `publicMcpToolInput`, `describeAcpUxToolExecution`, `invocationFromMcpExecution` | Records MCP execution identity, display metadata, category, file path, and output |
 | IO Tool System handler | `backend/services/tools/handlers/ioToolHandler.js` | `ioToolHandler`, `applyIoToolMetadata` | Applies IO title/category/file metadata to normalized tool lifecycle events |
 | Tool registry | `backend/services/tools/index.js` | `toolRegistry.register`, `ACP_UX_IO_TOOL_NAMES` loop | Registers IO tools with Tool System V2 lifecycle dispatch |
-| Provider tool normalization | `backend/services/tools/providerToolNormalization.js` | `ACP_UX_MCP_TITLE_TO_TOOL_NAME`, `resolveToolNameFromAcpUiMcpTitle`, `resolvePatternToolName`, `inputFromToolUpdate` | Resolves provider-supplied MCP tool names/titles back to canonical AcpUI names |
+| Provider tool normalization | `backend/services/tools/providerToolNormalization.js` | `ACP_UX_MCP_TITLE_TO_TOOL_NAME`, `resolveToolNameFromAcpUiMcpTitle`, `resolvePatternToolName`, `inputFromToolUpdate` | Resolves provider-supplied MCP tool names/titles back to canonical AcpUI names, including titles with `: <detail>` suffixes |
 
 ### Frontend Rendering
 
@@ -343,7 +343,7 @@ wrapToolHandlers begin
 | MCP server tests | `backend/test/mcpServer.test.js` | `optional IO MCP tools`, `does not register optional IO or Google handlers by default`, `registers IO handlers when MCP config enables IO`, `uses glob description for cached tool headers`, `uses grep description for cached tool headers`, `returns written content from write_file`, `returns a diff from replace`, `emits full directory path in list_directory title`, `emits fetch URL title and structured web_fetch output` | Covers handler registration and Tool System V2 title/category output |
 | Tool metadata tests | `backend/test/ioToolHandler.test.js` | `IO Tool System V2 handler`, `applies file metadata for ux_write_file`, `uses grep description for the visual title`, `uses fetch URL for the visual title` | Covers IO lifecycle metadata projection |
 | Invocation resolver tests | `backend/test/toolInvocationResolver.test.js` | `marks registered AcpUI UX tool names without relying on a ux prefix`, `can claim a recent MCP execution when the provider tool id arrives later` | Covers centralized MCP execution metadata and delayed provider tool IDs |
-| Provider normalization tests | `backend/test/providerToolNormalization.test.js` | `resolveToolNameFromCandidates`, `resolveToolNameFromAcpUiMcpTitle` | Covers canonical name recovery from provider MCP tool labels/IDs |
+| Provider normalization tests | `backend/test/providerToolNormalization.test.js` | `resolveToolNameFromCandidates`, `resolveToolNameFromAcpUiMcpTitle` | Covers canonical name recovery from provider MCP tool labels/IDs, including colon-suffixed display titles |
 | Frontend renderer tests | `frontend/src/test/renderToolOutput.test.tsx` | `renders structured web fetch output`, `renders structured grep search output` | Covers structured JSON rendering contracts |
 | Frontend stream tests | `frontend/src/test/useStreamStore.test.ts` | grep title preservation tests around `ux_grep_search` tool events | Covers preserving Tool System V2 titles through frontend stream merging |
 

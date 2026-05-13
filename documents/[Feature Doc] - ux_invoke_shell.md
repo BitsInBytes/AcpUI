@@ -178,10 +178,12 @@ eventToEmit = toolRegistry.dispatch('start', { acpClient, providerId, sessionId 
 File: `backend/services/tools/handlers/shellToolHandler.js` (Export: `shellToolHandler`, Methods: `onStart`, `onUpdate`, `onEnd`)  
 File: `backend/services/tools/toolCallState.js` (Function: `upsert`)
 
-`shellToolHandler.onStart` attaches the timeline event to an existing shell run when the MCP execution path has already created one, otherwise it creates a pending shell run before the PTY starts. Because ACP provider tool IDs and MCP request-derived tool IDs can differ for the same invocation, this UI-binding lookup can match by command/cwd with `allowToolCallIdMismatch: true`; the shell start path still avoids arbitrary pending-run fallback. The returned `runId` is stored in `toolCallState.toolSpecific.shellRunId` and attached to the `system_event` emitted to the frontend.
+`shellToolHandler.onStart` attaches the timeline event to an existing shell run when the MCP execution path has already created one. If a provider start event contains a command, it prepares a pending shell run before the PTY starts; if the event only contains description/title metadata, it records the title and leaves the event without `shellRunId` until a real shell run can be matched. Because ACP provider tool IDs and MCP request-derived tool IDs can differ for the same invocation, this UI-binding lookup can match by command/cwd with `allowToolCallIdMismatch: true`; the shell start path still avoids arbitrary pending-run fallback. When a run is available, the returned `runId` is stored in `toolCallState.toolSpecific.shellRunId` and attached to the `system_event` emitted to the frontend.
 
 ```javascript
 // FILE: backend/services/tools/handlers/shellToolHandler.js (Method: onStart)
+const command = typeof invocation.input?.command === 'string' ? invocation.input.command : '';
+const hasCommand = normalizeText(command) !== '';
 const mcpRequestId = invocation.raw?.mcpExecution?.mcpRequestId ?? null;
 const existingRun = shellRunManager.findRun?.({
   providerId: ctx.providerId,
@@ -195,15 +197,11 @@ const existingRun = shellRunManager.findRun?.({
 });
 const prepared = existingRun
   ? (shellRunManager.snapshot?.(existingRun) || existingRun)
-  : shellRunManager.prepareRun({
-    providerId: ctx.providerId,
-    sessionId: ctx.sessionId,
-    toolCallId: invocation.toolCallId,
-    mcpRequestId,
-    description,
-    command,
-    cwd
-  });
+  : hasCommand
+    ? shellRunManager.prepareRun({ providerId: ctx.providerId, sessionId: ctx.sessionId, toolCallId: invocation.toolCallId, mcpRequestId, description, command, cwd })
+    : null;
+
+if (!prepared?.runId) return { ...event, title };
 
 return {
   ...event,
@@ -269,7 +267,7 @@ Windows startup control sequences are stripped before storage and frontend emiss
 File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Helpers: `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`)
 File: `frontend/src/store/useShellRunStore.ts` (Store: `useShellRunStore`, Actions: `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`)
 
-`useChatManager` listens for all shell run events. It updates `useShellRunStore` by `runId`, patches the matching timeline tool event by `shellRunId`, and creates a fallback `ux_invoke_shell` tool step when shell lifecycle events arrive before a provider `tool_start`.
+`useChatManager` listens for all shell run events. It updates `useShellRunStore` by `runId`, patches the matching timeline tool event by `shellRunId`, by matching tool-call ID, or by the active shell description title when a provider start event arrived before the run ID. If no rendered step exists, it queues a fallback `ux_invoke_shell` `tool_start` through `useStreamStore.onStreamEvent` so the fallback respects thought/tool ordering.
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager)
@@ -297,17 +295,17 @@ socket.on('shell_run_exit', (data) => {
 });
 ```
 
-This keeps the timeline event and the shell run store aligned even when the shell description or command arrives through a snapshot after the initial tool start, and still renders a shell tool card if the provider never emits a matching tool-start event.
+This keeps the timeline event and the shell run store aligned even when the shell description or command arrives through a snapshot after the initial tool start. Queued fallback starts are also merged with queued provider starts by run ID, tool-call ID, or description title, so a description-only provider event and the real shell run do not render as duplicate cards. Provider shell starts without `shellRunId` also merge by provider tool id before lifecycle events attach the run id, preventing duplicate provider starts from becoming duplicate terminals for one run. Active shell tool steps stay expanded while later parallel shell starts arrive; terminal auto-collapse is reserved for completed or failed shell steps after the read-only view settles.
 
 ### 11. ToolStep renders ShellToolTerminal
 
 File: `frontend/src/components/ToolStep.tsx` (Component: `ToolStep`, Helper: `getFilePathFromEvent`)  
 File: `frontend/src/components/ShellToolTerminal.tsx` (Component: `ShellToolTerminal`)  
-File: `frontend/src/components/ChatMessage.css` (CSS classes: `.shell-tool-terminal`, `.shell-tool-terminal-surface`, `.shell-tool-terminal-readonly`)
+File: `frontend/src/components/ChatMessage.css` (CSS classes: `.shell-tool-terminal`, `.shell-tool-terminal-surface`, `.shell-tool-terminal-readonly`, `.shell-tool-terminal-readonly.is-settling`)
 
 `ToolStep` renders `ShellToolTerminal` whenever the tool event has `shellRunId`. It suppresses generic output rendering for that step so final output does not duplicate the terminal transcript.
 
-`ShellToolTerminal` uses a stored run when available, or falls back to shell metadata attached to the event. Active runs mount xterm.js; exited runs render a read-only `<pre>` with ANSI-to-HTML conversion.
+`ShellToolTerminal` uses a stored run when available, or falls back to shell metadata attached to the event. Active runs mount xterm.js; exited runs render a read-only `<pre>` with ANSI-to-HTML conversion. `ChatMessage` auto-collapses terminal shell steps after the read-only view has settled and preserves that local collapsed state across later timeline updates.
 
 ### 12. User controls flow back through socket handlers
 
@@ -597,10 +595,11 @@ Shell output chunk:
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Socket dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, listeners `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit` | Stores shell snapshots, patches timeline events by `shellRunId`, and creates fallback shell tool steps when provider tool starts are missing. |
+| Socket dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, listeners `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit` | Stores shell snapshots, patches timeline events by `shellRunId`, tool-call ID, or active description title, and queues fallback shell tool starts when provider starts are missing. |
 | Shell store | `frontend/src/store/useShellRunStore.ts` | `useShellRunStore`, `ShellRunSnapshot`, `trimShellTranscript`, `pruneShellRuns`, actions `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited` | Holds frontend run state keyed by `runId`. |
 | Tool renderer | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `ShellToolTerminal` | Uses shell terminal rendering for tool events with `shellRunId`. |
 | Terminal renderer | `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal`, `getTranscriptWritePlan`, `getSuffixPrefixOverlap`, `getReadOnlyTerminalHtml`, `emitResize`, `stopRun` | Renders xterm.js for active runs and ANSI HTML for exited runs. |
+| AcpUI UX tool identity | `frontend/src/utils/acpUxTools.ts` | `ACP_UX_TOOL_NAMES`, `isAcpUxShellToolEvent`, `isAcpUxShellToolName` | Central frontend constants and predicates for shell tool identity checks. |
 | Types | `frontend/src/types.ts` | `SystemEvent`, `StreamEventData`, fields `shellRunId`, `shellInteractive`, `shellState`, `canonicalName`, `isAcpUxTool` | Defines the frontend event shape used by the shell timeline. |
 | Styling | `frontend/src/components/ChatMessage.css` | `.shell-tool-terminal`, `.shell-tool-terminal-toolbar`, `.shell-tool-terminal-surface`, `.shell-tool-terminal-readonly`, `.shell-tool-terminal-stop` | Styles the embedded terminal and read-only transcript. |
 
@@ -618,7 +617,7 @@ Shell detection depends on `resolveToolInvocation` seeing `canonicalName: 'ux_in
 
 ### 3. MCP execution can emit a title update before the full shell event
 
-`mcpExecutionRegistry.begin` projects `Invoke Shell: <description>` into `toolCallState` and can emit a `tool_update`. The terminal becomes available when the `tool_start` event receives `shellRunId` from `shellToolHandler.onStart` or when a prepared run is created by `startPreparedRun`.
+`mcpExecutionRegistry.begin` projects `Invoke Shell: <description>` into `toolCallState` and can emit a `tool_update`. Description-only provider starts remain metadata-only until the command is known or a real run is matched. The terminal becomes available when the `tool_start` event receives `shellRunId` from `shellToolHandler.onStart`, when a prepared run is created by `startPreparedRun`, or when `useChatManager` attaches shell lifecycle events to the active description-matched step.
 
 ### 4. The route abort signal does not stop the PTY
 
@@ -669,11 +668,13 @@ Shell detection depends on `resolveToolInvocation` seeing `canonicalName: 'ux_in
 
 | File | Verified anchors and important tests |
 |---|---|
+| `frontend/src/test/acpUxTools.test.ts` | `centralizes known AcpUI UX tool names`; `normalizes direct tool name checks`; `resolves tool identity from normalized event fields` |
 | `frontend/src/test/useShellRunStore.test.ts` | `upserts snapshots by run id`; `appends output and applies max line trimming`; `hydrates active state from snapshots for reattach`; `marks exits as read-only terminal state`; `prunes old exited runs while retaining active runs`; `keeps the last N lines while preserving trailing newline` |
-| `frontend/src/test/ShellToolTerminal.test.tsx` | `replays transcript into xterm without spawning a terminal`; `paces xterm writes until the previous write callback completes`; `writes only the overlapping delta when transcript trimming drops old lines`; `splits large transcript writes into bounded xterm chunks`; `renders completed runs as read-only text without creating xterm`; `prefers colored stored transcript over plain final output after exit`; `collapses PowerShell startup blank rows in read-only output`; `prefers final output over prompt-only stored transcript after exit`; `sends input only while running`; `sends clipboard paste through shell_run_input`; `emits resize from fitted xterm dimensions`; `sends stop command and disables stop after exit`; `focuses xterm when terminal is running and session is active`; `does not focus xterm when session is not active` |
+| `frontend/src/test/ShellToolTerminal.test.tsx` | `replays transcript into xterm without spawning a terminal`; `paces xterm writes until the previous write callback completes`; `writes only the overlapping delta when transcript trimming drops old lines`; `splits large transcript writes into bounded xterm chunks`; `renders completed runs as read-only text without creating xterm`; `prefers colored stored transcript over plain final output after exit`; `collapses PowerShell startup blank rows in read-only output`; `prefers final output over prompt-only stored transcript after exit`; `sends input only while running`; `sends clipboard paste through shell_run_input`; `emits resize from fitted xterm dimensions`; `sends stop command and disables stop after exit`; `settles read-only output at terminal height before compacting after exit`; `focuses xterm when terminal is running and session is active`; `does not focus xterm when session is not active` |
 | `frontend/src/test/useChatManager.test.ts` | `handles Shell V2 socket events by explicit shellRunId`; `creates a Shell V2 tool step from shell lifecycle events when provider tool_start is missing`; `marks Shell V2 tool steps failed on non-zero shell exits`; `routes parallel Shell V2 output by shellRunId without claiming legacy shell steps` |
-| `frontend/src/test/useStreamStore.test.ts` | `hydrates queued shell tool_start from an existing shell snapshot`; `merges duplicate shell tool_start events by shellRunId`; `merges shell tool_end events by shellRunId when tool ids differ`; `preserves Shell V2 terminal output on tool_end by shellRunId` |
+| `frontend/src/test/useStreamStore.test.ts` | `hydrates queued shell tool_start from an existing shell snapshot`; `keeps active parallel shell tool starts expanded while later shell steps arrive`; `merges duplicate shell tool_start events by shellRunId`; `merges provider shell tool_start without run id into an existing shell run by description`; `merges duplicate provider shell tool_start events before a shell run id is attached`; `merges shell tool_end events by shellRunId when tool ids differ`; `preserves Shell V2 terminal output on tool_end by shellRunId` |
 | `frontend/src/test/ToolStep.test.tsx` | `renders ShellToolTerminal for Shell V2 tool steps`; `uses the AcpUI UX icon for ux tools`; `returns undefined for non-file AcpUI UX tools even when a file path is present`; `returns undefined for shell commands` |
+| `frontend/src/test/ChatMessage.test.tsx` | `auto-collapses completed shell tool steps after a short settling delay`; `keeps auto-collapsed terminal shell steps collapsed while later shell steps stream` |
 
 Recommended targeted verification commands:
 
@@ -711,8 +712,8 @@ cd frontend; npx vitest run src/test/useShellRunStore.test.ts src/test/ShellTool
 - `ux_invoke_shell` is a core AcpUI MCP tool gated by `configuration/mcp.json` key `tools.invokeShell`.
 - The stdio proxy advertises the tool and forwards calls to `POST /api/mcp/tool-call` with provider/session/proxy context.
 - `mcpExecutionRegistry`, `toolInvocationResolver`, and `toolCallState` keep structured identity, input, titles, and shell-specific metadata sticky across MCP and ACP update timing.
-- `shellToolHandler.onStart` prepares a run and attaches `shellRunId` to the timeline event.
+- `shellToolHandler.onStart` prepares a run when command input is available and attaches `shellRunId` to the timeline event when a real run exists.
 - `ShellRunManager` owns PTY spawn, output streaming, transcript trimming, stdin, resize, kill, timeout, final text, and cleanup.
-- `useChatManager` stores shell snapshots, patches timeline events by explicit `shellRunId`, and creates fallback shell tool steps when provider tool-start events are missing.
+- `useChatManager` stores shell snapshots, patches timeline events by explicit `shellRunId`, tool-call ID, or active description title, and queues fallback shell tool starts when provider tool-start events are missing.
 - `ToolStep` renders `ShellToolTerminal` for shell runs; active runs use xterm.js and exited runs use ANSI-to-HTML read-only rendering.
 - The critical contract is structured tool identity plus `toolCallId` and `shellRunId` correlation across backend and frontend boundaries.

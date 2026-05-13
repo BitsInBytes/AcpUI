@@ -9,6 +9,7 @@ import { useSystemStore } from '../store/useSystemStore';
 import { useCanvasStore } from '../store/useCanvasStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSubAgentStore } from '../store/useSubAgentStore';
+import { isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
 import UserMessage from './UserMessage';
 import AssistantMessage from './AssistantMessage';
 
@@ -42,13 +43,19 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
   return success;
 };
 
-const SUB_AGENT_TOOL_NAMES = new Set(['ux_invoke_subagents', 'ux_invoke_counsel']);
 const ACTIVE_SUB_AGENT_STATUSES = new Set(['spawning', 'prompting', 'running', 'waiting_permission', 'cancelling']);
+const SHELL_AUTO_COLLAPSE_DELAY_MS = 900;
+
+function isTerminalShellTimelineStep(step: TimelineStep) {
+  return step.type === 'tool' && Boolean(step.event.shellRunId) && (step.event.status === 'completed' || step.event.status === 'failed');
+}
+
+function shellAutoCollapseKey(step: TimelineStep, index: number) {
+  return step.type === 'tool' ? (step.event.shellRunId || step.event.id || `idx:${index}`) : `idx:${index}`;
+}
 
 function isSubAgentTimelineStep(step: TimelineStep) {
-  if (step.type !== 'tool') return false;
-  const toolName = step.event.canonicalName || step.event.toolName || step.event.mcpToolName;
-  return Boolean(toolName && SUB_AGENT_TOOL_NAMES.has(toolName));
+  return step.type === 'tool' && isAcpUxSubAgentStartToolEvent(step.event);
 }
 
 function isActiveSubAgentTimelineStep(step: TimelineStep, activeInvocationIds: ReadonlySet<string>) {
@@ -112,8 +119,11 @@ const CodeBlock = ({ language, value }: { language: string; value: string }) => 
 };
 
 const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, providerId }) => {
+  const { role, timeline, isStreaming } = message || {};
   const [localCollapsed, setLocalCollapsed] = useState<Record<number, boolean>>({});
   const manuallyToggled = useRef<Set<number>>(new Set());
+  const latestTimelineRef = useRef<TimelineStep[] | undefined>(timeline);
+  const shellAutoCollapseTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const activeSubAgentInvocationIds = useSubAgentStore(state => {
     const activeIds = new Set<string>();
     for (const invocation of state.invocations) {
@@ -128,7 +138,10 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
     () => new Set(activeSubAgentInvocationIds ? activeSubAgentInvocationIds.split('|') : []),
     [activeSubAgentInvocationIds]
   );
-  const { role, timeline, isStreaming } = message || {};
+
+  useEffect(() => {
+    latestTimelineRef.current = timeline;
+  }, [timeline]);
 
   useEffect(() => {
     if (!timeline) return;
@@ -139,6 +152,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
         if (manuallyToggled.current.has(idx)) return;
         if (isActiveSubAgentTimelineStep(step, activeSubAgentInvocationSet)) updates[idx] = false;
         else if (isSubAgentTimelineStep(step)) updates[idx] = true;
+        else if (isTerminalShellTimelineStep(step) && localCollapsed[idx] === true) updates[idx] = true;
         else if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
         else if (step.type === 'tool') updates[idx] = true;
         else if (step.type === 'thought') updates[idx] = true;
@@ -154,6 +168,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
         if (manuallyToggled.current.has(idx)) return;
         if (isActiveSubAgentTimelineStep(step, activeSubAgentInvocationSet)) updates[idx] = false;
         else if (isSubAgentTimelineStep(step)) updates[idx] = true;
+        else if (isTerminalShellTimelineStep(step) && localCollapsed[idx] === true) updates[idx] = true;
         else if (typeof step.isCollapsed === 'boolean') updates[idx] = step.isCollapsed;
         else if (step.type === 'tool') updates[idx] = !last3Tools.includes(idx);
         else if (step.type === 'thought') updates[idx] = !last3Thoughts.includes(idx);
@@ -167,6 +182,41 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
     if (hasChanged) setLocalCollapsed(updates);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timeline, isStreaming, activeSubAgentInvocationIds]);
+
+  useEffect(() => {
+    if (!timeline) return;
+
+    const activeTimerKeys = new Set<string>();
+    timeline.forEach((step, idx) => {
+      if (!isTerminalShellTimelineStep(step) || manuallyToggled.current.has(idx)) return;
+      const key = shellAutoCollapseKey(step, idx);
+      activeTimerKeys.add(key);
+      const collapsed = localCollapsed[idx] ?? step.isCollapsed ?? false;
+      if (collapsed || shellAutoCollapseTimers.current.has(key)) return;
+
+      const timer = setTimeout(() => {
+        shellAutoCollapseTimers.current.delete(key);
+        setLocalCollapsed(prev => {
+          const latestTimeline = latestTimelineRef.current || [];
+          const currentIdx = latestTimeline.findIndex((latestStep, latestIdx) => shellAutoCollapseKey(latestStep, latestIdx) === key);
+          if (currentIdx === -1 || manuallyToggled.current.has(currentIdx) || prev[currentIdx]) return prev;
+          return { ...prev, [currentIdx]: true };
+        });
+      }, SHELL_AUTO_COLLAPSE_DELAY_MS);
+      shellAutoCollapseTimers.current.set(key, timer);
+    });
+
+    shellAutoCollapseTimers.current.forEach((timer, key) => {
+      if (activeTimerKeys.has(key)) return;
+      clearTimeout(timer);
+      shellAutoCollapseTimers.current.delete(key);
+    });
+  }, [timeline, localCollapsed]);
+
+  useEffect(() => () => {
+    shellAutoCollapseTimers.current.forEach(timer => clearTimeout(timer));
+    shellAutoCollapseTimers.current.clear();
+  }, []);
 
   if (!message) return null;
 

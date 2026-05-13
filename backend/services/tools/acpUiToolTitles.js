@@ -5,6 +5,17 @@ function headerValue(value) {
   return String(value || '').trim();
 }
 
+function isExplicitFalse(value) {
+  return value === false || String(value || '').trim().toLowerCase() === 'false';
+}
+
+export function subAgentCheckToolTitle(input = {}) {
+  const waitForCompletion = input.waitForCompletion ?? input.wait_for_completion;
+  return isExplicitFalse(waitForCompletion)
+    ? 'Check Subagents: Quick status check'
+    : 'Check Subagents: Waiting for agents to finish';
+}
+
 export function basenameForToolPath(value) {
   const text = headerValue(value);
   if (!text) return '';

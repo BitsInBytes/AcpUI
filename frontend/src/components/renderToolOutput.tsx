@@ -2,6 +2,7 @@ import React from 'react';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import AnsiToHtml from 'ansi-to-html';
+import { ACP_UX_RESULT_TYPES } from '../utils/acpUxTools';
 
 const ansiConverter = new AnsiToHtml({ fg: '#c9d1d9', bg: '#0d1117', newline: true, escapeXML: true });
 
@@ -58,7 +59,7 @@ type GrepSearchMatch = {
 };
 
 type GrepSearchResult = {
-  type: 'ux_grep_search_result';
+  type: typeof ACP_UX_RESULT_TYPES.grepSearch;
   pattern?: string;
   dirPath?: string;
   matchCount?: number;
@@ -86,7 +87,7 @@ const isWebFetchResult = (value: Record<string, unknown> | null): value is WebFe
 );
 
 const isGrepSearchResult = (value: Record<string, unknown> | null): value is GrepSearchResult => (
-  value?.type === 'ux_grep_search_result'
+  value?.type === ACP_UX_RESULT_TYPES.grepSearch
 );
 
 const renderHighlightedMatch = (line: string, submatches: GrepSearchMatch['submatches'] = []) => {

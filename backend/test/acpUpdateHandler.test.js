@@ -196,6 +196,48 @@ describe('acpUpdateHandler', () => {
       }));
   });
 
+  it('does not prepare shell run metadata before command input is known', async () => {
+      client.providerId = 'test-provider';
+      mockProviderModule.normalizeTool.mockImplementation(e => ({ ...e, toolName: 'ux_invoke_shell' }));
+      mockProviderModule.categorizeToolCall.mockReturnValue({ category: 'shell', isShellCommand: true });
+      mockProviderModule.extractToolInvocation.mockReturnValue({
+        canonicalName: 'ux_invoke_shell',
+        mcpServer: 'AcpUI',
+        mcpToolName: 'ux_invoke_shell',
+        input: { description: 'Check Node.js version' },
+        title: 'Invoke Shell: Check Node.js version',
+        category: { category: 'shell', isShellCommand: true }
+      });
+
+      await handleUpdate(client, sid, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 't1',
+        title: 'Tool: AcpUI/ux_invoke_shell'
+      });
+
+      expect(mockShellRunManager.setIo).toHaveBeenCalledWith(client.io);
+      expect(mockShellRunManager.findRun).toHaveBeenCalledWith({
+        providerId: 'test-provider',
+        sessionId: sid,
+        toolCallId: 't1',
+        mcpRequestId: null,
+        command: '',
+        cwd: null,
+        statuses: ['pending', 'starting', 'running', 'exiting', 'exited'],
+        allowToolCallIdMismatch: true
+      });
+      expect(mockShellRunManager.prepareRun).not.toHaveBeenCalled();
+      const systemEvent = client.io.emit.mock.calls.find(c => c[0] === 'system_event')[1];
+      expect(systemEvent).toEqual(expect.objectContaining({
+        type: 'tool_start',
+        isAcpUxTool: true,
+        title: 'Invoke Shell: Check Node.js version'
+      }));
+      expect(systemEvent).not.toHaveProperty('shellRunId');
+      expect(systemEvent).not.toHaveProperty('shellInteractive');
+      expect(systemEvent).not.toHaveProperty('shellState');
+  });
+
   it('reuses an already-started shell run for late ux_invoke_shell tool starts', async () => {
       client.providerId = 'test-provider';
       mockShellRunManager.findRun.mockReturnValue({
@@ -507,7 +549,7 @@ describe('acpUpdateHandler', () => {
     expect(systemEvents.at(-1)[1]).toEqual(expect.objectContaining({
       toolName: 'ux_check_subagents',
       canonicalName: 'ux_check_subagents',
-      title: 'Check Subagents'
+      title: 'Check Subagents: Waiting for agents to finish'
     }));
   });
 

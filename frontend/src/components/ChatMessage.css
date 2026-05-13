@@ -162,6 +162,85 @@
   margin-bottom: 1rem;
 }
 
+.sub-agent-pinned-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.sub-agent-pinned-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.sub-agent-pinned-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-height: 2rem;
+}
+
+.sub-agent-pinned-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.sub-agent-pinned-title {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sub-agent-pinned-status {
+  color: var(--text-muted, var(--text-secondary));
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.sub-agent-pinned-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.sub-agent-pinned-toggle:hover {
+  background: rgba(148, 163, 184, 0.16);
+  border-color: rgba(148, 163, 184, 0.42);
+  color: var(--text-primary);
+}
+
+.sub-agent-pinned-toggle:focus-visible {
+  outline: 2px solid rgba(148, 163, 184, 0.35);
+  outline-offset: 2px;
+}
+
+.sub-agent-pinned-body {
+  overflow: hidden;
+}
+
+.sub-agent-pinned-panels .sub-agent-panel {
+  margin-top: 0;
+}
+
 .timeline-step-header-wrapper {
   display: flex;
   align-items: center;
@@ -376,6 +455,17 @@
   white-space: pre-wrap;
   word-break: break-word;
   background: #0b0f14;
+  transition: min-height 260ms ease, max-height 260ms ease;
+}
+
+.shell-tool-terminal-readonly.is-settling {
+  min-height: clamp(180px, 28vh, 320px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shell-tool-terminal-readonly {
+    transition: none;
+  }
 }
 
 .tool-output-pre {
