@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as claude from '../index.js';
 import { extractClaudeQuotaHeaders, stopClaudeQuotaProxy } from '../quotaProxy.js';
 import fs from 'fs';
-import path from 'path';
 
 // Mock getProvider
 vi.mock('../../../backend/services/providerLoader.js', () => ({
@@ -174,6 +173,119 @@ describe('Claude Provider', () => {
       });
 
       describe('intercept', () => {
+
+    it('treats usage_update as an absolute latest snapshot, not additive', async () => {
+      const emitProviderExtension = vi.fn();
+      const sessionId = 'sess-usage-snapshot';
+
+      fs.existsSync.mockImplementation(filePath => String(filePath).endsWith('acp_session_context.json'));
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) return JSON.stringify({});
+        return '';
+      });
+
+      await claude.prepareAcpEnvironment(
+        { CLAUDE_QUOTA_PROXY: 'false' },
+        { emitProviderExtension }
+      );
+
+      claude.intercept({
+        method: 'session/update',
+        params: { sessionId, update: { sessionUpdate: 'usage_update', used: 10, size: 100 } }
+      });
+      claude.intercept({
+        method: 'session/update',
+        params: { sessionId, update: { sessionUpdate: 'usage_update', used: 25, size: 100 } }
+      });
+      claude.intercept({
+        method: 'session/update',
+        params: { sessionId, update: { sessionUpdate: 'usage_update', used: 5, size: 100 } }
+      });
+
+      expect(claude.emitCachedContext(sessionId)).toBe(true);
+      expect(emitProviderExtension).toHaveBeenCalledWith('_anthropic/metadata', {
+        sessionId,
+        contextUsagePercentage: 5
+      });
+    });
+
+    it('persists 100 percent when usage_update reports zero size', async () => {
+      const emitProviderExtension = vi.fn();
+      const sessionId = 'sess-zero-size';
+
+      fs.existsSync.mockImplementation(filePath => String(filePath).endsWith('acp_session_context.json'));
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) return JSON.stringify({});
+        return '';
+      });
+
+      await claude.prepareAcpEnvironment(
+        { CLAUDE_QUOTA_PROXY: 'false' },
+        { emitProviderExtension }
+      );
+
+      claude.intercept({
+        method: 'session/update',
+        params: { sessionId, update: { sessionUpdate: 'usage_update', used: 120, size: 0 } }
+      });
+
+      expect(claude.emitCachedContext(sessionId)).toBe(true);
+      expect(emitProviderExtension).toHaveBeenCalledWith('_anthropic/metadata', {
+        sessionId,
+        contextUsagePercentage: 100
+      });
+    });
+
+    it('does not emit stale cached metadata during usage_update replay', async () => {
+      const emitProviderExtension = vi.fn();
+      const sessionId = 'sess-usage-no-replay';
+
+      fs.existsSync.mockImplementation(filePath => String(filePath).endsWith('acp_session_context.json'));
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) return JSON.stringify({ [sessionId]: 80 });
+        return '';
+      });
+
+      await claude.prepareAcpEnvironment(
+        { CLAUDE_QUOTA_PROXY: 'false' },
+        { emitProviderExtension }
+      );
+
+      claude.intercept({
+        method: 'session/update',
+        params: { sessionId, update: { sessionUpdate: 'usage_update', used: 10, size: 100 } }
+      });
+
+      expect(emitProviderExtension).not.toHaveBeenCalled();
+    });
+
+    it('ignores invalid usage_update values without overwriting cached context', async () => {
+      const emitProviderExtension = vi.fn();
+      const sessionId = 'sess-invalid-usage';
+
+      fs.existsSync.mockImplementation(filePath => String(filePath).endsWith('acp_session_context.json'));
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) return JSON.stringify({ [sessionId]: 70 });
+        return '';
+      });
+
+      await claude.prepareAcpEnvironment(
+        { CLAUDE_QUOTA_PROXY: 'false' },
+        { emitProviderExtension }
+      );
+
+      claude.intercept({
+        method: 'session/update',
+        params: { sessionId, update: { sessionUpdate: 'usage_update', used: 'nope', size: 100 } }
+      });
+
+      expect(claude.emitCachedContext(sessionId)).toBe(true);
+      expect(emitProviderExtension).toHaveBeenCalledWith('_anthropic/metadata', {
+        sessionId,
+        contextUsagePercentage: 70
+      });
+    });
+
     it('normalizes available_commands_update', () => {
       const payload = {
         method: 'session/update',

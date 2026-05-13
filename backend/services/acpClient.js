@@ -250,7 +250,10 @@ export class AcpClient {
     // Intercept phase: let the provider mutate or swallow the payload before routing.
     // Uses the cached this.providerModule (loaded in start()) — getProvider() only
     // returns { config, modulePath } and does NOT expose the module's exported functions.
-    const processedPayload = this.providerModule.intercept(payload);
+    const responseRequest = payload?.id !== undefined
+      ? this.transport.getPendingRequestContext(payload.id)
+      : null;
+    const processedPayload = this.providerModule.intercept(payload, { responseRequest });
 
     // If interceptor returns null, the message is swallowed/ignored by the provider
     if (!processedPayload) return;
@@ -354,10 +357,16 @@ export class AcpClient {
       }
     }
 
+    const normalizedStatusExtension = rememberProviderStatusExtension(payload, providerId);
+    if (normalizedStatusExtension && typeof db.saveProviderStatusExtension === 'function') {
+      db.saveProviderStatusExtension(providerId, normalizedStatusExtension).catch(err =>
+        writeLog(`[DB ERR] Failed to save provider status for ${providerId}: ${err.message}`)
+      );
+    }
+
     if (this.io) {
-      rememberProviderStatusExtension(payload, providerId);
       const params = payload.params || {};
-      this.io.emit('provider_extension', {
+      this.io.emit('provider_extension', normalizedStatusExtension || {
         providerId,
         method: payload.method,
         params: { ...params, providerId }

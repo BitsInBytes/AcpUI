@@ -94,7 +94,7 @@ This feature is a backend provider adapter plus provider-specific file/session l
 
    Files: `backend/services/acpClient.js` (Method: `handleAcpMessage`), `providers/gemini/index.js` (Export: `intercept`, Helper: `normalizeCommands`, Export: `emitCachedContext`).
 
-   `handleAcpMessage` calls `intercept(payload)` before routing. Gemini interception rewrites `available_commands_update` into `_gemini/commands/available`, emits cached context once a session id is observed, caches tool arguments for later tool updates, drops `usage_update`, and emits `_gemini/metadata` after final prompt results with quota token counts.
+   `handleAcpMessage` calls `intercept(payload, { responseRequest })` before routing. Gemini interception rewrites `available_commands_update` into `_gemini/commands/available`, emits cached context once a session id is observed, caches tool arguments for later tool updates, drops `usage_update`, and emits `_gemini/metadata` after final prompt results with quota token counts. For prompt responses that omit `result.sessionId`, the provider uses `responseRequest.sessionId` (mapped from JSON-RPC response id) to attribute quota/context metadata to the correct session.
 
    ```javascript
    // FILE: providers/gemini/index.js (Export: intercept)
@@ -137,9 +137,9 @@ This feature is a backend provider adapter plus provider-specific file/session l
 
 8. **Provider extensions are parsed and broadcast**
 
-   Files: `providers/gemini/index.js` (Export: `parseExtension`, Helper: `_emitStatus`), `backend/services/acpClient.js` (Method: `handleProviderExtension`), `backend/services/providerStatusMemory.js` (Functions: `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions`).
+   Files: `providers/gemini/index.js` (Export: `parseExtension`, Helper: `_emitStatus`), `backend/services/acpClient.js` (Method: `handleProviderExtension`), `backend/services/providerStatusMemory.js` (Functions: `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions`), `backend/database.js` (Functions: `saveProviderStatusExtension`, `getProviderStatusExtensions`).
 
-   Provider extension methods under `_gemini/` are converted into structured types: `commands`, `metadata`, `provider_status`, or `unknown`. `handleProviderExtension` emits them as `provider_extension` and remembers status-like extensions so new Socket.IO clients receive current provider state.
+   Provider extension methods under `_gemini/` are converted into structured types: `commands`, `metadata`, `provider_status`, or `unknown`. `handleProviderExtension` emits them as `provider_extension`, caches status-like extensions in memory, and persists valid provider statuses so new Socket.IO clients receive memory-first status with SQLite fallback after cold starts.
 
 9. **Prompt lifecycle controls quota polling**
 
@@ -199,7 +199,7 @@ flowchart TD
 The Gemini provider contract has five required boundaries:
 
 - **Handshake contract:** `performHandshake(acpClient)` must send `initialize` with `clientCapabilities: { terminal: true }` and must send `authenticate` without waiting for the initialize response.
-- **Interception contract:** `intercept(payload)` must return a routed payload object or `null`. `usage_update` returns `null`; `available_commands_update` returns a `_gemini/commands/available` extension payload.
+- **Interception contract:** `intercept(payload, { responseRequest })` must return a routed payload object or `null`. `usage_update` returns `null`; `available_commands_update` returns a `_gemini/commands/available` extension payload. Final prompt-result quota attribution must use `responseRequest.sessionId` when `result.sessionId` is absent.
 - **Tool identity contract:** `provider.json.toolIdPattern` and `extractToolInvocation(update, context)` must agree on the Gemini MCP id shape. For AcpUI tools, the returned `canonicalName`, `mcpServer`, `mcpToolName`, and `input` are the source data for `toolInvocationResolver` and `toolRegistry`.
 - **Quota/context contract:** `onPromptStarted`, `onPromptCompleted`, final prompt result quota fields, and `_emitProviderExtension` are the only provider-owned path for Gemini quota polling and context percentage metadata.
 - **Session-file contract:** `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, and `parseSessionHistory` must follow Gemini's project-hashed directory layout and first-UUID-segment filename lookup.
@@ -234,7 +234,7 @@ Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagen
 ### Context usage data flow
 
 1. Gemini returns a final prompt result with `result._meta.quota.token_count` and `result._meta.quota.model_usage`.
-2. `intercept` reads the cumulative `input_tokens` and `output_tokens` for the session.
+2. `intercept` resolves session ownership from `result.sessionId` or fallback `responseRequest.sessionId` (JSON-RPC id mapping), then reads the cumulative `input_tokens` and `output_tokens` for that session.
 3. The provider stores token counts in `_accumulatedTokensBySession` and writes token state through `_saveTokenState`.
 4. The provider computes `contextUsagePercentage` using `CONTEXT_WINDOWS` or `DEFAULT_CONTEXT_WINDOW`.
 5. `_emitProviderExtension` sends `_gemini/metadata` with `sessionId` and `contextUsagePercentage`.
@@ -299,7 +299,8 @@ Core AcpUI tools are `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagen
 | Session socket | `backend/sockets/sessionHandlers.js` | Socket event `create_session`, `fork_session`, `rehydrate_session`, `set_session_option`, `set_session_model`, Helper: `captureModelState` | Creates/loads sessions, injects provider params and MCP servers, captures model/config state. |
 | Session manager | `backend/services/sessionManager.js` | `getMcpServers`, `setSessionModel`, `setProviderConfigOption`, `reapplySavedConfigOptions`, `emitCachedContext` | Builds MCP proxy config and reapplies persisted session state. |
 | JSONL parser | `backend/services/jsonlParser.js` | `parseJsonlSession` | Calls provider `parseSessionHistory` during session rehydration. |
-| Provider status | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions` | Stores latest provider status extension for new clients. |
+| Provider status memory | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions` | Stores latest in-memory provider status extension for live clients. |
+| Provider status persistence | `backend/database.js` | `saveProviderStatusExtension`, `getProviderStatusExtensions`, table `provider_status` | Stores latest persisted provider status extension for cold-start bootstrap. |
 
 ### Tool and MCP Integration
 
@@ -376,6 +377,9 @@ Key test names:
 - `normalizes available commands into slash commands`
 - `emits persisted context for a loaded session on request`
 - `extracts context % and emits metadata extension on prompt result`
+- `uses response request session id instead of stale last-session fallback`
+- `prefers result session id over response request session id`
+- `does not attribute metadata from non-prompt response context`
 - `swallows native usage_update events`
 - `fixes read_file by reading from disk directly`
 - `reconstructs list_directory output using cached args`

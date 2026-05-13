@@ -121,7 +121,16 @@ export function initDb() {
       `, (err) => { if (err) writeLog(`[DB] Table error: ${err.message}`); });
       db.run(`ALTER TABLE folders ADD COLUMN provider_id TEXT`, (err) => { if (err && !err.message.includes('duplicate')) writeLog(`[DB] Migration skip: ${err.message}`); });
 
-      // 5. Canvas Artifacts table
+      // 5. Provider status persistence
+      db.run(`
+        CREATE TABLE IF NOT EXISTS provider_status (
+          provider TEXT PRIMARY KEY,
+          extension_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+      `, (err) => { if (err) writeLog(`[DB] Table error: ${err.message}`); });
+
+      // 6. Canvas Artifacts table
       db.run(`
         CREATE TABLE IF NOT EXISTS canvas_artifacts (
           id TEXT PRIMARY KEY,
@@ -828,6 +837,71 @@ export function saveNotes(uiId, notes) {
     db.run(`UPDATE sessions SET notes = ? WHERE ui_id = ?`, [notes, uiId], (err) => {
       if (err) reject(err);
       else resolve();
+    });
+  });
+}
+
+function mapProviderStatusRow(row) {
+  if (!row?.extension_json) return null;
+  try {
+    const extension = JSON.parse(row.extension_json);
+    return extension && typeof extension === 'object' ? extension : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveProviderStatusExtension(providerId, extension) {
+  const params = extension?.params && typeof extension.params === 'object' ? extension.params : {};
+  const status = params.status && typeof params.status === 'object' ? params.status : null;
+  const resolvedProviderId = providerId || extension?.providerId || params.providerId || status?.providerId || null;
+
+  if (!resolvedProviderId || !extension || typeof extension !== 'object' || !status || !Array.isArray(status.sections)) {
+    return Promise.resolve();
+  }
+
+  const normalizedExtension = {
+    ...extension,
+    providerId: resolvedProviderId,
+    params: {
+      ...params,
+      providerId: resolvedProviderId,
+      ...(status ? { status: { ...status, providerId: resolvedProviderId } } : {})
+    }
+  };
+  const extensionJson = JSON.stringify(normalizedExtension);
+  const updatedAt = Date.now();
+
+  return new Promise((resolve, reject) => {
+    db.run(`
+      INSERT INTO provider_status (provider, extension_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(provider) DO UPDATE SET
+        extension_json = excluded.extension_json,
+        updated_at = excluded.updated_at
+      WHERE excluded.updated_at >= provider_status.updated_at
+    `, [resolvedProviderId, extensionJson, updatedAt], (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+export function getProviderStatusExtension(providerId) {
+  if (!providerId) return Promise.resolve(null);
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT extension_json FROM provider_status WHERE provider = ?`, [providerId], (err, row) => {
+      if (err) reject(err);
+      else resolve(mapProviderStatusRow(row));
+    });
+  });
+}
+
+export function getProviderStatusExtensions() {
+  return new Promise((resolve, reject) => {
+    db.all(`SELECT extension_json FROM provider_status ORDER BY updated_at DESC`, [], (err, rows) => {
+      if (err) reject(err);
+      else resolve((rows || []).map(mapProviderStatusRow).filter(Boolean));
     });
   });
 }

@@ -314,13 +314,15 @@
   color: var(--accent-color);
 }
 
-.session-item.awaiting-permission {
+.session-item.awaiting-permission,
+.session-item.awaiting-shell-input {
   animation: greenBreatheGlow 1.5s ease-in-out infinite;
   color: var(--text-primary);
   border-left-color: #10b981;
 }
 
-.session-item.awaiting-permission .session-icon {
+.session-item.awaiting-permission .session-icon,
+.session-item.awaiting-shell-input .session-icon {
   color: #10b981;
 }
 

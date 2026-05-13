@@ -145,12 +145,6 @@ describe('Gemini Provider', () => {
       const emitSpy = vi.fn();
       await gemini.prepareAcpEnvironment({}, { emitProviderExtension: emitSpy });
 
-      // First track the session
-      gemini.intercept({
-        method: 'session/update',
-        params: { sessionId: 'sid-123', update: { sessionUpdate: 'text' } }
-      });
-
       const payload = {
         result: {
           stopReason: 'end_turn',
@@ -163,11 +157,111 @@ describe('Gemini Provider', () => {
         }
       };
 
-      gemini.intercept(payload);
+      gemini.intercept(payload, {
+        responseRequest: {
+          method: 'session/prompt',
+          sessionId: 'sid-123',
+          params: { sessionId: 'sid-123' }
+        }
+      });
+
       expect(emitSpy).toHaveBeenCalledWith('_gemini/metadata', expect.objectContaining({
         sessionId: 'sid-123',
         contextUsagePercentage: expect.closeTo(10, 1)
       }));
+      const savedTokenState = fs.writeFileSync.mock.calls.find(call => String(call[0]).endsWith('acp_session_tokens.json.tmp'))?.[1];
+      expect(JSON.parse(savedTokenState)['sid-123'].model).toBe('gemini-pro');
+    });
+
+    it('uses response request session id instead of stale last-session fallback', async () => {
+      const emitSpy = vi.fn();
+      await gemini.prepareAcpEnvironment({}, { emitProviderExtension: emitSpy });
+
+      gemini.intercept({
+        method: 'session/update',
+        params: { sessionId: 'sid-old', update: { sessionUpdate: 'text' } }
+      });
+
+      gemini.intercept({
+        result: {
+          stopReason: 'end_turn',
+          _meta: {
+            quota: {
+              token_count: { input_tokens: 4096 },
+              model_usage: [{ model: 'gemini-pro' }]
+            }
+          }
+        }
+      }, {
+        responseRequest: {
+          method: 'session/prompt',
+          sessionId: 'sid-new',
+          params: { sessionId: 'sid-new' }
+        }
+      });
+
+      expect(emitSpy).toHaveBeenCalledWith('_gemini/metadata', expect.objectContaining({
+        sessionId: 'sid-new'
+      }));
+      expect(emitSpy).not.toHaveBeenCalledWith('_gemini/metadata', expect.objectContaining({
+        sessionId: 'sid-old'
+      }));
+    });
+
+    it('prefers result session id over response request session id', async () => {
+      const emitSpy = vi.fn();
+      await gemini.prepareAcpEnvironment({}, { emitProviderExtension: emitSpy });
+
+      gemini.intercept({
+        result: {
+          sessionId: 'sid-result',
+          stopReason: 'end_turn',
+          _meta: {
+            quota: {
+              token_count: { input_tokens: 4096 },
+              model_usage: [{ model: 'gemini-pro' }]
+            }
+          }
+        }
+      }, {
+        responseRequest: {
+          method: 'session/prompt',
+          sessionId: 'sid-request',
+          params: { sessionId: 'sid-request' }
+        }
+      });
+
+      expect(emitSpy).toHaveBeenCalledWith('_gemini/metadata', expect.objectContaining({
+        sessionId: 'sid-result'
+      }));
+      expect(emitSpy).not.toHaveBeenCalledWith('_gemini/metadata', expect.objectContaining({
+        sessionId: 'sid-request'
+      }));
+    });
+
+    it('does not attribute metadata from non-prompt response context', async () => {
+      const emitSpy = vi.fn();
+      await gemini.prepareAcpEnvironment({}, { emitProviderExtension: emitSpy });
+
+      gemini.intercept({
+        result: {
+          stopReason: 'end_turn',
+          _meta: {
+            quota: {
+              token_count: { input_tokens: 4096 },
+              model_usage: [{ model: 'gemini-pro' }]
+            }
+          }
+        }
+      }, {
+        responseRequest: {
+          method: 'session/load',
+          sessionId: 'sid-load',
+          params: { sessionId: 'sid-load' }
+        }
+      });
+
+      expect(emitSpy).not.toHaveBeenCalledWith('_gemini/metadata', expect.anything());
     });
 
     it('swallows native usage_update events', () => {
@@ -182,12 +276,12 @@ describe('Gemini Provider', () => {
     it('caches tool arguments on tool_call', () => {
       const payload = {
         method: 'session/update',
-        params: { 
-          update: { 
-            sessionUpdate: 'tool_call', 
-            toolCallId: 't1', 
-            arguments: { path: 'foo.txt' } 
-          } 
+        params: {
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 't1',
+            arguments: { path: 'foo.txt' }
+          }
         }
       };
       gemini.intercept(payload);

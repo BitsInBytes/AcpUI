@@ -8,7 +8,7 @@ The Session Settings Modal is the per-session control surface for system identif
 
 - Opens for one UI session through `useUIStore.setSettingsOpen()` and renders the session selected by `settingsSessionId`.
 - Shows system discovery fields, including `ChatSession.acpSessionId`, the provider-specific `branding.sessionLabel`, and the UI session id.
-- Displays context usage from `useSystemStore.contextUsageBySession[acpSessionId]` through `ContextUsageCard`.
+- Displays context usage through `ContextUsageCard`, which calls `useSystemStore.getContextUsage(providerId, acpSessionId)` over provider-scoped context entries.
 - Renders model choices from `getFullModelChoices(session, branding.models)` and applies model updates through `handleSessionModelChange()`.
 - Renders provider config options from `ChatSession.configOptions` and applies option updates through `handleSetSessionOption()`.
 - Rehydrates messages from provider JSONL, exports session assets to a user-specified directory, and permanently deletes sessions after confirmation.
@@ -66,15 +66,15 @@ This feature spans the frontend modal, Zustand stores, Socket.IO session handler
 
    Files:
    - `frontend/src/components/SessionSettingsModal.tsx` (Component: `ContextUsageCard`, Tab: `session`)
-   - `frontend/src/store/useSystemStore.ts` (State: `contextUsageBySession`, Action: `setContextUsage`)
+   - `frontend/src/store/useSystemStore.ts` (State: `contextUsageBySession`, Actions: `setContextUsage`, `getContextUsage`)
    - `frontend/src/hooks/useSocket.ts` (Socket event: `provider_extension`, Routed type: `metadata`)
    - `frontend/src/store/useSessionLifecycleStore.ts` (Helpers: `maybeHydrateContextUsage`, `fetchStats`)
 
-   `ContextUsageCard` indexes context usage by ACP session id. Provider metadata events reach the card through `useSocket`, `routeExtension()`, and `useSystemStore.setContextUsage()`. Persisted stats can also hydrate context usage during initial load, session selection, and stats fetches.
+   `ContextUsageCard` indexes context usage by provider id + ACP session id. Provider metadata events reach the card through `useSocket`, `routeExtension()`, and `useSystemStore.setContextUsage(providerId, sessionId, pct)`. Persisted stats can also hydrate context usage during initial load, session selection, and stats fetches.
 
    ```typescript
    // FILE: frontend/src/components/SessionSettingsModal.tsx (Component: ContextUsageCard)
-   const pct = useSystemStore(state => acpSessionId ? state.contextUsageBySession[acpSessionId] : undefined);
+   const pct = useSystemStore(state => acpSessionId ? state.getContextUsage(providerId, acpSessionId) : undefined);
    ```
 
 5. **The Config tab builds model choices from session/provider state**
@@ -357,7 +357,7 @@ export interface ChatSession {
 |---|---|---|---|
 | App shell | `frontend/src/App.tsx` | Component usage: `SessionSettingsModal` | Mounts the global modal. |
 | Modal | `frontend/src/components/SessionSettingsModal.tsx` | Component: `SessionSettingsModal` | Renders tabs, state, socket actions, and close behavior. |
-| Context card | `frontend/src/components/SessionSettingsModal.tsx` | Component: `ContextUsageCard` | Displays context percentage by ACP session id. |
+| Context card | `frontend/src/components/SessionSettingsModal.tsx` | Component: `ContextUsageCard` | Displays context percentage by provider id and ACP session id through `getContextUsage`. |
 | Opening state | `frontend/src/store/useUIStore.ts` | Type: `SettingsTab`, Action: `setSettingsOpen` | Stores modal visibility, target session, and initial tab. |
 | Session store | `frontend/src/store/useSessionLifecycleStore.ts` | Actions: `handleSessionModelChange`, `handleSetSessionOption`, `handleDeleteSession`, `hydrateSession`, `fetchStats`; Helpers: `applyModelState`, `maybeHydrateContextUsage` | Applies optimistic state, emits session events, hydrates stats. |
 | Socket routing | `frontend/src/hooks/useSocket.ts` | Socket events: `session_model_options`, `provider_extension` | Applies backend model/options/context updates. |

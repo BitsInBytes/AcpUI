@@ -11,6 +11,18 @@ export class JsonRpcTransport {
     this.acpProcess = acpProcess;
   }
 
+  getPendingRequestContext(id) {
+    const pending = this.pendingRequests.get(id);
+    if (!pending) return null;
+
+    return {
+      id,
+      method: pending.method,
+      sessionId: pending.sessionId,
+      params: pending.params
+    };
+  }
+
   sendRequest(method, params = {}) {
     const id = this.requestId++;
     const payload = { jsonrpc: '2.0', id, method, params };
@@ -22,7 +34,8 @@ export class JsonRpcTransport {
     }
 
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject, method, params });
+      const sessionId = typeof params?.sessionId === 'string' ? params.sessionId : null;
+      this.pendingRequests.set(id, { resolve, reject, method, params, sessionId });
       this.acpProcess.stdin.write(json);
     });
   }

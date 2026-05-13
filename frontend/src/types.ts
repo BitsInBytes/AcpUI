@@ -92,6 +92,7 @@ export interface StreamEventData {
   shellRunId?: string;
   shellInteractive?: boolean;
   shellState?: 'pending' | 'starting' | 'running' | 'exiting' | 'exited';
+  shellNeedsInput?: boolean;
   options?: PermissionOption[];
   toolCall?: { toolCallId: string; title: string };
 }
@@ -102,6 +103,7 @@ export interface StreamDoneData {
 }
 
 export interface StatsPushData {
+  providerId?: string;
   sessionId: string;
   usedTokens?: number;
   totalTokens?: number;
@@ -111,6 +113,14 @@ export interface ProviderExtensionData {
   providerId?: string;
   method: string;
   params: Record<string, unknown>;
+}
+
+export interface InvalidJsonConfig {
+  id: string;
+  label: string;
+  path: string;
+  message: string;
+  blocksStartup?: boolean;
 }
 
 export type ProviderStatusTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
@@ -214,6 +224,7 @@ export interface SystemEvent {
   shellRunId?: string;
   shellInteractive?: boolean;
   shellState?: 'pending' | 'starting' | 'running' | 'exiting' | 'exited';
+  shellNeedsInput?: boolean;
   providerId?: string;
   sessionId?: string;
   command?: string;
@@ -318,6 +329,7 @@ export interface ChatSession {
   forkPoint?: number | null;
   stats?: SessionStats;
   isAwaitingPermission?: boolean;
+  isAwaitingShellInput?: boolean;
   isHooksRunning?: boolean;
   isSubAgent?: boolean;
   parentAcpSessionId?: string | null;

@@ -1,15 +1,15 @@
 const latestProviderStatusExtensions = new Map();
 let latestProviderStatusExtension = null;
 
-export function rememberProviderStatusExtension(extension, providerId = null) {
-  if (!extension || typeof extension.method !== 'string') return;
-  if (!extension.params || typeof extension.params !== 'object') return;
+export function normalizeProviderStatusExtension(extension, providerId = null) {
+  if (!extension || typeof extension.method !== 'string') return null;
+  if (!extension.params || typeof extension.params !== 'object') return null;
 
   const status = extension.params.status;
-  if (!status || typeof status !== 'object' || !Array.isArray(status.sections)) return;
+  if (!status || typeof status !== 'object' || !Array.isArray(status.sections)) return null;
 
   const resolvedProviderId = providerId || extension.providerId || extension.params.providerId || status.providerId || null;
-  const normalizedExtension = cloneJson({
+  return cloneJson({
     ...extension,
     ...(resolvedProviderId ? { providerId: resolvedProviderId } : {}),
     params: {
@@ -21,11 +21,17 @@ export function rememberProviderStatusExtension(extension, providerId = null) {
       }
     }
   });
+}
+
+export function rememberProviderStatusExtension(extension, providerId = null) {
+  const normalizedExtension = normalizeProviderStatusExtension(extension, providerId);
+  if (!normalizedExtension) return null;
 
   latestProviderStatusExtension = normalizedExtension;
-  if (resolvedProviderId) {
-    latestProviderStatusExtensions.set(resolvedProviderId, normalizedExtension);
+  if (normalizedExtension.providerId) {
+    latestProviderStatusExtensions.set(normalizedExtension.providerId, normalizedExtension);
   }
+  return cloneJson(normalizedExtension);
 }
 
 export function getLatestProviderStatusExtension(providerId = null) {

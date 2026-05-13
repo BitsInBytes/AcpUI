@@ -44,6 +44,20 @@ describe('JsonRpcTransport', () => {
       await expect(p2).resolves.toBe('res2');
     });
 
+    it('captures sessionId in pending request context', async () => {
+      const promptPromise = transport.sendRequest('session/prompt', { sessionId: 'session-42', prompt: [] });
+      const context = transport.getPendingRequestContext(1);
+
+      expect(context).toEqual(expect.objectContaining({
+        id: 1,
+        method: 'session/prompt',
+        sessionId: 'session-42'
+      }));
+
+      transport.pendingRequests.get(1).resolve({ stopReason: 'end_turn' });
+      await expect(promptPromise).resolves.toEqual({ stopReason: 'end_turn' });
+    });
+
     it('should reject if process is missing', async () => {
       transport.setProcess(null);
       await expect(transport.sendRequest('any')).rejects.toThrow('ACP process not started');

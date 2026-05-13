@@ -87,20 +87,20 @@ Claude is a provider-specific backend adapter. The frontend stays provider-agnos
 
    Files: `backend/services/acpClient.js` (Method: `handleAcpMessage`), `providers/claude/index.js` (Functions: `intercept`, `emitCachedContext`, `normalizeConfigOptions`)
 
-   - `handleAcpMessage` calls Claude `intercept(payload)` before routing any daemon message.
-   - `intercept` emits cached context for any message carrying a session id when a persisted context value exists.
-   - Claude `usage_update` updates the in-memory context cache and saves `acp_session_context.json`.
+   - `handleAcpMessage` calls Claude `intercept(payload, { responseRequest })` before routing any daemon message.
+   - `intercept` emits cached context for non-`usage_update` messages carrying a session id when a persisted context value exists.
+   - Claude `usage_update` treats `used/size` as an authoritative absolute snapshot per session, clamps the calculated percentage to `0..100` (using `100` when `size <= 0`), updates the in-memory context cache, and saves `acp_session_context.json` without replaying stale cached metadata for that same update.
    - Claude `config_option_update` becomes `_anthropic/config_options` with `replace: true` after model filtering; model-only updates return `null` and are swallowed.
    - Claude `available_commands_update` becomes `_anthropic/commands/available`, prefixes command names with `/`, and maps `input.hint` to `meta.hint`.
 
 8. **Provider Extension Routing and Reconnect Replay**
 
-   Files: `backend/services/acpClient.js` (Methods: `handleProviderExtension`, `handleModelStateUpdate`), `backend/services/providerStatusMemory.js` (Functions: `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions`), `backend/sockets/index.js` (Functions: `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers`), `providers/claude/index.js` (Function: `parseExtension`)
+   Files: `backend/services/acpClient.js` (Methods: `handleProviderExtension`, `handleModelStateUpdate`), `backend/services/providerStatusMemory.js` (Functions: `rememberProviderStatusExtension`, `getLatestProviderStatusExtensions`), `backend/database.js` (Function: `saveProviderStatusExtension`), `backend/sockets/index.js` (Functions: `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers`), `providers/claude/index.js` (Function: `parseExtension`)
 
    - Any processed method with prefix `_anthropic/` is routed through `handleProviderExtension`.
    - `handleProviderExtension` merges config-option payloads into session metadata, persists them through `db.saveConfigOptions`, and emits `provider_extension` globally.
-   - `rememberProviderStatusExtension` caches only provider-status payloads that include `params.status.sections`.
-   - `registerSocketHandlers` emits cached provider status extensions on client connection.
+   - `rememberProviderStatusExtension` caches only provider-status payloads that include `params.status.sections`, and `db.saveProviderStatusExtension` persists the normalized status by provider.
+   - `registerSocketHandlers` emits in-memory provider status extensions on client connection, then emits SQLite fallback rows only for providers missing from memory.
    - Claude `parseExtension` maps `_anthropic/commands/available`, `_anthropic/metadata`, `_anthropic/compaction/status`, `_anthropic/provider/status`, and `_anthropic/config_options` into frontend extension types.
 
 9. **Tool Pipeline and Canonical Invocation**
@@ -227,7 +227,7 @@ Claude model state is first-class AcpUI model state. Generic config rendering re
 
 Files: `providers/claude/index.js` (Functions: `_loadContextState`, `_saveContextState`, `_emitCachedContext`, `emitCachedContext`, `intercept`), `backend/sockets/sessionHandlers.js` (Helper: `emitCachedContext`), `backend/services/sessionManager.js` (Helper: `emitCachedContext`)
 
-Claude context usage percentage is persisted under `{paths.home}/acp_session_context.json`. `emitCachedContext(sessionId)` emits `_anthropic/metadata` at most once per process/session id when a cached value exists. This preserves footer and settings context indicators across hot session reuse and explicit session load paths.
+Claude context usage percentage is persisted under `{paths.home}/acp_session_context.json`. For Claude `usage_update`, the provider treats `used/size` as the latest absolute snapshot per session, never adds to prior values, clamps finite percentages to `0..100`, and stores `100` when `size <= 0`. `emitCachedContext(sessionId)` emits `_anthropic/metadata` at most once per process/session id when a cached value exists, and `intercept` suppresses cached replay during `usage_update` processing so the authoritative update is not preceded by stale metadata. This preserves footer and settings context indicators across hot session reuse and explicit session load paths.
 
 ### 5. Session Path Contract
 
@@ -239,7 +239,7 @@ Claude sessions are project-scoped under `paths.sessions`. Any session operation
 
 Files: `providers/claude/index.js` (Function: `buildClaudeProviderStatus`), `backend/services/providerStatusMemory.js` (Function: `rememberProviderStatusExtension`), `documents/[Feature Doc] - Provider Status Panel.md`
 
-Claude quota status must be emitted as `_anthropic/provider/status` with `params.status.sections` as an array. `providerStatusMemory` ignores payloads without that shape, so reconnect hydration depends on the status object returned by `buildClaudeProviderStatus`.
+Claude quota status must be emitted as `_anthropic/provider/status` with `params.status.sections` as an array. `providerStatusMemory` and SQLite provider-status persistence ignore payloads without that shape, so reconnect and cold-start hydration depend on the status object returned by `buildClaudeProviderStatus`.
 
 ## Configuration / Provider-Specific Behavior
 
@@ -442,7 +442,7 @@ Provider status output from `buildClaudeProviderStatus`:
 }
 ```
 
-The emitted provider extension is `_anthropic/provider/status`; `providerStatusMemory` caches it for reconnect hydration.
+The emitted provider extension is `_anthropic/provider/status`; `providerStatusMemory` caches it for reconnect hydration and SQLite stores it for cold-start hydration.
 
 ### D. JSONL Rehydration Path
 
@@ -470,8 +470,9 @@ The emitted provider extension is `_anthropic/provider/status`; `providerStatusM
 | Backend | `backend/sockets/sessionHandlers.js` | `create_session`, `fork_session`, `set_session_model`, `set_session_option`, `captureModelState`, `emitCachedContext` | Session creation/load/fork and provider config/model orchestration. |
 | Backend | `backend/services/jsonlParser.js` | `parseJsonlSession` | Delegates JSONL parsing to Claude provider. |
 | Backend | `backend/sockets/archiveHandlers.js` | `archive_session`, `restore_archive`, `delete_archive`, `list_archives` | Archive/restore orchestration calling Claude file operations. |
-| Backend | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtension`, `getLatestProviderStatusExtensions`, `clearProviderStatusExtension` | Provider status cache for reconnect bootstrap. |
-| Backend | `backend/sockets/index.js` | `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers` | Emits provider registry, branding, readiness, and cached status. |
+| Backend | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtension`, `getLatestProviderStatusExtensions`, `clearProviderStatusExtension` | In-memory provider status cache for live and reconnect bootstrap. |
+| Backend | `backend/database.js` | `saveProviderStatusExtension`, `getProviderStatusExtension`, `getProviderStatusExtensions`, table `provider_status` | SQLite provider status persistence for cold-start bootstrap. |
+| Backend | `backend/sockets/index.js` | `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers` | Emits provider registry, branding, readiness, in-memory status, and SQLite status fallback. |
 | Backend | `backend/services/hookRunner.js` | `runHooks` | Executes Claude settings hooks through provider hook lookup. |
 | Config | `providers/claude/provider.json` | `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `clientInfo`, `supportsAgentSwitching`, `cliManagedHooks` | Provider contract keys. |
 | Config | `providers/claude/branding.json` | Branding text keys | UI labels and messages emitted by backend socket bootstrap. |
@@ -520,9 +521,9 @@ The emitted provider extension is `_anthropic/provider/status`; `providerStatusM
    - `_sessionsWithInitialEmit` prevents duplicate `_anthropic/metadata` emissions.
    - If no cached value exists, the session is not marked consumed and can emit after a later `usage_update` persists context.
 
-7. **Provider status memory caches status-shaped extensions only**
-   - `rememberProviderStatusExtension` requires `params.status.sections`.
-   - `_anthropic/config_options`, `_anthropic/metadata`, and command extensions are broadcast but not provider-status cache entries.
+7. **Provider status memory and persistence store status-shaped extensions only**
+   - `rememberProviderStatusExtension` and `saveProviderStatusExtension` require `params.status.sections`.
+   - `_anthropic/config_options`, `_anthropic/metadata`, and command extensions are broadcast but not provider-status cache or persistence entries.
 
 8. **Claude session files are project-scoped**
    - `findSessionDir` scans project subdirectories below `paths.sessions`.
@@ -552,6 +553,10 @@ Important test names:
 - `prepareAcpEnvironment` -> `does not consume initial replay when cached context is unavailable`
 - `prepareAcpEnvironment` -> `starts a provider-owned proxy and injects ANTHROPIC_BASE_URL`
 - `prompt lifecycle hooks` -> `exports onPromptStarted and onPromptCompleted as no-op hooks`
+- `intercept` -> `treats usage_update as an absolute latest snapshot, not additive`
+- `intercept` -> `persists 100 percent when usage_update reports zero size`
+- `intercept` -> `does not emit stale cached metadata during usage_update replay`
+- `intercept` -> `ignores invalid usage_update values without overwriting cached context`
 - `intercept` -> `normalizes available_commands_update`
 - `intercept` -> `normalizes non-model config_option_update`
 - `intercept` -> `emits an authoritative snapshot when effort is absent for the active model`
@@ -595,6 +600,8 @@ Important test names:
 - `backend/test/providerStatusMemory.test.js` -> `providerStatusMemory` / `keeps provider status memory isolated by provider id`
 - `backend/test/jsonlParser.test.js` -> `jsonlParser` / `delegates parsing to providerModule`
 - `backend/test/sockets-index.test.js` -> `Socket Index Handler` / `emits cached provider status on connection`
+- `backend/test/sockets-index.test.js` -> `Socket Index Handler` / `emits persisted provider status on connection when memory is empty`
+- `backend/test/sockets-index.test.js` -> `Socket Index Handler` / `does not emit persisted provider status over newer memory status for the same provider`
 - `backend/test/mcpServer.test.js` -> `mcpServer` / `getMcpServers returns server config`
 - `backend/test/mcpServer.test.js` -> `mcpServer` / `getMcpServers omits _meta when getMcpServerMeta returns undefined`
 
@@ -606,14 +613,14 @@ Important test names:
 2. Check `providers/claude/provider.json` for `protocolPrefix`, `mcpName`, `toolIdPattern`, `toolCategories`, `supportsAgentSwitching`, and `cliManagedHooks` before changing protocol behavior.
 3. For MCP tool behavior, update `normalizeTool`, `extractToolInvocation`, provider tests, and backend `toolInvocationResolver` expectations together.
 4. For config/model behavior, update `normalizeConfigOptions`, `setConfigOption`, `captureModelState` expectations, and session handler tests together.
-5. For quota behavior, update `quotaProxy.js`, `buildClaudeProviderStatus`, provider status memory expectations, and provider status panel docs if the frontend status shape changes.
+5. For quota behavior, update `quotaProxy.js`, `buildClaudeProviderStatus`, provider status memory and persistence expectations, and provider status panel docs if the frontend status shape changes.
 6. For session files, update `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `parseSessionHistory`, and the provider's session operation tests together.
 7. For hooks or agents, update `buildSessionParams`, `getHooksForAgent`, `supportsAgentSwitching`, `cliManagedHooks`, and session handler tests together.
 
 ### For debugging Claude provider issues
 
 1. Spawn/env issue: inspect `AcpClient.start`, `prepareAcpEnvironment`, `user.json`, and `quotaProxy.js` startup logs.
-2. Missing quota status: inspect `extractClaudeQuotaHeaders`, `buildClaudeProviderStatus`, `_anthropic/provider/status`, and `providerStatusMemory` cache shape.
+2. Missing quota status: inspect `extractClaudeQuotaHeaders`, `buildClaudeProviderStatus`, `_anthropic/provider/status`, `providerStatusMemory` cache shape, and `provider_status` persistence rows.
 3. Missing slash commands: inspect `intercept` handling of `available_commands_update` and frontend provider extension parsing.
 4. Missing config options: inspect `intercept`, `normalizeConfigOptions`, `handleProviderExtension`, and `captureModelState`.
 5. Wrong tool title or handler: inspect `toolIdPattern`, `normalizeTool`, `extractToolInvocation`, `resolveToolInvocation`, and `toolRegistry.dispatch`.

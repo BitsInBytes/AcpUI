@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { fileURLToPath } from 'url';
+
 import { getProvider } from '../../backend/services/providerLoader.js';
 import { acpUiToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
 import {
@@ -12,9 +12,6 @@ import {
 } from '../../backend/services/tools/providerToolNormalization.js';
 import { matchToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
 import { getLatestClaudeQuota, startClaudeQuotaProxy } from './quotaProxy.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // Cache for context usage percentage
 let _emitProviderExtension = null;
@@ -77,6 +74,20 @@ function _saveContextState() {
   }
 }
 
+function contextUsagePercentFromUsageUpdate(update) {
+  if (!update) return null;
+
+  const used = Number(update.used);
+  const size = Number(update.size);
+  if (!Number.isFinite(used) || !Number.isFinite(size)) return null;
+
+  if (size <= 0) return 100;
+
+  const percent = (used / size) * 100;
+  if (!Number.isFinite(percent)) return null;
+  return Math.max(0, Math.min(100, percent));
+}
+
 /**
  * Intercept raw messages from the Claude process and translate them into 
  * standardized ACP protocol messages.
@@ -86,22 +97,22 @@ export function intercept(payload) {
   const { config } = getProvider();
   const sessionId = payload?.params?.sessionId || payload?.result?.sessionId;
 
-  if (sessionId) {
-    _emitCachedContext(sessionId, config);
-  }
-
-  // Handle Claude's usage_update to cache context usage
-  if (
+  const isUsageUpdate =
     payload.method === 'session/update' &&
     payload.params?.update?.sessionUpdate === 'usage_update' &&
-    payload.params?.sessionId
-  ) {
-    const update = payload.params.update;
-    if (typeof update.used === 'number' && typeof update.size === 'number' && update.size > 0) {
-      const percent = Math.min(100, (update.used / update.size) * 100);
+    payload.params?.sessionId;
+
+  // Treat usage_update as authoritative absolute state per session.
+  if (isUsageUpdate) {
+    const percent = contextUsagePercentFromUsageUpdate(payload.params.update);
+    if (percent !== null) {
       _sessionContextCache.set(payload.params.sessionId, percent);
       _saveContextState();
     }
+  }
+
+  if (sessionId && !isUsageUpdate) {
+    _emitCachedContext(sessionId, config);
   }
 
   // Handle Claude's dynamic config options (Effort, Mode, etc.)
@@ -129,8 +140,8 @@ export function intercept(payload) {
 
   // Handle Claude's specific way of announcing available commands.
   // Normalize each command into the shape the generic UI pipeline expects:
-  //   - Prepend '/' to the name (Claude Code ACP omits it, e.g. "compact" → "/compact").
-  //   - Map input.hint → meta.hint so the dropdown knows which commands need arguments
+  //   - Prepend '/' to the name (Claude Code ACP omits it, e.g. "compact" -> "/compact").
+  //   - Map input.hint -> meta.hint so the dropdown knows which commands need arguments
   //     and won't auto-submit them before the user has typed their input.
   if (
     payload.method === 'session/update' &&

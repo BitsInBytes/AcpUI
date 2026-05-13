@@ -192,6 +192,9 @@ describe('Exhaustive Database Coverage', () => {
     };
     db.setDbForTesting(mockDb);
 
+    await expect(db.saveProviderStatusExtension('p1', { method: 'test/provider/status', params: { status: { sections: [] } } })).rejects.toThrow();
+    await expect(db.getProviderStatusExtension('p1')).rejects.toThrow();
+    await expect(db.getProviderStatusExtensions()).rejects.toThrow();
     await expect(db.saveSession({})).rejects.toThrow();
     await expect(db.getAllSessions()).rejects.toThrow();
     await expect(db.getPinnedSessions()).rejects.toThrow();

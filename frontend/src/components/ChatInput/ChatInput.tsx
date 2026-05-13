@@ -19,7 +19,7 @@ const ChatInput: React.FC = () => {
   const { socket, connected, isEngineReady } = useSystemStore();
   const slashCommandsByProviderId = useSystemStore(state => state.slashCommandsByProviderId);
   const globalSlashCommands = useSystemStore(state => state.slashCommands);
-  const contextUsageBySession = useSystemStore(state => state.contextUsageBySession);
+  const getContextUsage = useSystemStore(state => state.getContextUsage);
   const { isRecording, isProcessingVoice, isVoiceEnabled } = useVoiceStore();
   
   const {
@@ -313,7 +313,7 @@ const ChatInput: React.FC = () => {
           )}
         </div>
         {(() => {
-          const rawPct = activeSession?.acpSessionId ? contextUsageBySession[activeSession.acpSessionId] : undefined;
+          const rawPct = activeSession?.acpSessionId ? getContextUsage(activeSession.provider, activeSession.acpSessionId) : undefined;
           const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(Number(rawPct), 100)) : null;
           const pctForColor = pct ?? 0;
           const color = pctForColor >= 80 ? '#dc2626' : pctForColor >= 60 ? '#eab308' : pctForColor >= 50 ? '#22c55e' : 'rgba(96, 165, 250, 0.5)';

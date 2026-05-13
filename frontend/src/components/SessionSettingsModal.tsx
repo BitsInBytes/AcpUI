@@ -7,8 +7,8 @@ import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSystemStore } from '../store/useSystemStore';
 import { getFullModelChoices, getFullModelSelectionValue } from '../utils/modelOptions';
 
-const ContextUsageCard: React.FC<{ acpSessionId: string | null | undefined }> = ({ acpSessionId }) => {
-  const pct = useSystemStore(state => acpSessionId ? state.contextUsageBySession[acpSessionId] : undefined);
+const ContextUsageCard: React.FC<{ providerId: string | null | undefined; acpSessionId: string | null | undefined }> = ({ providerId, acpSessionId }) => {
+  const pct = useSystemStore(state => acpSessionId ? state.getContextUsage(providerId, acpSessionId) : undefined);
   const rounded = pct !== undefined ? Math.round(pct) : 0;
   return (
     <div className="stat-card context-card">
@@ -162,7 +162,7 @@ const SessionSettingsModal: React.FC = () => {
 
                     <div className="stats-container">
                       <div className="structured-stats">
-                        <ContextUsageCard acpSessionId={session.acpSessionId} />
+                        <ContextUsageCard providerId={session.provider} acpSessionId={session.acpSessionId} />
                       </div>
                     </div>
                   </div>

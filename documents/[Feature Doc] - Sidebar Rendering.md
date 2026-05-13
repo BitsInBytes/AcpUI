@@ -13,7 +13,7 @@ Agents working in this area need the exact rendering contract because a small mi
 - Renders one provider stack per `ProviderSummary` in `useSystemStore.orderedProviderIds`, with a default provider fallback when backend provider metadata is unavailable.
 - Displays root folders and root sessions for the expanded provider, and renders nested folder trees through `FolderItem`.
 - Renders forked sessions and sub-agent sessions beneath their parent session through `Sidebar.renderChildren` and `FolderItem.renderForkTree`.
-- Applies visual state classes from `ChatSession` flags: `active`, `pinned`, `typing`, `unread`, `awaiting-permission`, and `popped-out`.
+- Applies visual state classes from `ChatSession` flags: `active`, `pinned`, `typing`, `unread`, `awaiting-permission`, `awaiting-shell-input`, and `popped-out`.
 - Handles drag/drop for moving sessions between folders, moving folders under folders, and dropping sessions or folders back to the provider root.
 - Exposes provider-scoped new chat, new folder, archive restore/delete, provider status, sidebar pin, sidebar collapse, search, and resize controls.
 
@@ -21,7 +21,7 @@ Agents working in this area need the exact rendering contract because a small mi
 
 - The sidebar is the main navigation surface for active, background, forked, archived, and sub-agent work.
 - Provider and folder identity are matched in the frontend, so stale or missing `provider` and `providerId` fields create display bugs without throwing runtime errors.
-- Streaming and permission state are rendered through CSS classes, so store flags must be updated consistently by socket handlers and stream stores.
+- Streaming, permission, and interactive shell input-wait state are rendered through CSS classes, so store flags must be updated consistently by socket handlers and stream stores.
 - Drag/drop updates both backend folder persistence and optimistic frontend session state.
 - Search changes the tree shape by flattening matching sessions and hiding folder recursion while the query is active.
 
@@ -220,14 +220,14 @@ if (sessionId) {
 ### 9. SessionItem Applies State Classes, Icons, Actions, and Pop-Out Behavior
 
 File: `frontend/src/components/SessionItem.tsx` (Component: `SessionItem`)
-File: `frontend/src/components/Sidebar.css` (Classes: `.session-item`, `.typing`, `.unread`, `.awaiting-permission`, `.popped-out`)
+File: `frontend/src/components/Sidebar.css` (Classes: `.session-item`, `.typing`, `.unread`, `.awaiting-permission`, `.awaiting-shell-input`, `.popped-out`)
 File: `frontend/src/lib/sessionOwnership.ts` (Functions: `isSessionPoppedOut`, `openPopout`, `focusPopout`)
 
 `SessionItem` builds its class string directly from session flags and pop-out ownership. It selects an icon in this order: sub-agent, fork, terminal, normal chat. Terminal presence is derived from `useCanvasStore.terminals`.
 
 ```tsx
 // FILE: frontend/src/components/SessionItem.tsx (Component: SessionItem)
-className={`session-item ${isActive ? 'active' : ''} ${session.isPinned ? 'pinned' : ''} ${session.isTyping ? 'typing' : ''} ${session.hasUnreadResponse ? 'unread' : ''} ${session.isAwaitingPermission ? 'awaiting-permission' : ''} ${isSessionPoppedOut(session.id) ? 'popped-out' : ''}`}
+className={`session-item ${isActive ? 'active' : ''} ${session.isPinned ? 'pinned' : ''} ${session.isTyping ? 'typing' : ''} ${session.hasUnreadResponse ? 'unread' : ''} ${session.isAwaitingPermission ? 'awaiting-permission' : ''} ${session.isAwaitingShellInput ? 'awaiting-shell-input' : ''} ${isSessionPoppedOut(session.id) ? 'popped-out' : ''}`}
 
 {session.isSubAgent ? <Bot />
   : session.forkedFrom ? <GitFork />
@@ -235,7 +235,7 @@ className={`session-item ${isActive ? 'active' : ''} ${session.isPinned ? 'pinne
   : <MessageSquare />}
 ```
 
-Sub-agent sessions show only a delete action when they are not typing. Regular sessions show pin, rename, settings, pop-out, and archive/delete actions.
+Sub-agent sessions show only a delete action when they are not typing. Regular sessions show pin, rename, settings, pop-out, and archive/delete actions. Permission requests and shell input prompts share the green waiting glow through `.awaiting-permission` and `.awaiting-shell-input`.
 
 ### 10. Forks and Sub-Agents Render Beneath Their Parent UI Session
 
@@ -252,10 +252,11 @@ const getSubAgentsOf = (parentId: string) => filteredSessions.filter(s => s.isSu
 
 `parentAcpSessionId` is retained on sub-agent sessions, but the sidebar tree lookup uses `forkedFrom`.
 
-### 11. Stream Events Update Sidebar State Through useStreamStore
+### 11. Stream and Shell Events Update Sidebar State
 
-File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket events: `thought`, `token`, `system_event`, `permission_request`, `token_done`, `session_renamed`)
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket events: `thought`, `token`, `system_event`, `permission_request`, `token_done`, `session_renamed`, `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit`)
 File: `frontend/src/store/useStreamStore.ts` (Actions: `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`)
+File: `frontend/src/store/useShellRunStore.ts` (Actions: `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`)
 File: `frontend/src/store/useChatStore.ts` (Action: `handleRespondPermission`)
 
 `useChatManager` routes socket events into `useStreamStore`. Stream actions set `isTyping` for thoughts, tokens, and system events; permission requests set `isAwaitingPermission`; completion clears typing after the queue drains and marks inactive sessions with `hasUnreadResponse`.
@@ -275,7 +276,7 @@ useSessionLifecycleStore.setState(state => ({
 }));
 ```
 
-`handleRespondPermission` clears `isAwaitingPermission` and emits `respond_permission`. `handleSessionSelect` clears `hasUnreadResponse` for the selected UI session.
+`handleRespondPermission` clears `isAwaitingPermission` and emits `respond_permission`. Shell run snapshots and output carry `needsInput`; `useChatManager.syncShellInputStateForSession` mirrors any active run for the ACP session into `ChatSession.isAwaitingShellInput`, then shell input and exit events clear it. `handleSessionSelect` clears `hasUnreadResponse` for the selected UI session.
 
 ### 12. Sub-Agent Socket Events Materialize Sidebar Sessions Lazily
 
@@ -426,10 +427,11 @@ interface ChatSession {
   isWarmingUp: boolean;
   hasUnreadResponse?: boolean;
   isAwaitingPermission?: boolean;
+  isAwaitingShellInput?: boolean;
 }
 ```
 
-The stream layer owns `isTyping`, `hasUnreadResponse`, and `isAwaitingPermission`. Session lifecycle actions own selected-session unread clearing, pin sorting, rename state, and hydration.
+The stream layer owns `isTyping`, `hasUnreadResponse`, and `isAwaitingPermission`. Shell run socket handling owns `isAwaitingShellInput` by folding active `ShellRunSnapshot.needsInput` values per ACP session. Session lifecycle actions own selected-session unread clearing, pin sorting, rename state, and hydration.
 
 ---
 
@@ -454,6 +456,7 @@ The stream layer owns `isTyping`, `hasUnreadResponse`, and `isAwaitingPermission
 | Backend to frontend | `sidebar_settings` | `useSocket.getOrCreateSocket` | Sets archive/delete mode and notification settings. |
 | Backend to frontend | `session_renamed` | `useChatManager` | Updates a session title by UI session ID. |
 | Backend to frontend | `thought`, `token`, `system_event`, `permission_request`, `token_done` | `useChatManager`, `useStreamStore` | Drives typing, unread, permission, and stream completion flags. |
+| Backend to frontend | `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit` | `useChatManager`, `useShellRunStore` | Drives shell run state and mirrors interactive input-wait prompts into `isAwaitingShellInput`. |
 | Backend to frontend | `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed` | `useChatManager`, `useSubAgentStore` | Maintains invocation-level and agent-level sub-agent state plus lazy sidebar sessions. |
 | Frontend to backend | `load_folders`, `create_folder`, `rename_folder`, `delete_folder`, `move_folder`, `move_session_to_folder` | `useFolderStore`, `folderHandlers.js` | Persists folder tree changes. |
 | Frontend to backend | `save_snapshot` | `useSessionLifecycleStore`, `useStreamStore`, `useChatStore` | Persists session metadata after pin, rename, stream completion, or permission response. |
@@ -473,7 +476,8 @@ The `folders` table stores `id`, `name`, `parent_id`, `position`, `created_at`, 
 4. `FolderItem` recursively expands folders based on `expandedFolderIds`.
 5. `Sidebar.renderChildren` and `FolderItem.renderForkTree` recursively render forks and sub-agents.
 6. `SessionItem` maps flags to icons, actions, and CSS classes.
-7. `Sidebar.css` supplies responsive layout, drag-over states, and status animations.
+7. Shell run `needsInput` snapshots are mirrored into `ChatSession.isAwaitingShellInput` before `SessionItem` renders.
+8. `Sidebar.css` supplies responsive layout, drag-over states, and status animations.
 
 ---
 
@@ -486,7 +490,7 @@ The `folders` table stores `id`, `name`, `parent_id`, `position`, `created_at`, 
 | Sidebar shell | `frontend/src/components/Sidebar.tsx` | Component `Sidebar`; handlers `handleSelect`, `handleNew`, `handlePrimaryNew`, `handleShowArchives`, `handleRestore`, `handleRemoveSession`, `handleDropSession`, `handleDropFolder`, `handleRootDrop`, `renderChildren`, `onResizeStart` | Main provider stack, search, workspace, archive, folder, session, drag/drop, resize, and footer renderer. |
 | Folder tree | `frontend/src/components/FolderItem.tsx` | Component `FolderItem`; function `renderForkTree`; handlers `handleDrop`, `handleFolderDragStart`, `startEdit`, `saveEdit`; function `isDescendant` | Recursive folder renderer with rename/delete/subfolder controls and folder/session drop targets. |
 | Session row | `frontend/src/components/SessionItem.tsx` | Component `SessionItem`; handlers `handleStartEdit`, `handleSaveEdit`; functions `isSessionPoppedOut`, `openPopout`, `focusPopout` | Applies session classes, icons, notes indicator, sub-agent action restrictions, edit mode, and pop-out behavior. |
-| Styling | `frontend/src/components/Sidebar.css` | Classes `.sidebar`, `.sessions-list`, `.provider-stack`, `.provider-stack-header`, `.collapsed-running`, `.folder-row`, `.folder-row.drag-over`, `.session-item`, `.typing`, `.unread`, `.awaiting-permission`, `.popped-out`, `.sidebar-resize-handle`; keyframes `breatheGlow`, `greenBreatheGlow` | Layout, responsive behavior, status animations, drag-over feedback, and row states. |
+| Styling | `frontend/src/components/Sidebar.css` | Classes `.sidebar`, `.sessions-list`, `.provider-stack`, `.provider-stack-header`, `.collapsed-running`, `.folder-row`, `.folder-row.drag-over`, `.session-item`, `.typing`, `.unread`, `.awaiting-permission`, `.awaiting-shell-input`, `.popped-out`, `.sidebar-resize-handle`; keyframes `breatheGlow`, `greenBreatheGlow` | Layout, responsive behavior, status animations, drag-over feedback, and row states. |
 | Archive modal | `frontend/src/components/ArchiveModal.tsx` | Component `ArchiveModal` | Lists, filters, restores, and deletes archive folder entries passed by `Sidebar`. |
 | Workspace picker | `frontend/src/components/WorkspacePickerModal.tsx` | Component `WorkspacePickerModal` | Lets the user choose a workspace cwd and optional agent when multiple workspaces exist. |
 | Provider status | `frontend/src/components/ProviderStatusPanel.tsx` | Component `ProviderStatusPanel`; prop `providerId` | Renders provider status inside expanded provider content. |
@@ -496,13 +500,14 @@ The `folders` table stores `id`, `name`, `parent_id`, `position`, `created_at`, 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Socket bootstrap | `frontend/src/hooks/useSocket.ts` | Function `getOrCreateSocket`; hook `useSocket`; events `providers`, `branding`, `workspace_cwds`, `sidebar_settings` | Loads provider/workspace/branding/settings data used by the sidebar. |
-| Chat event routing | `frontend/src/hooks/useChatManager.ts` | Hook `useChatManager`; handlers for `session_renamed`, `token_done`, `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`; local map `pendingSubAgents` | Routes stream and sub-agent events into stores that drive sidebar state. |
+| Chat event routing | `frontend/src/hooks/useChatManager.ts` | Hook `useChatManager`; handlers for `session_renamed`, `token_done`, `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit`, `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`; local map `pendingSubAgents`; helper `syncShellInputStateForSession` | Routes stream, shell, and sub-agent events into stores that drive sidebar state. |
 | Sessions | `frontend/src/store/useSessionLifecycleStore.ts` | Store `useSessionLifecycleStore`; actions `handleInitialLoad`, `handleSessionSelect`, `handleNewChat`, `handleTogglePin`, `handleRenameSession`, `setSessions` | Holds session list, active session, notes map, selection behavior, pin sorting, and rename persistence. |
 | Folders | `frontend/src/store/useFolderStore.ts` | Store `useFolderStore`; actions `loadFolders`, `createFolder`, `renameFolder`, `deleteFolder`, `moveFolder`, `moveSessionToFolder`, `toggleFolder`; constant `EXPANDED_KEY` | Holds folder tree and expanded state, emits folder socket events, and applies optimistic folder/session updates. |
 | UI | `frontend/src/store/useUIStore.ts` | Store `useUIStore`; actions `setSidebarOpen`, `setSidebarPinned`, `toggleSidebarPinned`, `setExpandedProviderId`, `setSettingsOpen` | Holds sidebar open/pinned state, expanded provider state, and session settings modal target. |
 | System | `frontend/src/store/useSystemStore.ts` | Store `useSystemStore`; actions `setProviders`, `setProviderBranding`, `setWorkspaceCwds`, `setDeletePermanent`, `setProviderStatus`, `getBranding` | Holds provider order, provider summaries, workspace list, delete mode, and provider status data. |
 | Canvas | `frontend/src/store/useCanvasStore.ts` | Store `useCanvasStore`; field `terminals` | Lets `SessionItem` show the terminal icon for sessions with open terminal tabs. |
 | Stream | `frontend/src/store/useStreamStore.ts` | Store `useStreamStore`; actions `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `ensureAssistantMessage`, `processBuffer` | Sets typing, unread, and permission flags while managing the message stream. |
+| Shell runs | `frontend/src/store/useShellRunStore.ts` | Store `useShellRunStore`; actions `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`; field `ShellRunSnapshot.needsInput` | Holds live shell run state that `useChatManager` mirrors into `isAwaitingShellInput`. |
 | Permission response | `frontend/src/store/useChatStore.ts` | Action `handleRespondPermission` | Clears `isAwaitingPermission` and emits `respond_permission`. |
 
 ### Backend and Persistence
@@ -563,6 +568,10 @@ The `folders` table stores `id`, `name`, `parent_id`, `position`, `created_at`, 
 
    `useStreamStore.onStreamEvent` sets `isAwaitingPermission` on permission requests. `useChatStore.handleRespondPermission` clears the flag and annotates the matching permission step with the selected response.
 
+12. **Interactive shell input state is separate from typing**
+
+   A shell command can still be typing while also waiting for stdin. `useChatManager.syncShellInputStateForSession` sets `isAwaitingShellInput` from active `ShellRunSnapshot.needsInput` values so `.awaiting-shell-input` can override the normal blue typing glow with the green waiting glow.
+
 ---
 
 ## Unit Tests
@@ -574,9 +583,9 @@ The `folders` table stores `id`, `name`, `parent_id`, `position`, `created_at`, 
 | `frontend/src/test/Sidebar.test.tsx` | `renders session list with pinned status indicators`; `applies typing class when a session is typing`; `renders a typing session outside the provider content when collapsed`; `renders an unread session outside the provider content when collapsed`; `marks a collapsed provider header as unread when one of its chats has an unread response`; `applies awaiting-permission class when a session is awaiting permission`; `filters sessions by search input`; `new folder button opens the app modal and creates a folder`; `drag and drop session to root calls moveSessionToFolder with null`; `deleting a parent session also removes its forks from the session list`; `forked sessions render indented under parent`; `renders resize handle when sidebar is open`; `restores width from localStorage` | Sidebar rendering, state classes, collapsed provider summaries, search, workspace controls, archive modal, new folder modal, root drag/drop, fork cascade removal, pop-out class, and resize persistence. |
 | `frontend/src/test/SidebarExtended.test.tsx` | `renders session items in the correct provider stack`; `filters sessions based on search input`; `handles "New Chat" click`; `toggles pinned state of sidebar` | Provider stack rendering with mocked child components and top-level interactions. |
 | `frontend/src/test/FolderItem.test.tsx` | `renders folder name`; `shows child count`; `expands on click to show children`; `enters rename mode on right-click`; `saves rename on Enter`; `handles drop of session onto folder`; `handles drop of folder onto folder`; `renders fork-indent for forked sessions inside folders`; `shows fork arrow for forked sessions` | Folder recursion, counts, rename flow, drag/drop callbacks, and fork rendering inside folders. |
-| `frontend/src/test/SessionItem.test.tsx` | `has active class when isActive is true`; `calls onSelect when clicked`; `enters edit mode when rename button is clicked`; `shows only delete button for sub-agent when not typing`; `hides delete button for sub-agent when typing`; `shows "Archive Chat" when deletePermanent is false`; `shows "Delete Chat" when deletePermanent is true`; `shows GitFork icon when session has forkedFrom`; `shows Terminal icon when session has a terminal in canvas store`; `fork icon takes priority over terminal icon when session has both forkedFrom and a terminal` | Session row classes, action gating, delete/archive title, icon priority, and terminal indicator. |
+| `frontend/src/test/SessionItem.test.tsx` | `has active class when isActive is true`; `uses the shell input waiting class when an interactive shell needs input`; `calls onSelect when clicked`; `enters edit mode when rename button is clicked`; `shows only delete button for sub-agent when not typing`; `hides delete button for sub-agent when typing`; `shows "Archive Chat" when deletePermanent is false`; `shows "Delete Chat" when deletePermanent is true`; `shows GitFork icon when session has forkedFrom`; `shows Terminal icon when session has a terminal in canvas store`; `fork icon takes priority over terminal icon when session has both forkedFrom and a terminal` | Session row classes, shell input-wait class, action gating, delete/archive title, icon priority, and terminal indicator. |
 | `frontend/src/test/useFolderStore.test.ts` | `createFolder emits and updates local state`; `deleteFolder reparents sub-folders and sessions`; `loadFolders emits and sets folders`; `renameFolder emits and updates local state`; `moveFolder emits and updates local state`; `moveSessionToFolder emits socket event`; `toggleFolder manages expanded set` | Folder store socket calls, optimistic state, reparenting, and expansion persistence state. |
-| `frontend/src/test/useChatManager.test.ts` | `handles "sub_agents_starting" - clears old sidebar sessions immediately`; `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`; `handles "sub_agent_invocation_status" event`; `handles "sub_agent_status" with invocationId by updating agent and invocation state`; `moves waiting sub-agents back to running on token events`; `passes terminal sub-agent completion statuses through to the store`; `creates lazy sub-agent session with provider on first token`; `creates lazy sub-agent session with provider on first system_event`; `handles "session_renamed" event`; `handles "token_done" event` | Realtime sidebar updates from title, completion, and sub-agent socket events. |
+| `frontend/src/test/useChatManager.test.ts` | `marks the session as awaiting shell input from shell output and clears it on exit`; `handles "sub_agents_starting" - clears old sidebar sessions immediately`; `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`; `handles "sub_agent_invocation_status" event`; `handles "sub_agent_status" with invocationId by updating agent and invocation state`; `moves waiting sub-agents back to running on token events`; `passes terminal sub-agent completion statuses through to the store`; `creates lazy sub-agent session with provider on first token`; `creates lazy sub-agent session with provider on first system_event`; `handles "session_renamed" event`; `handles "token_done" event` | Realtime sidebar updates from title, completion, shell input-wait state, and sub-agent socket events. |
 | `frontend/src/test/useStreamStore.test.ts` | `onStreamToken queues text and triggers typewriter`; `onStreamDone marks message as finished and saves snapshot` | Stream-driven typing and completion behavior used by sidebar state classes. |
 
 ### Backend Tests
@@ -620,9 +629,10 @@ npx vitest run test/folderHandlers.test.js
 5. **Typing glow missing:** Inspect `session.isTyping` and confirm `useStreamStore.onStreamToken`, `onStreamThought`, or `onStreamEvent` receives the ACP session ID matching `session.acpSessionId`.
 6. **Unread marker missing:** Inspect `session.hasUnreadResponse`, active session ID, and `useStreamStore.onStreamDone`. Collapsed provider headers do not show unread class while any session in that provider is typing.
 7. **Permission glow stuck or missing:** Inspect `session.isAwaitingPermission`, `useStreamStore.onStreamEvent`, and `useChatStore.handleRespondPermission`.
-8. **Drag/drop does not persist:** Check `DataTransfer` keys (`session-id`, `folder-id`), `useFolderStore.moveSessionToFolder`, `useFolderStore.moveFolder`, and backend `folderHandlers.js` events.
-9. **Width or pin state resets:** Check `acpui-sidebar-width` and `isSidebarPinned` in `localStorage`.
-10. **Search result shape is surprising:** Search intentionally hides folders and recursive child rendering from provider content.
+8. **Shell input glow missing or stuck:** Inspect `session.isAwaitingShellInput`, `useShellRunStore.runs[runId].needsInput`, and `useChatManager.syncShellInputStateForSession` after `shell_run_output`, `shell_run_snapshot`, and `shell_run_exit`.
+9. **Drag/drop does not persist:** Check `DataTransfer` keys (`session-id`, `folder-id`), `useFolderStore.moveSessionToFolder`, `useFolderStore.moveFolder`, and backend `folderHandlers.js` events.
+10. **Width or pin state resets:** Check `acpui-sidebar-width` and `isSidebarPinned` in `localStorage`.
+11. **Search result shape is surprising:** Search intentionally hides folders and recursive child rendering from provider content.
 
 ---
 
@@ -633,6 +643,6 @@ npx vitest run test/folderHandlers.test.js
 - `SessionItem` owns row state classes, icon priority, edit mode, notes indicator, pop-out behavior, and action restrictions for sub-agents.
 - `useSessionLifecycleStore`, `useFolderStore`, `useUIStore`, `useSystemStore`, `useCanvasStore`, and `useStreamStore` are all part of the rendering contract.
 - Provider matching uses `session.provider` and `folder.providerId`; tree matching uses `folderId`, `forkedFrom`, and `isSubAgent`.
-- Realtime status classes come from `isTyping`, `hasUnreadResponse`, `isAwaitingPermission`, and pop-out ownership.
+- Realtime status classes come from `isTyping`, `hasUnreadResponse`, `isAwaitingPermission`, `isAwaitingShellInput`, and pop-out ownership.
 - Drag/drop uses `session-id` and `folder-id` data transfer keys and persists through `move_session_to_folder` and `move_folder`.
 - The critical contract is to keep provider identity, tree identity, and runtime status flags synchronized across socket handlers, stores, and row components.

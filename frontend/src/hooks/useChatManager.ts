@@ -71,6 +71,7 @@ export function useChatManager(
     const shellRunSnapshotPatch = (snapshot: ShellRunSnapshot, status = snapshot.status): Partial<SystemEvent> => ({
       shellRunId: snapshot.runId,
       shellState: status,
+      shellNeedsInput: Boolean(snapshot.needsInput),
       command: snapshot.command,
       cwd: snapshot.cwd,
       ...(snapshot.description ? { title: `Invoke Shell: ${snapshot.description}` } : {})
@@ -95,6 +96,7 @@ export function useChatManager(
       shellRunId: snapshot.runId,
       shellInteractive: true,
       shellState: snapshot.status,
+      shellNeedsInput: Boolean(snapshot.needsInput),
       ...(snapshot.command ? { command: snapshot.command } : {}),
       ...(snapshot.cwd ? { cwd: snapshot.cwd } : {}),
       ...patch
@@ -195,6 +197,21 @@ export function useChatManager(
       if (!matched && snapshot) ensureShellRunToolStep(snapshot, patch);
     };
 
+    const syncShellInputStateForSession = (sessionId?: string | null) => {
+      if (!sessionId) return;
+      const runs = Object.values(useShellRunStore.getState().runs);
+      const isAwaitingShellInput = runs.some(run =>
+        run.sessionId === sessionId &&
+        run.status !== 'exited' &&
+        run.needsInput === true
+      );
+      useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.map(s =>
+          s.acpSessionId === sessionId ? { ...s, isAwaitingShellInput } : s
+        )
+      }));
+    };
+
     // Pending sub-agents — session created lazily on first token
     const pendingSubAgents = new Map<string, { providerId: string; acpSessionId: string; uiId: string; index: number; name: string; prompt: string; agent: string; parentSessionId: string; parentUiId: string; model: string }>();
 
@@ -229,10 +246,11 @@ export function useChatManager(
       origOnStreamToken(data);
     };
 
-    socket.on('stats_push', (data: { sessionId: string; usedTokens?: number; totalTokens?: number }) => {
+    socket.on('stats_push', (data: { providerId?: string; sessionId: string; usedTokens?: number; totalTokens?: number }) => {
       if (!data || !data.sessionId) return;
+      const sessionProviderId = data.providerId || useSessionLifecycleStore.getState().sessions.find(s => s.acpSessionId === data.sessionId)?.provider || null;
       if (Number.isFinite(data.usedTokens) && Number.isFinite(data.totalTokens) && Number(data.totalTokens) > 0) {
-        useSystemStore.getState().setContextUsage(data.sessionId, (Number(data.usedTokens) / Number(data.totalTokens)) * 100);
+        useSystemStore.getState().setContextUsage(sessionProviderId, data.sessionId, (Number(data.usedTokens) / Number(data.totalTokens)) * 100);
       }
       setSessions(useSessionLifecycleStore.getState().sessions.map(s => {
         if (s.acpSessionId !== data.sessionId) return s;
@@ -303,12 +321,14 @@ export function useChatManager(
       if (!snapshot?.runId) return;
       useShellRunStore.getState().upsertSnapshot(snapshot);
       patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot), snapshot);
+      syncShellInputStateForSession(snapshot.sessionId);
     });
 
     socket.on('shell_run_snapshot', (snapshot: ShellRunSnapshot) => {
       if (!snapshot?.runId) return;
       useShellRunStore.getState().upsertSnapshot(snapshot);
       patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot), snapshot);
+      syncShellInputStateForSession(snapshot.sessionId);
     });
 
     socket.on('shell_run_started', (snapshot: ShellRunSnapshot) => {
@@ -316,27 +336,31 @@ export function useChatManager(
       const started = { ...snapshot, status: snapshot.status || 'running' } as ShellRunSnapshot;
       useShellRunStore.getState().markStarted(started);
       patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(started, started.status), started);
+      syncShellInputStateForSession(started.sessionId);
     });
 
-    socket.on('shell_run_output', (data: { providerId: string; sessionId: string; runId: string; chunk: string; maxLines?: number }) => {
+    socket.on('shell_run_output', (data: { providerId: string; sessionId: string; runId: string; chunk: string; maxLines?: number; needsInput?: boolean }) => {
       if (!data?.runId) return;
       useShellRunStore.getState().appendOutput(data);
       const snapshot = useShellRunStore.getState().runs[data.runId];
       // Ensure the step is updated if it wasn't already
-      patchShellRunToolStep(data.runId, { shellState: 'running' }, snapshot);
+      patchShellRunToolStep(data.runId, { shellState: 'running', shellNeedsInput: Boolean(snapshot?.needsInput) }, snapshot);
+      syncShellInputStateForSession(data.sessionId);
     });
 
-    socket.on('shell_run_exit', (data: { providerId: string; sessionId: string; runId: string; exitCode?: number | null; reason?: string | null; finalText?: string }) => {
+    socket.on('shell_run_exit', (data: { providerId: string; sessionId: string; runId: string; exitCode?: number | null; reason?: string | null; finalText?: string; needsInput?: boolean }) => {
       if (!data?.runId) return;
       useShellRunStore.getState().markExited(data);
       const snapshot = useShellRunStore.getState().runs[data.runId];
       const status: SystemEvent['status'] = data.reason === 'completed' || data.exitCode === 0 ? 'completed' : 'failed';
       patchShellRunToolStep(data.runId, {
         shellState: 'exited',
+        shellNeedsInput: false,
         status,
         endTime: Date.now(),
         ...(data.finalText !== undefined ? { output: data.finalText } : {})
       }, snapshot);
+      syncShellInputStateForSession(data.sessionId);
     });
 
     // Sub-agent events

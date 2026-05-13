@@ -12,6 +12,7 @@ AcpUI's provider system is the backend adapter layer that loads provider definit
 - Reads each provider directory through `provider.json`, optional `branding.json`, optional `user.json`, and optional `index.js`.
 - Normalizes provider IDs, validates provider paths, and keeps the default provider first in registry order.
 - Creates one runtime per enabled provider through `providerRuntimeManager.init`, with one `AcpClient` per runtime.
+- Runs startup JSON diagnostics before daemon startup so malformed provider registry or provider definition JSON can be reported to the UI instead of crashing the backend.
 - Spawns provider ACP daemon processes, performs provider-owned handshakes, and restarts exited daemons with exponential backoff.
 - Routes JSON-RPC daemon messages through provider hooks before emitting provider-agnostic socket events and Unified Timeline updates.
 - Delegates model state, config options, tool identity, session file paths, archive behavior, hooks, and prompt lifecycle tracking to provider modules.
@@ -107,7 +108,7 @@ function bindProviderModule(providerId, mod) {
 
 File: `backend/services/providerRuntimeManager.js` (Class: `ProviderRuntimeManager`, Methods: `init`, `getRuntime`, `getClient`, `getProviderSummaries`)
 
-`providerRuntimeManager.init(io, serverBootId)` reads registry entries, reuses the exported default `AcpClient` for the default provider, creates `new AcpClient(entry.id)` for every other provider, assigns each provider ID, loads provider config through `getProvider`, stores runtime records, and starts every client with `client.init(io, serverBootId)`. A second `init` call returns existing runtimes without starting daemons again.
+`providerRuntimeManager.init(io, serverBootId)` first calls `collectInvalidJsonConfigErrors()` and returns without daemon startup when `hasStartupBlockingJsonConfigError()` finds malformed provider registry or provider `provider.json` input. When startup diagnostics are clean, it reads registry entries, reuses the exported default `AcpClient` for the default provider, creates `new AcpClient(entry.id)` for every other provider, assigns each provider ID, loads provider config through `getProvider`, stores runtime records, and starts every client with `client.init(io, serverBootId)`. A second `init` call returns existing runtimes without starting daemons again.
 
 6. Each `AcpClient` starts its provider daemon
 
@@ -140,14 +141,16 @@ The provider's `performHandshake(client)` sends the ACP `initialize` request and
 
 8. Socket connections receive provider catalog and branding
 
-File: `backend/sockets/index.js` (Functions: `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers`; Socket events: `providers`, `ready`, `branding`, `provider_extension`)
+File: `backend/sockets/index.js` (Functions: `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers`; Socket events: `config_errors`, `providers`, `ready`, `branding`, `provider_extension`)
 
-On Socket.IO connection, the backend emits:
+On Socket.IO connection, the backend emits `config_errors` before provider hydration. Startup-blocking provider config diagnostics stop the remaining provider payloads so the frontend can show a blocking repair dialog.
+
+When startup diagnostics are clean, the backend emits:
 
 - `providers` with `defaultProviderId`, provider labels, ready state, and branding payloads.
 - `ready` for each runtime whose client has completed handshake.
 - `branding` for every provider, sourced from provider config.
-- `provider_extension` snapshots stored by `providerStatusMemory.js`.
+- `provider_extension` status snapshots stored by `providerStatusMemory.js` and cold-start status fallback rows stored in SQLite.
 
 `buildBrandingPayload` includes `providerId`, branding fields, `title`, `models`, `defaultModel`, `protocolPrefix`, and `supportsAgentSwitching`.
 
@@ -166,7 +169,7 @@ Model and config state are captured through `extractModelState`, `providerModule
 
 File: `backend/services/acpClient.js` (Methods: `handleAcpMessage`, `handleUpdate`, `handleRequestPermission`, `handleProviderExtension`, `handleModelStateUpdate`)
 
-Every parsed JSON-RPC payload passes through `this.providerModule.intercept(payload)` before routing. Any falsy return is ignored. A provider should return the payload object for normal routing and return `null` only for intentional drops.
+Every parsed JSON-RPC payload passes through `this.providerModule.intercept(payload, { responseRequest })` before routing. `responseRequest` is resolved from the pending transport entry for `payload.id` and includes the request method, params, and captured `sessionId`. Any falsy intercept return is ignored. A provider should return the payload object for normal routing and return `null` only for intentional drops.
 
 Routing order:
 
@@ -176,7 +179,7 @@ Routing order:
 - Methods starting with the provider config key `protocolPrefix` call `handleProviderExtension`.
 - Unmatched methods are logged.
 
-`handleProviderExtension` updates model state when model fields are present, merges dynamic config options when the extension method ends with `config_options`, stores provider status snapshots when `params.status.sections` exists, and emits `provider_extension` globally with `providerId` included in `params`.
+`handleProviderExtension` updates model state when model fields are present, merges dynamic config options when the extension method ends with `config_options`, stores provider status snapshots when `params.status.sections` exists, persists valid provider status through SQLite, and emits `provider_extension` globally with `providerId` included in `params`.
 
 11. Session updates become normalized timeline events
 
@@ -436,9 +439,10 @@ Session create/load
 |---|---|---|---|
 | Registry | `backend/services/providerRegistry.js` | `getProviderRegistry`, `getProviderEntries`, `getDefaultProviderId`, `resolveProviderId`, `getProviderEntry`, `resetProviderRegistryForTests` | Loads, validates, caches, and resolves provider registry entries |
 | Loader | `backend/services/providerLoader.js` | `getProvider`, `getProviderModule`, `getProviderModuleSync`, `runWithProvider`, `resetProviderLoaderForTests`, `DEFAULT_MODULE`, `bindProviderModule` | Loads provider config, imports provider modules, binds hooks to provider context |
-| Runtime Manager | `backend/services/providerRuntimeManager.js` | `ProviderRuntimeManager`, `init`, `getRuntime`, `getClient`, `getProviderSummaries`, `getRuntimes` | Creates and exposes provider runtimes and clients |
+| JSON Diagnostics | `backend/services/jsonConfigDiagnostics.js` | `collectInvalidJsonConfigErrors`, `hasStartupBlockingJsonConfigError` | Reports invalid startup config, including malformed JSON and missing required provider definitions, before daemon startup |
+| Runtime Manager | `backend/services/providerRuntimeManager.js` | `ProviderRuntimeManager`, `init`, `getRuntime`, `getClient`, `getProviderSummaries`, `getRuntimes` | Runs startup JSON diagnostics, creates provider runtimes, and exposes clients |
 | ACP Client | `backend/services/acpClient.js` | `AcpClient`, `buildAcpSpawnCommand`, `start`, `performHandshake`, `handleAcpMessage`, `handleProviderExtension`, `handleModelStateUpdate` | Owns daemon process lifecycle, JSON-RPC routing, provider extension handling, restart behavior |
-| Transport | `backend/services/jsonRpcTransport.js` | `JsonRpcTransport`, `setProcess`, `sendRequest`, `pendingRequests`, `reset` | Correlates JSON-RPC requests and daemon responses |
+| Transport | `backend/services/jsonRpcTransport.js` | `JsonRpcTransport`, `setProcess`, `sendRequest`, `getPendingRequestContext`, `pendingRequests`, `reset` | Correlates JSON-RPC requests, session ids, and daemon responses |
 | Permissions | `backend/services/permissionManager.js` | `PermissionManager`, `handleRequest`, `respond` | Handles `session/request_permission` lifecycle |
 | Streams | `backend/services/streamController.js` | `StreamController`, `beginDraining`, `waitForDrainToFinish`, `statsCaptures`, `onChunk` | Suppresses load replay and captures internal output |
 
@@ -446,7 +450,7 @@ Session create/load
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Socket Bootstrap | `backend/sockets/index.js` | `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers`, events `providers`, `ready`, `branding`, `provider_extension` | Hydrates frontend provider catalog and branding |
+| Socket Bootstrap | `backend/sockets/index.js` | `buildBrandingPayload`, `getProviderPayloads`, `registerSocketHandlers`, events `config_errors`, `providers`, `ready`, `branding`, `provider_extension` | Emits provider config diagnostics and hydrates frontend provider catalog and branding |
 | Session Socket | `backend/sockets/sessionHandlers.js` | `create_session`, `captureModelState`, `set_session_option`, `set_session_model`, `fork_session`, `get_session_history`, `rehydrate_session` | Creates, loads, configures, forks, and rehydrates sessions through provider hooks |
 | Session Manager | `backend/services/sessionManager.js` | `getMcpServers`, `loadSessionIntoMemory`, `autoLoadPinnedSessions`, `setSessionModel`, `reapplySavedConfigOptions`, `normalizeProviderConfigOptions` | MCP proxy config, hot loading, model/config state, pinned session warmup |
 | Update Handler | `backend/services/acpUpdateHandler.js` | `handleUpdate`, update types `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `usage_update`, `config_option_update`, `available_commands_update` | Normalizes ACP updates and emits timeline socket events |
@@ -467,7 +471,8 @@ Session create/load
 | Attachments | `backend/services/attachmentVault.js` | `getAttachmentsRoot`, `upload`, `handleUpload` | Resolves provider attachment root and handles upload storage |
 | Hook Runner | `backend/services/hookRunner.js` | `runHooks` | Loads provider agent hooks and executes matching scripts |
 | Prompt Socket | `backend/sockets/promptHandlers.js` | `prompt`, `cancel_prompt`, `respond_permission`, `onPromptStarted`, `onPromptCompleted` | Sends prompts and pairs provider lifecycle hooks around prompt execution |
-| Status Memory | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtension`, `getLatestProviderStatusExtensions`, `clearProviderStatusExtension` | Caches provider status extensions for new socket connections |
+| Status Memory | `backend/services/providerStatusMemory.js` | `normalizeProviderStatusExtension`, `rememberProviderStatusExtension`, `getLatestProviderStatusExtension`, `getLatestProviderStatusExtensions`, `clearProviderStatusExtension` | Caches provider status extensions for new socket connections |
+| Status Persistence | `backend/database.js` | `provider_status`, `saveProviderStatusExtension`, `getProviderStatusExtension`, `getProviderStatusExtensions` | Stores latest provider status extension per provider for cold-start socket hydration |
 | Models | `backend/services/modelOptions.js` | `extractModelState`, `normalizeModelOptions`, `mergeModelOptions`, `resolveModelSelection`, `modelOptionsFromProviderConfig` | Normalizes dynamic model catalogs and selections |
 | Config Options | `backend/services/configOptions.js` | `normalizeConfigOptions`, `applyConfigOptionsChange`, `mergeConfigOptions`, `normalizeRemovedConfigOptionIds` | Normalizes and merges provider config options |
 
@@ -503,22 +508,25 @@ Session create/load
 6. `user.json` overrides matching provider fields.
    `providerLoader.getProvider` merges `userData` after `providerData`. Local command, path, model, or protocol overrides affect runtime immediately after process start.
 
-7. `mcpName` controls MCP tool advertisement.
+7. Provider-critical invalid config blocks runtime startup.
+   `jsonConfigDiagnostics` marks the provider registry and enabled provider `provider.json` files as startup blocking when they are malformed or missing. The backend stays alive to emit `config_errors`, but provider daemons and normal provider hydration do not proceed until the config is fixed and the backend starts cleanly.
+
+8. `mcpName` controls MCP tool advertisement.
    `sessionManager.getMcpServers` returns an empty array when provider config has no `mcpName`. Tool calls through the AcpUI stdio proxy require `mcpName` and a bound `ACP_UI_MCP_PROXY_ID`.
 
-8. Model and config extensions can arrive before session metadata is keyed by the final session ID.
+9. Model and config extensions can arrive before session metadata is keyed by the final session ID.
    `AcpClient.handleProviderExtension` checks `sessionMetadata.get(sessionId)` and `sessionMetadata.get('pending-new')`. New-session code must keep `pending-new` populated until the daemon returns the final `sessionId`.
 
-9. Tool identity belongs in `extractToolInvocation`.
+10. Tool identity belongs in `extractToolInvocation`.
    Generic backend code should not classify AcpUI UX tools by searching titles or file contents. Provider adapters parse provider raw structures and return canonical identity.
 
-10. `session/load` replay is drained.
+11. `session/load` replay is drained.
     `StreamController.beginDraining` and `waitForDrainToFinish` suppress historical update replay during hot load. Debugging missing replay output should account for the drain state.
 
-11. Provider status memory only stores status-shaped extensions.
-    `rememberProviderStatusExtension` stores extensions only when `params.status.sections` is an array. Other provider extensions are emitted but not replayed to new socket connections by status memory.
+12. Provider status memory and persistence only store status-shaped extensions.
+    `rememberProviderStatusExtension` and `saveProviderStatusExtension` store extensions only when `params.status.sections` is an array. Other provider extensions are emitted but not replayed to new socket connections by status memory or SQLite fallback.
 
-12. Prompt lifecycle hooks are direct calls.
+13. Prompt lifecycle hooks are direct calls.
     `promptHandlers.js` calls `acpClient.providerModule.onPromptStarted(sessionId)` and `onPromptCompleted(sessionId)`. Provider modules need no-op implementations if they do not track prompt lifecycle.
 
 ---
@@ -557,10 +565,19 @@ Session create/load
 - `backend/test/providerContract.test.js`
   - `every provider explicitly exports every contract function`
 
+- `backend/test/jsonConfigDiagnostics.test.js`
+  - `returns no errors when loaded JSON config files are valid`
+  - `lists every malformed config file it can discover`
+  - `reports missing enabled provider definitions as startup-blocking`
+  - `reports a malformed provider registry and skips provider directory discovery`
+
 ### Runtime and ACP Client
 
 - `backend/test/providerRuntimeManager.test.js`
   - `initializes all providers in the registry`
+  - `blocks init when startup-blocking config diagnostics exist`
+  - `returns empty runtimes when provider registry loading throws`
+  - `clears partially built runtimes when provider config loading throws`
   - `does not re-initialize if already initialized`
   - `getRuntime returns the correct runtime`
   - `getRuntime defaults to default provider if no id provided`
@@ -589,8 +606,13 @@ Session create/load
 
 - `backend/test/acpClient-routing.test.js`
   - `routes all handleUpdate paths`
+  - `passes pending JSON-RPC request context into intercept`
   - `routes all handleProviderExtension paths`
+  - `emits provider status extensions even when persistence fails`
   - `hits JSON parse error in handleData`
+
+- `backend/test/jsonRpcTransport.test.js`
+  - `captures sessionId in pending request context`
 
 ### Update and Tool Contracts
 
@@ -604,6 +626,8 @@ Session create/load
   - `handles config_option_update and emits provider_extension`
   - `handles available_commands_update and emits provider_extension`
   - `handles usage_update with zero size`
+  - `treats usage_update as latest absolute snapshot (not additive)`
+  - `clamps usage_update provider metadata to 100 percent`
   - `falls back to standard ACP content for tool output`
   - `assigns lastSubAgentParentAcpId for sub-agent spawning tools`
   - `ignores empty tool_call_update`
@@ -704,7 +728,7 @@ Session create/load
 - The provider system is a provider-agnostic backend adapter and runtime isolation layer.
 - `providerRegistry.js` owns enabled provider discovery, ID normalization, default-provider validation, and ordering.
 - `providerLoader.js` owns config merging, module import, `AsyncLocalStorage` provider context, and cached bound modules.
-- `providerRuntimeManager.js` owns one `AcpClient` runtime per enabled provider.
+- `providerRuntimeManager.js` owns one `AcpClient` runtime per enabled provider and gates startup on provider-critical JSON diagnostics.
 - `acpClient.js` owns daemon spawn, restart, handshake, JSON-RPC routing, provider extensions, model state, and permission routing.
 - Provider modules own daemon initialization, protocol normalization, tool identity extraction, model/config normalization, session file operations, hooks, and prompt lifecycle callbacks.
 - Tool System V2 depends on `extractToolInvocation` for canonical identity and on `toolCallState` for sticky metadata.

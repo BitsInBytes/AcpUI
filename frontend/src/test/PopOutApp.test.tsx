@@ -49,6 +49,7 @@ class MockBroadcastChannel {
 
 let PopOutApp: typeof import('../PopOutApp').default;
 let sessionStore: any;
+let systemStore: any;
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -61,6 +62,8 @@ beforeEach(async () => {
   
   const storeMod = await import('../store/useSessionLifecycleStore');
   sessionStore = storeMod.useSessionLifecycleStore;
+  const systemStoreMod = await import('../store/useSystemStore');
+  systemStore = systemStoreMod.useSystemStore;
 
   act(() => {
     sessionStore.setState({ 
@@ -80,6 +83,7 @@ beforeEach(async () => {
       terminals: []
     });
     useUIStore.setState({ visibleCount: 50 });
+    systemStore.setState({ invalidJsonConfigs: [] });
   });
 });
 
@@ -87,6 +91,20 @@ describe('PopOutApp', () => {
   it('renders loading state initially', () => {
     render(<PopOutApp />);
     expect(screen.getByText('Loading session...')).toBeInTheDocument();
+  });
+
+  it('renders the config error modal while loading', () => {
+    act(() => {
+      systemStore.setState({
+        invalidJsonConfigs: [
+          { id: 'provider-registry', label: 'Provider registry', path: 'providers.json', message: 'Invalid JSON' }
+        ]
+      });
+    });
+
+    render(<PopOutApp />);
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument();
+    expect(screen.getByText('Provider registry')).toBeInTheDocument();
   });
 
   it('renders ChatHeader and ChatInput when ready', async () => {

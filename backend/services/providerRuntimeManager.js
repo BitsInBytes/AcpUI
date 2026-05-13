@@ -1,6 +1,7 @@
 import defaultAcpClient, { AcpClient } from './acpClient.js';
 import { getProviderEntries, getDefaultProviderId, resolveProviderId } from './providerRegistry.js';
 import { getProvider } from './providerLoader.js';
+import { collectInvalidJsonConfigErrors, hasStartupBlockingJsonConfigError } from './jsonConfigDiagnostics.js';
 import { writeLog } from './logger.js';
 
 class ProviderRuntimeManager {
@@ -20,21 +21,41 @@ class ProviderRuntimeManager {
     this.io = io;
     this.serverBootId = serverBootId;
 
-    const defaultProviderId = getDefaultProviderId();
-    const entries = getProviderEntries();
+    const configErrors = collectInvalidJsonConfigErrors();
+    if (hasStartupBlockingJsonConfigError(configErrors)) {
+      const names = configErrors.filter(issue => issue.blocksStartup).map(issue => issue.path).join(', ');
+      writeLog(`[PROVIDER RUNTIME] Provider startup blocked by invalid JSON config: ${names}`);
+      return this.getRuntimes();
+    }
 
-    for (const entry of entries) {
-      const client = entry.id === defaultProviderId
-        ? defaultAcpClient
-        : new AcpClient(entry.id);
-      client.setProviderId(entry.id);
+    let defaultProviderId;
+    let entries;
+    try {
+      defaultProviderId = getDefaultProviderId();
+      entries = getProviderEntries();
+    } catch (err) {
+      writeLog(`[PROVIDER RUNTIME] Provider startup failed while loading provider registry: ${err.message}`);
+      return this.getRuntimes();
+    }
 
-      const provider = getProvider(entry.id);
-      this.runtimes.set(entry.id, {
-        providerId: entry.id,
-        provider,
-        client
-      });
+    try {
+      for (const entry of entries) {
+        const client = entry.id === defaultProviderId
+          ? defaultAcpClient
+          : new AcpClient(entry.id);
+        client.setProviderId(entry.id);
+
+        const provider = getProvider(entry.id);
+        this.runtimes.set(entry.id, {
+          providerId: entry.id,
+          provider,
+          client
+        });
+      }
+    } catch (err) {
+      writeLog(`[PROVIDER RUNTIME] Provider startup failed while loading provider config: ${err.message}`);
+      this.runtimes.clear();
+      return this.getRuntimes();
     }
 
     this.initialized = true;

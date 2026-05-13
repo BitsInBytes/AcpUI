@@ -33,7 +33,7 @@ Spawns an ACP daemon natively on the host OS, parses the JSON-RPC stream into a 
 └─────────────────────────────────────────────┘
 ```
 
-The backend supports multiple concurrent providers configured via `configuration/providers.json` (or the `ACP_PROVIDERS_CONFIG` env var). Each provider defines its own ACP command, models, branding, extension protocol, and file paths. See the [Provider System feature doc](<documents/[Feature Doc] - Provider System.md>) for full documentation.
+The backend supports multiple concurrent providers configured via `configuration/providers.json` (or the `ACP_PROVIDERS_CONFIG` env var). Each provider defines its own ACP command, models, branding, extension protocol, and file paths. On app load, invalid config issues, including malformed JSON and missing required provider definitions, are reported through a blocking frontend popup that lists the affected paths. See the [Provider System feature doc](<documents/[Feature Doc] - Provider System.md>) for full documentation.
 
 ### Runtime Flow Graph
 
@@ -101,7 +101,76 @@ Example `providers.json`:
 
 The `.env` file at the project root controls global settings. See `.env.example` for a template and full list of available variables.
 
-MCP tool availability is controlled by the JSON file referenced by `MCP_CONFIG`, which defaults to `configuration/mcp.json`. Core tools (`ux_invoke_shell`, `ux_invoke_subagents`, `ux_invoke_counsel`) are enabled there by default; when sub-agents or counsel are enabled, `ux_check_subagents` and `ux_abort_subagents` are also advertised for async status/result polling and parent-agent aborts. Optional IO tools (`ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch`) and `ux_google_web_search` are disabled by default. `ux_google_web_search` requires `googleSearch.apiKey` in the MCP config before it is advertised. Sub-agent status waiting is configured with `subagents.statusWaitTimeoutMs` and `subagents.statusPollIntervalMs`.
+#### MCP Tool Setup (`configuration/mcp.json`)
+
+AcpUI exposes its UI-specific tools to ACP agents through a per-session stdio MCP proxy. Tool availability is controlled by the JSON file referenced by `MCP_CONFIG`; when `MCP_CONFIG` is not set, the backend reads `configuration/mcp.json`.
+
+Create the runtime config from the checked-in example:
+
+```powershell
+cp configuration/mcp.json.example configuration/mcp.json
+```
+
+The MCP config is fail-closed: if the selected file is missing or malformed, all config-controlled MCP tools are disabled. The backend caches the config during process startup, and each MCP proxy captures the advertised tool list when its ACP session starts. Restart the backend after editing `configuration/mcp.json`, then create or reload sessions so agents see the updated tool list.
+
+The top-level `tools` block enables tool groups. Each flag can be either `true` / `false` or an object such as `{ "enabled": true }`.
+
+| Config key | Exposed tools |
+|---|---|
+| `tools.invokeShell` | `ux_invoke_shell` |
+| `tools.subagents` | `ux_invoke_subagents`, plus `ux_check_subagents` and `ux_abort_subagents` |
+| `tools.counsel` | `ux_invoke_counsel`, plus `ux_check_subagents` and `ux_abort_subagents` |
+| `tools.io` | `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, `ux_web_fetch` |
+| `tools.googleSearch` | `ux_google_web_search`, only when `googleSearch.apiKey` is also non-empty |
+
+The other config blocks control tool behavior:
+
+- `subagents.statusWaitTimeoutMs` and `subagents.statusPollIntervalMs` control how long `ux_check_subagents` waits for async agent results and how often it polls.
+- `io.autoAllowWorkspaceCwd` allows file IO inside the active workspace automatically. `io.allowedRoots` adds extra allowed roots; `allowedRoots: ["*"]` allows any resolved path. The `maxReadBytes`, `maxWriteBytes`, `maxReplaceBytes`, and `maxOutputBytes` fields cap IO size.
+- `webFetch.allowedProtocols`, `blockedHosts`, `blockedHostPatterns`, `blockedCidrs`, `maxResponseBytes`, `timeoutMs`, and `maxRedirects` define URL fetch guardrails for `ux_web_fetch`.
+- `googleSearch.apiKey`, `timeoutMs`, and `maxOutputBytes` configure grounded Google search. Keep real API keys in local-only config or point `MCP_CONFIG` at a private file.
+
+A provider must also define `mcpName` in its `provider.json`; otherwise AcpUI will not inject the MCP proxy for that provider even when tool flags are enabled.
+
+Minimal example:
+
+```json
+{
+  "tools": {
+    "invokeShell": { "enabled": true },
+    "subagents": { "enabled": true },
+    "counsel": { "enabled": true },
+    "io": { "enabled": true },
+    "googleSearch": { "enabled": false }
+  },
+  "subagents": {
+    "statusWaitTimeoutMs": 120000,
+    "statusPollIntervalMs": 1000
+  },
+  "io": {
+    "autoAllowWorkspaceCwd": true,
+    "allowedRoots": [],
+    "maxReadBytes": 1048576,
+    "maxWriteBytes": 1048576,
+    "maxReplaceBytes": 1048576,
+    "maxOutputBytes": 262144
+  },
+  "webFetch": {
+    "allowedProtocols": ["http:", "https:"],
+    "blockedHosts": [],
+    "blockedHostPatterns": [],
+    "blockedCidrs": [],
+    "maxResponseBytes": 1048576,
+    "timeoutMs": 15000,
+    "maxRedirects": 5
+  },
+  "googleSearch": {
+    "apiKey": "",
+    "timeoutMs": 15000,
+    "maxOutputBytes": 262144
+  }
+}
+```
 
 ### 5. Configure SSL
 
@@ -219,7 +288,7 @@ Access at `https://localhost:3005`.
 
 When setting up the system and your custom agents, for the best experience **agents must be configured without their built-in `Bash`, `PowerShell`, `Shell`, and sub-agent commands**. Some providers allow you to do this on a per-agent basis while others require their global settings file to be changed. Each provider in this repo contains a README that will have information on how to do this or will contain information on how this is done automatically for you. The AcpUI-specific tools that will be used instead are:
 
-- **`ux_invoke_shell`** — Execute shell commands through AcpUI in a real terminal-backed tool step with live output, user stdin, resize, stop controls, and separate terminals for concurrent shell calls.
+- **`ux_invoke_shell`** — Execute shell commands through AcpUI in a real terminal-backed tool step with live output, user stdin, resize, stop controls, input-wait detection, and separate terminals for concurrent shell calls.
 - **`ux_invoke_subagents`** — Spawn parallel AI agents asynchronously with live streaming, sidebar nesting under parent chat, permission controls, status/result follow-up through `ux_check_subagents`, and parent-agent aborts through `ux_abort_subagents`. This provides the full agent coordination within AcpUI with full transparency and a global overview.
 
 The MCP server name that exposes these tools is defined in the provider's `provider.json` file and defaults to `AcpUI`, each provider README will also cover how to allow these tools if you don't want to see permission requests when these are used. This ensures all agent execution (shell commands, sub-agent spawning, and tool calls) flows through the AcpUI's unified timeline, maintains proper session context, respects permissions, and integrates with the UI's canvas, terminal, and diff viewer.

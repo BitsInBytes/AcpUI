@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { mockDefaultClient, mockAcpClientInstance, mockProvider, mockLogger } = vi.hoisted(() => ({
+const { mockDefaultClient, mockAcpClientInstance, mockProvider, mockLogger, mockJsonDiagnostics } = vi.hoisted(() => ({
   mockDefaultClient: {
     setProviderId: vi.fn(),
     init: vi.fn(),
@@ -21,6 +21,10 @@ const { mockDefaultClient, mockAcpClientInstance, mockProvider, mockLogger } = v
   },
   mockLogger: {
     writeLog: vi.fn()
+  },
+  mockJsonDiagnostics: {
+    collectInvalidJsonConfigErrors: vi.fn(() => []),
+    hasStartupBlockingJsonConfigError: vi.fn((issues) => issues.some(issue => issue.blocksStartup === true))
   }
 }));
 
@@ -52,7 +56,11 @@ vi.mock('../services/providerLoader.js', () => ({
   }))
 }));
 
+vi.mock('../services/jsonConfigDiagnostics.js', () => mockJsonDiagnostics);
+
 vi.mock('../services/logger.js', () => mockLogger);
+
+import { getProvider } from '../services/providerLoader.js';
 
 describe('providerRuntimeManager', () => {
   let providerRuntimeManager;
@@ -60,6 +68,19 @@ describe('providerRuntimeManager', () => {
   beforeEach(async () => {
     vi.resetModules();
     vi.clearAllMocks();
+    mockRegistry.getProviderEntries.mockReturnValue([
+      { id: 'provider-default', label: 'Provider Default Label' },
+      { id: 'provider-alt', label: 'Provider Alt Label' }
+    ]);
+    mockRegistry.getDefaultProviderId.mockReturnValue('provider-default');
+    mockRegistry.resolveProviderId.mockImplementation((providerId) => providerId || 'provider-default');
+    mockJsonDiagnostics.collectInvalidJsonConfigErrors.mockReturnValue([]);
+    mockJsonDiagnostics.hasStartupBlockingJsonConfigError.mockImplementation((issues) => issues.some(issue => issue.blocksStartup === true));
+    getProvider.mockImplementation((id) => ({
+      ...mockProvider,
+      id,
+      config: { ...mockProvider.config, name: id.charAt(0).toUpperCase() + id.slice(1) }
+    }));
     const mod = await import('../services/providerRuntimeManager.js');
     providerRuntimeManager = mod.providerRuntimeManager;
   });
@@ -75,6 +96,52 @@ describe('providerRuntimeManager', () => {
     expect(mockAcpClientInstance.init).toHaveBeenCalledWith(io, 'boot-123');
 
     expect(providerRuntimeManager.getRuntimes()).toHaveLength(2);
+  });
+
+  it('blocks init when startup-blocking config diagnostics exist', () => {
+    const io = { emit: vi.fn() };
+    mockJsonDiagnostics.collectInvalidJsonConfigErrors.mockReturnValue([
+      { path: 'configuration/providers.json', blocksStartup: true }
+    ]);
+
+    const runtimes = providerRuntimeManager.init(io, 'boot-blocked');
+
+    expect(runtimes).toEqual([]);
+    expect(mockDefaultClient.init).not.toHaveBeenCalled();
+    expect(mockAcpClientInstance.init).not.toHaveBeenCalled();
+    expect(mockLogger.writeLog).toHaveBeenCalledWith(expect.stringContaining('Provider startup blocked by invalid JSON config'));
+  });
+
+  it('returns empty runtimes when provider registry loading throws', () => {
+    const io = { emit: vi.fn() };
+    mockRegistry.getDefaultProviderId.mockImplementationOnce(() => {
+      throw new Error('registry failed');
+    });
+
+    const runtimes = providerRuntimeManager.init(io, 'boot-registry-fail');
+
+    expect(runtimes).toEqual([]);
+    expect(mockDefaultClient.init).not.toHaveBeenCalled();
+    expect(mockLogger.writeLog).toHaveBeenCalledWith(expect.stringContaining('Provider startup failed while loading provider registry: registry failed'));
+  });
+
+  it('clears partially built runtimes when provider config loading throws', () => {
+    const io = { emit: vi.fn() };
+    getProvider.mockImplementation((id) => {
+      if (id === 'provider-alt') throw new Error('provider config failed');
+      return {
+        ...mockProvider,
+        id,
+        config: { ...mockProvider.config, name: id }
+      };
+    });
+
+    const runtimes = providerRuntimeManager.init(io, 'boot-provider-fail');
+
+    expect(runtimes).toEqual([]);
+    expect(providerRuntimeManager.getRuntimes()).toEqual([]);
+    expect(mockDefaultClient.init).not.toHaveBeenCalled();
+    expect(mockLogger.writeLog).toHaveBeenCalledWith(expect.stringContaining('Provider startup failed while loading provider config: provider config failed'));
   });
 
   it('does not re-initialize if already initialized', () => {

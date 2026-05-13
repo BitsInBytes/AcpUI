@@ -73,6 +73,7 @@ describe('useSocket hook', () => {
       setProviderBranding: vi.fn((data: any) => {
         systemStoreState.branding = { ...systemStoreState.branding, ...data };
       }),
+      setInvalidJsonConfigs: vi.fn(),
       setState: vi.fn((update: any) => {
         Object.assign(systemStoreState, typeof update === 'function' ? update(systemStoreState) : update);
       }),
@@ -114,6 +115,21 @@ describe('useSocket hook', () => {
     const connectHandler = (mockSocket.on as any).mock.calls.find((call: any) => call[0] === 'connect')[1];
     connectHandler();
     expect(systemStoreState.setConnected).toHaveBeenCalledWith(true);
+  });
+
+  it('handles "config_errors" event', () => {
+    renderHook(() => useSocket());
+    const handler = (mockSocket.on as any).mock.calls.find((call: any) => call[0] === 'config_errors')[1];
+    const errors = [{ id: 'commands-config', label: 'Custom commands configuration', path: 'commands.json', message: 'Invalid JSON' }];
+    handler({ errors });
+    expect(systemStoreState.setInvalidJsonConfigs).toHaveBeenCalledWith(errors);
+  });
+
+  it('clears config errors when the backend sends no errors array', () => {
+    renderHook(() => useSocket());
+    const handler = (mockSocket.on as any).mock.calls.find((call: any) => call[0] === 'config_errors')[1];
+    handler({});
+    expect(systemStoreState.setInvalidJsonConfigs).toHaveBeenCalledWith([]);
   });
 
   it('handles "ready" event with providerId', () => {
@@ -211,8 +227,8 @@ describe('useSocket hook', () => {
     it('handles "metadata" extension', async () => {
       const { routeExtension } = await import('../utils/extensionRouter');
       (routeExtension as any).mockReturnValueOnce({ type: 'metadata', sessionId: 's1', contextUsagePercentage: 50 });
-      extensionHandler({ method: 'test/metadata', params: { sessionId: 's1' } });
-      expect(systemStoreState.setContextUsage).toHaveBeenCalledWith('s1', 50);
+      extensionHandler({ method: 'test/metadata', params: { sessionId: 's1', providerId: 'p1' } });
+      expect(systemStoreState.setContextUsage).toHaveBeenCalledWith('p1', 's1', 50);
     });
 
     it('handles "provider_status" extension', async () => {
@@ -233,8 +249,8 @@ describe('useSocket hook', () => {
     it('handles "compaction_started" extension', async () => {
       const { routeExtension } = await import('../utils/extensionRouter');
       (routeExtension as any).mockReturnValueOnce({ type: 'compaction_started', sessionId: 's1' });
-      extensionHandler({ method: 'test/compact_start', params: { sessionId: 's1' } });
-      expect(systemStoreState.setCompacting).toHaveBeenCalledWith('s1', true);
+      extensionHandler({ method: 'test/compact_start', params: { sessionId: 's1', providerId: 'p1' } });
+      expect(systemStoreState.setCompacting).toHaveBeenCalledWith('p1', 's1', true);
     });
 
     it('handles "compaction_completed" extension', async () => {
@@ -245,7 +261,8 @@ describe('useSocket hook', () => {
       const streamStore = { onStreamToken: vi.fn(), streamQueues: {} };
       (useStreamStore.getState as any).mockReturnValue(streamStore);
 
-      extensionHandler({ method: 'test/compact_done', params: { sessionId: 's1' } });
+      extensionHandler({ method: 'test/compact_done', params: { sessionId: 's1', providerId: 'p1' } });
+      expect(systemStoreState.setCompacting).toHaveBeenCalledWith('p1', 's1', false);
       expect(streamStore.onStreamToken).toHaveBeenCalled();
     });
   });

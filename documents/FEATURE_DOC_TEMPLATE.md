@@ -23,9 +23,9 @@ A good Feature Doc lets an agent load it and quickly build a working mental mode
 **Feature Docs are living documents that describe the system as it exists today. They are not historical records.**
 
 This means:
-- **Never mention older implementations** - do not say "The system used to X, but now does Y." Only describe how it works now.
-- **Never use past-tense implementation history** - say "Sessions are stored in project directories" not "Sessions were stored flat, but are now stored in project directories."
-- **Never compare to previous architectures** - if the system changes, document the current architecture only.
+- **Never mention replaced designs** - describe how the system works now.
+- **Never use implementation history** - describe only the current storage, routing, state, and API contracts.
+- **Never compare architectures across time** - if the system changes, document the current architecture only.
 - **Update named anchors and code snippets when code changes** - function names, component names, event names, config keys, and snippets must stay accurate.
 - **Replace obsolete sections entirely** - do not keep outdated patterns for context.
 
@@ -33,7 +33,7 @@ This means:
 
 **Example of what to avoid:**
 ```markdown
-Previously, context state was stored in memory. Now we persist it to disk at <location>.
+Background notes that are not part of the current contract.
 ```
 
 **Example of what to do:**

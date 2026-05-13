@@ -113,7 +113,7 @@ createRoot(document.getElementById('root')!).render(
 );
 ```
 
-The detached window has the same bundled frontend code as the main window. The `popout` query parameter selects `PopOutApp`, which omits main-window navigation and modal roots.
+The detached window has the same bundled frontend code as the main window. The `popout` query parameter selects `PopOutApp`, which omits main-window navigation and settings modal roots but still mounts the blocking `ConfigErrorModal` for startup JSON diagnostics.
 
 ### 5. `PopOutApp` claims ownership and hydrates the target session
 
@@ -175,7 +175,7 @@ socket.on('unwatch_session', ({ sessionId }) => {
 
 ### 7. `PopOutApp` renders the focused chat shell
 
-File: `frontend/src/PopOutApp.tsx` (Component: `PopOutApp`, Hooks: `useScroll`, `useChatManager`, Function: `computeResizeWidthNoSidebar`)
+File: `frontend/src/PopOutApp.tsx` (Component: `PopOutApp`, Hooks: `useScroll`, `useChatManager`, Component: `ConfigErrorModal`, Function: `computeResizeWidthNoSidebar`)
 
 ```tsx
 // FILE: frontend/src/PopOutApp.tsx (Component: PopOutApp)
@@ -193,11 +193,12 @@ return (
         <CanvasPane ... />
       </ErrorBoundary>
     )}
+    <ConfigErrorModal />
   </div>
 );
 ```
 
-The detached shell has no `Sidebar`, `SessionSettingsModal`, `SystemSettingsModal`, `NotesModal`, or `FileExplorer` component roots. It still registers chat socket listeners through `useChatManager`, scroll behavior through `useScroll`, canvas file handlers through `useCanvasStore`, and resize behavior through `computeResizeWidthNoSidebar`.
+The detached shell has no `Sidebar`, `SessionSettingsModal`, `SystemSettingsModal`, `NotesModal`, or `FileExplorer` component roots. It still mounts `ConfigErrorModal`, registers chat socket listeners through `useChatManager`, scroll behavior through `useScroll`, canvas file handlers through `useCanvasStore`, and resize behavior through `computeResizeWidthNoSidebar`.
 
 ### 8. `ChatHeader` switches controls by pop-out mode
 
@@ -432,14 +433,14 @@ PopOutApp reads popout UI session ID
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Routing | `frontend/src/main.tsx` | `isPopout`, `PopOutApp`, `App` | Chooses detached or main root from the `popout` query parameter. |
-| Detached root | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `claimSession`, `load_sessions`, `watch_session`, `hydrateSession`, `computeResizeWidthNoSidebar` | Owns detached session initialization, hydration, rendering, and canvas resizing. |
+| Detached root | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `ConfigErrorModal`, `claimSession`, `load_sessions`, `watch_session`, `hydrateSession`, `computeResizeWidthNoSidebar` | Owns detached session initialization, hydration, rendering, blocking config diagnostics, and canvas resizing. |
 | Main root | `frontend/src/App.tsx` | `App`, `setOwnershipChangeCallback`, `watch_session`, `unwatch_session`, `canvas_load` | Rerenders sidebar on ownership changes and manages main-window socket room membership. |
 | Ownership | `frontend/src/lib/sessionOwnership.ts` | `CHANNEL_NAME`, `OwnershipMessage`, `setOwnershipChangeCallback`, `claimSession`, `releaseSession`, `isSessionPoppedOut`, `getWindowId`, `openPopout`, `focusPopout`, `beforeunload` listener | Coordinates cross-window ownership with BroadcastChannel and opener window references. |
 | Sidebar row | `frontend/src/components/SessionItem.tsx` | `SessionItem`, `openPopout`, `isSessionPoppedOut`, `focusPopout`, `popped-out` class | Displays the pop-out action and gates sidebar selection for popped sessions. |
 | Header | `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, `isPopout`, `StatusIndicator`, `setSidebarOpen`, `setFileExplorerOpen`, `setSystemSettingsOpen` | Renders title/status and hides main-window-only controls in pop-out mode. |
 | Input | `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput`, `handleSubmit`, `handleCancel`, `setInput`, `openTerminal`, `setIsCanvasOpen`, `toggleAutoScroll`, `handleMergeFork` | Sends prompts, controls drafts/attachments, and exposes terminal/canvas/model controls in the detached window. |
 | Model footer | `frontend/src/components/ChatInput/ModelSelector.tsx` | `ModelSelector`, `onModelSelect`, `onOpenSettings`, `isModelDropdownOpen` | Shows active model/context state and emits model changes. |
-| Socket singleton | `frontend/src/hooks/useSocket.ts` | `useSocket`, `getOrCreateSocket`, Socket events `ready`, `providers`, `branding`, `session_model_options`, `provider_extension` | Creates the per-window Socket.IO client and stores backend/provider state. |
+| Socket singleton | `frontend/src/hooks/useSocket.ts` | `useSocket`, `getOrCreateSocket`, Socket events `config_errors`, `ready`, `providers`, `branding`, `session_model_options`, `provider_extension` | Creates the per-window Socket.IO client and stores backend/provider state, including startup JSON diagnostics. |
 | Chat events | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, events `token`, `thought`, `system_event`, `permission_request`, `token_done` | Registers stream/event listeners in both main and detached windows. |
 | Session store | `frontend/src/store/useSessionLifecycleStore.ts` | `activeSessionId`, `sessions`, `setActiveSessionId`, `handleInitialLoad`, `hydrateSession`, `handleActiveSessionModelChange`, `handleSetSessionOption` | Tracks session selection and hydrates UI session history. |
 | Input store | `frontend/src/store/useInputStore.ts` | `inputs`, `attachmentsMap`, `setInput`, `setAttachments`, `clearInput`, `handleFileUpload` | Stores drafts and attachments per UI session within each browser context. |
@@ -458,7 +459,7 @@ PopOutApp reads popout UI session ID
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Detached app | `frontend/src/test/PopOutApp.test.tsx` | `PopOutApp`, mocked `useSocket`, mocked `claimSession` | Verifies detached loading, rendering, title, hydration, `watch_session`, and ownership claim. |
+| Detached app | `frontend/src/test/PopOutApp.test.tsx` | `PopOutApp`, mocked `useSocket`, mocked `claimSession`, `renders the config error modal while loading` | Verifies detached loading, blocking config diagnostics, rendering, title, hydration, `watch_session`, and ownership claim. |
 | Ownership | `frontend/src/test/sessionOwnership.test.ts` | `claimSession`, `releaseSession`, `setOwnershipChangeCallback`, `isSessionPoppedOut`, `openPopout`, `focusPopout`, `getWindowId` | Verifies BroadcastChannel messaging, self-message filtering, window open/focus behavior, and release handling. |
 | Sidebar row | `frontend/src/test/SessionItem.test.tsx` | `SessionItem`, `Pop Out`, sub-agent branch | Verifies pop-out button presence for normal sessions and absence for sub-agent action branch. |
 | Sidebar list | `frontend/src/test/Sidebar.test.tsx` | `Sidebar - popped-out sessions`, `popped-out` class, `Pop Out` button | Verifies popped-out class rendering and pop-out buttons on session items. |

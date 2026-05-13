@@ -2,12 +2,11 @@ import { useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { useSystemStore } from '../store/useSystemStore';
 import { useVoiceStore } from '../store/useVoiceStore';
-import type { ProviderModelOption, WorkspaceCwd } from '../types';
+import type { InvalidJsonConfig, ProviderModelOption, ProviderSummary, WorkspaceCwd } from '../types';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useStreamStore } from '../store/useStreamStore';
 import { routeExtension } from '../utils/extensionRouter';
 import { mergeProviderConfigOptions } from '../utils/configOptions';
-import type { ProviderSummary } from '../types';
 
 import { BACKEND_URL } from '../utils/backendConfig';
 
@@ -27,6 +26,9 @@ function getOrCreateSocket(): Socket {
 
   _socket.on('connect', () => {
     useSystemStore.getState().setConnected(true);
+  });
+  _socket.on('config_errors', (data: { errors?: InvalidJsonConfig[] }) => {
+    useSystemStore.getState().setInvalidJsonConfigs(data.errors || []);
   });
   _socket.on('ready', (data: { bootId: string }) => {
     const providerId = (data as { providerId?: string }).providerId;
@@ -98,7 +100,7 @@ function getOrCreateSocket(): Socket {
     if (result.type === 'commands') {
       useSystemStore.getState().setSlashCommands(result.commands, providerId);
     } else if (result.type === 'metadata') {
-      useSystemStore.getState().setContextUsage(result.sessionId, result.contextUsagePercentage);
+      useSystemStore.getState().setContextUsage(providerId || null, result.sessionId, result.contextUsagePercentage);
     } else if (result.type === 'provider_status') {
       useSystemStore.getState().setProviderStatus(result.status, providerId);
     } else if (result.type === 'config_options') {
@@ -117,10 +119,10 @@ function getOrCreateSocket(): Socket {
           }) }));
       }
     } else if (result.type === 'compaction_started') {
-      useSystemStore.getState().setCompacting(result.sessionId, true);
+      useSystemStore.getState().setCompacting(providerId || null, result.sessionId, true);
       useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => s.acpSessionId === result.sessionId ? { ...s, isTyping: true } : s) }));
     } else if (result.type === 'compaction_completed') {
-      useSystemStore.getState().setCompacting(result.sessionId, false);
+      useSystemStore.getState().setCompacting(providerId || null, result.sessionId, false);
       if (result.summary) {
         useStreamStore.getState().onStreamToken({ sessionId: result.sessionId, text: `\n\n---\n\n**Context Compacted**\n\n${result.summary}` });
       }

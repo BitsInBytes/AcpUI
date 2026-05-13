@@ -290,7 +290,7 @@ Flow:
 2. `backend/services/acpClient.js` `handleProviderExtension` emits `provider_extension` with `providerId`, `method`, and `params`.
 3. `frontend/src/hooks/useSocket.ts` handles `provider_extension` and passes it to `routeExtension`.
 4. `frontend/src/utils/extensionRouter.ts` returns `{ type: 'metadata', sessionId, contextUsagePercentage }` for `metadata`.
-5. `frontend/src/store/useSystemStore.ts` `setContextUsage` stores the value by session ID.
+5. `frontend/src/store/useSystemStore.ts` `setContextUsage` stores the value by provider id + session ID.
 
 ### Tool Invocation Data Flow
 

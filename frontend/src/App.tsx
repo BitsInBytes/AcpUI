@@ -24,6 +24,7 @@ import SystemSettingsModal from './components/SystemSettingsModal';
 import NotesModal from './components/NotesModal';
 import FileExplorer from './components/FileExplorer';
 import CanvasPane from './components/CanvasPane/CanvasPane';
+import ConfigErrorModal from './components/ConfigErrorModal';
 
 // Styles
 import './styles/global.css';
@@ -248,6 +249,7 @@ function App() {
       <SystemSettingsModal />
       <NotesModal />
       <FileExplorer />
+      <ConfigErrorModal />
     </div>
   );
 }

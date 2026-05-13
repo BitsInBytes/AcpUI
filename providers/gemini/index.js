@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { getProvider } from '../../backend/services/providerLoader.js';
 import { acpUiToolTitle, subAgentCheckToolTitle } from '../../backend/services/tools/acpUiToolTitles.js';
 import { ACP_UX_TOOL_NAMES, isAcpUxToolName } from '../../backend/services/tools/acpUxTools.js';
@@ -11,9 +10,6 @@ import {
   resolveToolNameFromCandidates
 } from '../../backend/services/tools/providerToolNormalization.js';
 import { matchToolIdPattern } from '../../backend/services/tools/toolIdPattern.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // Cache for arguments to reconstruct outputs that Gemini CLI drops
 const toolArgCache = new Map();
@@ -31,7 +27,7 @@ let _activePromptCount = 0; // Only poll quota while prompts are in-flight
 let _inFlightSessions = new Set(); // Track which sessions have active prompts
 
 // Token accumulation tracking (not from quota API, but from actual turn results)
-let _accumulatedTokensBySession = new Map(); // sessionId -> { inputTokens, outputTokens, lastUpdated }
+let _accumulatedTokensBySession = new Map(); // sessionId -> { inputTokens, outputTokens, model, lastUpdated }
 let _tokenStateFile = null; // Path to persist token state
 let _sessionsWithInitialEmit = new Set(); // Track which sessions we've already emitted initial context for
 
@@ -52,7 +48,7 @@ function _emitCachedContext(sessionId) {
   const { config } = getProvider();
   const model = persisted.model || 'gemini-3-flash-preview';
   const windowSize = CONTEXT_WINDOWS[model] ?? DEFAULT_CONTEXT_WINDOW;
-  const percent = Math.min(100, (persisted.inputTokens / windowSize) * 100);
+  const percent = Math.max(0, Math.min(100, (persisted.inputTokens / windowSize) * 100));
   _emitProviderExtension(`${config.protocolPrefix}metadata`, {
     sessionId,
     contextUsagePercentage: percent
@@ -83,8 +79,7 @@ function normalizeCommands(commands) {
  * Intercept raw messages from the Gemini process and translate them into
  * standardized ACP protocol messages.
  */
-export function intercept(payload) {
-
+export function intercept(payload, context = {}) {
   try {
     const { config } = getProvider();
 
@@ -111,7 +106,7 @@ export function intercept(payload) {
         _emitCachedContext(sessionId);
       }
 
-      // Log usage_update events to understand the token flow
+      // Ignore streaming usage updates; rely on final prompt-result quota data.
       if (update?.sessionUpdate === 'usage_update') {
         return null;
       }
@@ -125,7 +120,9 @@ export function intercept(payload) {
 
     // 2. Handle Final Response Results (Turn Completion)
     if (payload?.result?.stopReason) {
-      const sessionId = payload.result.sessionId || _lastSessionId;
+      const responseRequest = context?.responseRequest;
+      const responseSessionId = responseRequest?.method === 'session/prompt' ? responseRequest.sessionId : null;
+      const sessionId = payload.result.sessionId || responseSessionId || null;
 
       if (payload.result?._meta?.quota && sessionId) {
         const quota = payload.result._meta.quota;
@@ -138,7 +135,7 @@ export function intercept(payload) {
         const model = quota.model_usage?.[0]?.model ?? '';
 
         // Store the cumulative value for this session
-        const accum = { inputTokens, outputTokens, lastUpdated: new Date().toISOString() };
+        const accum = { inputTokens, outputTokens, model, lastUpdated: new Date().toISOString() };
         _accumulatedTokensBySession.set(sessionId, accum);
 
 
@@ -148,8 +145,8 @@ export function intercept(payload) {
         const windowSize = CONTEXT_WINDOWS[model] ?? DEFAULT_CONTEXT_WINDOW;
         const percent = (inputTokens / windowSize) * 100;
 
-        // Clamp to 100% max (safety check in case of API anomalies)
-        const clampedPercent = Math.min(100, percent);
+        // Clamp to UI-safe bounds in case of API anomalies.
+        const clampedPercent = Math.max(0, Math.min(100, percent));
 
 
         if (_emitProviderExtension) {

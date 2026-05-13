@@ -1,12 +1,24 @@
 import { create } from 'zustand';
 import { Socket } from 'socket.io-client';
-import type { ProviderBranding, ProviderStatus, ProviderSummary, WorkspaceCwd } from '../types';
+import type { InvalidJsonConfig, ProviderBranding, ProviderStatus, ProviderSummary, WorkspaceCwd } from '../types';
 import type { BrandingModels } from '../utils/modelOptions';
 
 export interface SlashCommand {
   name: string;
   description: string;
   meta?: { inputType?: string; hint?: string; optionsMethod?: string; local?: boolean };
+}
+
+const UNKNOWN_PROVIDER_KEY = '__unknown_provider__';
+
+export function getProviderSessionKey(providerId: string | null | undefined, sessionId: string) {
+  return `${providerId || UNKNOWN_PROVIDER_KEY}::${sessionId}`;
+}
+
+function normalizeContextUsage(pct: number) {
+  const value = Number(pct);
+  if (!Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(100, value));
 }
 
 interface SystemState {
@@ -19,6 +31,7 @@ interface SystemState {
   orderedProviderIds: string[];
   providersById: Record<string, ProviderSummary>;
   readyByProviderId: Record<string, boolean>;
+  invalidJsonConfigs: InvalidJsonConfig[];
   sslError: boolean;
   slashCommands: SlashCommand[];
   slashCommandsByProviderId: Record<string, SlashCommand[]>;
@@ -59,11 +72,15 @@ interface SystemState {
   setBackendBootId: (bootId: string | null) => void;
   setProviders: (defaultProviderId: string | null, providers: ProviderSummary[]) => void;
   setProviderBranding: (branding: ProviderBranding) => void;
+  setInvalidJsonConfigs: (issues: InvalidJsonConfig[]) => void;
   setSslError: (error: boolean) => void;
   setSlashCommands: (commands: SlashCommand[], providerId?: string) => void;
-  setContextUsage: (sessionId: string, pct: number) => void;
+  setContextUsage: (providerId: string | null | undefined, sessionId: string, pct: number) => void;
+  getContextUsage: (providerId: string | null | undefined, sessionId: string | null | undefined) => number | undefined;
+  hasContextUsage: (providerId: string | null | undefined, sessionId: string | null | undefined) => boolean;
   setProviderStatus: (status: ProviderStatus | null, providerId?: string | null) => void;
-  setCompacting: (sessionId: string, compacting: boolean) => void;
+  setCompacting: (providerId: string | null | undefined, sessionId: string, compacting: boolean) => void;
+  getCompacting: (providerId: string | null | undefined, sessionId: string | null | undefined) => boolean;
   setWorkspaceCwds: (cwds: WorkspaceCwd[]) => void;
   setDeletePermanent: (val: boolean) => void;
   setNotificationSettings: (sound: boolean, desktop: boolean) => void;
@@ -81,6 +98,7 @@ export const useSystemStore = create<SystemState>((set, get) => ({
   orderedProviderIds: [],
   providersById: {},
   readyByProviderId: {},
+  invalidJsonConfigs: [],
   sslError: false,
   slashCommands: [],
   slashCommandsByProviderId: {},
@@ -145,6 +163,7 @@ export const useSystemStore = create<SystemState>((set, get) => ({
       ...(isActiveProvider ? { branding } : {})
     };
   }),
+  setInvalidJsonConfigs: (issues) => set({ invalidJsonConfigs: issues }),
   setSslError: (error) => set({ sslError: error }),
   setSlashCommands: (commands, providerId) => set(state => {
     if (providerId) {
@@ -156,7 +175,28 @@ export const useSystemStore = create<SystemState>((set, get) => ({
     }
     return { slashCommands: commands };
   }),
-  setContextUsage: (sessionId, pct) => set(state => ({ contextUsageBySession: { ...state.contextUsageBySession, [sessionId]: pct } })),
+  setContextUsage: (providerId, sessionId, pct) => set(state => {
+    const normalizedPct = normalizeContextUsage(pct);
+    if (normalizedPct === null) return {};
+    const key = getProviderSessionKey(providerId, sessionId);
+    return { contextUsageBySession: { ...state.contextUsageBySession, [key]: normalizedPct } };
+  }),
+  getContextUsage: (providerId, sessionId) => {
+    if (!sessionId) return undefined;
+    const state = get();
+    const key = getProviderSessionKey(providerId, sessionId);
+    if (Object.prototype.hasOwnProperty.call(state.contextUsageBySession, key)) {
+      return state.contextUsageBySession[key];
+    }
+    return state.contextUsageBySession[sessionId];
+  },
+  hasContextUsage: (providerId, sessionId) => {
+    if (!sessionId) return false;
+    const state = get();
+    const key = getProviderSessionKey(providerId, sessionId);
+    return Object.prototype.hasOwnProperty.call(state.contextUsageBySession, key)
+      || Object.prototype.hasOwnProperty.call(state.contextUsageBySession, sessionId);
+  },
   setProviderStatus: (status, providerId) => set(state => {
     const resolvedProviderId = providerId || status?.providerId || state.activeProviderId || state.defaultProviderId;
     if (!resolvedProviderId) return { providerStatus: status };
@@ -170,7 +210,19 @@ export const useSystemStore = create<SystemState>((set, get) => ({
       providerStatus: isActiveProvider ? status : state.providerStatus
     };
   }),
-  setCompacting: (sessionId, compacting) => set(state => ({ compactingBySession: { ...state.compactingBySession, [sessionId]: compacting } })),
+  setCompacting: (providerId, sessionId, compacting) => set(state => {
+    const key = getProviderSessionKey(providerId, sessionId);
+    return { compactingBySession: { ...state.compactingBySession, [key]: compacting } };
+  }),
+  getCompacting: (providerId, sessionId) => {
+    if (!sessionId) return false;
+    const state = get();
+    const key = getProviderSessionKey(providerId, sessionId);
+    if (Object.prototype.hasOwnProperty.call(state.compactingBySession, key)) {
+      return Boolean(state.compactingBySession[key]);
+    }
+    return Boolean(state.compactingBySession[sessionId]);
+  },
   setWorkspaceCwds: (cwds) => set({ workspaceCwds: cwds }),
   setDeletePermanent: (val) => set({ deletePermanent: val }),
   setNotificationSettings: (sound: boolean, desktop: boolean) => set({ notificationSound: sound, notificationDesktop: desktop }),
@@ -182,4 +234,4 @@ export const useSystemStore = create<SystemState>((set, get) => ({
     }
     return state.branding;
   },
-  }));
+}));

@@ -14,7 +14,7 @@ This area is high-risk because correctness depends on per-session stream isolati
 - Adapts typewriter speed by buffer size while keeping `Message.content` and `Message.timeline` synchronized.
 - Renders a single `Message.timeline` with `thought`, `tool`, `text`, and `permission` steps.
 - Preserves sticky tool metadata across `tool_start`, `tool_update`, and `tool_end` events.
-- Routes shell-run socket events by `shellRunId` into `useShellRunStore` and `ShellToolTerminal`.
+- Routes shell-run socket events by `shellRunId` into `useShellRunStore` and `ShellToolTerminal`, including input-wait state from `needsInput` / `shellNeedsInput`.
 - Renders markdown in stable blocks while streaming and renders tool output through specialized formatters.
 
 ### Why This Matters
@@ -255,7 +255,7 @@ timeline: message.timeline?.map(entry => {
 if (!matched && snapshot) ensureShellRunToolStep(snapshot, patch);
 ```
 
-Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message timeline receives status and display metadata patches by `shellRunId`, tool-call ID, or the active shell description title. If no matching rendered step exists yet, shell lifecycle events queue a fallback `tool_start` through `useStreamStore.onStreamEvent` so it stays ordered behind pending thought chunks. Provider shell starts that arrive before `shellRunId` exists merge by provider tool id, preventing duplicate no-run-id shell cards from later becoming duplicate terminals for one run. Active shell tool steps stay expanded when later parallel shell starts arrive, so running sibling terminals do not spawn collapsed. Completed shell steps stay open briefly so the terminal-to-read-only transition can settle, then ChatMessage auto-collapses them unless the user manually toggled that step. Once a terminal shell step has auto-collapsed, later timeline updates preserve that local collapsed state instead of reopening the step from stale `isCollapsed: false` stream metadata.
+Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message timeline receives status, display metadata, and `shellNeedsInput` patches by `shellRunId`, tool-call ID, or the active shell description title. `useChatManager.syncShellInputStateForSession` also mirrors active `ShellRunSnapshot.needsInput` values into `ChatSession.isAwaitingShellInput`, which drives the sidebar's green waiting state for interactive shell prompts. If no matching rendered step exists yet, shell lifecycle events queue a fallback `tool_start` through `useStreamStore.onStreamEvent` so it stays ordered behind pending thought chunks. Provider shell starts that arrive before `shellRunId` exists merge by provider tool id, preventing duplicate no-run-id shell cards from later becoming duplicate terminals for one run. Active shell tool steps stay expanded when later parallel shell starts arrive, so running sibling terminals do not spawn collapsed. Completed shell steps stay open briefly so the terminal-to-read-only transition can settle, then ChatMessage auto-collapses them unless the user manually toggled that step. Once a terminal shell step has auto-collapsed, later timeline updates preserve that local collapsed state instead of reopening the step from stale `isCollapsed: false` stream metadata.
 
 15. Sub-agent events coordinate panel rendering and child sessions
 - File: `frontend/src/hooks/useChatManager.ts` (Handlers: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`, `subAgentSystemHandler`)
@@ -439,6 +439,7 @@ interface SystemEvent {
 - `StreamEventData.type` uses `tool_start`, `tool_update`, `tool_end`, or `permission_request` for timeline mutations.
 - `StreamEventData.id` is stable across a tool start/update/end sequence.
 - `shellRunId` is stable across `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, and `shell_run_exit`.
+- `shellNeedsInput` on timeline events mirrors `ShellRunSnapshot.needsInput`; active session-level input waiting is stored on `ChatSession.isAwaitingShellInput`.
 - `invocationId` is stable for one sub-agent or counsel invocation and is used by `SubAgentPanel` filtering.
 - `toolCategory` and `isFileOperation` guide `ToolStep.getFilePathFromEvent` and canvas hoisting.
 
@@ -543,9 +544,9 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 ### Frontend Stores and Hooks
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Socket wiring | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `wrappedOnStreamToken`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, `subAgentSystemHandler`, socket events `thought`, `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes socket events into stream, shell-run, sub-agent, notification, and session stores. |
+| Socket wiring | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `wrappedOnStreamToken`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, `syncShellInputStateForSession`, `subAgentSystemHandler`, socket events `thought`, `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes socket events into stream, shell-run, sub-agent, notification, and session stores. |
 | Stream engine | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`, `shellRunPatch`, `isShellDescriptionTitle`, `isShellToolData`, `isTerminalToolStatus`, `isSameShellDescriptionTitle` | Owns stream queues, adaptive typewriter mutation, event merge logic, and active assistant message mapping. |
-| Shell run state | `frontend/src/store/useShellRunStore.ts` | `ShellRunSnapshot`, `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`, `trimShellTranscript`, `pruneShellRuns` | Stores live shell transcripts and shell-run metadata by `runId`. |
+| Shell run state | `frontend/src/store/useShellRunStore.ts` | `ShellRunSnapshot`, `ShellRunSnapshot.needsInput`, `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`, `trimShellTranscript`, `pruneShellRuns` | Stores live shell transcripts and shell-run metadata by `runId`, including input-wait state. |
 | Permission response | `frontend/src/store/useChatStore.ts` | `handleRespondPermission`, socket event `respond_permission`, socket event `save_snapshot` | Updates permission timeline responses and emits ACP permission selections. |
 | Session state | `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId`, `setSessions`, `fetchStats` | Holds `ChatSession.messages` and active-session state used by message rendering. |
 | Sub-agent state | `frontend/src/store/useSubAgentStore.ts` | `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent` | Stores invocation state, sub-agent cards, tool steps, and permission state for `SubAgentPanel`. |
@@ -643,6 +644,9 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `assigns lastSubAgentParentAcpId for sub-agent spawning tools`
   - `handles diff fallback in tool_call_update`
   - `skips path resolution for paths with ellipses`
+- `backend/test/shellRunManager.test.js`
+  - `detects shell output prompts that are waiting for user input`
+  - `marks running shell prompts as needing input and clears the marker on user input`
 - `backend/test/permissionManager.test.js`
   - `should track requests and emit to correct session room`
   - `should correlate approval and send correct JSON-RPC result`
@@ -692,7 +696,7 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `handles Shell V2 socket events by explicit shellRunId`
   - `creates a Shell V2 tool step from shell lifecycle events when provider tool_start is missing`
   - `marks Shell V2 tool steps failed on non-zero shell exits`
-  - `routes parallel Shell V2 output by shellRunId without claiming legacy shell steps`
+  - `routes parallel Shell V2 output by shellRunId without claiming unmatched shell steps`
   - `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`
   - `handles "sub_agent_invocation_status" event`
   - `handles "sub_agent_status" with invocationId by updating agent and invocation state`

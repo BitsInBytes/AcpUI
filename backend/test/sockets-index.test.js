@@ -33,6 +33,14 @@ vi.mock('../services/providerRuntimeManager.js', () => ({
 }));
 vi.mock('../services/workspaceConfig.js', () => ({ loadWorkspaces: vi.fn().mockReturnValue([]) }));
 vi.mock('../services/commandsConfig.js', () => ({ loadCommands: vi.fn().mockReturnValue([]) }));
+vi.mock('../services/jsonConfigDiagnostics.js', () => ({
+  collectInvalidJsonConfigErrors: vi.fn(() => []),
+  hasStartupBlockingJsonConfigError: vi.fn((errors) => errors.some(error => error.blocksStartup === true))
+}));
+vi.mock('../database.js', () => ({
+  initDb: vi.fn(() => Promise.resolve()),
+  getProviderStatusExtensions: vi.fn(() => Promise.resolve([]))
+}));
 vi.mock('../services/providerStatusMemory.js', () => ({
   getLatestProviderStatusExtension: vi.fn(() => null),
   getLatestProviderStatusExtensions: vi.fn(() => [])
@@ -57,7 +65,10 @@ vi.mock('../services/providerLoader.js', () => ({
 vi.mock('../voiceService.js', () => ({ isSTTEnabled: vi.fn().mockReturnValue(false) }));
 
 import registerSocketHandlers from '../sockets/index.js';
+import { collectInvalidJsonConfigErrors } from '../services/jsonConfigDiagnostics.js';
+import { getDefaultProviderId } from '../services/providerRegistry.js';
 import { getLatestProviderStatusExtension, getLatestProviderStatusExtensions } from '../services/providerStatusMemory.js';
+import { getProviderStatusExtensions } from '../database.js';
 
 function connectSocket(mockIo) {
   const mockSocket = new EventEmitter();
@@ -70,13 +81,19 @@ function connectSocket(mockIo) {
   return mockSocket;
 }
 
+function flushPromises() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
 describe('Socket Index Handler', () => {
   let mockIo;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    collectInvalidJsonConfigErrors.mockReturnValue([]);
     getLatestProviderStatusExtension.mockReturnValue(null);
     getLatestProviderStatusExtensions.mockReturnValue([]);
+    getProviderStatusExtensions.mockResolvedValue([]);
     mockIo = new EventEmitter();
     mockIo.engine = { clientsCount: 1 };
     registerSocketHandlers(mockIo);
@@ -90,6 +107,57 @@ describe('Socket Index Handler', () => {
     expect(promptHandlers).toHaveBeenCalled();
     expect(sessionHandlers).toHaveBeenCalled();
     expect(shellRunHandlers).toHaveBeenCalled();
+  });
+
+  it('emits config_errors on connection', () => {
+    const s = connectSocket(mockIo);
+    expect(s.emit).toHaveBeenCalledWith('config_errors', { errors: [] });
+  });
+
+  it('blocks normal hydration when startup JSON config is invalid', async () => {
+    const issue = {
+      id: 'provider-registry',
+      label: 'Provider registry',
+      path: 'configuration/providers.json',
+      message: 'Unexpected token',
+      blocksStartup: true
+    };
+    collectInvalidJsonConfigErrors.mockReturnValue([issue]);
+
+    const s = connectSocket(mockIo);
+    const promptHandlers = (await import('../sockets/promptHandlers.js')).default;
+
+    expect(s.emit).toHaveBeenCalledWith('config_errors', { errors: [issue] });
+    expect(s.emit).not.toHaveBeenCalledWith('providers', expect.anything());
+    expect(promptHandlers).not.toHaveBeenCalled();
+  });
+
+  it('preserves existing diagnostics when runtime config loading fails', () => {
+    const existingIssue = {
+      id: 'commands-config',
+      label: 'Custom commands configuration',
+      path: 'commands.json',
+      message: 'Unexpected token'
+    };
+    collectInvalidJsonConfigErrors.mockReturnValue([existingIssue]);
+    getDefaultProviderId.mockImplementationOnce(() => {
+      throw new Error('Provider registry is missing defaultProviderId');
+    });
+
+    const s = connectSocket(mockIo);
+
+    expect(s.emit).toHaveBeenCalledWith('config_errors', { errors: [existingIssue] });
+    expect(s.emit).toHaveBeenCalledWith('config_errors', {
+      errors: [
+        existingIssue,
+        expect.objectContaining({
+          id: 'runtime-config-load',
+          message: 'Provider registry is missing defaultProviderId',
+          blocksStartup: true
+        })
+      ]
+    });
+    expect(s.emit).not.toHaveBeenCalledWith('providers', expect.anything());
   });
 
   it('emits sidebar_settings on connection', () => {
@@ -132,6 +200,38 @@ describe('Socket Index Handler', () => {
 
     expect(s.emit).toHaveBeenCalledWith('provider_extension', providerStatusExtension);
   });
+
+  it('emits persisted provider status on connection when memory is empty', async () => {
+    const persistedExtension = {
+      method: '_test.dev/provider/status',
+      params: { status: { providerId: 'test', sections: [] } }
+    };
+    getProviderStatusExtensions.mockResolvedValue([persistedExtension]);
+
+    const s = connectSocket(mockIo);
+    await flushPromises();
+
+    expect(s.emit).toHaveBeenCalledWith('provider_extension', persistedExtension);
+  });
+
+  it('does not emit persisted provider status over newer memory status for the same provider', async () => {
+    const memoryExtension = {
+      method: '_test.dev/provider/status',
+      params: { status: { providerId: 'test', sections: [{ id: 'memory', items: [] }] } }
+    };
+    const persistedExtension = {
+      method: '_test.dev/provider/status',
+      params: { status: { providerId: 'test', sections: [{ id: 'persisted', items: [] }] } }
+    };
+    getLatestProviderStatusExtensions.mockReturnValue([memoryExtension]);
+    getProviderStatusExtensions.mockResolvedValue([persistedExtension]);
+
+    const s = connectSocket(mockIo);
+    await flushPromises();
+
+    expect(s.emit).toHaveBeenCalledWith('provider_extension', memoryExtension);
+    expect(s.emit).not.toHaveBeenCalledWith('provider_extension', persistedExtension);
+  });
 });
 
 describe('Socket Index - session rooms', () => {
@@ -139,8 +239,10 @@ describe('Socket Index - session rooms', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    collectInvalidJsonConfigErrors.mockReturnValue([]);
     getLatestProviderStatusExtension.mockReturnValue(null);
     getLatestProviderStatusExtensions.mockReturnValue([]);
+    getProviderStatusExtensions.mockResolvedValue([]);
     mockIo = new EventEmitter();
     mockIo.engine = { clientsCount: 1 };
     registerSocketHandlers(mockIo);

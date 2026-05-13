@@ -234,7 +234,7 @@ See [ACP_PROTOCOL_SAMPLES.md](./ACP_PROTOCOL_SAMPLES.md) for captured Claude ACP
 
 ### Context Usage Persistence
 
-Claude context usage is cached in `{paths.home or ~/.claude}\acp_session_context.json` when `usage_update` events arrive. On backend restart or hot-session reuse, AcpUI calls `emitCachedContext(sessionId)` after the session ID is known so the footer and session settings show the last context percentage before another prompt is sent.
+Claude context usage is cached in `{paths.home or ~/.claude}\acp_session_context.json` when `usage_update` events arrive. Each `usage_update.used/size` pair is treated as the latest absolute snapshot for that session (never added to prior values). On backend restart or hot-session reuse, AcpUI calls `emitCachedContext(sessionId)` after the session ID is known so the footer and session settings show the last context percentage before another prompt is sent.
 
 ## Operational Notes
 

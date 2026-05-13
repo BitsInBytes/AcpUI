@@ -9,6 +9,14 @@ import * as Diff from 'diff';
 import fs from 'fs';
 import path from 'path';
 
+function contextUsagePercentageFromTokens(usedValue, totalValue) {
+  const used = Number(usedValue);
+  const total = Number(totalValue);
+  if (!Number.isFinite(used) || !Number.isFinite(total)) return null;
+  if (total <= 0) return 100;
+  return Math.max(0, Math.min(100, (used / total) * 100));
+}
+
 /**
  * Routes ACP session/update events to the UI via socket.io.
  * Handles two bypass paths: draining sessions (swallow all chunks) and
@@ -284,14 +292,18 @@ export async function handleUpdate(acpClient, sessionId, update) {
   else if (update.sessionUpdate === 'usage_update') {
     const meta = acpClient.sessionMetadata.get(sessionId);
     if (meta && update.used !== undefined && update.size !== undefined) {
-       meta.usedTokens = update.used;
-       meta.totalTokens = update.size;
+       const usedTokens = Number(update.used);
+       const totalTokens = Number(update.size);
+       const contextUsagePercentage = contextUsagePercentageFromTokens(usedTokens, totalTokens);
+       if (contextUsagePercentage === null) return;
+       meta.usedTokens = usedTokens;
+       meta.totalTokens = totalTokens;
        acpClient.io.to('session:' + sessionId).emit('stats_push', { providerId, sessionId, usedTokens: meta.usedTokens, totalTokens: meta.totalTokens });
        if (config.protocolPrefix) {
          acpClient.io.emit('provider_extension', {
            providerId,
            method: `${config.protocolPrefix}metadata`,
-           params: { providerId, sessionId, contextUsagePercentage: update.size > 0 ? (update.used / update.size) * 100 : 100 }
+           params: { providerId, sessionId, contextUsagePercentage }
          });
        }
 

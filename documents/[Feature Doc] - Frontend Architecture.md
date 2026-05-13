@@ -9,7 +9,7 @@ AcpUI frontend is a React, Vite, and Zustand runtime that renders a provider-agn
 ### What It Does
 
 - Creates one Socket.IO client through `frontend/src/hooks/useSocket.ts` (Function: `getOrCreateSocket`) and stores it in `useSystemStore.socket`.
-- Hydrates provider metadata, branding, workspace entries, notification settings, custom commands, voice availability, session model options, and provider extensions from backend socket events.
+- Hydrates invalid JSON config diagnostics, provider metadata, branding, workspace entries, notification settings, custom commands, voice availability, session model options, and provider extensions from backend socket events.
 - Maintains session list state, active session selection, URL session sync, model/config state, stats, notes flags, and session hydration through `useSessionLifecycleStore`.
 - Submits prompts, cancels turns, forks sessions, and answers permissions through `useChatStore`.
 - Queues `thought`, `token`, `system_event`, and `permission_request` events per ACP session and drains them into `Message.timeline` through `useStreamStore.processBuffer`.
@@ -50,11 +50,11 @@ function getOrCreateSocket(): Socket {
 
 2. Backend bootstrap payloads hydrate system state
 
-File: `frontend/src/hooks/useSocket.ts` (Socket events: `connect`, `ready`, `voice_enabled`, `workspace_cwds`, `providers`, `branding`, `sidebar_settings`, `custom_commands`, `session_model_options`, `provider_extension`, `disconnect`)
+File: `frontend/src/hooks/useSocket.ts` (Socket events: `connect`, `config_errors`, `ready`, `voice_enabled`, `workspace_cwds`, `providers`, `branding`, `sidebar_settings`, `custom_commands`, `session_model_options`, `provider_extension`, `disconnect`)
 
-File: `frontend/src/store/useSystemStore.ts` (Actions: `setProviders`, `setProviderBranding`, `setSlashCommands`, `setContextUsage`, `setProviderStatus`, `setCompacting`, `getBranding`)
+File: `frontend/src/store/useSystemStore.ts` (Actions: `setInvalidJsonConfigs`, `setProviders`, `setProviderBranding`, `setSlashCommands`, `setContextUsage`, `getContextUsage`, `hasContextUsage`, `setProviderStatus`, `setCompacting`, `getCompacting`, `getBranding`)
 
-The socket listener writes provider catalog, active provider, readiness, branding, sidebar/notification settings, slash commands, context usage, provider status, and compaction state into system/session stores. `provider_extension` routes through `routeExtension` with the active provider branding prefix.
+The socket listener writes invalid JSON diagnostics, provider catalog, active provider, readiness, branding, sidebar/notification settings, slash commands, context usage, provider status, and compaction state into system/session stores. `config_errors` writes `invalidJsonConfigs` for the blocking startup modal, and `provider_extension` resolves provider id from the event payload before routing through `routeExtension` with that provider's branding prefix.
 
 ```typescript
 // FILE: frontend/src/hooks/useSocket.ts (Socket event: provider_extension)
@@ -68,7 +68,7 @@ const result = routeExtension(data.method, p, ext, [], useSystemStore.getState()
 
 File: `frontend/src/App.tsx` (Component: `App`)
 
-`App` mounts `Sidebar`, `ChatHeader`, `MessageList`, `ChatInput`, global modals, and `CanvasPane`. It wires `useSocket`, `useScroll`, and `useChatManager`, handles drag-and-drop uploads through `useInputStore.handleFileUpload`, and owns the normal-window session switch effect.
+`App` mounts `Sidebar`, `ChatHeader`, `MessageList`, `ChatInput`, global modals including `ConfigErrorModal`, and `CanvasPane`. It wires `useSocket`, `useScroll`, and `useChatManager`, handles drag-and-drop uploads through `useInputStore.handleFileUpload`, and owns the normal-window session switch effect.
 
 ```tsx
 // FILE: frontend/src/App.tsx (Component: App)
@@ -89,7 +89,7 @@ Stable socket events: `unwatch_session`, `watch_session`, `canvas_load`.
 
 File: `frontend/src/PopOutApp.tsx` (Component: `PopOutApp`)
 
-`PopOutApp` reads the `popout` URL query parameter, calls `claimSession(popoutSessionId)`, sets `activeSessionId`, emits `load_sessions`, maps returned sessions into local state, emits `watch_session` when the selected session has an ACP ID, calls `hydrateSession`, and renders `ChatHeader`, `MessageList`, `ChatInput`, and optional `CanvasPane` without `Sidebar` or global modals.
+`PopOutApp` reads the `popout` URL query parameter, calls `claimSession(popoutSessionId)`, sets `activeSessionId`, emits `load_sessions`, maps returned sessions into local state, emits `watch_session` when the selected session has an ACP ID, calls `hydrateSession`, and renders `ChatHeader`, `MessageList`, `ChatInput`, optional `CanvasPane`, and `ConfigErrorModal` without `Sidebar` or normal-window settings modals.
 
 Stable anchors: `claimSession`, `load_sessions`, `watch_session`, `hydrateSession`.
 
@@ -131,12 +131,13 @@ Stable socket events: `save_snapshot`, `prompt`.
 
 File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket events: `stats_push`, `session_renamed`, `merge_message`, `thought`, `token`, `system_event`, `permission_request`, `token_done`, `hooks_status`, `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit`, `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`)
 
-The hook registers turn-level socket listeners. Chat events route to `useStreamStore`; stats and rename events update `useSessionLifecycleStore`; shell events update `useShellRunStore`, patch timeline tool steps by `shellRunId`, tool-call ID, or active shell description title, and queue fallback shell tool starts through `useStreamStore` when shell lifecycle events arrive before a provider `tool_start`; sub-agent events update `useSubAgentStore` and lazily create sidebar `ChatSession` shells when a sub-agent first emits token or system-event output.
+The hook registers turn-level socket listeners. Chat events route to `useStreamStore`; stats and rename events update `useSessionLifecycleStore`; shell events update `useShellRunStore`, patch timeline tool steps by `shellRunId`, tool-call ID, or active shell description title, mirror active `ShellRunSnapshot.needsInput` into `ChatSession.isAwaitingShellInput`, and queue fallback shell tool starts through `useStreamStore` when shell lifecycle events arrive before a provider `tool_start`; sub-agent events update `useSubAgentStore` and lazily create sidebar `ChatSession` shells when a sub-agent first emits token or system-event output.
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Handler: shell_run_snapshot)
 useShellRunStore.getState().upsertSnapshot(snapshot);
 patchShellRunToolStep(snapshot.runId, shellRunSnapshotPatch(snapshot), snapshot);
+syncShellInputStateForSession(snapshot.sessionId);
 ```
 
 11. Stream store transforms queues into unified timeline entries
@@ -161,6 +162,7 @@ Files: `frontend/src/components/MessageList/MessageList.tsx`, `frontend/src/comp
 flowchart TB
   Backend[Backend Socket.IO events] --> Socket[useSocket getOrCreateSocket]
   Socket --> System[useSystemStore]
+  System --> ConfigModal[ConfigErrorModal]
   Socket --> Lifecycle[useSessionLifecycleStore]
   Socket --> Voice[useVoiceStore]
 
@@ -208,7 +210,7 @@ flowchart TB
 - `ChatSession.acpSessionId` is the transport identity. Use it for socket rooms (`watch_session`, `unwatch_session`), prompt routing, stream queues, stats, permission responses, shell run routing, sub-agent parent tracking, and backend history/ACP calls.
 - `Message.timeline` is the authoritative assistant render model. Assistant text, thoughts, tool calls, and permissions must become timeline entries instead of side-channel UI state.
 - `useStreamStore.activeMsgIdByAcp[acpSessionId]` identifies the assistant message receiving stream events for that ACP session.
-- Tool updates must merge into an existing `tool` timeline step by `SystemEvent.id`; shell events must patch by `shellRunId`; sub-agent panels must filter by `invocationId`.
+- Tool updates must merge into an existing `tool` timeline step by `SystemEvent.id`; shell events must patch by `shellRunId` and carry `shellNeedsInput`; sub-agent panels must filter by `invocationId`.
 - Provider data must flow through `useSystemStore.providersById`, `useSystemStore.branding`, and `useSystemStore.getBranding(providerId)`.
 
 If this contract is broken, session switching can watch the wrong backend room, background streams can write into the wrong chat, shell output can attach to the wrong tool step, sub-agent panels can display the wrong invocation, and provider-specific branding/model data can leak across sessions.
@@ -219,6 +221,7 @@ If this contract is broken, session switching can watch the wrong backend room, 
 
 ### Provider and App Configuration Flow
 
+- Backend `config_errors` event -> `useSocket` -> `useSystemStore.setInvalidJsonConfigs(errors)` -> `ConfigErrorModal` blocks interaction until the JSON files are fixed and the backend/app reload.
 - Backend `providers` event -> `useSocket` -> `useSystemStore.setProviders(defaultProviderId, providers)` -> `providersById`, `orderedProviderIds`, `activeProviderId`, `readyByProviderId`, active `branding`.
 - Backend `branding` event -> `useSocket` -> `useSystemStore.setProviderBranding(data)` for provider-scoped branding or root `branding` state for generic branding -> `document.title`.
 - Backend `sidebar_settings` event -> `useSocket` -> `deletePermanent`, notification settings, and browser notification permission prompt.
@@ -271,6 +274,13 @@ system_event { sessionId, type, id, title, output, filePath, shellRunId, invocat
 ```
 
 ```text
+shell_run_output { sessionId, runId, chunk, needsInput }
+  -> useShellRunStore.appendOutput
+  -> patch matching TimelineStep.event.shellNeedsInput
+  -> syncShellInputStateForSession -> ChatSession.isAwaitingShellInput
+```
+
+```text
 permission_request { sessionId, id, options, toolCall }
   -> useChatManager permission routing
   -> useSubAgentStore.setPermission for sub-agent sessions
@@ -280,7 +290,7 @@ permission_request { sessionId, id, options, toolCall }
 
 ### Core Data Shapes
 
-File: `frontend/src/types.ts` (Interfaces: `ChatSession`, `Message`, `TimelineStep`, `SystemEvent`, `StreamEventData`, `ProviderSummary`, `ProviderBranding`, `ProviderStatus`)
+File: `frontend/src/types.ts` (Interfaces: `ChatSession`, `Message`, `TimelineStep`, `SystemEvent`, `StreamEventData`, `InvalidJsonConfig`, `ProviderSummary`, `ProviderBranding`, `ProviderStatus`)
 
 ```typescript
 // FILE: frontend/src/types.ts (Interface: ChatSession)
@@ -292,6 +302,9 @@ export interface ChatSession {
   currentModelId?: string | null;
   provider?: string | null;
   configOptions?: ProviderConfigOption[];
+  isTyping: boolean;
+  isAwaitingPermission?: boolean;
+  isAwaitingShellInput?: boolean;
 }
 ```
 
@@ -312,24 +325,24 @@ export type TimelineStep =
 
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
-| Normal root | `frontend/src/App.tsx` | `App`, `ErrorBoundary`, session switch effect, `canvas_load`, `watch_session`, `unwatch_session` | Main shell with sidebar, chat, canvas, global modals, drag/drop upload, and session-room coordination |
-| Pop-out root | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `claimSession`, `load_sessions`, `watch_session`, `hydrateSession` | Detached chat runtime for one URL-selected session |
-| Socket singleton | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `useSocket`, socket events: `providers`, `branding`, `provider_extension` | Creates global socket and hydrates system/session stores |
-| Stream dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `trimShellOutputLines`, socket events: `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes backend events to lifecycle, stream, shell, and sub-agent stores |
+| Normal root | `frontend/src/App.tsx` | `App`, `ErrorBoundary`, `ConfigErrorModal`, session switch effect, `canvas_load`, `watch_session`, `unwatch_session` | Main shell with sidebar, chat, canvas, global modals, drag/drop upload, and session-room coordination |
+| Pop-out root | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `ConfigErrorModal`, `claimSession`, `load_sessions`, `watch_session`, `hydrateSession` | Detached chat runtime for one URL-selected session, including blocking config diagnostics |
+| Socket singleton | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `useSocket`, socket events: `config_errors`, `providers`, `branding`, `provider_extension` | Creates global socket and hydrates system/session stores |
+| Stream dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `trimShellOutputLines`, `syncShellInputStateForSession`, socket events: `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes backend events to lifecycle, stream, shell, and sub-agent stores, including shell input-wait session state |
 | Scroll | `frontend/src/hooks/useScroll.ts` | `useScroll`, `scrollToBottom`, `handleScroll`, `handleWheel`, `ResizeObserver` effect | Auto-scroll stickiness, manual override state, and back-to-bottom control |
 
 ### Zustand Stores
 
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
-| System state | `frontend/src/store/useSystemStore.ts` | `setSocket`, `setProviders`, `setProviderBranding`, `setSlashCommands`, `setContextUsage`, `setProviderStatus`, `setCompacting`, `getBranding` | Provider catalog, branding, connection status, status panel data, context usage, notifications, commands |
+| System state | `frontend/src/store/useSystemStore.ts` | `invalidJsonConfigs`, `setInvalidJsonConfigs`, `setSocket`, `setProviders`, `setProviderBranding`, `setSlashCommands`, `setContextUsage`, `getContextUsage`, `hasContextUsage`, `setProviderStatus`, `setCompacting`, `getCompacting`, `getBranding` | Config diagnostics, provider catalog, branding, connection status, status panel data, provider-scoped context usage and compaction state, notifications, commands |
 | Session lifecycle | `frontend/src/store/useSessionLifecycleStore.ts` | `handleInitialLoad`, `handleNewChat`, `handleSessionSelect`, `hydrateSession`, `fetchStats`, `handleSessionModelChange`, `handleSetSessionOption`, `handleSaveSession` | Session list, active selection, hydration, model/config state, stats, URL sync, persistence emits |
 | Stream timeline | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `processBuffer`, `onStreamDone` | Per-ACP stream queues, adaptive typewriter, timeline mutation, stream completion persistence |
 | Chat commands | `frontend/src/store/useChatStore.ts` | `handleSubmit`, `handleCancel`, `handleForkSession`, `handleRespondPermission` | Prompt submit/cancel/fork/permission workflows |
 | Input state | `frontend/src/store/useInputStore.ts` | `setInput`, `setAttachments`, `handleFileUpload`, `clearInput` | Per-UI-session input text and attachments |
 | UI state | `frontend/src/store/useUIStore.ts` | `setSidebarOpen`, `toggleSidebarPinned`, `setSettingsOpen`, `incrementVisibleCount`, `resetVisibleCount`, `toggleAutoScroll` | Sidebar, modal, pagination, and auto-scroll preferences |
 | Canvas state | `frontend/src/store/useCanvasStore.ts` | `openTerminal`, `closeTerminal`, `handleOpenInCanvas`, `handleOpenFileInCanvas`, `handleFileEdited`, `handleCloseArtifact`, `resetCanvas` | Canvas artifacts, terminal tabs, file reload, canvas persistence hooks |
-| Shell run state | `frontend/src/store/useShellRunStore.ts` | `useShellRunStore`, `trimShellTranscript`, `pruneShellRuns`, `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited` | Shell V2 snapshots and transcript pruning keyed by `runId` |
+| Shell run state | `frontend/src/store/useShellRunStore.ts` | `useShellRunStore`, `ShellRunSnapshot.needsInput`, `trimShellTranscript`, `pruneShellRuns`, `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited` | Shell V2 snapshots, input-wait state, and transcript pruning keyed by `runId` |
 | Sub-agent state | `frontend/src/store/useSubAgentStore.ts` | `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `completeAgent`, `addToolStep`, `updateToolStep`, `setPermission`, `clearForParent` | Invocation-level and agent-level panel state keyed by ACP session and `invocationId` |
 
 ### Rendering Components
@@ -343,6 +356,7 @@ export type TimelineStep =
 | Tool renderer | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `ShellToolTerminal` | Tool step header, timer, canvas hoist, shell terminal, sub-agent start output suppression, output wrapper |
 | Output formatting | `frontend/src/components/renderToolOutput.tsx` | `renderToolOutput`, `tryExtractShellOutput`, `isWebFetchResult`, `isGrepSearchResult` | Diff, ANSI, JSON, file, web fetch, grep, and plain output rendering |
 | Permissions | `frontend/src/components/PermissionStep.tsx` | `PermissionStep` | Permission response UI feeding `handleRespondPermission` |
+| Config diagnostics | `frontend/src/components/ConfigErrorModal.tsx` | `ConfigErrorModal`, `invalidJsonConfigs`, `role="alertdialog"` | Blocking app-load popup for invalid or missing startup config reported by the backend |
 | Shell terminal | `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal` | Live shell transcript and terminal controls for `shellRunId` tool steps |
 | Sub-agent panel | `frontend/src/components/SubAgentPanel.tsx` | `SubAgentPanel`, `handleStop`, `respond_permission` | Bottom-pinned sub-agent status, Stop action, output, tools, and permission response UI |
 
@@ -355,7 +369,7 @@ export type TimelineStep =
 | Config options | `frontend/src/utils/configOptions.ts` | `mergeProviderConfigOptions` | Merges provider config option updates from session creation and provider extensions |
 | AcpUI UX tool identity | `frontend/src/utils/acpUxTools.ts` | `ACP_UX_TOOL_NAMES`, `toolNameFromEvent`, `isAcpUxShellToolEvent`, `isAcpUxSubAgentStartToolEvent`, `isAcpUxSubAgentToolName` | Central frontend AcpUI UX tool-name constants and predicates shared by stream, socket, and rendering code |
 | Ownership | `frontend/src/lib/sessionOwnership.ts` | `claimSession`, `setOwnershipChangeCallback` | BroadcastChannel-backed pop-out ownership coordination |
-| Backend bootstrap contract | `backend/sockets/index.js` | Socket connection emits: `providers`, `ready`, `voice_enabled`, `workspace_cwds`, `branding`, `sidebar_settings`, `custom_commands`, `provider_extension` | Source of initial frontend runtime payloads |
+| Backend bootstrap contract | `backend/sockets/index.js` | Socket connection emits: `config_errors`, `providers`, `ready`, `voice_enabled`, `workspace_cwds`, `branding`, `sidebar_settings`, `custom_commands`, `provider_extension` | Source of initial frontend runtime payloads and startup config diagnostics |
 | Backend stream contract | `backend/services/acpUpdateHandler.js` | `handleUpdate`, emits: `token`, `thought`, `system_event`, `stats_push`, `provider_extension` | Source of normalized timeline stream events |
 | Backend permission contract | `backend/services/permissionManager.js` | `handleRequest`, emits: `permission_request` | Source of frontend permission timeline requests |
 
@@ -385,7 +399,7 @@ Tool updates, permission requests, shell metadata, and file edits must remain re
 
 6. Shell V2 output is keyed by `shellRunId`
 
-Shell snapshots and output update `useShellRunStore.runs[runId]` and patch matching tool timeline steps by `event.shellRunId`. Matching shell output by title or command is unsafe when multiple shell tools run in parallel.
+Shell snapshots and output update `useShellRunStore.runs[runId]`, patch matching tool timeline steps by `event.shellRunId`, and mirror active `needsInput` into `ChatSession.isAwaitingShellInput`. Matching shell output by title or command is unsafe when multiple shell tools run in parallel.
 
 7. Sub-agent sessions are created lazily
 
@@ -397,9 +411,13 @@ The first `sub_agent_started` event stamps `invocationId` onto the active `ux_in
 
 9. Provider extensions must remain provider-scoped
 
-`provider_extension` uses the provider's `protocolPrefix` from branding and passes provider ID to store updates where supported. Avoid writing extension results only to global state unless the store action is intentionally global.
+`provider_extension` uses the provider's `protocolPrefix` from branding and passes provider ID to store updates where supported. Context usage and compaction state must be keyed by `providerId + sessionId` in `useSystemStore` so interleaved providers cannot overwrite each other. Avoid writing extension results only to global state unless the store action is intentionally global.
 
-10. Persisted context usage must not be downgraded to zero
+10. Config error modal is intentionally not dismissible
+
+`ConfigErrorModal` has no close or continue action. It renders whenever `useSystemStore.invalidJsonConfigs` contains entries from `config_errors`, so the only recovery path is fixing the JSON, restarting the backend when needed, and reconnecting/reloading so the backend emits an empty error list.
+
+11. Persisted context usage must not be downgraded to zero
 
 `maybeHydrateContextUsage` and `fetchStats` preserve an existing positive context usage percentage when incoming stats imply zero. Keep this guard when changing stats hydration.
 
@@ -412,8 +430,10 @@ The first `sub_agent_started` event stamps `invocationId` onto the active `ux_in
 | File | Suites and Important Test Names |
 |---|---|
 | `frontend/src/test/acpUxTools.test.ts` | Suite: `acpUxTools`; tests: `centralizes known AcpUI UX tool names`, `normalizes direct tool name checks`, `resolves tool identity from normalized event fields` |
-| `frontend/src/test/useSocket.test.ts` | Suite: `useSocket hook`; tests: `initializes socket and sets up listeners`, `handles "ready" event with providerId`, `handles "providers" event`, `handles "custom_commands" event`, `handles "session_model_options" event`, `provider_extension event` cases for `commands`, `metadata`, `provider_status`, `config_options`, `compaction_started`, `compaction_completed` |
-| `frontend/src/test/useChatManager.test.ts` | Suite: `useChatManager hook`; tests: `sets up listeners and calls handleInitialLoad`, `handles Shell V2 socket events by explicit shellRunId`, `creates a Shell V2 tool step from shell lifecycle events when provider tool_start is missing`, `marks Shell V2 tool steps failed on non-zero shell exits`, `routes parallel Shell V2 output by shellRunId without claiming legacy shell steps`, `handles "sub_agents_starting" - clears old sidebar sessions immediately`, `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`, `handles "sub_agent_invocation_status" event`, `handles "sub_agent_status" with invocationId by updating agent and invocation state`, `moves waiting sub-agents back to running on token events`, `passes terminal sub-agent completion statuses through to the store`, `creates lazy sub-agent session with provider on first token`, `creates lazy sub-agent session with provider on first system_event`, `routes system_event tool_start/tool_end to sub-agent store`, `handles "token_done" event` |
+| `frontend/src/test/useSocket.test.ts` | Suite: `useSocket hook`; tests: `initializes socket and sets up listeners`, `handles "config_errors" event`, `clears config errors when the backend sends no errors array`, `handles "ready" event with providerId`, `handles "providers" event`, `handles "custom_commands" event`, `handles "session_model_options" event`, `provider_extension event` cases for `commands`, `metadata`, `provider_status`, `config_options`, `compaction_started`, `compaction_completed` |
+| `frontend/src/test/useChatManager.test.ts` | Suite: `useChatManager hook`; tests: `sets up listeners and calls handleInitialLoad`, `handles Shell V2 socket events by explicit shellRunId`, `marks the session as awaiting shell input from shell output and clears it on exit`, `keeps shell input waiting state while another run in the same session still needs input`, `creates a Shell V2 tool step from shell lifecycle events when provider tool_start is missing`, `attaches shell lifecycle to a queued provider shell start instead of adding a duplicate`, `does not attach shell lifecycle to ambiguous queued provider shell starts with the same description`, `attaches shell lifecycle to an existing provider shell step by description`, `marks Shell V2 tool steps failed on non-zero shell exits`, `routes parallel Shell V2 output by shellRunId without claiming unmatched shell steps`, `handles "sub_agents_starting" - clears old sidebar sessions immediately`, `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`, `handles "sub_agent_invocation_status" event`, `handles "sub_agent_status" with invocationId by updating agent and invocation state`, `moves waiting sub-agents back to running on token events`, `passes terminal sub-agent completion statuses through to the store`, `creates lazy sub-agent session with provider on first token`, `creates lazy sub-agent session with provider on first system_event`, `routes system_event tool_start/tool_end to sub-agent store`, `handles "token_done" event` |
+| `frontend/src/test/useShellRunStore.test.ts` | Suite: `useShellRunStore`; tests: `upserts snapshots by run id`, `appends output and applies max line trimming`, `hydrates active state from snapshots for reattach`, `marks exits as read-only terminal state`, `prunes old exited runs while retaining active runs`, `keeps the last N lines while preserving trailing newline` |
+| `frontend/src/test/useSystemStoreDeep.test.ts` | Suite: `useSystemStore deep coverage`; tests: `setContextUsage updates session percentage by provider+session key`, `clamps context usage to UI-safe bounds`, `setCompacting tracks compaction state per provider+session key`, `reads unscoped context and compaction entries as a fallback`, `keeps compaction state isolated for interleaved providers sharing a session id`, `keeps context usage isolated for interleaved providers sharing a session id` |
 | `frontend/src/test/useSessionLifecycleStore.test.ts` | Suite: `useSessionLifecycleStore`; tests: `handleInitialLoad loads sessions and syncs URL`, `fetchStats updates session with stats`, `fetchStats does not overwrite existing positive context usage with zero percent`, `handleNewChat creates session and retries if daemon not ready`, `hydrateSession cleans timeline and resumes on backend`, `hydrateSession hydrates context usage from existing session stats before history load`, `handleSessionSelect hydrates context usage from persisted session stats` |
 | `frontend/src/test/useSessionLifecycleStoreExtended.test.ts` | Suite: `useSessionLifecycleStore (extended)`; tests: `handleActiveSessionModelChange calls handleSessionModelChange`, `handleUpdateModel updates session model locally without socket emit`, `handleSaveSession emits save_snapshot for active session`, `checkPendingPrompts is a no-op currently`, `handleNewChat does not create if uiId already exists` |
 | `frontend/src/test/useStreamStore.test.ts` | Suite: `useStreamStore (Pure Logic)`; tests: `ensureAssistantMessage creates a placeholder message`, `onStreamToken queues text and triggers typewriter`, `processBuffer drains queue into session messages with adaptive speed`, `hydrates queued shell tool_start from an existing shell snapshot`, `prefers MCP handler titles over longer raw provider titles`, `preserves Shell V2 terminal output on tool_end by shellRunId`, `keeps active parallel shell tool starts expanded while later shell steps arrive`, `merges duplicate shell tool_start events by shellRunId`, `merges provider shell tool_start without run id into an existing shell run by description`, `merges duplicate provider shell tool_start events before a shell run id is attached`, `merges shell tool_end events by shellRunId when tool ids differ`, `keeps active sub-agent orchestration steps expanded when new timeline steps arrive`, `collapses inactive sub-agent orchestration steps when new timeline steps arrive`, `onStreamDone marks message as finished and saves snapshot` |
@@ -425,8 +445,9 @@ The first `sub_agent_started` event stamps `invocationId` onto the active `ux_in
 
 | File | Suites and Important Test Names |
 |---|---|
-| `frontend/src/test/App.test.tsx` | Suite: `App Component`; tests: `renders Sidebar and ChatInput`, `switches between sessions and emits watch events`, `handles file drop`, `persists canvas open state per session`, `auto-opens canvas for plans when awaiting permission`, `handles resize handle mouse events` |
-| `frontend/src/test/PopOutApp.test.tsx` | Suite: `PopOutApp`; tests: `renders loading state initially`, `renders ChatHeader and ChatInput when ready`, `does NOT render Sidebar`, `sets document.title with session name when ready`, `hydrates session and emits watch_session when ready`, `claims session ownership on mount` |
+| `frontend/src/test/App.test.tsx` | Suite: `App Component`; tests: `renders Sidebar and ChatInput`, `renders the config error modal from root state`, `switches between sessions and emits watch events`, `handles file drop`, `persists canvas open state per session`, `auto-opens canvas for plans when awaiting permission`, `handles resize handle mouse events` |
+| `frontend/src/test/PopOutApp.test.tsx` | Suite: `PopOutApp`; tests: `renders loading state initially`, `renders the config error modal while loading`, `renders ChatHeader and ChatInput when ready`, `does NOT render Sidebar`, `sets document.title with session name when ready`, `hydrates session and emits watch_session when ready`, `claims session ownership on mount` |
+| `frontend/src/test/ConfigErrorModal.test.tsx` | Suite: `ConfigErrorModal`; tests: `renders nothing when there are no invalid JSON configs`, `renders a blocking alert with every invalid JSON config` |
 | `frontend/src/test/MessageList.test.tsx` | Suite: `MessageList`; tests: `renders empty state when no messages`, `renders messages via HistoryList when available`, `shows load more button when hasMoreMessages is true`, `increments visible count when load more is clicked`, `shows scroll to bottom button when showScrollButton is true`, `renders empty state with provider-specific branding message` |
 | `frontend/src/test/ChatMessage.test.tsx` | Suites: `ChatMessage`, `ChatMessage - additional coverage`, `ChatMessage - Collapse Fix (Regression)`; tests: `renders assistant message correctly with interleaved timeline`, `keeps only the last 3 tool calls and last 3 thought bubbles expanded while streaming`, `auto-collapses completed shell tool steps after a short settling delay`, `keeps auto-collapsed terminal shell steps collapsed while later shell steps stream`, `pins active sub-agent orchestration to the bottom after later parent work`, `keeps active sub-agent orchestration expanded after remount`, `renders permission requests and allows response`, `tool timeline step renders with title`, `respects manual toggle during timeline updates while streaming`, `respects manual toggle after streaming stops` |
 | `frontend/src/test/AssistantMessage.test.tsx` | Suites: `AssistantMessage`, `AssistantMessage - fork and copy`, `AssistantMessage - sub-agent`; tests: `renders text timeline step content`, `renders permission step in timeline`, `renders fallback content when no timeline text steps`, `does not render fallback when timeline has text step`, `shows hooks running indicator`, `does not render fork button for sub-agent sessions` |
@@ -437,7 +458,7 @@ The first `sub_agent_started` event stamps `invocationId` onto the active `ux_in
 Run focused verification with:
 
 ```powershell
-cd frontend; npx vitest run src/test/App.test.tsx src/test/PopOutApp.test.tsx src/test/useSocket.test.ts src/test/useChatManager.test.ts src/test/useSessionLifecycleStore.test.ts src/test/useSessionLifecycleStoreExtended.test.ts src/test/useStreamStore.test.ts src/test/streamConcurrency.test.ts src/test/typewriter-adaptive.test.ts src/test/extensionRouter.test.ts src/test/MessageList.test.tsx src/test/ChatMessage.test.tsx src/test/AssistantMessage.test.tsx src/test/ToolStep.test.tsx src/test/renderToolOutput.test.tsx src/test/renderToolOutput-ansi.test.tsx
+cd frontend; npx vitest run src/test/App.test.tsx src/test/PopOutApp.test.tsx src/test/ConfigErrorModal.test.tsx src/test/useSocket.test.ts src/test/useChatManager.test.ts src/test/useSystemStoreDeep.test.ts src/test/useSessionLifecycleStore.test.ts src/test/useSessionLifecycleStoreExtended.test.ts src/test/useStreamStore.test.ts src/test/streamConcurrency.test.ts src/test/typewriter-adaptive.test.ts src/test/extensionRouter.test.ts src/test/SessionItem.test.tsx src/test/MessageList.test.tsx src/test/ChatMessage.test.tsx src/test/AssistantMessage.test.tsx src/test/ToolStep.test.tsx src/test/renderToolOutput.test.tsx src/test/renderToolOutput-ansi.test.tsx
 ```
 
 ---
@@ -466,10 +487,11 @@ cd frontend; npx vitest run src/test/App.test.tsx src/test/PopOutApp.test.tsx sr
 ## Summary
 
 - The frontend is socket-driven, provider-agnostic, store-split, and timeline-first.
+- Startup JSON config diagnostics flow through `config_errors`, `useSystemStore.invalidJsonConfigs`, and the blocking `ConfigErrorModal` mounted in both app roots.
 - `useSocket` owns singleton bootstrap listeners; `useChatManager` owns turn, shell, and sub-agent stream listeners.
 - `useSessionLifecycleStore` owns UI session lifecycle; `useStreamStore` owns ACP-session streaming and timeline mutation.
 - `App` and `PopOutApp` share chat rendering hooks but have different ownership, sidebar, and session bootstrap responsibilities.
 - `Message.timeline` is the render source for assistant text, thoughts, tools, and permissions.
-- Shell V2 routing depends on `shellRunId`; sub-agent panel routing depends on `invocationId`.
+- Shell V2 routing depends on `shellRunId`; input-wait sidebar state depends on `ShellRunSnapshot.needsInput`; sub-agent panel routing depends on `invocationId`.
 - Provider branding, models, slash commands, status, and config options must flow through backend payloads and store actions.
 - Changes in this area should be verified with the runtime/store and rendering tests listed above.

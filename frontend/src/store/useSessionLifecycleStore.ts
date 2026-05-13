@@ -38,9 +38,9 @@ function maybeHydrateContextUsage(session: ChatSession) {
   const total = Number(session.stats?.totalTokens);
   if (!acpSessionId || !Number.isFinite(used) || !Number.isFinite(total) || total <= 0) return;
   const nextPct = (used / total) * 100;
-  const currentPct = useSystemStore.getState().contextUsageBySession[acpSessionId];
+  const currentPct = useSystemStore.getState().getContextUsage(session.provider, acpSessionId);
   if (Number.isFinite(currentPct) && Number(currentPct) > 0 && nextPct <= 0) return;
-  useSystemStore.getState().setContextUsage(acpSessionId, nextPct);
+  useSystemStore.getState().setContextUsage(session.provider, acpSessionId, nextPct);
 }
 
 interface SessionLifecycleState {
@@ -139,9 +139,9 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
           const total = Number(res.stats.totalTokens);
           if (Number.isFinite(used) && Number.isFinite(total) && total > 0) {
             const nextPct = (used / total) * 100;
-            const currentPct = useSystemStore.getState().contextUsageBySession[acpSessionId];
+            const currentPct = useSystemStore.getState().getContextUsage(session?.provider, acpSessionId);
             if (!(Number.isFinite(currentPct) && Number(currentPct) > 0 && nextPct <= 0)) {
-              useSystemStore.getState().setContextUsage(acpSessionId, nextPct);
+              useSystemStore.getState().setContextUsage(session?.provider, acpSessionId, nextPct);
             }
           }
           set(state => ({
@@ -224,9 +224,8 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
     const session = sessions.find(s => s.id === uiId);
     if (!session) return;
     maybeHydrateContextUsage(session);
-    const contextUsageBySession = useSystemStore.getState().contextUsageBySession;
     const hasCachedContext = session.acpSessionId
-      ? Object.prototype.hasOwnProperty.call(contextUsageBySession, session.acpSessionId)
+      ? useSystemStore.getState().hasContextUsage(session.provider, session.acpSessionId)
       : false;
 
     set(state => ({

@@ -83,8 +83,41 @@ function hasVisibleShellOutput(chunk) {
   return stripAnsi(chunk || '').trim().length > 0;
 }
 
+const INPUT_PROMPT_PATTERNS = [
+  /^\?\s+\S/,
+  /\b(?:yes\/no|y\/n|y\/N|Y\/n)\b/i,
+  /(?:\[[YyNn]\/[YyNn]\]|\([YyNn]\/[YyNn]\))/,
+  /\b(?:continue|proceed|confirm|approve|install|overwrite|replace)\b.*(?:\?|:)\s*(?:\[[^\]]+\]|\([^)]+\))?\s*$/i,
+  /\b(?:enter|input|select|choose|type|press|password|passphrase|username|login|otp|token|code)\b.*[:?]\s*$/i,
+  /\b(?:use arrow keys|press enter|press any key|hit any key)\b/i,
+  /\?\s*(?:\[[^\]]+\]|\([^)]+\)|[A-Za-z0-9_-]+)?\s*$/
+];
+
+export function detectShellInputPrompt(output) {
+  const plain = stripAnsi(String(output || '')).replace(/\r/g, '');
+  if (!plain.trim() || /\n\s*$/.test(plain)) return false;
+  const lastLine = plain.split('\n').pop()?.trim() || '';
+  if (!lastLine || lastLine.length > 240) return false;
+  return INPUT_PROMPT_PATTERNS.some(pattern => pattern.test(lastLine));
+}
+
 function createRunId() {
   return `shell-run-${randomUUID()}`;
+}
+
+function buildPowerShellCommand(command) {
+  return [
+    '$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+    '$global:LASTEXITCODE = $null',
+    command,
+    '$__acpUiShellSucceeded = $?',
+    '$__acpUiShellLastExitCode = $LASTEXITCODE',
+    'if (-not $__acpUiShellSucceeded) {',
+    '  if ($null -ne $__acpUiShellLastExitCode -and $__acpUiShellLastExitCode -ne 0) { exit $__acpUiShellLastExitCode }',
+    '  exit 1',
+    '}',
+    'exit 0'
+  ].join('\n');
 }
 
 function buildShellInvocation(command, platform = process.platform, usePwsh = false) {
@@ -95,8 +128,7 @@ function buildShellInvocation(command, platform = process.platform, usePwsh = fa
     const shell = usePwsh ? 'pwsh.exe' : 'powershell.exe';
     return {
       shell,
-      // Prevent PowerShell from printing the Encoding object to stdout.
-      args: ['-NoProfile', '-Command', `$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`]
+      args: ['-NoProfile', '-Command', buildPowerShellCommand(command)]
     };
   }
   return { shell: 'bash', args: ['-c', command] };
@@ -177,7 +209,8 @@ export class ShellRunManager {
       terminationReason: null,
       createdAt: this.now(),
       startedAt: null,
-      exitedAt: null
+      exitedAt: null,
+      needsInput: false
     };
     this.runs.set(run.runId, run);
     this.emit(run, 'shell_run_prepared', this.snapshot(run));
@@ -277,7 +310,13 @@ export class ShellRunManager {
           cols: 120,
           rows: 30,
           cwd: run.cwd,
-          env: { ...process.env, TERM: 'xterm-256color', FORCE_COLOR: '1', PYTHONIOENCODING: 'utf-8' }
+          env: {
+            ...process.env,
+            TERM: 'xterm-256color',
+            FORCE_COLOR: '1',
+            PYTHONIOENCODING: 'utf-8',
+            GIT_PAGER: 'cat'
+          }
         });
 
         run.status = 'running';
@@ -312,12 +351,14 @@ export class ShellRunManager {
     if (!outputChunk) return;
     if (includeInRaw) run.rawOutput += outputChunk;
     run.transcript = trimShellOutputLines(`${run.transcript}${outputChunk}`, run.maxLines);
+    run.needsInput = run.status === 'running' && detectShellInputPrompt(run.transcript);
     this.emit(run, 'shell_run_output', {
       providerId: run.providerId,
       sessionId: run.sessionId,
       runId: run.runId,
       chunk: outputChunk,
-      maxLines: run.maxLines
+      maxLines: run.maxLines,
+      needsInput: run.needsInput
     });
   }
 
@@ -326,6 +367,10 @@ export class ShellRunManager {
     if (!run || run.status !== 'running' || !run.pty) return false;
     if (data === '\x03' || String(data).includes('\x03')) {
       run.interruptRequestedAt = this.now();
+    }
+    if (run.needsInput) {
+      run.needsInput = false;
+      this.emit(run, 'shell_run_snapshot', this.snapshot(run));
     }
     run.pty.write(data);
     return true;
@@ -386,6 +431,7 @@ export class ShellRunManager {
     run.reason = reason;
     run.exitedAt = now;
     run.pty = null;
+    run.needsInput = false;
 
     const finalText = this.formatFinalText(run, reason, exitCode, err);
     this.emit(run, 'shell_run_exit', {
@@ -394,7 +440,8 @@ export class ShellRunManager {
       runId: run.runId,
       exitCode,
       reason,
-      finalText
+      finalText,
+      needsInput: false
     });
 
     if (err) {
@@ -450,7 +497,8 @@ export class ShellRunManager {
       transcript: run.transcript,
       exitCode: run.exitCode,
       reason: run.reason,
-      maxLines: run.maxLines
+      maxLines: run.maxLines,
+      needsInput: Boolean(run.needsInput)
     };
   }
 

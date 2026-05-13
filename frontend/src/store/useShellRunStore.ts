@@ -18,6 +18,7 @@ export interface ShellRunSnapshot {
   exitCode?: number | null;
   reason?: string | null;
   maxLines?: number;
+  needsInput?: boolean;
   updatedAt?: number;
 }
 
@@ -25,8 +26,8 @@ interface ShellRunState {
   runs: Record<string, ShellRunSnapshot>;
   upsertSnapshot: (snapshot: ShellRunSnapshot) => void;
   markStarted: (snapshot: ShellRunSnapshot) => void;
-  appendOutput: (payload: { providerId: string; sessionId: string; runId: string; chunk: string; maxLines?: number }) => void;
-  markExited: (payload: { providerId: string; sessionId: string; runId: string; exitCode?: number | null; reason?: string | null; finalText?: string }) => void;
+  appendOutput: (payload: { providerId: string; sessionId: string; runId: string; chunk: string; maxLines?: number; needsInput?: boolean }) => void;
+  markExited: (payload: { providerId: string; sessionId: string; runId: string; exitCode?: number | null; reason?: string | null; finalText?: string; needsInput?: boolean }) => void;
   reset: () => void;
 }
 
@@ -87,7 +88,7 @@ export const useShellRunStore = create<ShellRunState>((set) => ({
     return { runs: pruneShellRuns(nextRuns) };
   }),
 
-  appendOutput: ({ providerId, sessionId, runId, chunk, maxLines }) => set(state => {
+  appendOutput: ({ providerId, sessionId, runId, chunk, maxLines, needsInput }) => set(state => {
     const existing = state.runs[runId];
     const effectiveMaxLines = maxLines || existing?.maxLines;
     const nextRuns: Record<string, ShellRunSnapshot> = {
@@ -99,6 +100,7 @@ export const useShellRunStore = create<ShellRunState>((set) => ({
         runId,
         status: existing?.status === 'exited' ? 'exited' : 'running',
         maxLines: effectiveMaxLines,
+        needsInput: needsInput ?? existing?.needsInput ?? false,
         transcript: trimShellTranscript(`${existing?.transcript || ''}${chunk || ''}`, effectiveMaxLines),
         updatedAt: Date.now()
       }
@@ -118,6 +120,7 @@ export const useShellRunStore = create<ShellRunState>((set) => ({
         status: 'exited',
         exitCode,
         reason,
+        needsInput: false,
         updatedAt: Date.now()
       }
     };

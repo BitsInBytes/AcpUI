@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ShellRunManager,
   detectPwsh,
+  detectShellInputPrompt,
   getMaxShellResultLines,
   isShellV2Enabled,
   sanitizeShellOutputChunk,
@@ -26,6 +27,21 @@ function createIoMock() {
   const room = { emit: vi.fn() };
   const io = { to: vi.fn(() => room), emit: vi.fn() };
   return { io, room };
+}
+
+function expectedWindowsCommand(command) {
+  return [
+    '$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+    '$global:LASTEXITCODE = $null',
+    command,
+    '$__acpUiShellSucceeded = $?',
+    '$__acpUiShellLastExitCode = $LASTEXITCODE',
+    'if (-not $__acpUiShellSucceeded) {',
+    '  if ($null -ne $__acpUiShellLastExitCode -and $__acpUiShellLastExitCode -ne 0) { exit $__acpUiShellLastExitCode }',
+    '  exit 1',
+    '}',
+    'exit 0'
+  ].join('\n');
 }
 
 describe('shellRunManager', () => {
@@ -61,6 +77,13 @@ describe('shellRunManager', () => {
     expect(getMaxShellResultLines({ MAX_SHELL_RESULT_LINES: 'bad' })).toBe(1000);
     expect(isShellV2Enabled({ SHELL_V2_ENABLED: 'true' })).toBe(true);
     expect(isShellV2Enabled({ SHELL_V2_ENABLED: 'false' })).toBe(false);
+  });
+
+  it('detects shell output prompts that are waiting for user input', () => {
+    expect(detectShellInputPrompt('$ npm install\nOk to proceed? (y) ')).toBe(true);
+    expect(detectShellInputPrompt('$ login\nPassword: ')).toBe(true);
+    expect(detectShellInputPrompt('$ test\nPASS\n')).toBe(false);
+    expect(detectShellInputPrompt('$ test\nWhat happened?\n')).toBe(false);
   });
 
   it('trims shell output to the last N lines', () => {
@@ -122,15 +145,21 @@ describe('shellRunManager', () => {
       cwd: 'D:/repo'
     });
 
-        expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('powershell.exe', [
-          '-NoProfile',
-          '-Command',
-          '$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; npm test'
-        ], expect.objectContaining({
-          cwd: 'D:/repo',
-          name: 'xterm-256color',
+    expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      expectedWindowsCommand('npm test')
+    ], expect.objectContaining({
+      cwd: 'D:/repo',
+      name: 'xterm-256color',
       cols: 120,
-      rows: 30
+      rows: 30,
+      env: expect.objectContaining({
+        TERM: 'xterm-256color',
+        FORCE_COLOR: '1',
+        PYTHONIOENCODING: 'utf-8',
+        GIT_PAGER: 'cat'
+      })
     }));
     expect(ioMock.room.emit).toHaveBeenCalledWith('shell_run_started', expect.objectContaining({
       runId: prepared.runId,
@@ -175,7 +204,7 @@ describe('shellRunManager', () => {
     expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('powershell.exe', [
       '-NoProfile',
       '-Command',
-      '$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; node -p "second"'
+      expectedWindowsCommand('node -p "second"')
     ], expect.objectContaining({ cwd: 'D:/repo' }));
 
     ptyMock.proc.dataCb('second\n');
@@ -313,6 +342,50 @@ describe('shellRunManager', () => {
     await expect(promise).resolves.toEqual({
       content: [{ type: 'text', text: 'failure\n\nExit Code: 1' }]
     });
+  });
+
+  it('wraps Windows commands so native process exit codes are propagated', async () => {
+    const command = 'node -e "console.log(\'fail-marker-before-exit\'); process.exit(7)"';
+    manager.prepareRun({ providerId: 'provider-a', sessionId: 'acp-1', command });
+    const promise = manager.startPreparedRun({ providerId: 'provider-a', sessionId: 'acp-1', command });
+
+    expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      expectedWindowsCommand(command)
+    ], expect.anything());
+
+    ptyMock.proc.dataCb('fail-marker-before-exit\n');
+    ptyMock.proc.exitCb({ exitCode: 7 });
+
+    await expect(promise).resolves.toEqual({
+      content: [{ type: 'text', text: 'fail-marker-before-exit\n\nExit Code: 7' }]
+    });
+  });
+
+  it('marks running shell prompts as needing input and clears the marker on user input', async () => {
+    const prepared = manager.prepareRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'npm install' });
+    const promise = manager.startPreparedRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'npm install' });
+
+    ioMock.room.emit.mockClear();
+    ptyMock.proc.dataCb('Ok to proceed? (y) ');
+
+    expect(manager.snapshot(prepared.runId)).toEqual(expect.objectContaining({ needsInput: true }));
+    expect(ioMock.room.emit).toHaveBeenCalledWith('shell_run_output', expect.objectContaining({
+      runId: prepared.runId,
+      needsInput: true
+    }));
+
+    ioMock.room.emit.mockClear();
+    expect(manager.writeInput(prepared.runId, 'y\n')).toBe(true);
+    expect(manager.snapshot(prepared.runId)).toEqual(expect.objectContaining({ needsInput: false }));
+    expect(ioMock.room.emit).toHaveBeenCalledWith('shell_run_snapshot', expect.objectContaining({
+      runId: prepared.runId,
+      needsInput: false
+    }));
+
+    ptyMock.proc.exitCb({ exitCode: 0 });
+    await promise;
   });
 
   it('writes input and resizes only while running', async () => {
@@ -482,7 +555,7 @@ describe('shellRunManager — pwsh.exe invocation', () => {
     expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('pwsh.exe', [
       '-NoProfile',
       '-Command',
-      '$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; npm test'
+      expectedWindowsCommand('npm test')
     ], expect.objectContaining({ name: 'xterm-256color' }));
 
     ptyMock.proc.exitCb({ exitCode: 0 });
@@ -498,7 +571,7 @@ describe('shellRunManager — pwsh.exe invocation', () => {
     expect(ptyMock.ptyModule.spawn).toHaveBeenCalledWith('pwsh.exe', [
       '-NoProfile',
       '-Command',
-      `$null = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`
+      expectedWindowsCommand(command)
     ], expect.anything());
 
     ptyMock.proc.exitCb({ exitCode: 0 });

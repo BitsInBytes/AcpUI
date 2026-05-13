@@ -10,11 +10,12 @@ System Settings Modal is the global configuration surface for audio device selec
 - Renders five tabs: Audio, Environment, Workspaces, Commands, and Provider.
 - Saves environment values through `update_env`, writing `.env` and updating `process.env[key]` in the backend process.
 - Saves JSON text through `save_workspaces_config`, `save_commands_config`, and `save_provider_config` after frontend and backend JSON validation.
+- Surfaces invalid startup/hydration config through the root-level `ConfigErrorModal` fed by the `config_errors` socket event.
 - Resolves provider settings from `expandedProviderId`, then `activeProviderId`, then `defaultProviderId`.
 - Uses `useVoiceStore` for microphone device listing, selected device persistence, and refresh behavior.
 
 ### Why This Matters
-- Invalid JSON in workspace, command, or provider settings can break startup and provider loading paths.
+- Invalid JSON in workspace, command, provider, registry, or MCP settings is reported during app load and blocks navigation until fixed.
 - Provider-scoped config writes must target the selected provider directory, not the active chat by accident.
 - Workspace and command loaders cache values, so file writes and runtime hydration are separate concerns.
 - This is the primary Socket.IO callback pattern for editable global configuration.
@@ -55,9 +56,9 @@ socket.emit('get_commands_config', (res) => { /* setCmdConfig */ });
 socket.emit('get_provider_config', { providerId }, handleProviderConfig);
 ```
 
-5. **Socket handlers are registered per connection**
+5. **Socket handlers are registered per connection after config diagnostics pass**
    - File: `backend/sockets/index.js` (Function: `registerSocketHandlers`, Call: `registerSystemSettingsHandlers(io, socket)`)
-   - On each Socket.IO connection, the backend emits provider, branding, workspace, sidebar, and command hydration payloads, then registers the system settings handlers.
+   - On each Socket.IO connection, the backend emits `config_errors` first. Startup-blocking invalid config stops normal hydration and handler registration for that connection. When diagnostics are clear, the backend emits provider, branding, workspace, sidebar, and command hydration payloads, then registers the system settings handlers.
 
 6. **Environment reads and writes use `.env`**
    - File: `backend/sockets/systemSettingsHandlers.js` (Function: `registerSystemSettingsHandlers`, Socket events: `get_env`, `update_env`)
@@ -90,8 +91,14 @@ socket.emit('get_provider_config', { providerId }, handleProviderConfig);
     - The Audio tab renders `availableAudioDevices`, calls `fetchAudioDevices` from the refresh button, and stores `selectedAudioDevice` in `localStorage`.
 
 12. **Runtime consumers hydrate through separate socket events**
-    - File: `frontend/src/hooks/useSocket.ts` (Function: `getOrCreateSocket`, Socket events: `workspace_cwds`, `custom_commands`, `sidebar_settings`, `providers`)
-    - On connection, `workspace_cwds` populates `useSystemStore.workspaceCwds`, `custom_commands` populates `customCommands` and local slash commands, and `sidebar_settings` populates notification/delete flags.
+    - File: `frontend/src/hooks/useSocket.ts` (Function: `getOrCreateSocket`, Socket events: `config_errors`, `workspace_cwds`, `custom_commands`, `sidebar_settings`, `providers`)
+    - On connection, `config_errors` populates `useSystemStore.invalidJsonConfigs` first. When the backend does not block hydration, `workspace_cwds` populates `useSystemStore.workspaceCwds`, `custom_commands` populates `customCommands` and local slash commands, and `sidebar_settings` populates notification/delete flags.
+
+13. **Invalid or missing startup config blocks app navigation at load**
+    - File: `backend/services/jsonConfigDiagnostics.js` (Function: `collectInvalidJsonConfigErrors`)
+    - File: `backend/sockets/index.js` (Socket event: `config_errors`)
+    - File: `frontend/src/components/ConfigErrorModal.tsx` (Component: `ConfigErrorModal`)
+    - On every socket connection, the backend emits `config_errors` with every invalid startup or hydration config issue it can discover, including missing required enabled-provider `provider.json` files. The frontend stores the list in `useSystemStore.invalidJsonConfigs`; `ConfigErrorModal` renders a non-dismissable `alertdialog` until the list is empty.
 
 ## Architecture Diagram
 
@@ -116,10 +123,13 @@ flowchart TD
   WorkspaceFile --> WorkspaceConfig[workspaceConfig.loadWorkspaces]
   CommandsFile --> CommandsConfig[commandsConfig.loadCommands]
 
-  SocketIndex[backend/sockets/index.js connection hydration] -->|workspace_cwds| UseSocket[useSocket singleton]
+  JsonDiagnostics[jsonConfigDiagnostics.collectInvalidJsonConfigErrors] --> SocketIndex[backend/sockets/index.js connection hydration]
+  SocketIndex -->|config_errors| UseSocket[useSocket singleton]
+  SocketIndex -->|workspace_cwds| UseSocket
   SocketIndex -->|custom_commands| UseSocket
   SocketIndex -->|sidebar_settings| UseSocket
   UseSocket --> SystemStore[useSystemStore]
+  SystemStore --> ConfigErrorModal[ConfigErrorModal]
 
   Modal --> VoiceStore[useVoiceStore]
   VoiceStore --> BrowserMedia[navigator.mediaDevices]
@@ -144,6 +154,13 @@ get_provider_config({ providerId }, callback) -> { content: string, error?: stri
 save_provider_config({ providerId?, content }, callback?) -> { success: true } | { error: string }
 ```
 
+Startup diagnostics use this separate, non-callback socket event:
+
+```text
+config_errors -> { errors: InvalidJsonConfig[] }
+InvalidJsonConfig -> { id, label, path, message, blocksStartup? }
+```
+
 The key hazards are:
 - JSON tabs require frontend validation and backend validation. Frontend validation provides immediate UX; backend validation protects the filesystem write path.
 - Provider saves must carry `providerId` when the UI has one. Missing provider scope falls back through `getProvider(null)` to the default provider context.
@@ -161,6 +178,7 @@ The key hazards are:
 | Command editor | `backend/sockets/systemSettingsHandlers.js` (`COMMANDS_PATH`) | `process.env.COMMANDS_CONFIG || 'commands.json'`, resolved from repo root | `backend/services/commandsConfig.js` (`loadCommands`) |
 | Provider settings | `backend/sockets/systemSettingsHandlers.js` (`getProviderPaths`) | `providers/<provider.id>/user.json`; read fallback `user.json.example` | `backend/services/providerLoader.js` (`getProvider`) |
 | Provider registry | `backend/services/providerRegistry.js` (`getProviderRegistry`) | `process.env.ACP_PROVIDERS_CONFIG || 'configuration/providers.json'` | Provider list and provider resolution |
+| Startup JSON diagnostics | `backend/services/jsonConfigDiagnostics.js` (`collectInvalidJsonConfigErrors`) | Provider registry, enabled provider `provider.json`/`branding.json`/`user.json`, workspace config, command config, and MCP config paths | `config_errors` socket payload and provider startup blocking decisions |
 | Example env defaults | `.env.example` | `WORKSPACES_CONFIG=./configuration/workspaces.json`, `COMMANDS_CONFIG=./configuration/commands.json` | Local setup template |
 
 ### Environment Tab
@@ -220,15 +238,17 @@ Refresh button
 | Header Entry | `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, Button title `System Settings`, `setSystemSettingsOpen(true)` | Opens the modal from the main header |
 | Modal UI | `frontend/src/components/SystemSettingsModal.tsx` | `SystemSettingsModal`, open hydration `useEffect`, `updateEnv`, `activeTab` | Five-tab UI, socket callbacks, frontend JSON validation |
 | UI State | `frontend/src/store/useUIStore.ts` | `isSystemSettingsOpen`, `setSystemSettingsOpen`, `expandedProviderId`, `setExpandedProviderId` | Modal visibility and provider focus state |
-| System State | `frontend/src/store/useSystemStore.ts` | `socket`, `activeProviderId`, `defaultProviderId`, `workspaceCwds`, `customCommands` | Socket reference, provider scope, hydrated runtime config |
-| Socket Hydration | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `workspace_cwds`, `custom_commands`, `sidebar_settings`, `providers` | Receives connection-time runtime config payloads |
+| System State | `frontend/src/store/useSystemStore.ts` | `socket`, `invalidJsonConfigs`, `setInvalidJsonConfigs`, `activeProviderId`, `defaultProviderId`, `workspaceCwds`, `customCommands` | Socket reference, startup config diagnostics, provider scope, hydrated runtime config |
+| Socket Hydration | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `config_errors`, `workspace_cwds`, `custom_commands`, `sidebar_settings`, `providers` | Receives connection-time runtime config payloads and diagnostic errors |
+| Config Error Modal | `frontend/src/components/ConfigErrorModal.tsx` | `ConfigErrorModal`, `invalidJsonConfigs`, `role="alertdialog"` | Blocks app navigation when invalid or missing startup config is reported |
 | Voice State | `frontend/src/store/useVoiceStore.ts` | `AudioDevice`, `fetchAudioDevices`, `setSelectedAudioDevice`, `selectedAudioDevice` | Audio device enumeration and selected microphone persistence |
 
 ### Backend
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Socket Registration | `backend/sockets/index.js` | `registerSocketHandlers`, `registerSystemSettingsHandlers(io, socket)`, `workspace_cwds`, `custom_commands`, `sidebar_settings` | Registers handlers and emits connection hydration data |
+| Socket Registration | `backend/sockets/index.js` | `registerSocketHandlers`, `registerSystemSettingsHandlers(io, socket)`, `config_errors`, `workspace_cwds`, `custom_commands`, `sidebar_settings` | Emits config diagnostics first, registers handlers after diagnostics pass, and blocks hydration for startup-critical invalid config |
+| JSON Diagnostics | `backend/services/jsonConfigDiagnostics.js` | `collectInvalidJsonConfigErrors`, `hasStartupBlockingJsonConfigError` | Checks startup/hydration config files and returns user-visible invalid-config issues, including missing required provider definitions |
 | Settings Handlers | `backend/sockets/systemSettingsHandlers.js` | `registerSystemSettingsHandlers`, `getProviderPaths`, `get_env`, `update_env`, `get_workspaces_config`, `save_workspaces_config`, `get_commands_config`, `save_commands_config`, `get_provider_config`, `save_provider_config` | Reads and writes env/workspace/command/provider config files |
 | Workspace Runtime Loader | `backend/services/workspaceConfig.js` | `loadWorkspaces` | Loads, normalizes, and caches workspace definitions; falls back to `DEFAULT_WORKSPACE_CWD/AGENT` and `WORKSPACE_B_CWD/AGENT` env vars when JSON file is missing |
 | Command Runtime Loader | `backend/services/commandsConfig.js` | `loadCommands` | Loads, filters, and caches custom commands |
@@ -249,34 +269,37 @@ Refresh button
 
 ## Gotchas
 
-1. **Save callbacks do not refresh runtime hydration events**
+1. **Invalid or missing startup config is a blocking UI state**
+   - `config_errors` feeds `ConfigErrorModal`, which has no dismiss action. Fixing the file requires a backend restart when the affected loader caches or startup state has already run, then a frontend reconnect/reload to receive an empty diagnostic list.
+
+2. **Save callbacks do not refresh runtime hydration events**
    - `save_workspaces_config` and `save_commands_config` write files and return callback status. They do not emit `workspace_cwds` or `custom_commands` to connected clients.
 
-2. **Workspace and command loaders cache values**
+3. **Workspace and command loaders cache values**
    - `loadWorkspaces` and `loadCommands` keep module-level `cached` values. File writes and cache refresh are separate lifecycle events. Saving new workspace or command config via `save_workspaces_config` / `save_commands_config` updates the file but the in-memory cache retains old data until process restart. Additionally, if the workspace JSON file is absent on first load, `loadWorkspaces` falls back to the `DEFAULT_WORKSPACE_CWD/AGENT` and `WORKSPACE_B_CWD/AGENT` env vars and caches those results—subsequent saves to the file will not be picked up until restart.
 
-3. **Provider config is loaded through providerLoader cache**
+4. **Provider config is loaded through providerLoader cache**
    - `getProvider` caches merged provider config. Saving `user.json` writes the file; active provider config objects keep their loaded values until the loader cache is reset or the process starts with fresh state.
 
-4. **Config path constants are evaluated at module import**
+5. **Config path constants are evaluated at module import**
    - `WORKSPACES_PATH` and `COMMANDS_PATH` are constants in `systemSettingsHandlers.js`. Editing `WORKSPACES_CONFIG` or `COMMANDS_CONFIG` through the Environment tab does not change those constants inside the loaded module.
 
-5. **Provider tab follows sidebar-expanded provider first**
+6. **Provider tab follows sidebar-expanded provider first**
    - `expandedProviderId` wins over `activeProviderId` and `defaultProviderId`. A sidebar provider expansion changes which provider `user.json` the modal reads and writes.
 
-6. **The env parser is intentionally simple**
+7. **The env parser is intentionally simple**
    - `get_env` ignores comments and blank lines, splits at the first `=`, and returns strings. It does not unquote values or parse shell syntax.
 
-7. **Env keys are used in a regular expression**
+8. **Env keys are used in a regular expression**
    - `update_env` constructs a `RegExp` from the key. Keep editable keys in conventional env-var form: uppercase letters, digits, and underscores.
 
-8. **Audio device selection is local browser state**
+9. **Audio device selection is local browser state**
    - `selectedAudioDevice` is persisted in `localStorage`. Backend STT availability is driven by `voice_enabled` and `VOICE_STT_ENABLED`, not by this select box.
 
-9. **Provider config read supports two call signatures**
+10. **Provider config read supports two call signatures**
    - `get_provider_config(callback)` and `get_provider_config({ providerId }, callback)` are both valid. Frontend sends `{ providerId }` when it has a resolved provider scope.
 
-10. **Monaco is not the contract**
+11. **Monaco is not the contract**
    - Tests mock `@monaco-editor/react` with a textarea. The contract is string content plus save callbacks, not Monaco editor internals.
 
 ## Unit Tests
@@ -299,10 +322,14 @@ Refresh button
   - `fetchAudioDevices handles errors gracefully`
   - `fetchAudioDevices labels unknown devices`
 - `frontend/src/test/useSocket.test.ts`
+  - `handles "config_errors" event`
   - `handles "workspace_cwds" event`
   - `handles "providers" event`
   - `handles "sidebar_settings" event`
   - `handles "custom_commands" event`
+- `frontend/src/test/ConfigErrorModal.test.tsx`
+  - `renders nothing when there are no invalid JSON configs`
+  - `renders a blocking alert with every invalid JSON config`
 
 ### Backend
 
@@ -325,8 +352,15 @@ Refresh button
   - `loads commands from JSON config file`
   - `returns empty array when config file does not exist`
   - `filters out entries without name or description`
+- `backend/test/jsonConfigDiagnostics.test.js`
+  - `returns no errors when loaded JSON config files are valid`
+  - `lists every malformed config file it can discover`
+  - `reports a malformed provider registry and skips provider directory discovery`
 - `backend/test/sockets-index.test.js`
   - `registers all modular handlers on connection`
+  - `emits config_errors on connection`
+  - `blocks normal hydration when startup JSON config is invalid`
+  - `preserves existing diagnostics when runtime config loading fails`
   - `emits sidebar_settings on connection`
   - `emits custom_commands on connection`
   - `emits branding on connection`
@@ -338,8 +372,9 @@ Refresh button
 2. Add a Socket.IO event in `backend/sockets/systemSettingsHandlers.js` (`registerSystemSettingsHandlers`) with callback responses shaped as `{ success: true }` or `{ error }` for writes, and `{ content }` or `{ vars }` for reads.
 3. Resolve file paths from repo root or provider scope using named helpers or constants; avoid hidden CWD dependencies.
 4. Validate JSON in the frontend before emitting and in the backend before writing.
-5. Update runtime hydration if connected clients need immediate store updates, using `backend/sockets/index.js` and `frontend/src/hooks/useSocket.ts` event anchors.
-6. Add matching frontend tests in `SystemSettingsModal.test.tsx` and backend tests in `systemSettingsHandlers.test.js`.
+5. Update startup diagnostics in `jsonConfigDiagnostics.js` when adding a JSON config that is loaded during app startup or socket hydration.
+6. Update runtime hydration if connected clients need immediate store updates, using `backend/sockets/index.js` and `frontend/src/hooks/useSocket.ts` event anchors.
+7. Add matching frontend tests in `SystemSettingsModal.test.tsx`, `ConfigErrorModal.test.tsx`, or `useSocket.test.ts`, and backend tests in `systemSettingsHandlers.test.js`, `jsonConfigDiagnostics.test.js`, or `sockets-index.test.js`.
 
 ### For debugging issues with this feature
 1. Confirm `useUIStore.isSystemSettingsOpen` is true and `App` is mounting `SystemSettingsModal`.
@@ -347,7 +382,8 @@ Refresh button
 3. Inspect the emitted socket event and callback payload: `get_env`, `update_env`, `get_*_config`, or `save_*_config`.
 4. Verify `WORKSPACES_CONFIG`, `COMMANDS_CONFIG`, and `ACP_PROVIDERS_CONFIG` values in `.env` or `.env.example`-derived local config.
 5. Trace runtime consumers separately: `loadWorkspaces`, `loadCommands`, `getProvider`, and `useSocket` hydration events.
-6. For audio issues, debug `useVoiceStore.fetchAudioDevices`, `navigator.mediaDevices.enumerateDevices`, and `localStorage.selectedAudioDevice`.
+6. For load-time JSON failures, inspect `config_errors`, `useSystemStore.invalidJsonConfigs`, and `ConfigErrorModal`.
+7. For audio issues, debug `useVoiceStore.fetchAudioDevices`, `navigator.mediaDevices.enumerateDevices`, and `localStorage.selectedAudioDevice`.
 
 ## Summary
 
@@ -356,5 +392,6 @@ Refresh button
 - Environment writes update `.env` and `process.env[key]`; JSON tabs write workspace, command, or provider config files after dual validation.
 - Provider settings are scoped by `expandedProviderId || activeProviderId || defaultProviderId` and target `providers/<provider.id>/user.json`.
 - Runtime stores hydrate through separate connection events handled in `useSocket`.
+- Malformed load-time JSON config flows through `jsonConfigDiagnostics`, `config_errors`, `useSystemStore.invalidJsonConfigs`, and the blocking `ConfigErrorModal`.
 - Workspace, command, and provider loaders cache values, so file persistence and active runtime state must be reasoned about separately.
 - Audio device selection is managed by `useVoiceStore` and browser APIs, with selected device persistence in `localStorage`.

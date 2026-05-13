@@ -30,13 +30,15 @@ describe('useShellRunStore', () => {
       sessionId: 'acp-1',
       runId: 'run-1',
       chunk: 'one\ntwo\nthree\n',
-      maxLines: 2
+      maxLines: 2,
+      needsInput: true
     });
 
     expect(useShellRunStore.getState().runs['run-1']).toEqual(expect.objectContaining({
       status: 'running',
       transcript: 'two\nthree\n',
-      maxLines: 2
+      maxLines: 2,
+      needsInput: true
     }));
   });
 
@@ -59,7 +61,8 @@ describe('useShellRunStore', () => {
       sessionId: 'acp-1',
       runId: 'run-1',
       status: 'running',
-      transcript: '$ test\n'
+      transcript: '$ test\n',
+      needsInput: true
     });
 
     useShellRunStore.getState().markExited({
@@ -74,7 +77,8 @@ describe('useShellRunStore', () => {
       status: 'exited',
       exitCode: 130,
       reason: 'user_terminated',
-      transcript: '$ test\n'
+      transcript: '$ test\n',
+      needsInput: false
     }));
   });
 

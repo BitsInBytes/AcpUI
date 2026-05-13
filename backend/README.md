@@ -47,7 +47,9 @@ The backend reads from repository-level configuration and environment files:
 - `configuration/mcp.json`
 - `.env`
 
-`ux_invoke_shell` uses the backend `ShellRunManager` and session-scoped `shell_run_*` socket events for interactive terminal execution. Concurrent shell calls are supported; each command receives a separate `shellRunId`, PTY, and terminal stream. On Windows, PowerShell startup terminal-control noise is sanitized before transcript streaming so the injected command prompt stays aligned with command output.
+Invalid startup or socket-hydrated config is collected by `services/jsonConfigDiagnostics.js` and sent to clients as `config_errors`. Provider-critical failures, including malformed JSON and missing required enabled-provider definitions, keep the backend alive but stop provider daemon startup and normal socket hydration until the config is fixed.
+
+`ux_invoke_shell` uses the backend `ShellRunManager` and session-scoped `shell_run_*` socket events for interactive terminal execution. Concurrent shell calls are supported; each command receives a separate `shellRunId`, PTY, and terminal stream. The PTY environment sets `GIT_PAGER=cat` so Git commands print directly instead of launching an interactive pager. Prompt-like output that waits for stdin is flagged with `needsInput` so the frontend can show the session as waiting for input. On Windows, PowerShell startup terminal-control noise is sanitized before transcript streaming so the injected command prompt stays aligned with command output.
 
 MCP tools are controlled by `configuration/mcp.json`, or the JSON file referenced by `MCP_CONFIG`. Core tools are enabled by default. Optional tools are disabled by default; the IO group advertises `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, and `ux_web_fetch`, and the Google search group advertises `ux_google_web_search`. `ux_google_web_search` requires `googleSearch.apiKey` in the MCP config before it is advertised.
 

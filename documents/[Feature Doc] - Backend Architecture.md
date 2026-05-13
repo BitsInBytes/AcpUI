@@ -13,9 +13,9 @@ This feature doc is the backend map for agents changing server startup, provider
 The backend performs these responsibilities:
 
 - **Server bootstrap:** Builds the Express app, Socket.IO server, MCP API router, branding API, static routes, voice service bootstrap, and global error logging in `backend/server.js`.
-- **Provider runtime management:** Loads enabled providers from `configuration/providers.json`, creates one `AcpClient` runtime per provider, and starts each ACP daemon through `ProviderRuntimeManager.init`.
+- **Provider runtime management:** Loads enabled providers from `configuration/providers.json`, creates one `AcpClient` runtime per provider, checks startup-blocking JSON config diagnostics, and starts each ACP daemon through `ProviderRuntimeManager.init`.
 - **ACP transport and lifecycle:** Uses `JsonRpcTransport`, `PermissionManager`, and `StreamController` inside `AcpClient` to manage JSON-RPC requests, permission responses, history draining, stats captures, daemon restarts, and provider extension routing.
-- **Socket gateway:** Registers modular socket handlers from `backend/sockets/index.js`, hydrates clients with provider metadata and settings, and scopes streaming events to `session:<acpSessionId>` rooms.
+- **Socket gateway:** Registers modular socket handlers from `backend/sockets/index.js`, emits JSON config diagnostics through `config_errors`, hydrates clients with provider metadata and settings, and scopes streaming events to `session:<acpSessionId>` rooms.
 - **Session lifecycle:** Creates, loads, forks, merges, rehydrates, exports, snapshots, and deletes sessions through `registerSessionHandlers`, `sessionManager`, provider hooks, and SQLite helpers in `backend/database.js`.
 - **Prompt execution:** Converts UI prompts and attachments into ACP prompt parts, applies model selection, pairs provider prompt lifecycle hooks, sends `session/prompt`, and persists completion state through `autoSaveTurn`.
 - **Update normalization:** Routes ACP `session/update` and `session/notification` payloads through provider normalization, Tool System V2, socket emissions, provider extensions, and database updates.
@@ -34,7 +34,7 @@ The backend performs these responsibilities:
 
 The backend sits between these systems:
 
-1. Frontend: Socket.IO clients use events such as `providers`, `ready`, `create_session`, `prompt`, `system_event`, `token`, `thought`, `stats_push`, `permission_request`, and `token_done`.
+1. Frontend: Socket.IO clients use events such as `config_errors`, `providers`, `ready`, `create_session`, `prompt`, `system_event`, `token`, `thought`, `stats_push`, `permission_request`, and `token_done`.
 2. ACP daemons: `AcpClient` communicates over JSON-RPC 2.0 payloads on child-process stdio using `JsonRpcTransport`.
 3. Providers: `providerRegistry` and `providerLoader` load config and bind provider hooks under `AsyncLocalStorage` context.
 4. Persistence: `backend/database.js` stores session, folder, canvas, note, model, config, stats, and provider-scoped lookup data.
@@ -80,17 +80,17 @@ Provider modules are merged with `DEFAULT_MODULE` and every function is bound th
 ### 3. ProviderRuntimeManager Builds One Runtime Per Provider
 File: `backend/services/providerRuntimeManager.js` (Class: `ProviderRuntimeManager`, Methods: `init`, `getRuntime`, `getClient`, `getProviderSummaries`)
 
-`ProviderRuntimeManager.init(io, serverBootId)` is idempotent. It resolves the default provider id, iterates `getProviderEntries()`, reuses the default singleton `defaultAcpClient` for the default provider, creates `new AcpClient(entry.id)` for other providers, sets the provider id, loads provider config, stores `{ providerId, provider, client }` in `runtimes`, then starts every client.
+`ProviderRuntimeManager.init(io, serverBootId)` is idempotent. It first calls `collectInvalidJsonConfigErrors()` and returns without daemon startup when a startup-blocking JSON config issue is present, such as an unreadable provider registry or provider `provider.json`. When config diagnostics are clean, it resolves the default provider id, iterates `getProviderEntries()`, reuses the default singleton `defaultAcpClient` for the default provider, creates `new AcpClient(entry.id)` for other providers, sets the provider id, loads provider config, stores `{ providerId, provider, client }` in `runtimes`, then starts every client.
 
 ```javascript
 // FILE: backend/services/providerRuntimeManager.js (Method: init)
-const client = entry.id === defaultProviderId
-  ? defaultAcpClient
-  : new AcpClient(entry.id);
-client.setProviderId(entry.id);
-this.runtimes.set(entry.id, { providerId: entry.id, provider, client });
-runtime.client.init(io, serverBootId);
+const configErrors = collectInvalidJsonConfigErrors();
+if (hasStartupBlockingJsonConfigError(configErrors)) return this.getRuntimes();
+const defaultProviderId = getDefaultProviderId();
+const entries = getProviderEntries();
 ```
+
+Provider config load failures after diagnostics are logged and leave `runtimes` empty so the backend process can stay online long enough for the frontend to display the blocking config popup.
 
 Consumers call `getRuntime(providerId)` or `getClient(providerId)` instead of importing the singleton directly when provider identity matters.
 
@@ -117,15 +117,23 @@ On Windows, `buildAcpSpawnCommand` routes bare commands and `.cmd` or `.bat` shi
 ### 5. Socket Connections Hydrate UI State
 File: `backend/sockets/index.js` (Function: `registerSocketHandlers`, Events: `connection`, `watch_session`, `unwatch_session`)
 
-On every Socket.IO connection, `registerSocketHandlers` emits provider and runtime state before registering modular handlers. It sends `providers`, one `ready` per ready runtime, `voice_enabled`, `workspace_cwds`, `branding` for each provider, `sidebar_settings`, `custom_commands`, and cached provider status extensions from `providerStatusMemory`.
+On every Socket.IO connection, `registerSocketHandlers` emits `config_errors` before provider hydration. The payload always contains an `errors` array; invalid or missing startup-critical JSON config stops normal provider hydration so the frontend can render a blocking popup instead of navigating into a broken runtime. When file diagnostics are non-blocking or empty, the handler resolves runtime provider config. If runtime config loading throws, it emits a startup-blocking `runtime-config-load` issue and stops hydration. Otherwise it sends `providers`, one `ready` per ready runtime, `voice_enabled`, `workspace_cwds`, `branding` for each provider, `sidebar_settings`, `custom_commands`, and provider status extensions from memory plus SQLite fallback rows for providers missing from memory.
 
 ```javascript
 // FILE: backend/sockets/index.js (Function: registerSocketHandlers)
+const configErrors = collectInvalidJsonConfigErrors();
+socket.emit('config_errors', { errors: configErrors });
+if (hasStartupBlockingJsonConfigError(configErrors)) return;
+try {
+  defaultProviderId = getDefaultProviderId();
+  providerPayloads = getProviderPayloads();
+} catch (err) {
+  socket.emit('config_errors', { errors: [...configErrors, runtimeConfigIssue(err)] });
+  return;
+}
 socket.emit('providers', { defaultProviderId, providers: providerPayloads });
-socket.emit('voice_enabled', { enabled: isSTTEnabled() });
-for (const provider of providerPayloads) socket.emit('branding', provider.branding);
-socket.emit('sidebar_settings', { deletePermanent, notificationSound, notificationDesktop });
 socket.emit('custom_commands', { commands: loadCommands() });
+emitCachedProviderStatuses(socket, defaultProviderId);
 ```
 
 `watch_session` joins `session:<sessionId>` and immediately emits shell run and sub-agent snapshots for the requested session. `unwatch_session` leaves the same room. Stream events in prompt and update handlers use this room convention.
@@ -181,11 +189,14 @@ File: `backend/services/acpClient.js` (Methods: `handleAcpMessage`, `handleUpdat
 File: `backend/services/jsonRpcTransport.js` (Class: `JsonRpcTransport`)
 File: `backend/services/permissionManager.js` (Class: `PermissionManager`)
 
-Every parsed daemon payload goes through `providerModule.intercept(payload)` before generic routing. Intercepted `null` values are swallowed. `session/update` and `session/notification` are routed to `handleUpdate(sessionId, update)`. `session/request_permission` with a JSON-RPC id becomes a `permission_request` socket event through `PermissionManager.handleRequest`. JSON-RPC responses resolve or reject `transport.pendingRequests` by id. Provider extension methods are detected with `provider.config.protocolPrefix`.
+Every parsed daemon payload goes through `providerModule.intercept(payload, { responseRequest })` before generic routing. `responseRequest` is read from `JsonRpcTransport` pending request state for the inbound JSON-RPC `id`, so providers can map responses back to the originating request/session. Intercepted `null` values are swallowed. `session/update` and `session/notification` are routed to `handleUpdate(sessionId, update)`. `session/request_permission` with a JSON-RPC id becomes a `permission_request` socket event through `PermissionManager.handleRequest`. JSON-RPC responses resolve or reject `transport.pendingRequests` by id. Provider extension methods are detected with `provider.config.protocolPrefix`.
 
 ```javascript
 // FILE: backend/services/acpClient.js (Method: handleAcpMessage)
-const processedPayload = this.providerModule.intercept(payload);
+const responseRequest = payload?.id !== undefined
+  ? this.transport.getPendingRequestContext(payload.id)
+  : null;
+const processedPayload = this.providerModule.intercept(payload, { responseRequest });
 if (!processedPayload) return;
 if (processedPayload.method === 'session/update' || processedPayload.method === 'session/notification') {
   this.handleUpdate(processedPayload.params.sessionId, processedPayload.params.update);
@@ -194,7 +205,7 @@ if (processedPayload.method === 'session/update' || processedPayload.method === 
 }
 ```
 
-`handleProviderExtension` captures model and config option updates into metadata, persists provider-scoped model/config state through `db.saveModelState` and `db.saveConfigOptions`, remembers provider status extensions, and emits `provider_extension` with `providerId` included in `params`.
+`handleProviderExtension` captures model and config option updates into metadata, persists provider-scoped model/config state through `db.saveModelState` and `db.saveConfigOptions`, remembers provider status extensions, persists valid provider status through `db.saveProviderStatusExtension`, and emits `provider_extension` with `providerId` included in `params`.
 
 ### 9. acpUpdateHandler Normalizes Stream Updates and Tool Events
 File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`)
@@ -235,9 +246,9 @@ File: `backend/services/tools/mcpExecutionRegistry.js` (Class: `McpExecutionRegi
 `createToolHandlers(io)` only registers enabled tools. It wraps all handlers with `mcpExecutionRegistry.begin`, `complete`, and `fail`, so tool executions can be matched later to provider `tool_call` updates and converted into stable UI titles, categories, inputs, file paths, and outputs.
 
 ### 11. SQLite Persists Backend State
-File: `backend/database.js` (Functions: `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `createSubAgentInvocation`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, `createFolder`, `saveCanvasArtifact`, `saveNotes`)
+File: `backend/database.js` (Functions: `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `saveProviderStatusExtension`, `getProviderStatusExtensions`, `createSubAgentInvocation`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, `createFolder`, `saveCanvasArtifact`, `saveNotes`)
 
-`initDb` uses `UI_DATABASE_PATH` or `persistence.db`, creates `sessions`, `subagent_invocations`, `subagent_invocation_agents`, `folders`, and `canvas_artifacts`, applies additive migrations, and creates provider/ACP and sub-agent invocation lookup indexes. Session rows store UI id, ACP id, provider, model, messages JSON, pinned state, cwd, folder id, notes, fork metadata, sub-agent metadata, context token stats, config options JSON, current model id, and model options JSON. Sub-agent invocation rows store async batch status by provider and parent UI session, and agent rows store each spawned ACP session status, result text, error text, and completion timestamps.
+`initDb` uses `UI_DATABASE_PATH` or `persistence.db`, creates `sessions`, `subagent_invocations`, `subagent_invocation_agents`, `folders`, `provider_status`, and `canvas_artifacts`, applies additive migrations, and creates provider/ACP and sub-agent invocation lookup indexes. Session rows store UI id, ACP id, provider, model, messages JSON, pinned state, cwd, folder id, notes, fork metadata, sub-agent metadata, context token stats, config options JSON, current model id, and model options JSON. Sub-agent invocation rows store async batch status by provider and parent UI session, and agent rows store each spawned ACP session status, result text, error text, and completion timestamps.
 
 ```sql
 -- FILE: backend/database.js (Function: initDb, Tables: sessions, subagent_invocations, subagent_invocation_agents)
@@ -276,9 +287,15 @@ CREATE TABLE IF NOT EXISTS subagent_invocation_agents (
   error_text TEXT,
   PRIMARY KEY(invocation_id, acp_session_id)
 )
+
+CREATE TABLE IF NOT EXISTS provider_status (
+  provider TEXT PRIMARY KEY,
+  extension_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+)
 ```
 
-`saveSession` upserts by `ui_id`, preserves existing stats/model/config fields when an incoming value is empty, and stores normalized model options. `getAllSessions(provider, { providerAliases })` filters by provider plus aliases or unscoped rows. `getSessionByAcpId(provider, acpId)` prefers provider-scoped rows over unscoped rows. `saveConfigOptions` and `saveModelState` accept provider-scoped or unscoped signatures. Sub-agent invocation helpers create one active invocation per provider/parent UI session, update aggregate and per-agent status, load status snapshots for `ux_check_subagents`, and delete registry rows when a parent session is deleted or archived.
+`saveSession` upserts by `ui_id`, preserves existing stats/model/config fields when an incoming value is empty, and stores normalized model options. `getAllSessions(provider, { providerAliases })` filters by provider plus aliases or unscoped rows. `getSessionByAcpId(provider, acpId)` prefers provider-scoped rows over unscoped rows. `saveConfigOptions` and `saveModelState` accept provider-scoped or unscoped signatures. `saveProviderStatusExtension` stores one latest status extension per provider and uses `updated_at` precedence so older async writes do not replace newer rows. Sub-agent invocation helpers create one active invocation per provider/parent UI session, update aggregate and per-agent status, load status snapshots for `ux_check_subagents`, and delete registry rows when a parent session is deleted or archived.
 
 ### 12. Auto-Save and Pinned Session Warmup Keep Runtime and DB Aligned
 File: `backend/services/sessionManager.js` (Functions: `loadSessionIntoMemory`, `autoLoadPinnedSessions`, `autoSaveTurn`)
@@ -398,13 +415,14 @@ MCP tool calls are authoritative for AcpUI UX tool names, user-facing titles, in
 | `configuration/providers.json` or `ACP_PROVIDERS_CONFIG` | `defaultProviderId`, `providers[].path`, `providers[].id`, `providers[].enabled`, `providers[].label`, `providers[].order` | `providerRegistry.js` | Provider discovery and default selection |
 | Provider directory | `provider.json`, `branding.json`, `user.json`, `index.js` | `providerLoader.js`, provider runtime hooks | Provider command, args, MCP name, protocol prefix, branding, models, user overrides, hook implementation |
 | `configuration/mcp.json` | Core and optional MCP tool feature flags, IO/search hardening settings | `mcpConfig.js`, `mcpApi.js`, `mcpServer.js` | Tool advertisement and handler registration |
-| Workspace and command config | Workspace entries, custom commands | `workspaceConfig.js`, `commandsConfig.js`, `sockets/index.js` | Initial socket hydration data |
+| Workspace and command config | Workspace entries, custom commands | `workspaceConfig.js`, `commandsConfig.js`, `sockets/index.js`, `jsonConfigDiagnostics.js` | Initial socket hydration data and invalid config diagnostics |
+| JSON config diagnostics | `ACP_PROVIDERS_CONFIG`, `WORKSPACES_CONFIG`, `COMMANDS_CONFIG`, `MCP_CONFIG`, provider `provider.json`, `branding.json`, `user.json` | `jsonConfigDiagnostics.js`, `providerRuntimeManager.js`, `sockets/index.js` | Lists invalid JSON config files and marks provider-registry/provider-definition failures as startup blocking |
 
 ### Runtime Data Flow
 
-1. `providerRuntimeManager.init` creates `{ providerId, provider, client }` and starts the client.
+1. `providerRuntimeManager.init` checks JSON config diagnostics, then creates `{ providerId, provider, client }` and starts the client when startup config is valid.
 2. `AcpClient.start` initializes DB, spawns the daemon, and performs provider handshake.
-3. `registerSocketHandlers` emits provider summaries, branding, ready state, settings, commands, and cached provider status.
+3. `registerSocketHandlers` emits `config_errors`, then provider summaries, branding, ready state, settings, commands, in-memory provider status, and SQLite status fallback for providers missing from memory when startup config is not blocked.
 4. `create_session` sends `session/new` or `session/load`, creates or rebuilds `sessionMetadata`, binds the MCP proxy, captures model/config state, and returns ACP session state.
 5. `save_snapshot` persists the UI session row with the ACP session id.
 6. `prompt` builds ACP prompt parts, sends model changes and `session/prompt`, and pairs prompt lifecycle hooks.
@@ -416,7 +434,7 @@ MCP tool calls are authoritative for AcpUI UX tool names, user-facing titles, in
 
 | Direction | Events | Owner |
 |---|---|---|
-| Backend to frontend hydration | `providers`, `ready`, `voice_enabled`, `workspace_cwds`, `branding`, `sidebar_settings`, `custom_commands`, `provider_extension` | `backend/sockets/index.js` |
+| Backend to frontend hydration | `config_errors`, `providers`, `ready`, `voice_enabled`, `workspace_cwds`, `branding`, `sidebar_settings`, `custom_commands`, `provider_extension` | `backend/sockets/index.js` |
 | Frontend to backend sessions | `load_sessions`, `create_session`, `save_snapshot`, `get_session_history`, `rehydrate_session`, `delete_session`, `fork_session`, `merge_fork`, `set_session_model`, `set_session_option` | `backend/sockets/sessionHandlers.js` |
 | Frontend to backend prompt flow | `prompt`, `cancel_prompt`, `respond_permission`, `set_mode` | `backend/sockets/promptHandlers.js` |
 | Backend to frontend streaming | `token`, `thought`, `system_event`, `stats_push`, `permission_request`, `token_done`, `merge_message` | `promptHandlers.js`, `acpUpdateHandler.js`, `permissionManager.js`, `sessionHandlers.js` |
@@ -433,9 +451,10 @@ MCP tool calls are authoritative for AcpUI UX tool names, user-facing titles, in
 | Server | `backend/server.js` | `startServer`, `app`, `httpServer`, `io`, route `/api/mcp`, route `/api/branding`, `SERVER_BOOT_ID` | Express, Socket.IO, MCP API, branding API, static routes, STT bootstrap, provider runtime startup |
 | Provider registry | `backend/services/providerRegistry.js` | `getProviderRegistry`, `getProviderEntries`, `getDefaultProviderId`, `resolveProviderId`, `getProviderEntry` | Loads and validates provider registry config |
 | Provider loader | `backend/services/providerLoader.js` | `runWithProvider`, `getProvider`, `getProviderModule`, `getProviderModuleSync`, `DEFAULT_MODULE` | Loads provider config and binds provider hooks under AsyncLocalStorage |
-| Runtime manager | `backend/services/providerRuntimeManager.js` | `ProviderRuntimeManager`, `init`, `getRuntime`, `getClient`, `getProviderSummaries` | Owns runtime map and client startup |
+| Runtime manager | `backend/services/providerRuntimeManager.js` | `ProviderRuntimeManager`, `init`, `getRuntime`, `getClient`, `getProviderSummaries` | Owns runtime map, startup JSON diagnostics gate, and client startup |
+| JSON config diagnostics | `backend/services/jsonConfigDiagnostics.js` | `collectInvalidJsonConfigErrors`, `hasStartupBlockingJsonConfigError` | Scans configured JSON files, reports invalid config metadata, and marks provider startup blockers |
 | ACP client | `backend/services/acpClient.js` | `AcpClient`, `buildAcpSpawnCommand`, `start`, `performHandshake`, `handleAcpMessage`, `handleProviderExtension`, `handleModelStateUpdate`, `reset` | ACP daemon lifecycle, routing, model/config extensions, restart behavior |
-| JSON-RPC | `backend/services/jsonRpcTransport.js` | `JsonRpcTransport`, `sendRequest`, `sendNotification`, `reset` | Request ids, pending request correlation, notifications |
+| JSON-RPC | `backend/services/jsonRpcTransport.js` | `JsonRpcTransport`, `sendRequest`, `sendNotification`, `getPendingRequestContext`, `reset` | Request ids, pending request/session correlation, notifications |
 | Permissions | `backend/services/permissionManager.js` | `PermissionManager`, `handleRequest`, `respond`, `pendingPermissions` | Permission socket event and JSON-RPC response handling |
 | Stream state | `backend/services/streamController.js` | `StreamController`, `statsCaptures`, `drainingSessions`, `beginDraining`, `waitForDrainToFinish`, `onChunk` | Drain and internal capture lifecycle |
 
@@ -443,7 +462,7 @@ MCP tool calls are authoritative for AcpUI UX tool names, user-facing titles, in
 
 | File | Stable Anchors | Purpose |
 |---|---|---|
-| `backend/sockets/index.js` | `registerSocketHandlers`, `buildBrandingPayload`, `getProviderPayloads`, events `connection`, `watch_session`, `unwatch_session` | Socket hydration, modular handler registration, room management |
+| `backend/sockets/index.js` | `registerSocketHandlers`, `buildBrandingPayload`, `getProviderPayloads`, `emitCachedProviderStatuses`, events `connection`, `config_errors`, `watch_session`, `unwatch_session` | Config diagnostics, socket hydration, provider status replay, modular handler registration, room management |
 | `backend/sockets/sessionHandlers.js` | `registerSessionHandlers`, `captureModelState`, `emitCachedContext`, `loadingSessions`, session events | Session CRUD, resume, fork/merge, snapshots, notes, model/config changes |
 | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, events `prompt`, `cancel_prompt`, `respond_permission`, `set_mode` | Prompt assembly, attachment conversion, lifecycle hooks, cancellation, permission responses |
 | `backend/sockets/archiveHandlers.js` | `registerArchiveHandlers`, events `list_archives`, `archive_session`, `restore_archive`, `delete_archive` | Archive and restore lifecycle |
@@ -470,40 +489,43 @@ MCP tool calls are authoritative for AcpUI UX tool names, user-facing titles, in
 | MCP IO definitions | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions` | Optional IO/search tool schemas |
 | Tool registry | `backend/services/tools/index.js` | `toolRegistry.register`, exports `toolCallState`, `mcpExecutionRegistry`, `resolveToolInvocation`, `applyInvocationToEvent` | Tool System V2 integration point |
 | MCP execution registry | `backend/services/tools/mcpExecutionRegistry.js` | `McpExecutionRegistry`, `begin`, `complete`, `fail`, `find`, `publicMcpToolInput`, `toolCallIdFromMcpContext`, `describeAcpUxToolExecution` | Authoritative MCP execution metadata cache |
-| Database | `backend/database.js` | `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `createSubAgentInvocation`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, tables `sessions`, `subagent_invocations`, `subagent_invocation_agents`, `folders`, `canvas_artifacts`, indexes `idx_sessions_provider_acp`, `idx_sessions_acp`, `idx_subagent_active_parent` | SQLite schema, migrations, and persistence APIs |
+| Database | `backend/database.js` | `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState`, `saveProviderStatusExtension`, `getProviderStatusExtension`, `getProviderStatusExtensions`, `createSubAgentInvocation`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, tables `sessions`, `provider_status`, `subagent_invocations`, `subagent_invocation_agents`, `folders`, `canvas_artifacts`, indexes `idx_sessions_provider_acp`, `idx_sessions_acp`, `idx_subagent_active_parent` | SQLite schema, migrations, and persistence APIs |
 
 ---
 
 ## Gotchas
 
-1. **Provider id must be resolved before runtime access**
+1. **Startup-blocking JSON config stops provider hydration**
+   `collectInvalidJsonConfigErrors` marks the provider registry and provider `provider.json` as startup blocking. `ProviderRuntimeManager.init` and `registerSocketHandlers` must return early for those errors so the backend stays alive and the frontend receives `config_errors`.
+
+2. **Provider id must be resolved before runtime access**
    `providerRuntimeManager.getRuntime(providerId)` throws for unknown ids. Socket handlers that accept provider input should catch this and emit a visible error path, as `prompt` and `cancel_prompt` do.
 
-2. **Default AcpClient is shared only for the default provider**
+3. **Default AcpClient is shared only for the default provider**
    `ProviderRuntimeManager.init` reuses the default singleton for the default provider and creates separate `AcpClient` instances for the rest. Code that imports the singleton bypasses multi-provider isolation unless it is intentionally default-only.
 
-3. **`pending-new` metadata is temporary**
+4. **`pending-new` metadata is temporary**
    Fresh session creation uses `sessionMetadata.set('pending-new', ...)` before `session/new` returns. The metadata must be moved to the returned ACP session id before prompt execution, model updates, or config updates rely on it.
 
-4. **Hot session resume skips daemon load**
+5. **Hot session resume skips daemon load**
    `create_session` with `existingAcpId` returns metadata directly when `sessionMetadata` already contains the ACP session id. Any feature that depends on daemon load side effects must also handle the hot path.
 
-5. **Drain state is required for `session/load`**
+6. **Drain state is required for `session/load`**
    `StreamController.beginDraining` and `waitForDrainToFinish` prevent loaded transcript updates from being emitted as live UI output. Do not emit message or tool updates while `drainingSessions` contains the session.
 
-6. **Prompt lifecycle hooks must be paired**
+7. **Prompt lifecycle hooks must be paired**
    `providerModule.onPromptStarted(sessionId)` is called only after pre-prompt setup succeeds. `onPromptCompleted(sessionId)` belongs in the inner `finally` that wraps `session/prompt` so provider lifecycle counters remain accurate on success, cancellation, and execution failure.
 
-7. **Permission responses must use the JSON-RPC request id**
+8. **Permission responses must use the JSON-RPC request id**
    `PermissionManager.respond` writes the daemon response directly through `transport.acpProcess.stdin`. The response id must match the original `session/request_permission` id or the daemon remains blocked.
 
-8. **MCP tool definitions and handlers must stay in sync**
+9. **MCP tool definitions and handlers must stay in sync**
    `GET /api/mcp/tools` advertises schemas from definition modules while `POST /api/mcp/tool-call` calls handlers from `createToolHandlers`. Add, remove, rename, or feature-flag tools in both places.
 
-9. **Tool titles are sticky by design**
+10. **Tool titles are sticky by design**
    `mcpExecutionRegistry` and `toolCallState` preserve handler-derived titles and inputs across provider `tool_call_update` payloads. Provider normalization should enrich tool state without replacing authoritative MCP metadata with generic titles.
 
-10. **SQLite provider scoping is part of lookup correctness**
+11. **SQLite provider scoping is part of lookup correctness**
    `getSessionByAcpId(provider, acpId)`, `saveConfigOptions(provider, acpId, ...)`, and `saveModelState(provider, acpId, ...)` protect sessions from cross-provider id collisions. Avoid unscoped calls when provider id is available.
 
 ---
@@ -515,15 +537,19 @@ Run backend tests from `backend` with `npx vitest run`. Focused backend architec
 | Test File | Important Test Names / Describe Blocks | Verified Surface |
 |---|---|---|
 | `backend/test/server.test.js` | `Express Server & Routes`, `should allow local origins`, `should handle /api/branding/manifest.json`, `should return 503 for MCP API if not ready`, `should handle unhandledRejection`, `should handle uncaughtException` | Express app, CORS, routes, global error handlers |
-| `backend/test/providerRuntimeManager.test.js` | `providerRuntimeManager`, `initializes all providers in the registry`, `does not re-initialize if already initialized`, `getProviderSummaries returns correct data`, `throws error if runtime is not found` | Runtime map, default provider, readiness summaries |
+| `backend/test/providerRuntimeManager.test.js` | `providerRuntimeManager`, `initializes all providers in the registry`, `blocks init when startup-blocking config diagnostics exist`, `returns empty runtimes when provider registry loading throws`, `clears partially built runtimes when provider config loading throws`, `does not re-initialize if already initialized`, `getProviderSummaries returns correct data`, `throws error if runtime is not found` | Runtime map, startup diagnostics gate, runtime-load failure handling, default provider, readiness summaries |
+| `backend/test/jsonConfigDiagnostics.test.js` | `jsonConfigDiagnostics`, `returns no errors when loaded JSON config files are valid`, `lists every malformed config file it can discover`, `reports missing enabled provider definitions as startup-blocking`, `reports a malformed provider registry and skips provider directory discovery` | Startup JSON config diagnostics and blocking classification |
 | `backend/test/acpClient.test.js` | `AcpClient Service`, `start lifecycle`, `handleModelStateUpdate`, `buildAcpSpawnCommand`, `should implement exponential back-off for restarts`, `uses cmd.exe wrapper for bare commands on Windows` | Daemon lifecycle, routing, provider extensions, spawn command behavior |
 | `backend/test/acpClient-deep.test.js` | `AcpClient Deep Coverage`, `skips duplicate start calls`, `hits intercepted message swallowing`, `hits empty config_options extension branch`, `buffers data in handleUpdate when statsCapture active` | Edge paths for client state and update routing |
 | `backend/test/acpClient-multi.test.js` | `AcpClient Multi-Instance`, `maintains isolation between instances`, `restarts only the dead instance` | Multi-provider client isolation |
-| `backend/test/acpClient-routing.test.js` | `routes all handleUpdate paths`, `routes all handleProviderExtension paths`, `hits JSON parse error in handleData` | ACP routing branches |
-| `backend/test/sockets-index.test.js` | `Socket Index Handler`, `registers all modular handlers on connection`, `emits sidebar_settings on connection`, `emits cached provider status on connection`, `watch_session joins the session room`, `watch_session emits shell run snapshots` | Socket hydration and rooms |
+| `backend/test/acpClient-routing.test.js` | `routes all handleUpdate paths`, `passes pending JSON-RPC request context into intercept`, `routes all handleProviderExtension paths`, `emits provider status extensions even when persistence fails`, `hits JSON parse error in handleData` | ACP routing branches, response attribution, provider status persistence failure fallback |
+| `backend/test/jsonRpcTransport.test.js` | `should increment request ID and correlate response`, `captures sessionId in pending request context`, `should reject all pending requests on reset`, `should handle JSON-RPC error responses` | Pending request/session context and response correlation |
+| `backend/test/sockets-index.test.js` | `Socket Index Handler`, `registers all modular handlers on connection`, `emits config_errors on connection`, `blocks normal hydration when startup JSON config is invalid`, `preserves existing diagnostics when runtime config loading fails`, `emits sidebar_settings on connection`, `emits cached provider status on connection`, `emits persisted provider status on connection when memory is empty`, `does not emit persisted provider status over newer memory status for the same provider`, `watch_session joins the session room`, `watch_session emits shell run snapshots` | Socket hydration, config diagnostics, provider status replay, and rooms |
 | `backend/test/sessionHandlers.test.js` | `handles create_session`, `captures normalized config options returned by session/new`, `handles create_session with existingAcpId (resume)`, `reapplies saved config options on resume when the provider still advertises them`, `handles create_session skipping load for hot sessions`, `handles create_session performing load for cold sessions with dbSession` | Session create/load/resume, model/config capture, snapshots |
 | `backend/test/promptHandlers.test.js` | `Prompt Handlers`, `should handle incoming prompt and send to ACP`, `should cancel prompt when cancel_prompt received`, `should forward permission response to acpClient`, `provider prompt lifecycle hooks`, `calls onPromptCompleted even when sendRequest rejects (error path)` | Prompt assembly, cancellation, permissions, lifecycle pairing |
-| `backend/test/acpUpdateHandler.test.js` | `acpUpdateHandler`, `delegates normalization to provider`, `caches and re-injects metadata (Sticky Metadata)`, `handles config_option_update and emits provider_extension`, `prepares shell run metadata for ux_invoke_shell tool starts`, `restores tool title from cache if missing in update` | Update normalization, tokens, thoughts, tools, provider extensions |
+| `backend/test/acpUpdateHandler.test.js` | `acpUpdateHandler`, `delegates normalization to provider`, `caches and re-injects metadata (Sticky Metadata)`, `handles usage_update and emits stats_push`, `treats usage_update as latest absolute snapshot (not additive)`, `clamps usage_update provider metadata to 100 percent`, `handles usage_update with zero size`, `handles config_option_update and emits provider_extension`, `prepares shell run metadata for ux_invoke_shell tool starts`, `restores tool title from cache if missing in update` | Update normalization, usage snapshots, tokens, thoughts, tools, provider extensions |
+| `backend/test/providerStatusMemory.test.js` | `remembers the latest provider status extension`, `ignores extensions that are not provider status payloads`, `returns a copy so callers cannot mutate cached memory`, `keeps provider status memory isolated by provider id`, `normalizes provider id into status extensions without mutating the source` | Provider status normalization and memory isolation |
+| `backend/test/persistence.test.js` | `saves and retrieves sessions`, `saves and retrieves the latest provider status by provider`, `resolves provider status provider id from the extension payload`, `keeps newer provider status when an older write arrives later` | Session persistence and provider status SQLite fallback |
 | `backend/test/sessionManager.test.js` | `getMcpServers`, `autoLoadPinnedSessions`, `loadSessionIntoMemory`, `autoSaveTurn`, `should attach _meta when getMcpServerMeta returns a value`, `should perform full hot-load lifecycle` | MCP server config, pinned warmup, hot load, autosave |
 | `backend/test/database-exhaustive.test.js` | `Exhaustive Database Coverage`, `hits all optional field branches in saveSession`, `handles getSessionByAcpId with null provider`, `hits parseProviderScopedArgs 2-arg signature`, `hits parseProviderScopedArgs 3-arg signature` | Persistence shape and provider-scoped helper signatures |
 | `backend/test/mcpApi.test.js` | `MCP API Routes`, route tests for `/tools`, `/tool-call`, abort handling, response write guards | MCP HTTP bridge |
@@ -566,6 +592,7 @@ Run backend tests from `backend` with `npx vitest run`. Focused backend architec
 - `ProviderRuntimeManager` owns one runtime per enabled provider and is the entry point for provider-aware backend code.
 - `AcpClient` owns daemon spawn, JSON-RPC transport, provider intercepts, permission handling, stream state, model/config extension handling, restart behavior, and pinned-session warmup.
 - Socket handlers own UI-facing workflows; high-volume stream events are scoped to `session:<acpSessionId>` rooms.
+- Startup JSON diagnostics keep the backend alive long enough to emit `config_errors` and block provider hydration when provider-critical config is malformed.
 - `sessionMetadata` is the runtime contract for prompts, streams, model/config options, stats, hooks, and title generation.
 - SQLite stores durable UI session state, provider-scoped ACP lookups, model/config state, stats, folders, canvas artifacts, and notes.
 - MCP tools flow through stdio proxy -> `mcpApi.js` -> `mcpServer.createToolHandlers` -> `mcpExecutionRegistry` -> Tool System V2 -> UI timeline.

@@ -10,6 +10,7 @@ import ChatHeader from './components/ChatHeader/ChatHeader';
 import MessageList from './components/MessageList/MessageList';
 import ChatInput from './components/ChatInput/ChatInput';
 import CanvasPane from './components/CanvasPane/CanvasPane';
+import ConfigErrorModal from './components/ConfigErrorModal';
 import { claimSession } from './lib/sessionOwnership';
 import { computeResizeWidthNoSidebar } from './utils/resizeHelper';
 import './styles/global.css';
@@ -101,7 +102,12 @@ function PopOutApp() {
   }, [activeSession?.name]);
 
   if (!ready) {
-    return <div className="app-container" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8b949e' }}>Loading session...</div>;
+    return (
+      <div className="app-container" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8b949e' }}>
+        Loading session...
+        <ConfigErrorModal />
+      </div>
+    );
   }
 
   return (
@@ -130,6 +136,7 @@ function PopOutApp() {
           />
         </ErrorBoundary>
       )}
+      <ConfigErrorModal />
     </div>
   );
 }

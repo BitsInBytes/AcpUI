@@ -234,6 +234,12 @@ Because the Gemini CLI natively emits erratic `usage_update` events during strea
 
 Gemini context usage is cached in `~/.gemini/acp_session_tokens.json` when turns complete. On backend restart or hot-session reuse, AcpUI calls the provider's `emitCachedContext(sessionId)` hook after the session ID is known so the footer and session settings can show the last context percentage before another prompt is sent.
 
+## Prompt Result Session Attribution
+
+Gemini `session/prompt` results can omit `result.sessionId`, so context/quota metadata attribution is resolved from the pending JSON-RPC request context (`response id -> request params.sessionId`) passed from the backend transport into provider interception.
+
+This avoids stale-session attribution when multiple sessions are active and ensures `_meta.quota` updates are emitted for the correct session.
+
 ## Implementation Notes
 
 These are non-obvious behaviours discovered by capturing live protocol traffic. Violating any of them causes silent failures.

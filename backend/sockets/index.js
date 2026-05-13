@@ -19,6 +19,8 @@ import { loadCommands } from '../services/commandsConfig.js';
 import { getProvider } from '../services/providerLoader.js';
 import { getLatestProviderStatusExtension, getLatestProviderStatusExtensions } from '../services/providerStatusMemory.js';
 import { getDefaultProviderId, getProviderEntries } from '../services/providerRegistry.js';
+import { collectInvalidJsonConfigErrors, hasStartupBlockingJsonConfigError } from '../services/jsonConfigDiagnostics.js';
+import * as db from '../database.js';
 
 import { isSTTEnabled } from '../voiceService.js';
 
@@ -47,6 +49,65 @@ function getProviderPayloads() {
   }));
 }
 
+function runtimeConfigIssue(err) {
+  return {
+    id: 'runtime-config-load',
+    label: 'Runtime configuration',
+    path: 'configuration/providers.json',
+    message: err?.message || 'Failed to load runtime configuration',
+    blocksStartup: true
+  };
+}
+
+function getStatusExtensionProviderId(extension) {
+  return extension?.providerId || extension?.params?.providerId || extension?.params?.status?.providerId || null;
+}
+
+function emitProviderStatusExtension(socket, extension, emittedProviderIds) {
+  if (!extension) return false;
+  const providerId = getStatusExtensionProviderId(extension);
+  socket.emit('provider_extension', extension);
+  if (providerId) emittedProviderIds.add(providerId);
+  return true;
+}
+
+function emitCachedProviderStatuses(socket, defaultProviderId) {
+  const emittedProviderIds = new Set();
+
+  const providerStatusExtensions = getLatestProviderStatusExtensions();
+  if (providerStatusExtensions.length > 0) {
+    for (const providerStatusExtension of providerStatusExtensions) {
+      emitProviderStatusExtension(socket, providerStatusExtension, emittedProviderIds);
+    }
+  } else {
+    emitProviderStatusExtension(
+      socket,
+      getLatestProviderStatusExtension(defaultProviderId),
+      emittedProviderIds
+    );
+  }
+
+  if (typeof db.getProviderStatusExtensions !== 'function') return;
+
+  Promise.resolve()
+    .then(() => (typeof db.initDb === 'function' ? db.initDb() : undefined))
+    .then(() => db.getProviderStatusExtensions())
+    .then((persistedExtensions) => {
+      const currentMemoryProviderIds = new Set([
+        ...emittedProviderIds,
+        ...getLatestProviderStatusExtensions().map(getStatusExtensionProviderId).filter(Boolean)
+      ]);
+
+      for (const persistedExtension of persistedExtensions || []) {
+        const providerId = getStatusExtensionProviderId(persistedExtension);
+        if (providerId && currentMemoryProviderIds.has(providerId)) continue;
+        emitProviderStatusExtension(socket, persistedExtension, emittedProviderIds);
+        if (providerId) currentMemoryProviderIds.add(providerId);
+      }
+    })
+    .catch(err => writeLog(`[DB ERR] Failed to load provider status extensions: ${err.message}`));
+}
+
 export default function registerSocketHandlers(io) {
   // On connect: emit all config/state so the UI can hydrate without extra round-trips
   io.on('connection', (socket) => {
@@ -54,9 +115,32 @@ export default function registerSocketHandlers(io) {
     const referer = socket.handshake?.headers?.referer || socket.handshake?.headers?.origin || 'no referrer';
     const address = socket.handshake?.address || 'unknown address';
     writeLog(`Client connected: ${socket.id} (${address}; ${referer}; ${userAgent})`);
-    
-    const defaultProviderId = getDefaultProviderId();
-    const providerPayloads = getProviderPayloads();
+
+    const configErrors = collectInvalidJsonConfigErrors();
+    socket.emit('config_errors', { errors: configErrors });
+    if (hasStartupBlockingJsonConfigError(configErrors)) {
+      writeLog(`[CONFIG] Blocking socket hydration because invalid JSON config was found: ${configErrors.map(issue => issue.path).join(', ')}`);
+      socket.on('disconnect', () => {
+        writeLog(`Client disconnected: ${socket.id}`);
+      });
+      return;
+    }
+
+    let defaultProviderId;
+    let providerPayloads;
+    try {
+      defaultProviderId = getDefaultProviderId();
+      providerPayloads = getProviderPayloads();
+    } catch (err) {
+      const issue = runtimeConfigIssue(err);
+      socket.emit('config_errors', { errors: [...configErrors, issue] });
+      writeLog(`[CONFIG] Blocking socket hydration because runtime configuration failed: ${issue.message}`);
+      socket.on('disconnect', () => {
+        writeLog(`Client disconnected: ${socket.id}`);
+      });
+      return;
+    }
+
     socket.emit('providers', {
       defaultProviderId,
       providers: providerPayloads
@@ -83,17 +167,7 @@ export default function registerSocketHandlers(io) {
       notificationDesktop: process.env.NOTIFICATION_DESKTOP === 'true',
     });
     socket.emit('custom_commands', { commands: loadCommands() });
-    const providerStatusExtensions = getLatestProviderStatusExtensions();
-    if (providerStatusExtensions.length > 0) {
-      for (const providerStatusExtension of providerStatusExtensions) {
-        socket.emit('provider_extension', providerStatusExtension);
-      }
-    } else {
-      const providerStatusExtension = getLatestProviderStatusExtension(defaultProviderId);
-      if (providerStatusExtension) {
-        socket.emit('provider_extension', providerStatusExtension);
-      }
-    }
+    emitCachedProviderStatuses(socket, defaultProviderId);
 
     registerSessionHandlers(io, socket);
     registerArchiveHandlers(io, socket);

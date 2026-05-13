@@ -95,7 +95,7 @@ describe('useSessionLifecycleStore', () => {
       await useSessionLifecycleStore.getState().fetchStats(mockSocket, acpId);
     });
 
-    expect(useSystemStore.getState().contextUsageBySession[acpId]).toBe(42);
+    expect(useSystemStore.getState().getContextUsage('p1', acpId)).toBe(42);
   });
 
   it('handleNewChat creates session and retries if daemon not ready', () => {
@@ -187,7 +187,7 @@ describe('useSessionLifecycleStore', () => {
       useSessionLifecycleStore.getState().hydrateSession(mockSocket, 's1');
     });
 
-    expect(useSystemStore.getState().contextUsageBySession['old-acp']).toBe(40);
+    expect(useSystemStore.getState().getContextUsage(undefined, 'old-acp')).toBe(40);
   });
 
   it('handleDeleteSession removes session and emits archive_session by default', () => {
@@ -239,7 +239,7 @@ describe('useSessionLifecycleStore', () => {
       useSessionLifecycleStore.getState().handleSessionSelect(mockSocket, 's1');
     });
 
-    expect(useSystemStore.getState().contextUsageBySession['acp-1']).toBe(25);
+    expect(useSystemStore.getState().getContextUsage(undefined, 'acp-1')).toBe(25);
   });
 
   it('handleSessionSelect does not downgrade positive cached context to zero from persisted stats', () => {
@@ -258,7 +258,7 @@ describe('useSessionLifecycleStore', () => {
       useSessionLifecycleStore.getState().handleSessionSelect(mockSocket, 's1');
     });
 
-    expect(useSystemStore.getState().contextUsageBySession['acp-1']).toBe(25);
+    expect(useSystemStore.getState().getContextUsage(undefined, 'acp-1')).toBe(25);
   });
 
   it('handleTogglePin sorts sessions with pins first', () => {

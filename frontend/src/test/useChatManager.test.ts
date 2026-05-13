@@ -58,12 +58,19 @@ describe('useChatManager hook', () => {
 
   it('handles "stats_push" event', () => {
     const setSessions = vi.fn();
-    act(() => { useSessionLifecycleStore.setState({ setSessions, sessions: [{ id: 's1', acpSessionId: 'acp-1', messages: [] } as any] }); });
+    act(() => {
+      useSystemStore.setState({ contextUsageBySession: {} });
+      useSessionLifecycleStore.setState({
+        setSessions,
+        sessions: [{ id: 's1', acpSessionId: 'acp-1', provider: 'provider-a', messages: [] } as any]
+      });
+    });
     renderHook(() => useChatManager(vi.fn()));
-    
+
     const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'stats_push')[1];
     handler({ sessionId: 'acp-1', usedTokens: 100, totalTokens: 1000 });
-    
+
+    expect(useSystemStore.getState().getContextUsage('provider-a', 'acp-1')).toBe(10);
     expect(setSessions).toHaveBeenCalled();
   });
 
@@ -151,6 +158,107 @@ describe('useChatManager hook', () => {
     expect(toolStep.event.cwd).toBe('D:/repo');
     expect(toolStep.event.output).toBe('PASS');
     expect(toolStep.event.endTime).toBeDefined();
+  });
+
+  it('marks the session as awaiting shell input from shell output and clears it on exit', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          name: 'Session',
+          messages: [{
+            id: 'assistant-1',
+            role: 'assistant',
+            content: '',
+            timeline: [{
+              type: 'tool',
+              event: {
+                id: 'tool-1',
+                title: 'Invoke Shell: Install deps',
+                status: 'in_progress',
+                toolName: 'ux_invoke_shell',
+                shellRunId: 'shell-run-1',
+                shellState: 'running'
+              }
+            }],
+            isStreaming: true
+          }],
+          isTyping: true,
+          isWarmingUp: false,
+          model: 'balanced',
+          provider: 'provider-a'
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
+
+    act(() => {
+      handlers.shell_run_output({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-1',
+        chunk: 'Ok to proceed? (y) ',
+        needsInput: true
+      });
+    });
+
+    let session = useSessionLifecycleStore.getState().sessions[0];
+    expect(session.isAwaitingShellInput).toBe(true);
+    expect((session.messages[0].timeline?.[0] as any).event.shellNeedsInput).toBe(true);
+
+    act(() => {
+      handlers.shell_run_exit({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        runId: 'shell-run-1',
+        exitCode: 0,
+        reason: 'completed',
+        finalText: 'done'
+      });
+    });
+
+    session = useSessionLifecycleStore.getState().sessions[0];
+    expect(session.isAwaitingShellInput).toBe(false);
+    expect((session.messages[0].timeline?.[0] as any).event.shellNeedsInput).toBe(false);
+  });
+
+  it('keeps shell input waiting state while another run in the same session still needs input', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          name: 'Session',
+          messages: [],
+          isTyping: true,
+          isWarmingUp: false,
+          model: 'balanced',
+          provider: 'provider-a'
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handlers = Object.fromEntries(mockSocket.on.mock.calls.map((call: any) => [call[0], call[1]]));
+
+    act(() => {
+      handlers.shell_run_output({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-1', chunk: 'Password: ', needsInput: true });
+      handlers.shell_run_output({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-2', chunk: 'Continue? ', needsInput: true });
+      handlers.shell_run_exit({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-1', exitCode: 0, reason: 'completed' });
+    });
+
+    expect(useSessionLifecycleStore.getState().sessions[0].isAwaitingShellInput).toBe(true);
+
+    act(() => {
+      handlers.shell_run_exit({ providerId: 'provider-a', sessionId: 'acp-1', runId: 'shell-run-2', exitCode: 0, reason: 'completed' });
+    });
+
+    expect(useSessionLifecycleStore.getState().sessions[0].isAwaitingShellInput).toBe(false);
   });
 
   it('creates a Shell V2 tool step from shell lifecycle events when provider tool_start is missing', async () => {

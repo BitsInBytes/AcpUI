@@ -18,7 +18,7 @@ This feature matters because it is the frontend boundary that creates `prompt` s
 - Attachment upload and attachment prompt conversion are separate phases with different failure points.
 - Model selection has an optimistic frontend update and a backend ACP `session/set_model` enforcement path.
 - Slash command visibility depends on provider extension data and local custom command data arriving through socket handlers.
-- Context usage is displayed from metadata and stats state keyed by ACP session id, not UI session id.
+- Context usage is displayed from metadata and stats state keyed by provider id + ACP session id, not UI session id.
 
 ## How It Works - End-to-End Flow
 1. Active session state is selected in the input component.
@@ -103,7 +103,7 @@ This feature matters because it is the frontend boundary that creates `prompt` s
 
     Files: `frontend/src/hooks/useSocket.ts` (Socket event: `provider_extension`), `frontend/src/utils/extensionRouter.ts` (Extension result: `metadata`), `frontend/src/store/useSystemStore.ts` (Action: `setContextUsage`), `frontend/src/store/useSessionLifecycleStore.ts` (Functions: `fetchStats`, `maybeHydrateContextUsage`), `frontend/src/components/ChatInput/ChatInput.tsx` (CSS classes: `context-bar-track`, `context-bar-fill`), `frontend/src/components/ChatInput/ModelSelector.tsx` (Label: context percentage and compaction suffix)
 
-    Provider metadata extensions with `contextUsagePercentage` update `contextUsageBySession[acpSessionId]`. Session stats can also hydrate the value from `usedTokens / totalTokens`. `ChatInput` clamps the percentage to `0..100` for the thin context bar and selects green/yellow/red/accent colors by threshold. `ModelSelector` appends a rounded percentage to the model label when context data exists and shows a compacting suffix while `compactingBySession[acpSessionId]` is true.
+    Provider metadata extensions with `contextUsagePercentage` update a provider-scoped key (`providerId + acpSessionId`) in `contextUsageBySession`. Session stats can also hydrate the value from `usedTokens / totalTokens` using the same keying. `ChatInput` clamps the percentage to `0..100` for the thin context bar and selects green/yellow/red/accent colors by threshold. `ModelSelector` appends a rounded percentage to the model label when context data exists and shows a compacting suffix while the provider-scoped `compactingBySession` entry is true.
 
 ## Architecture Diagram
 ```mermaid
@@ -240,7 +240,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 3. `getFooterModelChoices` returns quick-access model choices from branding.
 4. Selecting a quick-access item calls `handleActiveSessionModelChange`, then `handleSessionModelChange`, then socket event `set_session_model`.
 5. `useSocket` routes context metadata from `provider_extension` through `routeExtension`; stats hydration can also call `setContextUsage`.
-6. `ChatInput` renders a context bar from `contextUsageBySession[activeSession.acpSessionId]`; `ModelSelector` appends rounded context percentage or compaction state to the model label.
+6. `ChatInput` renders a context bar from provider-scoped context usage keyed by `activeSession.provider + activeSession.acpSessionId`; `ModelSelector` appends rounded context percentage or compaction state to the model label.
 
 ## Component Reference
 ### Frontend Components and Hooks
@@ -259,7 +259,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 | Input state | `frontend/src/store/useInputStore.ts` | `inputs`, `attachmentsMap`, `setInput`, `setAttachments`, `clearInput`, `handleFileUpload` | Session-scoped drafts and attachments |
 | Submit state | `frontend/src/store/useChatStore.ts` | `handleSubmit`, `handleCancel` | Optimistic messages, prompt/cancel socket emission, custom command prompt substitution |
 | Session lifecycle | `frontend/src/store/useSessionLifecycleStore.ts` | `handleActiveSessionModelChange`, `handleSessionModelChange`, `handleSetSessionOption`, `fetchStats`, `maybeHydrateContextUsage` | Model mutation, session options, stats and context hydration |
-| System state | `frontend/src/store/useSystemStore.ts` | `SlashCommand`, `setSlashCommands`, `setCustomCommands`, `setContextUsage`, `setCompacting`, `getBranding` | Provider branding, command lists, context usage, compaction state |
+| System state | `frontend/src/store/useSystemStore.ts` | `SlashCommand`, `setSlashCommands`, `setCustomCommands`, `setContextUsage`, `getContextUsage`, `hasContextUsage`, `setCompacting`, `getCompacting`, `getBranding` | Provider branding, command lists, provider-scoped context usage and compaction state |
 | UI state | `frontend/src/store/useUIStore.ts` | `isModelDropdownOpen`, `setModelDropdownOpen`, `toggleAutoScroll`, `setSettingsOpen`, `setNotesOpen` | Dropdown, auto-scroll, settings, and notes modal state |
 | Canvas state | `frontend/src/store/useCanvasStore.ts` | `terminals`, `isCanvasOpen`, `openTerminal`, `setIsCanvasOpen` | Terminal and canvas footer pill behavior |
 | Model utilities | `frontend/src/utils/modelOptions.ts` | `getDefaultModelSelection`, `getModelIdForSelection`, `getModelLabel`, `getFooterModelChoices`, `getFullModelChoices`, `isModelChoiceActive` | Frontend model labels and option lists |
@@ -306,7 +306,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 
 8. Backend model enforcement can change ACP state even after the frontend local model update. `handleSessionModelChange` updates the UI optimistically; `registerPromptHandlers` still resolves `model` and sends ACP `session/set_model` when needed.
 
-9. Context bar absence can be valid state. No fill renders until `contextUsageBySession[acpSessionId]` exists from metadata or stats hydration.
+9. Context bar absence can be valid state. No fill renders until the provider-scoped context key (`providerId + acpSessionId`) exists from metadata or stats hydration.
 
 10. Input clear is eager. `handleSubmit` clears draft text and attachments before the backend prompt completes; submit failures emit error timeline events but do not restore the previous draft.
 
@@ -373,6 +373,12 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
   - `handleSessionSelect hydrates context usage from persisted session stats`
 - `frontend/src/test/useSessionLifecycleStoreExtended.test.ts`
   - `handleActiveSessionModelChange calls handleSessionModelChange`
+- `frontend/src/test/useSystemStoreDeep.test.ts`
+  - `setContextUsage updates session percentage by provider+session key`
+  - `clamps context usage to UI-safe bounds`
+  - `setCompacting tracks compaction state per provider+session key`
+  - `keeps compaction state isolated for interleaved providers sharing a session id`
+  - `keeps context usage isolated for interleaved providers sharing a session id`
 - `frontend/src/test/extensionRouter.test.ts`
   - `routes commands/available with system + custom commands merged`
   - `routes metadata with sessionId and percentage`
@@ -418,7 +424,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 2. For attachments, update `frontend/src/hooks/useFileUpload.ts`, `frontend/src/store/useInputStore.ts`, `frontend/src/components/FileTray.tsx`, `backend/routes/upload.js`, `backend/services/attachmentVault.js`, and the attachment conversion block in `backend/sockets/promptHandlers.js` as a single contract.
 3. For model footer changes, update `frontend/src/components/ChatInput/ModelSelector.tsx`, `frontend/src/utils/modelOptions.ts`, `frontend/src/store/useSessionLifecycleStore.ts`, and backend `resolveModelSelection` behavior when ACP model ids are affected.
 4. For slash commands, verify `frontend/src/hooks/useSocket.ts`, `frontend/src/utils/extensionRouter.ts`, `frontend/src/store/useSystemStore.ts`, `ChatInput` filtering, and `useChatStore.handleSubmit` custom command substitution.
-5. For context usage, verify `provider_extension` metadata routing, `useSystemStore.setContextUsage`, `useSessionLifecycleStore.fetchStats`, `ChatInput` context bar rendering, and `ModelSelector` label rendering.
+5. For context usage, verify `provider_extension` metadata routing, `useSystemStore.setContextUsage`, `useSystemStore.getContextUsage`, `useSystemStore.getCompacting`, `useSessionLifecycleStore.fetchStats`, `ChatInput` context bar rendering, and `ModelSelector` label rendering.
 6. Update the tests listed in this guide when the corresponding contract changes.
 
 ### For debugging issues with this feature
@@ -429,7 +435,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 5. For attachment prompt failures, inspect the attachment conversion block in `registerPromptHandlers` and confirm whether the file has `data`, `path`, and a correct `mimeType`.
 6. For missing slash commands, inspect `custom_commands`, `provider_extension`, `routeExtension`, `setSlashCommands`, and `slashCommandsByProviderId[activeProvider]`.
 7. For model dropdown issues, inspect provider branding in `providersById[activeSession.provider].branding.models.quickAccess` and the session fields `model`, `currentModelId`, and `modelOptions`.
-8. For context display issues, inspect `contextUsageBySession[activeSession.acpSessionId]`, `stats.usedTokens`, `stats.totalTokens`, and compaction state in `compactingBySession`.
+8. For context display issues, inspect provider-scoped context/compaction entries for `activeSession.provider + activeSession.acpSessionId`, plus `stats.usedTokens` and `stats.totalTokens`.
 
 ## Summary
 - `ChatInput` coordinates prompt composition, attachments, slash commands, voice controls, footer actions, context display, and model/session option controls for the active session.
@@ -437,5 +443,5 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 - Attachment upload returns disk metadata first; ACP prompt conversion later transforms attachments into `image`, `text`, or `resource_link` parts.
 - Model quick-select is sourced from provider branding quick-access entries and enforced again in the backend prompt handler through ACP `session/set_model`.
 - Slash command data comes from provider extensions and prompt-backed custom commands; exact custom command names can substitute configured prompt text.
-- Context display is keyed by ACP session id and can be populated from provider metadata or stats hydration.
+- Context display is keyed by provider id + ACP session id and can be populated from provider metadata or stats hydration.
 - The critical contract is the `prompt` payload plus the `Attachment` shape and the separation between UI session id and ACP session id.

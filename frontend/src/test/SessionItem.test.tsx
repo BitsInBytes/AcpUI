@@ -44,6 +44,14 @@ describe('SessionItem', () => {
     expect(container.querySelector('.session-item.active')).toBeInTheDocument();
   });
 
+  it('uses the shell input waiting class when an interactive shell needs input', () => {
+    const props = { ...defaultProps(), session: makeSession({ isTyping: true, isAwaitingShellInput: true }) };
+    const { container } = render(<SessionItem {...props} />);
+    const item = container.querySelector('.session-item');
+    expect(item).toHaveClass('typing');
+    expect(item).toHaveClass('awaiting-shell-input');
+  });
+
   it('calls onSelect when clicked', () => {
     const props = defaultProps();
     render(<SessionItem {...props} />);

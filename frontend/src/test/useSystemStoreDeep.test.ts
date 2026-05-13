@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useSystemStore } from '../store/useSystemStore';
+import { getProviderSessionKey, useSystemStore } from '../store/useSystemStore';
 import { act } from 'react';
 
 describe('useSystemStore (Deep Logic)', () => {
@@ -15,14 +15,57 @@ describe('useSystemStore (Deep Logic)', () => {
     });
   });
 
-  it('setContextUsage updates session percentage', () => {
-    act(() => { useSystemStore.getState().setContextUsage('s1', 45); });
-    expect(useSystemStore.getState().contextUsageBySession['s1']).toBe(45);
+  it('setContextUsage updates session percentage by provider+session key', () => {
+    act(() => { useSystemStore.getState().setContextUsage('p1', 's1', 45); });
+    const key = getProviderSessionKey('p1', 's1');
+    expect(useSystemStore.getState().contextUsageBySession[key]).toBe(45);
+    expect(useSystemStore.getState().getContextUsage('p1', 's1')).toBe(45);
   });
 
-  it('setCompacting tracks compaction state per session', () => {
-    act(() => { useSystemStore.getState().setCompacting('s1', true); });
-    expect(useSystemStore.getState().compactingBySession['s1']).toBe(true);
+  it('clamps context usage to UI-safe bounds', () => {
+    act(() => {
+      useSystemStore.getState().setContextUsage('p1', 'over', 125);
+      useSystemStore.getState().setContextUsage('p1', 'under', -10);
+    });
+    expect(useSystemStore.getState().getContextUsage('p1', 'over')).toBe(100);
+    expect(useSystemStore.getState().getContextUsage('p1', 'under')).toBe(0);
+  });
+
+  it('setCompacting tracks compaction state per provider+session key', () => {
+    act(() => { useSystemStore.getState().setCompacting('p1', 's1', true); });
+    const key = getProviderSessionKey('p1', 's1');
+    expect(useSystemStore.getState().compactingBySession[key]).toBe(true);
+    expect(useSystemStore.getState().getCompacting('p1', 's1')).toBe(true);
+  });
+
+  it('reads legacy unscoped context and compaction entries as a fallback', () => {
+    act(() => {
+      useSystemStore.setState({
+        contextUsageBySession: { legacy: 33 },
+        compactingBySession: { legacy: true }
+      });
+    });
+    expect(useSystemStore.getState().getContextUsage('p1', 'legacy')).toBe(33);
+    expect(useSystemStore.getState().hasContextUsage('p1', 'legacy')).toBe(true);
+    expect(useSystemStore.getState().getCompacting('p1', 'legacy')).toBe(true);
+  });
+
+  it('keeps compaction state isolated for interleaved providers sharing a session id', () => {
+    act(() => {
+      useSystemStore.getState().setCompacting('claude', 'same-session', true);
+      useSystemStore.getState().setCompacting('gemini', 'same-session', false);
+    });
+    expect(useSystemStore.getState().getCompacting('claude', 'same-session')).toBe(true);
+    expect(useSystemStore.getState().getCompacting('gemini', 'same-session')).toBe(false);
+  });
+
+  it('keeps context usage isolated for interleaved providers sharing a session id', () => {
+    act(() => {
+      useSystemStore.getState().setContextUsage('claude', 'same-session', 12);
+      useSystemStore.getState().setContextUsage('gemini', 'same-session', 78);
+    });
+    expect(useSystemStore.getState().getContextUsage('claude', 'same-session')).toBe(12);
+    expect(useSystemStore.getState().getContextUsage('gemini', 'same-session')).toBe(78);
   });
 
   it('setCustomCommands updates state', () => {

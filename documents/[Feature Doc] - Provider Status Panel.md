@@ -9,8 +9,9 @@ This guide covers the generic status pipeline and payload contract. Provider-spe
 ### What It Does
 
 - Accepts provider extension payloads whose method resolves to `provider/status` or `provider_status` after removing the provider `protocolPrefix`.
-- Caches the latest valid status extension per `providerId` in `backend/services/providerStatusMemory.js`.
-- Replays cached status extensions to each browser socket during `backend/sockets/index.js` connection hydration.
+- Normalizes and caches the latest valid status extension per `providerId` in `backend/services/providerStatusMemory.js`.
+- Persists the latest valid provider status extension per provider in SQLite through `backend/database.js`.
+- Replays in-memory status extensions first, then fills missing providers from SQLite during `backend/sockets/index.js` connection hydration.
 - Routes `provider_extension` socket events through `frontend/src/hooks/useSocket.ts` and `frontend/src/utils/extensionRouter.ts`.
 - Stores status by provider in `useSystemStore.providerStatusByProviderId` and keeps `useSystemStore.providerStatus` aligned with the active provider.
 - Renders provider-scoped sidebar panels through `frontend/src/components/Sidebar.tsx` and `frontend/src/components/ProviderStatusPanel.tsx`.
@@ -18,11 +19,11 @@ This guide covers the generic status pipeline and payload contract. Provider-spe
 ### Why This Matters
 
 - Status is provider-owned data, but the UI contract is generic and provider-agnostic.
-- The backend cache lets reconnecting browser clients see the latest status without waiting for another provider emission.
+- The backend memory cache and SQLite fallback let reconnecting browser clients and backend cold starts show the latest stored status without waiting for another provider emission.
 - The frontend routes status by provider id, so multi-provider sidebars can show each provider's own status card.
 - The payload shape is intentionally UI-ready: the panel renders sections, items, progress values, tones, and details without provider-specific branching.
 
-Architectural role: backend extension cache and Socket.IO emission, frontend extension routing, Zustand system state, sidebar rendering.
+Architectural role: backend extension cache and SQLite persistence, Socket.IO emission, frontend extension routing, Zustand system state, sidebar rendering.
 
 ## How It Works - End-to-End Flow
 
@@ -51,7 +52,10 @@ Provider extensions that arrive from the ACP daemon are accepted only when the m
 
 ```javascript
 // FILE: backend/services/acpClient.js (Method: handleAcpMessage)
-const processedPayload = this.providerModule.intercept(payload);
+const responseRequest = payload?.id !== undefined
+  ? this.transport.getPendingRequestContext(payload.id)
+  : null;
+const processedPayload = this.providerModule.intercept(payload, { responseRequest });
 if (!processedPayload) return;
 
 if (processedPayload.method &&
@@ -65,14 +69,20 @@ if (processedPayload.method &&
 
 File: `backend/services/acpClient.js` (Method: `handleProviderExtension`)
 
-`handleProviderExtension` handles side effects shared by provider extensions, including model state updates, config option updates, provider-status cache insertion, and Socket.IO broadcast. `rememberProviderStatusExtension` is called for each extension, and the cache function filters out non-status payloads.
+`handleProviderExtension` handles side effects shared by provider extensions, including model state updates, config option updates, provider-status cache insertion, SQLite persistence, and Socket.IO broadcast. `rememberProviderStatusExtension` is called for each extension, and the cache function returns a normalized clone only for valid status payloads.
 
 ```javascript
 // FILE: backend/services/acpClient.js (Method: handleProviderExtension)
+const normalizedStatusExtension = rememberProviderStatusExtension(payload, providerId);
+if (normalizedStatusExtension && typeof db.saveProviderStatusExtension === 'function') {
+  db.saveProviderStatusExtension(providerId, normalizedStatusExtension).catch(err =>
+    writeLog(`[DB ERR] Failed to save provider status for ${providerId}: ${err.message}`)
+  );
+}
+
 if (this.io) {
-  rememberProviderStatusExtension(payload, providerId);
   const params = payload.params || {};
-  this.io.emit('provider_extension', {
+  this.io.emit('provider_extension', normalizedStatusExtension || {
     providerId,
     method: payload.method,
     params: { ...params, providerId }
@@ -82,9 +92,9 @@ if (this.io) {
 
 4. Backend cache validates and normalizes status payloads.
 
-File: `backend/services/providerStatusMemory.js` (Function: `rememberProviderStatusExtension`)
+File: `backend/services/providerStatusMemory.js` (Functions: `normalizeProviderStatusExtension`, `rememberProviderStatusExtension`)
 
-The cache only accepts extensions with a string `method`, object `params`, object `params.status`, and array `params.status.sections`. It resolves `providerId`, writes that id into the extension, params, and status object, stores the latest global extension, and stores per-provider entries when a provider id exists.
+The cache only accepts extensions with a string `method`, object `params`, object `params.status`, and array `params.status.sections`. It resolves `providerId`, writes that id into the extension, params, and status object, stores the latest global extension, stores per-provider entries when a provider id exists, and returns a cloned normalized extension for persistence and live emission.
 
 ```javascript
 // FILE: backend/services/providerStatusMemory.js (Function: rememberProviderStatusExtension)
@@ -108,28 +118,46 @@ const normalizedExtension = cloneJson({
 });
 ```
 
-5. Socket connection hydration replays cached statuses.
+5. SQLite stores the latest provider status per provider.
 
-File: `backend/sockets/index.js` (Function: `registerSocketHandlers`, Socket event: `connection`)
+File: `backend/database.js` (Functions: `saveProviderStatusExtension`, `getProviderStatusExtensions`, Table: `provider_status`)
 
-During socket hydration, the backend emits provider catalog and branding first, then replays cached status extensions. It emits every provider-scoped cached status returned by `getLatestProviderStatusExtensions()`. The default-provider fallback uses `getLatestProviderStatusExtension(defaultProviderId)` when the per-provider list is empty.
+`saveProviderStatusExtension(providerId, extension)` accepts only status-shaped extensions with `params.status.sections`, normalizes provider id into the extension, and upserts the JSON payload by provider. The `updated_at` guard keeps an older async write from replacing a newer provider status.
+
+6. Socket connection hydration replays memory first and SQLite fallback second.
+
+File: `backend/sockets/index.js` (Function: `registerSocketHandlers`, Helper: `emitCachedProviderStatuses`, Socket event: `connection`)
+
+During socket hydration, the backend emits provider catalog and branding first, then replays in-memory status extensions. It emits every provider-scoped cached status returned by `getLatestProviderStatusExtensions()`. The default-provider fallback uses `getLatestProviderStatusExtension(defaultProviderId)` when the per-provider list is empty. If the database provider-status helper exists, it initializes SQLite, loads `db.getProviderStatusExtensions()`, and emits only persisted statuses whose provider id is not already present in the in-memory set. Persistence replay errors are logged without blocking live socket hydration.
 
 ```javascript
-// FILE: backend/sockets/index.js (Function: registerSocketHandlers, Event: connection)
+// FILE: backend/sockets/index.js (Helper: emitCachedProviderStatuses)
 const providerStatusExtensions = getLatestProviderStatusExtensions();
-if (providerStatusExtensions.length > 0) {
-  for (const providerStatusExtension of providerStatusExtensions) {
-    socket.emit('provider_extension', providerStatusExtension);
-  }
-} else {
-  const providerStatusExtension = getLatestProviderStatusExtension(defaultProviderId);
-  if (providerStatusExtension) {
-    socket.emit('provider_extension', providerStatusExtension);
-  }
+for (const providerStatusExtension of providerStatusExtensions) {
+  emitProviderStatusExtension(socket, providerStatusExtension, emittedProviderIds);
 }
+
+if (typeof db.getProviderStatusExtensions !== 'function') return;
+
+Promise.resolve()
+  .then(() => (typeof db.initDb === 'function' ? db.initDb() : undefined))
+  .then(() => db.getProviderStatusExtensions())
+  .then((persistedExtensions) => {
+    const currentMemoryProviderIds = new Set([
+      ...emittedProviderIds,
+      ...getLatestProviderStatusExtensions().map(getStatusExtensionProviderId).filter(Boolean)
+    ]);
+    for (const persistedExtension of persistedExtensions || []) {
+      const providerId = getStatusExtensionProviderId(persistedExtension);
+      if (providerId && currentMemoryProviderIds.has(providerId)) continue;
+      emitProviderStatusExtension(socket, persistedExtension, emittedProviderIds);
+      if (providerId) currentMemoryProviderIds.add(providerId);
+    }
+  })
+  .catch(err => writeLog(`[DB ERR] Failed to load provider status extensions: ${err.message}`));
 ```
 
-6. Frontend extracts provider identity and protocol prefix.
+7. Frontend extracts provider identity and protocol prefix.
 
 File: `frontend/src/hooks/useSocket.ts` (Function: `getOrCreateSocket`, Socket event: `provider_extension`)
 
@@ -145,7 +173,7 @@ const ext = providerBranding?.protocolPrefix || '_provider/';
 const result = routeExtension(data.method, p, ext, [], useSystemStore.getState().customCommands);
 ```
 
-7. Frontend router accepts only status method suffixes and valid shapes.
+8. Frontend router accepts only status method suffixes and valid shapes.
 
 File: `frontend/src/utils/extensionRouter.ts` (Function: `routeExtension`, Helper: `isProviderStatus`)
 
@@ -164,7 +192,7 @@ function isProviderStatus(value: unknown): value is ProviderStatus {
 }
 ```
 
-8. System store writes status by provider id.
+9. System store writes status by provider id.
 
 File: `frontend/src/store/useSystemStore.ts` (Action: `setProviderStatus`)
 
@@ -180,7 +208,7 @@ if (status) providerStatusByProviderId[resolvedProviderId] = { ...status, provid
 else delete providerStatusByProviderId[resolvedProviderId];
 ```
 
-9. Sidebar scopes a panel to each provider stack.
+10. Sidebar scopes a panel to each provider stack.
 
 File: `frontend/src/components/Sidebar.tsx` (Component: `Sidebar`, Render anchor: `ProviderStatusPanel providerId={p.providerId}`)
 
@@ -194,7 +222,7 @@ The sidebar renders a `ProviderStatusPanel` inside each expanded provider stack.
 <ProviderStatusPanel providerId={p.providerId} />
 ```
 
-10. ProviderStatusPanel renders summary rows and modal details.
+11. ProviderStatusPanel renders summary rows and modal details.
 
 File: `frontend/src/components/ProviderStatusPanel.tsx` (Components: `ProviderStatusPanels`, `ProviderStatusPanelSingle`, `ProviderStatusModal`, `ProviderStatusRow`)
 
@@ -218,8 +246,10 @@ return firstSectionItems.slice(0, 2);
 flowchart TD
   Provider[Provider adapter or ACP daemon] -->|emitProviderExtension or prefixed ACP method| AcpClient[AcpClient.handleProviderExtension]
   AcpClient -->|shape-filtered cache write| Memory[providerStatusMemory]
+  AcpClient -->|provider-scoped upsert| DB[(SQLite provider_status)]
   AcpClient -->|Socket.IO provider_extension| SocketLive[Connected browser sockets]
-  Memory -->|getLatestProviderStatusExtensions| SocketConnect[sockets/index connection hydration]
+  Memory -->|memory-first replay| SocketConnect[sockets/index connection hydration]
+  DB -->|missing-provider fallback| SocketConnect
   SocketConnect -->|Socket.IO provider_extension| SocketLive
 
   SocketLive --> UseSocket[useSocket provider_extension listener]
@@ -254,7 +284,8 @@ Rules:
 - `method` must start with the provider branding `protocolPrefix` available through `useSystemStore.getBranding(providerId)`.
 - The method suffix after `protocolPrefix` must be `provider/status` or `provider_status` for frontend rendering.
 - A stable provider id should be present at the top level, in `params.providerId`, or in `params.status.providerId`.
-- Backend cache insertion requires `params.status.sections` to be an array.
+- Backend cache insertion and SQLite persistence require `params.status.sections` to be an array.
+- SQLite persistence requires a resolved provider id; provider-less status payloads can be emitted live but are not stored in `provider_status`.
 
 ### UI Status Shape
 
@@ -337,6 +368,7 @@ Provider-owned status source
   -> provider extension method `${protocolPrefix}provider/status`
   -> AcpClient.handleProviderExtension
   -> providerStatusMemory.rememberProviderStatusExtension
+  -> database.saveProviderStatusExtension
   -> Socket.IO `provider_extension`
   -> useSocket `provider_extension` listener
   -> extensionRouter.routeExtension
@@ -400,8 +432,9 @@ Provider-owned status source
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | ACP client | `backend/services/acpClient.js` | `start`, `emitProviderExtension`, `handleAcpMessage`, `handleProviderExtension` | Receives provider emissions, routes prefixed ACP extension methods, broadcasts `provider_extension` |
-| Status cache | `backend/services/providerStatusMemory.js` | `rememberProviderStatusExtension`, `getLatestProviderStatusExtension`, `getLatestProviderStatusExtensions`, `clearProviderStatusExtension`, `cloneJson` | Validates, normalizes, clones, stores, and clears latest status extensions |
-| Socket hydration | `backend/sockets/index.js` | `registerSocketHandlers`, `connection`, `getLatestProviderStatusExtensions`, `getLatestProviderStatusExtension`, `provider_extension` | Replays cached statuses during browser socket connection |
+| Status cache | `backend/services/providerStatusMemory.js` | `normalizeProviderStatusExtension`, `rememberProviderStatusExtension`, `getLatestProviderStatusExtension`, `getLatestProviderStatusExtensions`, `clearProviderStatusExtension`, `cloneJson` | Validates, normalizes, clones, stores, and clears latest in-memory status extensions |
+| Status persistence | `backend/database.js` | `provider_status`, `saveProviderStatusExtension`, `getProviderStatusExtension`, `getProviderStatusExtensions` | Stores the latest status extension per provider and protects newer writes with `updated_at` |
+| Socket hydration | `backend/sockets/index.js` | `registerSocketHandlers`, `emitCachedProviderStatuses`, `connection`, `getLatestProviderStatusExtensions`, `getLatestProviderStatusExtension`, `provider_extension` | Replays memory statuses first and SQLite statuses for providers missing from memory |
 | Branding payload | `backend/sockets/index.js` | `buildBrandingPayload`, `protocolPrefix` | Sends provider protocol prefix to frontend routing state |
 
 ### Frontend
@@ -420,9 +453,10 @@ Provider-owned status source
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Backend cache | `backend/test/providerStatusMemory.test.js` | `providerStatusMemory` suite | Validates cache acceptance, rejection, cloning, and provider isolation |
-| Socket hydration | `backend/test/sockets-index.test.js` | `emits cached provider status on connection` | Verifies cached status replay on browser connection |
-| Backend extension broadcast | `backend/test/acpClient-routing.test.js` | `routes all handleProviderExtension paths` | Verifies `handleProviderExtension` emits `provider_extension` |
+| Backend cache | `backend/test/providerStatusMemory.test.js` | `providerStatusMemory` suite | Validates cache acceptance, normalization, rejection, cloning, and provider isolation |
+| Backend persistence | `backend/test/persistence.test.js` | `saves and retrieves the latest provider status by provider`, `resolves provider status provider id from the extension payload`, `keeps newer provider status when an older write arrives later` | Verifies SQLite provider status upsert, provider-id normalization, shape gate, and newer-write precedence |
+| Socket hydration | `backend/test/sockets-index.test.js` | `emits cached provider status on connection`, `emits persisted provider status on connection when memory is empty`, `does not emit persisted provider status over newer memory status for the same provider` | Verifies memory replay, SQLite fallback, and memory precedence on browser connection |
+| Backend extension broadcast | `backend/test/acpClient-routing.test.js` | `routes all handleProviderExtension paths`, `emits provider status extensions even when persistence fails` | Verifies `handleProviderExtension` persists status when possible and still emits `provider_extension` if persistence fails |
 | Frontend router | `frontend/src/test/extensionRouter.test.ts` | `routes generic provider status`, `routes generic provider_status alias`, `ignores malformed provider status payloads` | Verifies method suffixes and shape guard |
 | Frontend store | `frontend/src/test/useSystemStore.test.ts`, `frontend/src/test/useSystemStoreExtended.test.ts`, `frontend/src/test/useSystemStoreDeep.test.ts` | `setProviderStatus manages active status vs background status`, `setProviderStatus manages per-provider status`, `setProviderStatus handles missing resolvedProviderId`, `setProviderStatus correctly identifies active provider updates` | Verifies keyed and active status state |
 | Socket dispatch | `frontend/src/test/useSocket.test.ts` | `handles "provider_status" extension` | Verifies socket listener calls `setProviderStatus` with provider id |
@@ -436,7 +470,7 @@ Backend caching is shape-based, but frontend rendering requires `method.startsWi
 
 2. `sections` is the gate at both backend and frontend boundaries.
 
-`rememberProviderStatusExtension` and `isProviderStatus` both require `status.sections` to be an array. An empty array passes routing, but the component needs at least one item-bearing section to render visible content.
+`rememberProviderStatusExtension`, `saveProviderStatusExtension`, and `isProviderStatus` require `status.sections` to be an array. An empty array passes routing, but the component needs at least one item-bearing section to render visible content.
 
 3. Provider id resolution has fallbacks.
 
@@ -446,9 +480,9 @@ The backend and frontend resolve provider id from explicit arguments, top-level 
 
 `providerStatusMemory` stores and returns JSON clones. Mutating the result of `getLatestProviderStatusExtension` or `getLatestProviderStatusExtensions` does not mutate cache memory.
 
-5. Cache lifetime is process memory.
+5. Memory status wins over SQLite fallback.
 
-The cache is not persisted to SQLite. It survives browser refresh and socket reconnect while the backend process is alive; providers should emit status again after backend startup.
+`providerStatusMemory` holds the freshest status observed by the current backend process. Socket hydration emits memory first, then loads SQLite and skips persisted rows for providers already present in memory, so a stored cold-start value cannot overwrite a newer live provider emission.
 
 6. Compact view can show detail text.
 
@@ -479,12 +513,21 @@ Only `neutral`, `info`, `success`, `warning`, and `danger` have type support. CS
   - `ignores extensions that are not provider status payloads`
   - `returns a copy so callers cannot mutate cached memory`
   - `keeps provider status memory isolated by provider id`
+  - `normalizes provider id into status extensions without mutating the source`
+
+- `backend/test/persistence.test.js`
+  - `saves and retrieves the latest provider status by provider`
+  - `resolves provider status provider id from the extension payload`
+  - `keeps newer provider status when an older write arrives later`
 
 - `backend/test/sockets-index.test.js`
   - `emits cached provider status on connection`
+  - `emits persisted provider status on connection when memory is empty`
+  - `does not emit persisted provider status over newer memory status for the same provider`
 
 - `backend/test/acpClient-routing.test.js`
   - `routes all handleProviderExtension paths`
+  - `emits provider status extensions even when persistence fails`
 
 - `backend/test/acpClient-deep.test.js`
   - `handles handleProviderExtension without metadata`
@@ -520,7 +563,7 @@ Only `neutral`, `info`, `success`, `warning`, and `danger` have type support. CS
 ### Focused Commands
 
 ```powershell
-cd backend; npx vitest run providerStatusMemory.test.js sockets-index.test.js acpClient-routing.test.js acpClient-deep.test.js
+cd backend; npx vitest run providerStatusMemory.test.js sockets-index.test.js acpClient-routing.test.js persistence.test.js acpClient-deep.test.js
 cd frontend; npx vitest run ProviderStatusPanel.test.tsx extensionRouter.test.ts useSocket.test.ts useSystemStore.test.ts useSystemStoreExtended.test.ts useSystemStoreDeep.test.ts
 ```
 
@@ -531,14 +574,15 @@ cd frontend; npx vitest run ProviderStatusPanel.test.tsx extensionRouter.test.ts
 1. Start with the payload contract in `frontend/src/types.ts` and build a UI-ready `ProviderStatus` object.
 2. Emit `params.status` through `emitProviderExtension` or a prefixed ACP extension method using `${protocolPrefix}provider/status`.
 3. Verify `backend/services/providerStatusMemory.js` accepts the payload by checking `sections` and `providerId` normalization.
-4. Verify `frontend/src/utils/extensionRouter.ts` accepts the method and status shape.
-5. Add or adjust focused tests in `providerStatusMemory.test.js`, `extensionRouter.test.ts`, `useSystemStore*.test.ts`, and `ProviderStatusPanel.test.tsx`.
+4. Verify `backend/database.js` stores the normalized extension when a provider id is resolved.
+5. Verify `frontend/src/utils/extensionRouter.ts` accepts the method and status shape.
+6. Add or adjust focused tests in `providerStatusMemory.test.js`, `persistence.test.js`, `sockets-index.test.js`, `extensionRouter.test.ts`, `useSystemStore*.test.ts`, and `ProviderStatusPanel.test.tsx`.
 
 ### For debugging issues with this feature
 
 1. Confirm the backend emits a `provider_extension` event from `AcpClient.handleProviderExtension`.
 2. Confirm `rememberProviderStatusExtension` accepts the payload and `getLatestProviderStatusExtensions` returns it.
-3. Refresh the browser and confirm socket connection hydration replays the cached extension from `registerSocketHandlers`.
+3. Refresh the browser and confirm socket connection hydration replays the in-memory extension or, after backend restart, the SQLite extension from `registerSocketHandlers`.
 4. Confirm `useSocket` resolves the same provider id and branding `protocolPrefix` used by the extension method.
 5. Confirm `routeExtension` returns `{ type: 'provider_status', status }`.
 6. Inspect `useSystemStore.providerStatusByProviderId[providerId]` and the sidebar `ProviderStatusPanel providerId` prop.
@@ -547,9 +591,10 @@ cd frontend; npx vitest run ProviderStatusPanel.test.tsx extensionRouter.test.ts
 ## Summary
 
 - Provider status is delivered as a provider extension with a prefixed `provider/status` or `provider_status` method.
-- `AcpClient.handleProviderExtension` broadcasts every provider extension and lets `providerStatusMemory` cache only valid status payloads.
+- `AcpClient.handleProviderExtension` broadcasts every provider extension, lets `providerStatusMemory` cache only valid status payloads, and persists normalized status extensions to SQLite.
 - `providerStatusMemory` validates `params.status.sections`, normalizes provider id into the cached extension, and returns clones.
-- `registerSocketHandlers` replays cached status extensions during socket connection hydration.
+- `backend/database.js` stores latest provider status rows in `provider_status` and protects newer rows with `updated_at`.
+- `registerSocketHandlers` replays in-memory status extensions first, then emits SQLite status extensions for providers missing from memory during socket connection hydration.
 - `useSocket` resolves provider id and protocol prefix before calling `routeExtension`.
 - `routeExtension` is the frontend gate for method suffix and `sections` shape.
 - `useSystemStore.setProviderStatus` maintains both keyed provider status and active-provider status.

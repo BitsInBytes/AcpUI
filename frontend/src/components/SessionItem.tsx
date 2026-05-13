@@ -35,7 +35,7 @@ const SessionItem: React.FC<SessionItemProps> = ({ session, isActive, onSelect, 
 
   return (
     <div
-      className={`session-item ${isActive ? 'active' : ''} ${session.isPinned ? 'pinned' : ''} ${session.isTyping ? 'typing' : ''} ${session.hasUnreadResponse ? 'unread' : ''} ${session.isAwaitingPermission ? 'awaiting-permission' : ''} ${isSessionPoppedOut(session.id) ? 'popped-out' : ''}`}
+      className={`session-item ${isActive ? 'active' : ''} ${session.isPinned ? 'pinned' : ''} ${session.isTyping ? 'typing' : ''} ${session.hasUnreadResponse ? 'unread' : ''} ${session.isAwaitingPermission ? 'awaiting-permission' : ''} ${session.isAwaitingShellInput ? 'awaiting-shell-input' : ''} ${isSessionPoppedOut(session.id) ? 'popped-out' : ''}`}
       onClick={() => !isEditing && (isSessionPoppedOut(session.id) ? focusPopout(session.id) : onSelect())}
       onContextMenu={(e) => { e.preventDefault(); handleStartEdit(); }}
     >

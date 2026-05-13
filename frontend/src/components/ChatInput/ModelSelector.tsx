@@ -25,8 +25,8 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
   disabled,
   onOpenSettings
 }) => {
-  const contextPct = useSystemStore(state => activeSession?.acpSessionId ? state.contextUsageBySession[activeSession.acpSessionId] : undefined);
-  const isCompacting = useSystemStore(state => activeSession?.acpSessionId ? state.compactingBySession[activeSession.acpSessionId] : false);
+  const contextPct = useSystemStore(state => activeSession?.acpSessionId ? state.getContextUsage(activeSession.provider, activeSession.acpSessionId) : undefined);
+  const isCompacting = useSystemStore(state => activeSession?.acpSessionId ? state.getCompacting(activeSession.provider, activeSession.acpSessionId) : false);
   // Subscribe directly to the session's provider branding in providersById so the
   // component re-renders whenever provider branding is updated (e.g. after the
   // 'providers' socket event arrives), instead of relying on the stable getBranding

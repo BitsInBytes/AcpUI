@@ -58,7 +58,7 @@ describe('App Component', () => {
     };
 
     act(() => {
-      useSystemStore.setState({ socket: mockSocket as any, connected: true, isEngineReady: true });
+      useSystemStore.setState({ socket: mockSocket as any, connected: true, isEngineReady: true, invalidJsonConfigs: [] });
       useSessionLifecycleStore.setState({ 
         sessions: [
           { id: 's1', name: 'Chat 1', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, acpSessionId: 'a1' },
@@ -81,6 +81,20 @@ describe('App Component', () => {
     render(<App />);
     expect(screen.getByTestId('sidebar')).toBeInTheDocument();
     expect(screen.getByTestId('chat-input')).toBeInTheDocument();
+  });
+
+  it('renders the config error modal from root state', () => {
+    act(() => {
+      useSystemStore.setState({
+        invalidJsonConfigs: [
+          { id: 'commands-config', label: 'Custom commands configuration', path: 'commands.json', message: 'Invalid JSON' }
+        ]
+      });
+    });
+
+    render(<App />);
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument();
+    expect(screen.getByText('Custom commands configuration')).toBeInTheDocument();
   });
 
   it('switches between sessions and emits watch events', async () => {

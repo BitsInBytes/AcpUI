@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   clearProviderStatusExtension,
   getLatestProviderStatusExtension,
+  normalizeProviderStatusExtension,
   rememberProviderStatusExtension
 } from '../services/providerStatusMemory.js';
 
@@ -21,7 +22,14 @@ describe('providerStatusMemory', () => {
       }
     };
 
-    rememberProviderStatusExtension(extension);
+    expect(rememberProviderStatusExtension(extension)).toEqual({
+      providerId: 'test',
+      method: extension.method,
+      params: {
+        providerId: 'test',
+        status: extension.params.status
+      }
+    });
 
     expect(getLatestProviderStatusExtension()).toEqual({
       providerId: 'test',
@@ -77,5 +85,24 @@ describe('providerStatusMemory', () => {
 
     expect(getLatestProviderStatusExtension('a').params.status.sections[0].items[0].value).toBe('10%');
     expect(getLatestProviderStatusExtension('b').params.status.sections[0].items[0].value).toBe('90%');
+  });
+
+  it('normalizes provider id into status extensions without mutating the source', () => {
+    const extension = {
+      method: '_test.dev/provider/status',
+      params: {
+        status: { sections: [{ id: 'usage', items: [] }] }
+      }
+    };
+
+    expect(normalizeProviderStatusExtension(extension, 'test')).toEqual({
+      providerId: 'test',
+      method: extension.method,
+      params: {
+        providerId: 'test',
+        status: { providerId: 'test', sections: [{ id: 'usage', items: [] }] }
+      }
+    });
+    expect(extension.params.status.providerId).toBeUndefined();
   });
 });

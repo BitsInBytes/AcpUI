@@ -143,6 +143,34 @@ describe('acpUpdateHandler', () => {
       expect(client.io.emit).toHaveBeenCalledWith('stats_push', expect.objectContaining({ usedTokens: 50 }));
   });
 
+  it('treats usage_update as latest absolute snapshot (not additive)', async () => {
+      const meta = client.sessionMetadata.get(sid);
+      meta.usedTokens = 90;
+      meta.totalTokens = 100;
+
+      await handleUpdate(client, sid, { sessionUpdate: 'usage_update', used: 20, size: 200 });
+
+      expect(meta.usedTokens).toBe(20);
+      expect(meta.totalTokens).toBe(200);
+      expect(client.io.emit).toHaveBeenCalledWith('stats_push', expect.objectContaining({
+        usedTokens: 20,
+        totalTokens: 200
+      }));
+      expect(client.io.emit).toHaveBeenCalledWith('provider_extension', expect.objectContaining({
+        method: 'test/metadata',
+        params: expect.objectContaining({ contextUsagePercentage: 10 })
+      }));
+  });
+
+  it('clamps usage_update provider metadata to 100 percent', async () => {
+      await handleUpdate(client, sid, { sessionUpdate: 'usage_update', used: 250, size: 100 });
+
+      expect(client.io.emit).toHaveBeenCalledWith('provider_extension', expect.objectContaining({
+        method: 'test/metadata',
+        params: expect.objectContaining({ contextUsagePercentage: 100 })
+      }));
+  });
+
   it('handles tool_call start', async () => {
       await handleUpdate(client, sid, { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Running' });
       expect(client.io.emit).toHaveBeenCalledWith('system_event', expect.objectContaining({ type: 'tool_start' }));

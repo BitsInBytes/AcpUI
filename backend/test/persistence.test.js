@@ -137,6 +137,103 @@ describe('Persistence (Database)', () => {
     expect(s.configOptions).toHaveLength(1);
   });
 
+  it('saves and retrieves the latest provider status by provider', async () => {
+    const firstStatus = {
+      providerId: 'provider-a',
+      method: '_test.dev/provider/status',
+      params: {
+        providerId: 'provider-a',
+        status: {
+          providerId: 'provider-a',
+          sections: [{ id: 'usage', items: [{ id: 'quota', label: 'Quota', value: '42%' }] }]
+        }
+      }
+    };
+    const secondStatus = {
+      ...firstStatus,
+      params: {
+        ...firstStatus.params,
+        status: {
+          ...firstStatus.params.status,
+          sections: [{ id: 'usage', items: [{ id: 'quota', label: 'Quota', value: '84%' }] }]
+        }
+      }
+    };
+
+    await db.saveProviderStatusExtension('provider-a', { method: '_test.dev/provider/status', params: { status: {} } });
+    expect(await db.getProviderStatusExtensions()).toEqual([]);
+
+    await db.saveProviderStatusExtension('provider-a', firstStatus);
+    expect(await db.getProviderStatusExtension('provider-a')).toEqual(firstStatus);
+
+    await db.saveProviderStatusExtension('provider-a', secondStatus);
+    expect((await db.getProviderStatusExtension('provider-a')).params.status.sections[0].items[0].value).toBe('84%');
+    expect(await db.getProviderStatusExtension('provider-b')).toBeNull();
+    expect(await db.getProviderStatusExtensions()).toEqual([secondStatus]);
+  });
+
+  it('resolves provider status provider id from the extension payload', async () => {
+    const status = {
+      method: '_test.dev/provider/status',
+      params: {
+        status: {
+          providerId: 'provider-from-status',
+          sections: [{ id: 'usage', items: [{ id: 'quota', label: 'Quota', value: '42%' }] }]
+        }
+      }
+    };
+
+    await db.saveProviderStatusExtension(null, status);
+
+    expect(await db.getProviderStatusExtension('provider-from-status')).toEqual({
+      ...status,
+      providerId: 'provider-from-status',
+      params: {
+        providerId: 'provider-from-status',
+        status: {
+          ...status.params.status,
+          providerId: 'provider-from-status'
+        }
+      }
+    });
+  });
+
+  it('keeps newer provider status when an older write arrives later', async () => {
+    const statusAt2000 = {
+      providerId: 'provider-a',
+      method: '_test.dev/provider/status',
+      params: {
+        providerId: 'provider-a',
+        status: {
+          providerId: 'provider-a',
+          sections: [{ id: 'usage', items: [{ id: 'quota', label: 'Quota', value: 'newer' }] }]
+        }
+      }
+    };
+    const statusAt1000 = {
+      ...statusAt2000,
+      params: {
+        ...statusAt2000.params,
+        status: {
+          ...statusAt2000.params.status,
+          sections: [{ id: 'usage', items: [{ id: 'quota', label: 'Quota', value: 'older' }] }]
+        }
+      }
+    };
+    const nowSpy = vi.spyOn(Date, 'now');
+
+    try {
+      nowSpy.mockReturnValueOnce(2000);
+      await db.saveProviderStatusExtension('provider-a', statusAt2000);
+      nowSpy.mockReturnValueOnce(1000);
+      await db.saveProviderStatusExtension('provider-a', statusAt1000);
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect((await db.getProviderStatusExtension('provider-a')).params.status.sections[0].items[0].value).toBe('newer');
+  });
+
   it('handles saveConfigOptions select error', async () => {
     const mockDb = {
       get: vi.fn((_q, _p, cb) => cb(new Error('select fail'))),

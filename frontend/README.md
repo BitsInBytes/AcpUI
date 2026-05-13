@@ -9,7 +9,7 @@ It is designed to stay provider-agnostic. Branding, model metadata, and provider
 - Session navigation and message rendering.
 - Streaming output display (thoughts, tools, assistant text).
 - Sidebar/folder/session UX flows.
-- Canvas/editor/terminal surfaces, plus Shell V2 tool terminals rendered inside shell ToolSteps when `shellRunId` metadata is present, with sanitized read-only transcript rendering after command exit.
+- Canvas/editor/terminal surfaces, plus Shell V2 tool terminals rendered inside shell ToolSteps when `shellRunId` metadata is present, with sanitized read-only transcript rendering after command exit and green sidebar waiting state when a shell prompt needs user input.
 - Settings, attachments, and utility modals.
 
 ## Quick Start
@@ -39,6 +39,7 @@ npm run build
 
 - Uses a singleton Socket.IO connection.
 - Pulls system/provider/session state into dedicated stores.
+- Shows a blocking config error modal when the backend emits invalid config diagnostics through `config_errors`.
 - Renders timeline-driven chat UI from normalized event data.
 
 ## Where To Find Detailed Technical Docs

@@ -200,7 +200,9 @@ export const useStreamStore = create<StreamState>((set, get) => ({
     if (!data || !data.sessionId) return;
     const { sessionId } = data;
     // Don't clear isTyping if compaction is in progress
-    const isCompacting = useSystemStore.getState().compactingBySession[sessionId];
+    const isCompacting = useSessionLifecycleStore.getState().sessions
+      .filter(s => s.acpSessionId === sessionId)
+      .some(s => useSystemStore.getState().getCompacting(s.provider, sessionId));
     if (!isCompacting) {
       useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => s.acpSessionId === sessionId ? { ...s, isTyping: false } : s) }));
     }
@@ -214,7 +216,9 @@ export const useStreamStore = create<StreamState>((set, get) => ({
       if (isQueueEmpty || isTimedOut) {
         clearInterval(check);
         const activeMsgId = activeMsgIdByAcp[sessionId];
-        const isCompacting = useSystemStore.getState().compactingBySession[sessionId];
+        const isCompacting = useSessionLifecycleStore.getState().sessions
+          .filter(s => s.acpSessionId === sessionId)
+          .some(s => useSystemStore.getState().getCompacting(s.provider, sessionId));
 
         useSessionLifecycleStore.setState(state => {
           const activeId = state.activeSessionId;
