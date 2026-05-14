@@ -36,6 +36,32 @@ describe('useScroll', () => {
     expect(toggleAutoScrollMock).toHaveBeenCalled();
   });
 
+  it('uses the latest auto-scroll disabled flag without remounting', async () => {
+    const { result } = renderHook(() => useScroll('1', [], 3));
+    const mockEl = { scrollTop: 0, scrollHeight: 1000, clientHeight: 500 };
+    (result.current.scrollRef as any).current = mockEl;
+
+    act(() => {
+      useUIStore.setState({ isAutoScrollDisabled: true });
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.scrollToBottom();
+      result.current.handleWheel({ deltaY: -10 } as any);
+    });
+
+    await act(async () => {
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    });
+
+    expect(mockEl.scrollTop).toBe(0);
+    expect(result.current.showScrollButton).toBe(true);
+  });
+
   it('should scroll to bottom when session changes even if manually disabled', () => {
     act(() => { useUIStore.setState({ isAutoScrollDisabled: true }); });
     const { result, rerender } = renderHook(

@@ -26,9 +26,11 @@ class ErrorBoundary extends React.Component<{ children: React.ReactNode; onError
 
 function PopOutApp() {
   const popoutSessionId = new URLSearchParams(window.location.search).get('popout')!;
-  const [ready, setReady] = useState(false);
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const didInitRef = useRef(false);
 
-  const { sessions, activeSessionId } = useSessionLifecycleStore();
+  const { sessions, activeSessionId, setSessions, setActiveSessionId, hydrateSession } = useSessionLifecycleStore();
   const { visibleCount } = useUIStore();
   const {
     isCanvasOpen, canvasArtifacts, activeCanvasArtifact, canvasError,
@@ -47,35 +49,43 @@ function PopOutApp() {
   useChatManager(
     scrollToBottom,
     (filePath) => handleFileEdited(socket, filePath),
-    (filePath) => handleOpenFileInCanvas(socket, activeSessionId, filePath)
+    (filePath) => handleOpenFileInCanvas(socket, activeSessionId, filePath),
+    { skipInitialLoad: true }
   );
 
   // Initialize: load the specific session and claim ownership
   useEffect(() => {
-    if (!socket || !popoutSessionId || ready) return;
+    if (!socket || !popoutSessionId || didInitRef.current) return;
+    didInitRef.current = true;
 
-    // Claim ownership via BroadcastChannel
     claimSession(popoutSessionId);
+    setActiveSessionId(popoutSessionId);
 
-    // Set the active session
-    useSessionLifecycleStore.setState({ activeSessionId: popoutSessionId });
-
-    // Load sessions from backend
-    socket.emit('load_sessions', (res: { sessions?: ChatSession[] }) => {
-      if (res.sessions) {
-        const mapped = res.sessions.map((s: ChatSession) => ({ ...s, isTyping: false, isWarmingUp: false }));
-        useSessionLifecycleStore.setState({ sessions: mapped, activeSessionId: popoutSessionId });
-
-        // Hydrate the session
-        const session = mapped.find((s: ChatSession) => s.id === popoutSessionId);
-        if (session?.acpSessionId) {
-          socket.emit('watch_session', { sessionId: session.acpSessionId });
-          useSessionLifecycleStore.getState().hydrateSession(socket, popoutSessionId);
-        }
-        setReady(true);
+    socket.emit('load_sessions', (res: { sessions?: ChatSession[]; error?: string }) => {
+      if (!Array.isArray(res.sessions)) {
+        setLoadError(res.error || 'Could not load sessions for pop-out window.');
+        setStatus('error');
+        return;
       }
+
+      const mapped = res.sessions.map((s: ChatSession) => ({ ...s, isTyping: false, isWarmingUp: false }));
+      setSessions(mapped);
+      setActiveSessionId(popoutSessionId);
+
+      const session = mapped.find((s: ChatSession) => s.id === popoutSessionId);
+      if (!session) {
+        setLoadError(`Session ${popoutSessionId} was not found.`);
+        setStatus('error');
+        return;
+      }
+
+      if (session.acpSessionId) {
+        socket.emit('watch_session', { sessionId: session.acpSessionId });
+      }
+      hydrateSession(socket, popoutSessionId);
+      setStatus('ready');
     });
-  }, [socket, popoutSessionId, ready]);
+  }, [socket, popoutSessionId, setActiveSessionId, setSessions, hydrateSession]);
 
   // Canvas resize
   const [chatWidth, setChatWidth] = useState<number | null>(null);
@@ -103,10 +113,20 @@ function PopOutApp() {
     if (activeSession?.name) document.title = `${activeSession.name} — Pop Out`;
   }, [activeSession?.name]);
 
-  if (!ready) {
+  if (status === 'loading') {
     return (
       <div className="app-container" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8b949e' }}>
         Loading session...
+        <ConfigErrorModal />
+      </div>
+    );
+  }
+
+  if (status === 'error') {
+    return (
+      <div className="app-container" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#ff7b72', flexDirection: 'column', gap: '6px' }}>
+        <div>Failed to load session.</div>
+        {loadError && <div>{loadError}</div>}
         <ConfigErrorModal />
       </div>
     );

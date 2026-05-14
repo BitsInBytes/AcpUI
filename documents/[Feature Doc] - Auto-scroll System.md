@@ -142,7 +142,7 @@ const scrollToBottom = useCallback((force = false) => {
   const el = scrollRef.current;
   if (!el) return;
 
-  if (isAutoScrollDisabled && !force) return;
+  if (isAutoScrollDisabledRef.current && !force) return;
 
   if (force || isAutoScrollEnabledRef.current) {
     if (force) {
@@ -184,7 +184,7 @@ The pill is active when non-forced auto-scroll calls are allowed.
 ```typescript
 // FILE: frontend/src/hooks/useScroll.ts (function: `toggleAutoScroll`)
 const toggleAutoScroll = useCallback(() => {
-  const wasDisabled = isAutoScrollDisabled;
+  const wasDisabled = isAutoScrollDisabledRef.current;
   toggleAutoScrollStore();
 
   if (wasDisabled) {
@@ -222,7 +222,7 @@ const handleScroll = useCallback(() => {
   if (isAtBottom) {
     setShowScrollButton(false);
   } else if (isScrollingUp) {
-    if (isAutoScrollDisabled) setShowScrollButton(true);
+    if (isAutoScrollDisabledRef.current) setShowScrollButton(true);
   }
 
   lastScrollTop.current = el.scrollTop;
@@ -500,6 +500,7 @@ React commit or syntax-highlighted/code/tool content grows .chat-content
 
 1. Two states have different meanings.
    - `useUIStore.isAutoScrollDisabled` is persisted and global; `isAutoScrollEnabled` is live stickiness for a hook instance.
+   - Event handlers and non-forced scroll paths read the persisted flag through `isAutoScrollDisabledRef.current` to avoid stale closure behavior after runtime toggles.
 
 2. Forced scrolling bypasses the persisted toggle.
    - `scrollToBottom(true)` runs on session changes and back-to-bottom recovery so the user can always reach the newest content.

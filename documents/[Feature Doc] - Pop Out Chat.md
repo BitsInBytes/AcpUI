@@ -488,9 +488,9 @@ A pop-out owns its own session but does not store that ownership as a local `pop
 
 BroadcastChannel `announce` can mark a session as popped out even when the current window has no `Window` reference for `focusPopout`. In that state the sidebar can show `popped-out` while a click cannot focus the detached window from this main page context.
 
-### 4. `ready` depends on `load_sessions` returning a `sessions` array
+### 4. `PopOutApp` always settles loading state from the `load_sessions` callback
 
-`PopOutApp` renders `Loading session...` until the `load_sessions` callback includes `res.sessions`. Socket failures or callback shape changes leave the detached UI in the loading state.
+`PopOutApp` transitions to `ready` on a valid target session and transitions to `error` when callbacks return missing sessions, explicit errors, or no matching pop-out session ID. Detached windows no longer remain stuck in loading on callback failure paths.
 
 ### 5. Header controls and modal roots are different in the detached shell
 
@@ -632,7 +632,8 @@ The main and detached windows communicate through `BroadcastChannel`, so they mu
 - `SessionItem` starts the flow with `openPopout(session.id)` and uses `isSessionPoppedOut` to gate sidebar selection.
 - `sessionOwnership.ts` owns BroadcastChannel messaging, opener window references, and unload release behavior.
 - `main.tsx` routes `?popout` windows to `PopOutApp`.
-- `PopOutApp` claims the UI session ID, loads sessions, watches the ACP session room, hydrates the session, and renders the detached chat shell.
+- `PopOutApp` claims the UI session ID, runs one pop-out-specific `load_sessions` path, sets loading/ready/error status from callback outcomes, watches the ACP session room, hydrates the session, and renders the detached chat shell.
+- `useChatManager` ignores stream events for sessions marked as owned by another window, so stale room subscriptions cannot mutate non-owning windows.
 - `ChatHeader` hides main-window-only controls in pop-out mode.
 - `ChatInput` keeps normal prompt, attachment, terminal, canvas, model, and context controls, with modal roots limited by the detached shell.
 - Backend socket rooms use ACP session IDs; frontend ownership uses UI session IDs.

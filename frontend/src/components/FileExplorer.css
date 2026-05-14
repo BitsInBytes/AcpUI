@@ -120,6 +120,16 @@
   align-items: center;
 }
 
+.fe-save-error {
+  color: #ff7b72;
+  font-size: 0.78em;
+  margin-left: 8px;
+  max-width: 280px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .fe-tab-btn {
   background: none;
   border: 1px solid rgba(255, 255, 255, 0.15);

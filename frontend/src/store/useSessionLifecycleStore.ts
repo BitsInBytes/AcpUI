@@ -180,9 +180,9 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
     };
 
     set(state => ({
-      sessions: [...state.sessions, newSession],
-      activeSessionId: uiId
+      sessions: [...state.sessions, newSession]
     }));
+    get().setActiveSessionId(uiId);
 
     socket.emit('save_snapshot', newSession);
 
@@ -229,9 +229,9 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
       : false;
 
     set(state => ({
-      activeSessionId: uiId,
       sessions: state.sessions.map(s => s.id === uiId ? { ...s, hasUnreadResponse: false } : s)
     }));
+    get().setActiveSessionId(uiId);
 
     if (session.acpSessionId && !session.isWarmingUp && session.messages.length > 0) {
       if (!hasCachedContext) get().hydrateSession(socket, uiId);
@@ -321,7 +321,8 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
       ? activeSessionId
       : null;
 
-    set({ sessions: updated, activeSessionId: nextActiveId });
+    set({ sessions: updated });
+    get().setActiveSessionId(nextActiveId);
   },
 
   handleTogglePin: (socket, id) => {

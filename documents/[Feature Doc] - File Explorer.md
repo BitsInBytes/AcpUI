@@ -468,13 +468,13 @@ No database tables are used. File Explorer state is frontend-local, and file per
 
    `loadDir` passes `res.items || []`, and `openFileHandler` uses `res.content || ''`. Backend errors are available in callback payloads and logs, but the modal does not render an error state.
 
-7. Debounced save does not wait for backend acknowledgement.
+7. Debounced save waits for backend acknowledgement.
 
-   `handleChange` emits `explorer_write` without a callback and sets `original` to the emitted content. This clears dirty state even when the backend write fails after emission.
+   `handleChange` debounces `explorer_write` with a callback and updates `original` only when `{ success: true }` is returned. Failed writes keep the dirty marker.
 
-8. Manual save does not inspect callback payloads.
+8. Manual save validates callback payloads.
 
-   `handleSave` clears dirty state and `saving` in the callback regardless of `{ success: true }` or `{ error }`. UI error handling must be added before treating write failures as visible user feedback.
+   `handleSave` clears dirty state only on explicit `{ success: true }`, keeps dirty state on `{ error }`, and surfaces failures in the editor header with a visible error message.
 
 9. Markdown preview unmounts Monaco.
 
@@ -564,4 +564,4 @@ Frontend test coverage note: the current suite does not directly assert `handleS
 - The critical contract is that `explorer_list`, `explorer_read`, and `explorer_write` call `safePath`/`resolvePathWithinRoot` before filesystem access.
 - Directory listings filter dotfiles, sort directories first, and lazy-load child nodes through `TreeItem` expansion.
 - Markdown files use `ReactMarkdown` preview by default; other edit views use Monaco with `getLanguage` extension mapping.
-- Manual save waits for a callback; debounced save emits after 1500 ms and clears dirty state without waiting for backend acknowledgement.
+- Manual and debounced saves both require explicit `{ success: true }` callbacks before clearing dirty state; failed writes keep dirty state and surface an inline save error.

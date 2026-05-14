@@ -8,6 +8,7 @@ import { useVoiceStore } from '../store/useVoiceStore';
 import { useSubAgentStore } from '../store/useSubAgentStore';
 import { useShellRunStore, type ShellRunSnapshot } from '../store/useShellRunStore';
 import { ACP_UX_TOOL_NAMES, isAcpUxShellToolEvent, isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
+import { isSessionPoppedOut } from '../lib/sessionOwnership';
 
 /**
  * Central socket event dispatcher. Wires socket.io events to the appropriate stores.
@@ -23,8 +24,10 @@ import { ACP_UX_TOOL_NAMES, isAcpUxShellToolEvent, isAcpUxSubAgentStartToolEvent
 export function useChatManager(
   scrollToBottom: () => void,
   onFileEdited?: (path: string) => void,
-  onOpenFileInCanvas?: (path: string) => void
+  onOpenFileInCanvas?: (path: string) => void,
+  options?: { skipInitialLoad?: boolean }
 ) {
+  const skipInitialLoad = options?.skipInitialLoad === true;
   const socket = useSystemStore(state => state.socket);
   
   // Session actions from chat store
@@ -41,7 +44,7 @@ export function useChatManager(
 
   // Initial Load
   useEffect(() => {
-    if (socket) {
+    if (socket && !skipInitialLoad) {
       // Mock fetchAudioDevices for now or import it correctly
       const mockFetch = async () => {
         try {
@@ -56,7 +59,7 @@ export function useChatManager(
       };
       handleInitialLoad(socket, mockFetch);
     }
-  }, [socket, handleInitialLoad]);
+  }, [socket, handleInitialLoad, skipInitialLoad]);
 
   // Socket Listeners
   useEffect(() => {
@@ -212,12 +215,20 @@ export function useChatManager(
       }));
     };
 
+    const shouldProcessSessionStream = (sessionId?: string | null) => {
+      if (!sessionId) return false;
+      const owner = useSessionLifecycleStore.getState().sessions.find(s => s.acpSessionId === sessionId);
+      if (!owner) return true;
+      return !isSessionPoppedOut(owner.id);
+    };
+
     // Pending sub-agents — session created lazily on first token
     const pendingSubAgents = new Map<string, { providerId: string; acpSessionId: string; uiId: string; index: number; name: string; prompt: string; agent: string; parentSessionId: string; parentUiId: string; model: string }>();
 
     // Intercept tokens to lazily create sub-agent sessions
     const origOnStreamToken = onStreamToken;
     const wrappedOnStreamToken = (data: { sessionId: string; text: string }) => {
+      if (!shouldProcessSessionStream(data.sessionId)) return;
       if (pendingSubAgents.has(data.sessionId)) {
         const pending = pendingSubAgents.get(data.sessionId)!;
         pendingSubAgents.delete(data.sessionId);
@@ -274,10 +285,17 @@ export function useChatManager(
         }) }));
     });
 
-    socket.on('thought', onStreamThought);
+    socket.on('thought', (data: { sessionId: string; text: string }) => {
+      if (!shouldProcessSessionStream(data?.sessionId)) return;
+      onStreamThought(data);
+    });
     socket.on('token', wrappedOnStreamToken);
-    socket.on('system_event', onStreamEvent);
+    socket.on('system_event', (event: StreamEventData) => {
+      if (!shouldProcessSessionStream(event?.sessionId)) return;
+      onStreamEvent(event);
+    });
     socket.on('permission_request', (event: StreamEventData) => {
+      if (!shouldProcessSessionStream(event?.sessionId)) return;
       // Check if this is a sub-agent permission
       const agents = useSubAgentStore.getState().agents;
       const evtData = event as unknown as { sessionId: string; id: number; options: { optionId: string; name: string; kind: string }[]; toolCall: { title: string; toolCallId?: string } };
@@ -295,6 +313,7 @@ export function useChatManager(
       onStreamEvent({ ...event, type: 'permission_request' });
     });
     socket.on('token_done', (data: StreamDoneData) => {
+      if (!shouldProcessSessionStream(data?.sessionId)) return;
       onStreamDone(socket, data);
       const { notificationSound, notificationDesktop, workspaceCwds, branding } = useSystemStore.getState();
       const activeAcpId = useSessionLifecycleStore.getState().sessions.find(s => s.id === useSessionLifecycleStore.getState().activeSessionId)?.acpSessionId;
@@ -498,6 +517,7 @@ export function useChatManager(
 
     // Route system_event for sub-agent tool steps to the sub-agent store
     const subAgentSystemHandler = (data: { sessionId: string; type: string; id: string; title: string; status?: string; output?: string }) => {
+      if (!shouldProcessSessionStream(data?.sessionId)) return;
       // Lazily create session if pending
       if (pendingSubAgents.has(data.sessionId)) {
         const pending = pendingSubAgents.get(data.sessionId)!;

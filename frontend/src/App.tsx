@@ -11,7 +11,7 @@ import { useSessionLifecycleStore } from './store/useSessionLifecycleStore';
 import { useInputStore } from './store/useInputStore';
 import { useCanvasStore } from './store/useCanvasStore';
 import { useUIStore } from './store/useUIStore';
-import { setOwnershipChangeCallback } from './lib/sessionOwnership';
+import { isSessionPoppedOut, setOwnershipChangeCallback } from './lib/sessionOwnership';
 import { computeResizeWidth } from './utils/resizeHelper';
 
 // Components
@@ -110,7 +110,13 @@ function App() {
       const prevSession = sessions.find(s => s.id === lastActiveSessionIdRef.current);
       const newSession = sessions.find(s => s.id === activeSessionId);
       if (prevSession?.acpSessionId && socket && !prevSession.isTyping) socket.emit('unwatch_session', { sessionId: prevSession.acpSessionId });
-      if (newSession?.acpSessionId && socket) socket.emit('watch_session', { sessionId: newSession.acpSessionId });
+      if (newSession && isSessionPoppedOut(newSession.id)) {
+        useSessionLifecycleStore.getState().setActiveSessionId(null);
+        return;
+      }
+      if (newSession?.acpSessionId && socket) {
+        socket.emit('watch_session', { sessionId: newSession.acpSessionId });
+      }
       // Save current session's canvas open state
       const prevId = lastActiveSessionIdRef.current;
       if (prevId) {

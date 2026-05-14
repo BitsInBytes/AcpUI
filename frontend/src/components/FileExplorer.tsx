@@ -25,6 +25,7 @@ const FileExplorer: React.FC = () => {
   const [previewMode, setPreviewMode] = useState(false);
   const [rootLabel, setRootLabel] = useState('');
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadDir = useCallback((dirPath: string, cb: (items: DirEntry[]) => void) => {
@@ -41,6 +42,7 @@ const FileExplorer: React.FC = () => {
     setExpanded(new Set());
     setOpenFile(null);
     setPreviewMode(false);
+    setSaveError(null);
     const handleRoot = (res: { root?: string }) => {
       setRootLabel(res.root || '');
     };
@@ -54,6 +56,12 @@ const FileExplorer: React.FC = () => {
     });
   }, [isOpen, socket, providerId, loadDir]);
   /* eslint-enable react-hooks/set-state-in-effect */
+
+  useEffect(() => {
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, []);
 
   const toggleDir = (node: TreeNode) => {
     const key = node.path;
@@ -82,25 +90,53 @@ const FileExplorer: React.FC = () => {
       const content = res.content || '';
       setOpenFile({ path: filePath, content, original: content });
       setPreviewMode(filePath.endsWith('.md'));
+      setSaveError(null);
     });
   };
+
+  const emitWrite = useCallback((filePath: string, content: string, onSuccess?: () => void) => {
+    if (!socket) return;
+    socket.emit(
+      'explorer_write',
+      { ...(providerId ? { providerId } : {}), filePath, content },
+      (res: { success?: boolean; error?: string }) => {
+        if (res?.success) {
+          setSaveError(null);
+          onSuccess?.();
+          return;
+        }
+        setSaveError(res?.error || 'Failed to save file.');
+      }
+    );
+  }, [socket, providerId]);
 
   const handleSave = () => {
     if (!openFile || !socket) return;
     setSaving(true);
-    socket.emit('explorer_write', { ...(providerId ? { providerId } : {}), filePath: openFile.path, content: openFile.content }, () => {
-      setOpenFile(prev => prev ? { ...prev, original: prev.content } : null);
-      setSaving(false);
-    });
+    socket.emit(
+      'explorer_write',
+      { ...(providerId ? { providerId } : {}), filePath: openFile.path, content: openFile.content },
+      (res: { success?: boolean; error?: string }) => {
+        if (res?.success) {
+          setSaveError(null);
+          setOpenFile(prev => prev ? { ...prev, original: prev.content } : null);
+        } else {
+          setSaveError(res?.error || 'Failed to save file.');
+        }
+        setSaving(false);
+      }
+    );
   };
 
   const handleChange = (content: string) => {
+    const currentPath = openFile?.path;
     setOpenFile(prev => prev ? { ...prev, content } : null);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      if (!socket || !openFile) return;
-      socket.emit('explorer_write', { ...(providerId ? { providerId } : {}), filePath: openFile.path, content });
-      setOpenFile(prev => prev ? { ...prev, original: content } : null);
+      if (!currentPath) return;
+      emitWrite(currentPath, content, () => {
+        setOpenFile(prev => prev && prev.path === currentPath ? { ...prev, original: content } : prev);
+      });
     }, 1500);
   };
 
@@ -161,6 +197,7 @@ const FileExplorer: React.FC = () => {
                         <Save size={14} /> {saving ? 'Saving...' : 'Save'}
                       </button>
                     </div>
+                    {saveError && <span className="fe-save-error" role="alert">{saveError}</span>}
                   </div>
                   <div className="fe-editor-content">
                     {previewMode && isMarkdown ? (

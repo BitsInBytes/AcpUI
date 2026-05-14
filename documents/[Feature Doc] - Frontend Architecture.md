@@ -61,7 +61,7 @@ This architecture doc intentionally avoids duplicating feature-level rendering r
 3. **Pop-out shell**
    File: `frontend/src/PopOutApp.tsx` (Component: `PopOutApp`)
 
-   `PopOutApp` claims a single URL-selected session, loads sessions, watches the selected ACP session, and renders the chat surface without the sidebar shell.
+   `PopOutApp` claims a single URL-selected session, runs a dedicated one-time `load_sessions` path, sets explicit loading/ready/error UI states for callback outcomes, watches the selected ACP session when available, and renders the chat surface without the sidebar shell.
 
 4. **Socket bootstrap**
    File: `frontend/src/hooks/useSocket.ts` (Function: `getOrCreateSocket`, Hook: `useSocket`)
@@ -71,7 +71,7 @@ This architecture doc intentionally avoids duplicating feature-level rendering r
 5. **Turn-level dispatcher**
    File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`)
 
-   The chat manager registers stream, stats, rename, shell, sub-agent, and permission listeners. It routes events into lifecycle, stream, shell-run, and sub-agent stores.
+   The chat manager registers stream, stats, rename, shell, sub-agent, and permission listeners. It drops stream events for sessions currently owned by another pop-out window and routes remaining events into lifecycle, stream, shell-run, and sub-agent stores.
 
 6. **State ownership**
    Directory: `frontend/src/store/`
@@ -214,8 +214,8 @@ If this contract is broken, background streams can write into the wrong chat, sh
 8. **Config diagnostics block interaction**
    `config_errors` drives the non-dismissible `ConfigErrorModal`; recovery happens by fixing config and reconnecting/reloading.
 
-9. **Normal and pop-out windows share runtime hooks but not shell ownership**
-   Check both roots when changing session selection, watch rooms, URL sync, or canvas behavior.
+9. **Normal and pop-out windows share runtime hooks but not initial-load ownership**
+   `PopOutApp` must pass `skipInitialLoad` to `useChatManager` and keep its dedicated `load_sessions` lifecycle so detached windows do not run duplicate session loading paths.
 
 ---
 

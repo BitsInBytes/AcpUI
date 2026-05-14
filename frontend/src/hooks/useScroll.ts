@@ -27,7 +27,7 @@ export function useScroll(activeSessionId: string | null, activeSessionMessages:
     const el = scrollRef.current;
     if (!el) return;
 
-    if (isAutoScrollDisabled && !force) return;
+    if (isAutoScrollDisabledRef.current && !force) return;
 
     if (force || isAutoScrollEnabledRef.current) {
       if (force) {
@@ -46,17 +46,17 @@ export function useScroll(activeSessionId: string | null, activeSessionMessages:
         snapToBottom();
       });
     }
-  }, [isAutoScrollDisabled, snapToBottom]);
+  }, [snapToBottom]);
 
   const toggleAutoScroll = useCallback(() => {
-    const wasDisabled = isAutoScrollDisabled;
+    const wasDisabled = isAutoScrollDisabledRef.current;
     toggleAutoScrollStore();
 
     // If we are about to enable it (wasDisabled is true), scroll to bottom
     if (wasDisabled) {
       scrollToBottom(true);
     }
-  }, [isAutoScrollDisabled, toggleAutoScrollStore, scrollToBottom]);
+  }, [toggleAutoScrollStore, scrollToBottom]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -73,20 +73,19 @@ export function useScroll(activeSessionId: string | null, activeSessionMessages:
     if (isAtBottom) {
       setShowScrollButton(false);
     } else if (isScrollingUp) {
-      if (isAutoScrollDisabled) setShowScrollButton(true);
+      if (isAutoScrollDisabledRef.current) setShowScrollButton(true);
     }
 
     lastScrollTop.current = el.scrollTop;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleWheel = (e: React.WheelEvent) => {
+  const handleWheel = useCallback((e: React.WheelEvent) => {
     if (e.deltaY < 0 && isAutoScrollEnabledRef.current) {
       isAutoScrollEnabledRef.current = false;
       setIsAutoScrollEnabled(false);
-      if (isAutoScrollDisabled) setShowScrollButton(true);
+      if (isAutoScrollDisabledRef.current) setShowScrollButton(true);
     }
-  };
+  }, []);
 
   // Observe content growth and pin the scroll to the bottom while auto-scroll
   // is on. This catches rapid layout changes — large tool outputs, multiple

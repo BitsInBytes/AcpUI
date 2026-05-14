@@ -206,7 +206,8 @@ const Sidebar: React.FC = () => {
     const nextId = activeSessionId && !removeIds.has(activeSessionId)
       ? activeSessionId
       : null;
-    useSessionLifecycleStore.setState({ sessions: updated, activeSessionId: nextId });
+    useSessionLifecycleStore.getState().setSessions(updated);
+    useSessionLifecycleStore.getState().setActiveSessionId(nextId);
   };
 
   const handleDropSession = (sessionId: string, folderId: string | null) => {

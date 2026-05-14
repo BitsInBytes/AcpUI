@@ -5,6 +5,12 @@ import FileExplorer from '../components/FileExplorer';
 import { useSystemStore } from '../store/useSystemStore';
 import { useUIStore } from '../store/useUIStore';
 
+vi.mock('@monaco-editor/react', () => ({
+  default: ({ value, onChange }: { value: string; onChange?: (value: string) => void }) => (
+    <textarea data-testid="monaco-mock" value={value} onChange={(e) => onChange?.(e.target.value)} />
+  )
+}));
+
 describe('FileExplorer', () => {
   const mockSocket = {
     emit: vi.fn((event: string, ...args: any[]) => {
@@ -103,5 +109,68 @@ describe('FileExplorer', () => {
     render(<FileExplorer />);
     fireEvent.click(document.querySelector('.file-explorer-overlay')!);
     expect(useUIStore.getState().isFileExplorerOpen).toBe(false);
+  });
+
+  it('keeps dirty state and shows error when manual save fails', () => {
+    mockSocket.emit.mockImplementation((event: string, ...args: any[]) => {
+      if (event === 'explorer_root') {
+        const cb = typeof args[0] === 'function' ? args[0] : args[1];
+        cb({ root: '~/.agent-data' });
+      }
+      if (event === 'explorer_list') {
+        const cb = args[1];
+        cb({ items: [{ name: 'settings.json', isDirectory: false }] });
+      }
+      if (event === 'explorer_read') {
+        const cb = args[1];
+        cb({ content: '{"key":"value"}', filePath: 'settings.json' });
+      }
+      if (event === 'explorer_write') {
+        const cb = args[1];
+        cb({ error: 'write failed' });
+      }
+    });
+
+    render(<FileExplorer />);
+    fireEvent.click(screen.getByText('settings.json'));
+    fireEvent.change(screen.getByTestId('monaco-mock'), { target: { value: '{"key":"changed"}' } });
+    fireEvent.click(screen.getByText('Save'));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('write failed');
+    expect(screen.getByText('●')).toBeInTheDocument();
+  });
+
+  it('clears dirty state only after autosave callback success', () => {
+    vi.useFakeTimers();
+    mockSocket.emit.mockImplementation((event: string, ...args: any[]) => {
+      if (event === 'explorer_root') {
+        const cb = typeof args[0] === 'function' ? args[0] : args[1];
+        cb({ root: '~/.agent-data' });
+      }
+      if (event === 'explorer_list') {
+        const cb = args[1];
+        cb({ items: [{ name: 'settings.json', isDirectory: false }] });
+      }
+      if (event === 'explorer_read') {
+        const cb = args[1];
+        cb({ content: '{"key":"value"}', filePath: 'settings.json' });
+      }
+      if (event === 'explorer_write') {
+        const cb = args[1];
+        cb({ success: true });
+      }
+    });
+
+    render(<FileExplorer />);
+    fireEvent.click(screen.getByText('settings.json'));
+    fireEvent.change(screen.getByTestId('monaco-mock'), { target: { value: '{"key":"changed"}' } });
+
+    expect(screen.getByText('●')).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(1500);
+    });
+    expect(screen.queryByText('●')).not.toBeInTheDocument();
+
+    vi.useRealTimers();
   });
 });

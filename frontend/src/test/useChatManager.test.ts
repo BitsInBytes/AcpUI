@@ -5,12 +5,18 @@ import { useSystemStore } from '../store/useSystemStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useStreamStore } from '../store/useStreamStore';
 import { useShellRunStore } from '../store/useShellRunStore';
+import { isSessionPoppedOut } from '../lib/sessionOwnership';
+
+vi.mock('../lib/sessionOwnership', () => ({
+  isSessionPoppedOut: vi.fn(() => false)
+}));
 
 describe('useChatManager hook', () => {
   let mockSocket: any;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(isSessionPoppedOut).mockReturnValue(false);
     mockSocket = {
       on: vi.fn(),
       off: vi.fn(),
@@ -56,6 +62,18 @@ describe('useChatManager hook', () => {
     expect(mockSocket.on).toHaveBeenCalled();
   });
 
+  it('skips initial load when configured', () => {
+    const handleInitialLoad = vi.fn();
+    act(() => {
+      useSessionLifecycleStore.setState({ handleInitialLoad });
+    });
+
+    renderHook(() => useChatManager(vi.fn(), vi.fn(), vi.fn(), { skipInitialLoad: true }));
+
+    expect(handleInitialLoad).not.toHaveBeenCalled();
+    expect(mockSocket.on).toHaveBeenCalled();
+  });
+
   it('handles "stats_push" event', () => {
     const setSessions = vi.fn();
     act(() => {
@@ -72,6 +90,32 @@ describe('useChatManager hook', () => {
 
     expect(useSystemStore.getState().getContextUsage('provider-a', 'acp-1')).toBe(10);
     expect(setSessions).toHaveBeenCalled();
+  });
+
+  it('ignores stream events for sessions owned by a pop-out window', () => {
+    vi.mocked(isSessionPoppedOut).mockReturnValue(true);
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{ id: 's1', acpSessionId: 'acp-1', provider: 'provider-a', messages: [] } as any],
+        activeSessionId: 's1'
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const tokenHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'token')[1];
+    const thoughtHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'thought')[1];
+    const eventHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'system_event')[1];
+    const doneHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'token_done')[1];
+
+    act(() => {
+      thoughtHandler({ sessionId: 'acp-1', text: 'thinking' });
+      tokenHandler({ sessionId: 'acp-1', text: 'hello' });
+      eventHandler({ sessionId: 'acp-1', type: 'tool_start', id: 't1', title: 'Tool', status: 'in_progress' });
+      doneHandler({ sessionId: 'acp-1' });
+    });
+
+    const queue = useStreamStore.getState().streamQueues['acp-1'];
+    expect(queue).toBeUndefined();
   });
 
   it('handles "permission_request" for sub-agent', async () => {

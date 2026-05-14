@@ -93,6 +93,17 @@ describe('PopOutApp', () => {
     expect(screen.getByText('Loading session...')).toBeInTheDocument();
   });
 
+  it('uses chat manager without initial load duplication', async () => {
+    render(<PopOutApp />);
+    const chatManagerModule = await import('../hooks/useChatManager');
+    expect(chatManagerModule.useChatManager).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.any(Function),
+      expect.any(Function),
+      { skipInitialLoad: true }
+    );
+  });
+
   it('renders the config error modal while loading', () => {
     act(() => {
       systemStore.setState({
@@ -187,6 +198,38 @@ describe('PopOutApp', () => {
     expect(hydrateSession).toHaveBeenCalled();
 
     vi.useRealTimers();
+  });
+
+  it('shows an error state when load_sessions returns no sessions payload', () => {
+    socketToReturn = {
+      on: vi.fn(), off: vi.fn(), connected: true, close: vi.fn(),
+      emit: vi.fn((event: string, ...args: any[]) => {
+        if (event === 'load_sessions') {
+          const cb = args[0];
+          cb({ error: 'boom' });
+        }
+      })
+    };
+
+    render(<PopOutApp />);
+    expect(screen.getByText('Failed to load session.')).toBeInTheDocument();
+    expect(screen.getByText('boom')).toBeInTheDocument();
+  });
+
+  it('shows an error state when target session is missing from load_sessions', () => {
+    socketToReturn = {
+      on: vi.fn(), off: vi.fn(), connected: true, close: vi.fn(),
+      emit: vi.fn((event: string, ...args: any[]) => {
+        if (event === 'load_sessions') {
+          const cb = args[0];
+          cb({ sessions: [{ id: 'other', name: 'Other', messages: [], model: 'balanced', acpSessionId: 'acp-other' }] });
+        }
+      })
+    };
+
+    render(<PopOutApp />);
+    expect(screen.getByText('Failed to load session.')).toBeInTheDocument();
+    expect(screen.getByText('Session pop-1 was not found.')).toBeInTheDocument();
   });
 
   it('claims session ownership on mount', async () => {
