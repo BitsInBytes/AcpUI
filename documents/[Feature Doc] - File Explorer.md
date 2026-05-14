@@ -27,7 +27,7 @@ This guide matters because File Explorer combines UI state, provider selection, 
 
 - Frontend modal: `frontend/src/components/FileExplorer.tsx` (Component: `FileExplorer`, helper component: `TreeItem`).
 - Frontend state: `frontend/src/store/useUIStore.ts` (State: `isFileExplorerOpen`, action: `setFileExplorerOpen`) and `frontend/src/store/useSystemStore.ts` (State: `socket`, `activeProviderId`, `defaultProviderId`).
-- Backend socket handlers: `backend/sockets/fileExplorerHandlers.js` (Export: `registerFileExplorerHandlers`, functions: `getRoot`, `safePath`).
+- Backend socket handlers: `backend/sockets/fileExplorerHandlers.js` (Export: `registerFileExplorerHandlers`, functions: `getRoot`, `safePath` using shared `resolvePathWithinRoot`).
 - Socket registration: `backend/sockets/index.js` (Function: `registerSocketHandlers`, call: `registerFileExplorerHandlers(io, socket)`).
 - Persistence: direct filesystem reads and writes through Node `fs`; no database tables are used.
 
@@ -126,10 +126,10 @@ This guide matters because File Explorer combines UI state, provider selection, 
 
 7. `explorer_list` validates and lists a directory.
 
-   File: `backend/sockets/fileExplorerHandlers.js` (Socket event: `explorer_list`, functions: `safePath`, `fs.readdirSync`)
+   File: `backend/sockets/fileExplorerHandlers.js` (Socket event: `explorer_list`, functions: `safePath`, `resolvePathWithinRoot`, `fs.readdirSync`)
 
    ```js
-   const fullPath = safePath(payload.dirPath || '', payload.providerId || null);
+   const fullPath = safePath(payload.dirPath || '.', payload.providerId || null);
    const entries = fs.readdirSync(fullPath, { withFileTypes: true });
    const items = entries
      .filter(e => !e.name.startsWith('.'))
@@ -277,16 +277,14 @@ graph TB
 
 ## Critical Contract
 
-The critical contract is: every filesystem operation that receives a user-controlled path must call `safePath(requestedPath, providerId)` before touching `fs`.
+The critical contract is: every filesystem operation that receives a user-controlled path must call `safePath(requestedPath, providerId)` before touching `fs`, and `safePath` must delegate containment checks to `resolvePathWithinRoot`.
 
 File: `backend/sockets/fileExplorerHandlers.js` (Function: `safePath`, dependency: `getRoot`)
 
 ```js
 function safePath(requestedPath, providerId = null) {
   const root = getRoot(providerId);
-  const resolved = path.resolve(root, requestedPath);
-  if (!resolved.startsWith(root)) throw new Error('Path traversal blocked');
-  return resolved;
+  return resolvePathWithinRoot(root, requestedPath || '.', 'requested path');
 }
 ```
 
@@ -294,7 +292,8 @@ Contract details:
 
 - `requestedPath` is a relative path from the provider root in frontend calls.
 - `providerId` selects the provider passed to `getProvider(providerId)`.
-- `getRoot(providerId)` returns `provider.config.paths?.home || ''`.
+- `getRoot(providerId)` must return a non-empty absolute provider root.
+- `resolvePathWithinRoot` uses canonicalization plus `path.relative` containment checks to block traversal, sibling-prefix bypasses, and symlink escapes when parent directories resolve outside root.
 - `explorer_list`, `explorer_read`, and `explorer_write` call `safePath` before reading or writing.
 - `explorer_root` returns the root label and does not perform file I/O.
 - Backend errors return callback payloads such as `{ error: err.message }` or `{ items: [], error: err.message }` and log `[EXPLORER ERR]` through `writeLog`.
@@ -312,7 +311,7 @@ What breaks when the contract is bypassed:
 
 - `../` path segments can escape provider-scoped storage.
 - Missing `providerId` can route through the default provider context rather than the intended provider.
-- A missing `paths.home` returns an empty root string, which removes provider-specific boundary checks from the prefix comparison.
+- Missing or non-absolute `paths.home` breaks root resolution and prevents safe filesystem operations.
 - Frontend code that assumes successful callbacks can clear dirty state while the backend reports a write error.
 
 ## Configuration/Data Flow
@@ -356,7 +355,7 @@ FileExplorer root-load effect
 
 FileExplorer loadDir('')
   -> socket.emit('explorer_list', { providerId, dirPath: '' }, callback)
-  -> backend safePath('', providerId)
+  -> backend safePath('.', providerId)
   -> fs.readdirSync(fullPath, { withFileTypes: true })
   -> filter dotfiles, sort directories first, map to { name, isDirectory }
   -> callback({ items, path })
@@ -429,7 +428,7 @@ The Save button is disabled when `isDirty` is false or `saving` is true. `isDirt
 | Socket registration | `backend/sockets/index.js` | Function: `registerSocketHandlers`, call: `registerFileExplorerHandlers(io, socket)` | Registers explorer handlers for each connected Socket.IO client. |
 | Explorer handlers | `backend/sockets/fileExplorerHandlers.js` | Export: `registerFileExplorerHandlers`; socket events: `explorer_root`, `explorer_list`, `explorer_read`, `explorer_write` | Handles root, directory listing, file reads, and file writes. |
 | Root resolution | `backend/sockets/fileExplorerHandlers.js` | Function: `getRoot`; config key: `provider.config.paths.home` | Converts provider ID to the explorer root directory. |
-| Path validation | `backend/sockets/fileExplorerHandlers.js` | Function: `safePath`; APIs: `path.resolve`, `String.startsWith` | Blocks paths whose resolved absolute path does not start with the provider root string. |
+| Path validation | `backend/sockets/fileExplorerHandlers.js` | Function: `safePath`; helper: `resolvePathWithinRoot` | Validates non-empty absolute roots and blocks traversal/sibling-prefix/symlink escapes with canonicalization plus `path.relative`. |
 | Logging | `backend/services/logger.js` | Function: `writeLog`; log prefix: `[EXPLORER ERR]` | Records list/read/write failures. |
 
 ### Tests
@@ -445,13 +444,13 @@ No database tables are used. File Explorer state is frontend-local, and file per
 
 ## Gotchas
 
-1. `paths.home` is required for provider isolation.
+1. `paths.home` must be non-empty and absolute.
 
-   `getRoot` falls back to an empty string. With an empty root, `safePath` still resolves paths, but the prefix check is not a provider-specific boundary. Keep provider `paths.home` populated for every provider that exposes File Explorer.
+   `getRoot` throws when `paths.home` is missing or relative. This blocks list/read/write until provider home configuration is fixed.
 
-2. `safePath` uses a string prefix check.
+2. `safePath` depends on canonicalized containment checks.
 
-   The guard is `resolved.startsWith(root)`. Any change to root formatting, relative root values, drive-letter casing, or trailing separators must be tested against `blocks path traversal` in `backend/test/fileExplorerHandlers.test.js` and against sibling-prefix paths.
+   The guard path is `safePath -> resolvePathWithinRoot`, which canonicalizes existing paths and existing parent directories before applying a `path.relative` boundary check. Keep traversal, sibling-prefix, and symlink-escape tests updated when this logic changes.
 
 3. `explorer_root` accepts two call shapes.
 
@@ -492,11 +491,15 @@ No database tables are used. File Explorer state is frontend-local, and file per
 File: `backend/test/fileExplorerHandlers.test.js` (Suite: `File Explorer Handlers`)
 
 - `explorer_root returns paths.home`: verifies `explorer_root` returns the provider home path from `paths.home`.
-- `explorer_root returns empty string if paths.home missing`: verifies the empty-string fallback.
+- `explorer_root returns an error when paths.home is missing`: verifies missing-root validation.
+- `explorer_root returns an error when paths.home is not absolute`: verifies absolute-root enforcement.
 - `explorer_list returns sorted entries without dotfiles`: verifies dotfile filtering and directory-first ordering.
 - `explorer_read returns file content`: verifies file content callback shape.
+- `explorer_read allows spaces and quotes in file names inside root`: verifies safe handling of quoted/spaced names.
 - `explorer_write saves file`: verifies `fs.writeFileSync` is called and `{ success: true }` is returned.
-- `blocks path traversal`: verifies traversal attempts return an error containing `traversal`.
+- `blocks path traversal`: verifies traversal attempts are rejected.
+- `blocks sibling-prefix bypass paths`: verifies prefix-adjacent directories are rejected.
+- `blocks symlink escape when target parent resolves outside root`: verifies canonicalization-based symlink escape blocking.
 - `handles list errors gracefully`: verifies list failures return `{ items: [], error }`.
 - `explorer_list sorts items of same type alphabetically`: verifies same-type alphabetical sorting.
 - `explorer_write handles errors gracefully`: verifies write failures return `{ error }`.
@@ -534,7 +537,7 @@ Frontend test coverage note: the current suite does not directly assert `handleS
 ### For Implementing or Extending This Feature
 
 1. Start with `frontend/src/components/FileExplorer.tsx` and identify whether the change touches `loadDir`, `toggleDir`, `openFileHandler`, `handleSave`, or `handleChange`.
-2. For new filesystem operations, add a Socket.IO event in `backend/sockets/fileExplorerHandlers.js` inside `registerFileExplorerHandlers` and call `safePath` before any `fs` access.
+2. For new filesystem operations, add a Socket.IO event in `backend/sockets/fileExplorerHandlers.js` inside `registerFileExplorerHandlers` and call `safePath` (which delegates to `resolvePathWithinRoot`) before any `fs` access.
 3. Keep provider scope in the frontend payload by following the existing `{ ...(providerId ? { providerId } : {}), ... }` pattern.
 4. Return callback payloads with explicit success or error fields, matching the existing `explorer_*` response style.
 5. Update `backend/test/fileExplorerHandlers.test.js` with success, error, and path traversal cases for any new backend operation.
@@ -548,7 +551,7 @@ Frontend test coverage note: the current suite does not directly assert `handleS
 3. Check Socket.IO callback traffic for `explorer_root`, `explorer_list`, `explorer_read`, and `explorer_write` if the UI stalls.
 4. Check `[EXPLORER ERR]` logs from `backend/sockets/fileExplorerHandlers.js` when list/read/write callbacks return errors.
 5. Check `provider.config.paths.home` through `getRoot` when the root label is empty or paths resolve outside the expected provider directory.
-6. Check `safePath` behavior with the exact `dirPath` or `filePath` payload when traversal errors appear.
+6. Check `safePath` and `resolvePathWithinRoot` behavior with the exact `dirPath` or `filePath` payload when traversal errors appear.
 7. Check `openFile.content`, `openFile.original`, `saving`, and `saveTimer` when dirty state or saves behave unexpectedly.
 8. Check `previewMode` and `filePath.endsWith('.md')` when markdown renders instead of Monaco.
 
@@ -558,7 +561,7 @@ Frontend test coverage note: the current suite does not directly assert `handleS
 - `ChatHeader` opens the modal through `useUIStore.setFileExplorerOpen(true)`, and `App` mounts `FileExplorer` once.
 - `FileExplorer` derives provider scope from `expandedProviderId`, `activeProviderId`, and `defaultProviderId`.
 - Backend behavior lives in `registerFileExplorerHandlers` with `explorer_root`, `explorer_list`, `explorer_read`, and `explorer_write`.
-- The critical contract is that `explorer_list`, `explorer_read`, and `explorer_write` call `safePath` before filesystem access.
+- The critical contract is that `explorer_list`, `explorer_read`, and `explorer_write` call `safePath`/`resolvePathWithinRoot` before filesystem access.
 - Directory listings filter dotfiles, sort directories first, and lazy-load child nodes through `TreeItem` expansion.
 - Markdown files use `ReactMarkdown` preview by default; other edit views use Monaco with `getLanguage` extension mapping.
 - Manual save waits for a callback; debounced save emits after 1500 ms and clears dirty state without waiting for backend acknowledgement.

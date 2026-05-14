@@ -214,17 +214,19 @@ describe('CanvasPane - additional coverage', () => {
     expect(screen.getByText('Applied!')).toBeInTheDocument();
   });
 
-  it('Apply button shows alert on failure', () => {
+  it('Apply button pushes error to canvas error state instead of alert', () => {
     mockSocketEmit.mockImplementation((_event: string, _data: any, cb: any) => {
       cb({ error: 'Permission denied' });
     });
+    useCanvasStore.setState({ canvasError: null });
     const alertMock = vi.spyOn(window, 'alert').mockImplementation(() => {});
     const artifact: CanvasArtifact = {
       id: '1', sessionId: 's1', title: 'Test', content: 'data', language: 'js', version: 1, filePath: '/tmp/test.js'
     };
     render(<CanvasPane artifacts={[artifact]} activeArtifact={artifact} onClose={vi.fn()} onCloseArtifact={vi.fn()} onSelectArtifact={vi.fn()} />);
     fireEvent.click(screen.getByText(/Apply/i));
-    expect(alertMock).toHaveBeenCalledWith('Failed to apply changes: Permission denied');
+    expect(useCanvasStore.getState().canvasError).toBe('Failed to apply changes: Permission denied');
+    expect(alertMock).not.toHaveBeenCalled();
     alertMock.mockRestore();
   });
 

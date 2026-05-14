@@ -22,6 +22,9 @@ vi.mock('../components/NotesModal', () => ({ default: () => null }));
 vi.mock('../components/FileExplorer', () => ({ default: () => null }));
 vi.mock('../components/HelpDocsModal', () => ({ default: () => null }));
 vi.mock('../components/CanvasPane/CanvasPane', () => ({ default: () => <div data-testid="canvas-pane">Canvas</div> }));
+vi.mock('../components/ConfirmModal', () => ({
+  default: ({ isOpen, title, message }: { isOpen: boolean; title: string; message: string }) => isOpen ? <div data-testid="confirm-modal"><h2>{title}</h2><p>{message}</p></div> : null
+}));
 
 vi.mock('../hooks/useSocket', () => ({
   useSocket: () => ({ socket: useSystemStore.getState().socket })
@@ -74,7 +77,7 @@ describe('App Component', () => {
       });
       useVoiceStore.setState({ isRecording: false, isProcessingVoice: false, availableAudioDevices: [], selectedAudioDevice: '' });
       useUIStore.setState({ isSidebarOpen: true, isModelDropdownOpen: false, isSidebarPinned: false });
-      useCanvasStore.setState({ isCanvasOpen: false, canvasArtifacts: [], canvasOpenBySession: {}, terminals: [] });
+      useCanvasStore.setState({ isCanvasOpen: false, canvasArtifacts: [], canvasOpenBySession: {}, terminals: [], canvasError: null });
     });
   });
 
@@ -96,6 +99,18 @@ describe('App Component', () => {
     render(<App />);
     expect(screen.getByRole('alertdialog')).toBeInTheDocument();
     expect(screen.getByText('Custom commands configuration')).toBeInTheDocument();
+  });
+
+
+  it('renders canvas error in app modal', () => {
+    act(() => {
+      useCanvasStore.setState({ canvasError: 'Failed to read file: blocked path' });
+    });
+
+    render(<App />);
+    expect(screen.getByTestId('confirm-modal')).toBeInTheDocument();
+    expect(screen.getByText('Canvas Error')).toBeInTheDocument();
+    expect(screen.getByText('Failed to read file: blocked path')).toBeInTheDocument();
   });
 
   it('switches between sessions and emits watch events', async () => {

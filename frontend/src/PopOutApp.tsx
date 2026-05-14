@@ -11,6 +11,7 @@ import MessageList from './components/MessageList/MessageList';
 import ChatInput from './components/ChatInput/ChatInput';
 import CanvasPane from './components/CanvasPane/CanvasPane';
 import ConfigErrorModal from './components/ConfigErrorModal';
+import ConfirmModal from './components/ConfirmModal';
 import { claimSession } from './lib/sessionOwnership';
 import { computeResizeWidthNoSidebar } from './utils/resizeHelper';
 import './styles/global.css';
@@ -30,9 +31,10 @@ function PopOutApp() {
   const { sessions, activeSessionId } = useSessionLifecycleStore();
   const { visibleCount } = useUIStore();
   const {
-    isCanvasOpen, canvasArtifacts, activeCanvasArtifact,
+    isCanvasOpen, canvasArtifacts, activeCanvasArtifact, canvasError,
     setIsCanvasOpen, setActiveCanvasArtifact,
-    resetCanvas, handleOpenFileInCanvas, handleFileEdited, handleCloseArtifact
+    resetCanvas, handleOpenFileInCanvas, handleFileEdited, handleCloseArtifact,
+    setCanvasError
   } = useCanvasStore();
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
@@ -136,6 +138,16 @@ function PopOutApp() {
           />
         </ErrorBoundary>
       )}
+      <ConfirmModal
+        isOpen={Boolean(canvasError)}
+        onClose={() => setCanvasError(null)}
+        onConfirm={() => setCanvasError(null)}
+        title="Canvas Error"
+        message={canvasError || ''}
+        confirmText="OK"
+        cancelText="Dismiss"
+        variant="warning"
+      />
       <ConfigErrorModal />
     </div>
   );

@@ -9,11 +9,13 @@ interface CanvasState {
   activeTerminalId: string | null;
   canvasArtifacts: CanvasArtifact[];
   activeCanvasArtifact: CanvasArtifact | null;
+  canvasError: string | null;
   
   // Basic Setters
   setIsCanvasOpen: (isOpen: boolean) => void;
   setCanvasArtifacts: (artifacts: CanvasArtifact[]) => void;
   setActiveCanvasArtifact: (artifact: CanvasArtifact | null) => void;
+  setCanvasError: (message: string | null) => void;
   
   // Terminal
   openTerminal: (sessionId: string) => void;
@@ -35,10 +37,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   activeTerminalId: null,
   canvasArtifacts: [],
   activeCanvasArtifact: null,
+  canvasError: null,
 
   setIsCanvasOpen: (isOpen) => set({ isCanvasOpen: isOpen }),
   setCanvasArtifacts: (artifacts) => set({ canvasArtifacts: artifacts }),
   setActiveCanvasArtifact: (artifact) => set({ activeCanvasArtifact: artifact }),
+  setCanvasError: (message) => set({ canvasError: message }),
 
   openTerminal: (sessionId) => set(prev => {
     const id = `term-${Date.now()}`;
@@ -85,7 +89,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       set(prev => ({
         activeCanvasArtifact: updated,
         canvasArtifacts: prev.canvasArtifacts.map(a => a.id === existing.id ? updated : a),
-        isCanvasOpen: true
+        isCanvasOpen: true,
+        canvasError: null
       }));
     } else {
       if (socket && newArtifact.sessionId) {
@@ -94,7 +99,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       set(prev => ({
         activeCanvasArtifact: newArtifact,
         canvasArtifacts: [...prev.canvasArtifacts, newArtifact],
-        isCanvasOpen: true
+        isCanvasOpen: true,
+        canvasError: null
       }));
     }
   },
@@ -105,7 +111,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       if (res.artifact) {
         get().handleOpenInCanvas(socket, activeSessionId, res.artifact);
       } else if (res.error) {
-        alert('Failed to read file: ' + res.error);
+        set({ canvasError: 'Failed to read file: ' + res.error });
       }
     });
   },

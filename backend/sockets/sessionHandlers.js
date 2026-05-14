@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
+import { spawn } from 'child_process';
 import { writeLog } from '../services/logger.js';
 import * as db from '../database.js';
 import { providerRuntimeManager } from '../services/providerRuntimeManager.js';
@@ -208,8 +208,20 @@ export default function registerSessionHandlers(io, socket) {
 
   socket.on('open_in_editor', ({ filePath }) => {
     if (!filePath) return;
-    exec(`code "${filePath}"`, (err) => {
-      if (err) writeLog(`[EDITOR ERR] ${err.message}`);
+
+    const child = spawn('code', [filePath], {
+      shell: false,
+      stdio: 'ignore'
+    });
+
+    child.on('error', (err) => {
+      writeLog(`[EDITOR ERR] ${err.message}`);
+    });
+
+    child.on('exit', (code) => {
+      if (typeof code === 'number' && code !== 0) {
+        writeLog(`[EDITOR ERR] VS Code exited with status ${code}`);
+      }
     });
   });
 

@@ -26,6 +26,7 @@ import FileExplorer from './components/FileExplorer';
 import HelpDocsModal from './components/HelpDocsModal';
 import CanvasPane from './components/CanvasPane/CanvasPane';
 import ConfigErrorModal from './components/ConfigErrorModal';
+import ConfirmModal from './components/ConfirmModal';
 
 // Styles
 import './styles/global.css';
@@ -57,13 +58,15 @@ function App() {
     isCanvasOpen,
     canvasArtifacts,
     activeCanvasArtifact,
+    canvasError,
     setIsCanvasOpen,
     setActiveCanvasArtifact,
     setCanvasArtifacts,
     resetCanvas,
     handleOpenFileInCanvas,
     handleFileEdited,
-    handleCloseArtifact
+    handleCloseArtifact,
+    setCanvasError
   } = useCanvasStore();
 
   // --- DERIVED ---
@@ -251,6 +254,16 @@ function App() {
       <NotesModal />
       <FileExplorer />
       <HelpDocsModal />
+      <ConfirmModal
+        isOpen={Boolean(canvasError)}
+        onClose={() => setCanvasError(null)}
+        onConfirm={() => setCanvasError(null)}
+        title="Canvas Error"
+        message={canvasError || ''}
+        confirmText="OK"
+        cancelText="Dismiss"
+        variant="warning"
+      />
       <ConfigErrorModal />
     </div>
   );

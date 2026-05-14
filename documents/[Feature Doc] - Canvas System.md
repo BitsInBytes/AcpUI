@@ -90,14 +90,14 @@ if (status === 'completed' && filePath) {
 4. `handleOpenFileInCanvas` reads file content before creating an artifact.
    - File: `frontend/src/store/useCanvasStore.ts` (Store action: `handleOpenFileInCanvas`)
    - File: `backend/sockets/canvasHandlers.js` (Socket event: `canvas_read_file`)
-   - The frontend emits `canvas_read_file` with `{ filePath }`. The backend resolves the path, uses `fs.realpathSync` when the file exists, reads UTF-8 content, derives `language` from the extension, and returns an artifact without `sessionId`. The store then passes the artifact through `handleOpenInCanvas`, which stamps the active UI session id.
+   - The frontend emits `canvas_read_file` with `{ filePath }`. The backend resolves the path through the shared IO MCP allowed-root validator, reads UTF-8 content from the allowed path, derives `language` from the extension, and returns an artifact without `sessionId`. The store then passes the artifact through `handleOpenInCanvas`, which stamps the active UI session id.
 
 ```js
 // FILE: backend/sockets/canvasHandlers.js (Socket event: canvas_read_file)
-const resolvedPath = path.resolve(filePath);
-const finalPath = fs.existsSync(resolvedPath) ? fs.realpathSync(resolvedPath) : resolvedPath;
-const language = path.extname(finalPath).slice(1) || 'text';
-callback({ artifact: { id: `canvas-fs-${Date.now()}`, title, content, language, filePath: finalPath, version: 1 } });
+const allowedPath = resolveAllowedPath(filePath, 'file_path');
+const content = fs.readFileSync(allowedPath, 'utf8');
+const language = path.extname(allowedPath).slice(1) || 'text';
+callback({ artifact: { id: `canvas-fs-${Date.now()}`, title, content, language, filePath: allowedPath, version: 1 } });
 ```
 
 5. `handleOpenInCanvas` deduplicates and persists artifacts.
@@ -162,7 +162,7 @@ const watched = state.canvasArtifacts.find(a =>
 10. Editor apply writes content to disk.
     - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Handler: `handleApplyToFile`)
     - File: `backend/sockets/canvasHandlers.js` (Socket event: `canvas_apply_to_file`)
-    - `handleApplyToFile` emits `{ filePath, content }`. The backend validates that `filePath` is truthy, writes UTF-8 content with `fs.writeFileSync`, and reports success or an error through the callback. The frontend shows `Applied!` for successful writes and alerts on errors.
+    - `handleApplyToFile` emits `{ filePath, content }`. The backend validates that `filePath` is truthy, writes UTF-8 content with `fs.writeFileSync`, and reports success or an error through the callback. The frontend shows `Applied!` for successful writes and routes failures into the app-styled Canvas error modal.
 
 11. Git status drives file list and diff affordances.
     - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Handlers: `refreshGitStatus`, `handleOpenGitFile`)
@@ -179,7 +179,7 @@ const watched = state.canvasArtifacts.find(a =>
 13. Open in VS Code delegates to the backend.
     - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Button: `Open in VS Code`)
     - File: `backend/sockets/sessionHandlers.js` (Socket event: `open_in_editor`)
-    - The frontend emits `open_in_editor` with the artifact `filePath`; the backend runs `code "<filePath>"` and logs failures through `writeLog`.
+    - The frontend emits `open_in_editor` with the artifact `filePath`; the backend spawns `code` with an argument array and `shell: false`, then logs failures through `writeLog`.
 
 ---
 
@@ -255,7 +255,7 @@ Runtime and host dependencies:
 - Git integration requires `git` to be available to the backend process and `cwd` to point at a git worktree.
 - `CanvasPane` resolves git `cwd` from `ChatSession.cwd` or `useSystemStore.workspaceCwds[0].path`.
 - `open_in_editor` requires the `code` command to be available on the backend host PATH.
-- `canvas_apply_to_file` writes directly to the provided path; it does not use the File Explorer `safePath` validation route.
+- `canvas_apply_to_file` validates `filePath` through the shared IO MCP allowed-root resolver before writing UTF-8 content to disk.
 
 ---
 
@@ -382,8 +382,8 @@ ORDER BY created_at DESC
 4. File artifacts read from disk need store stamping.
    - `canvas_read_file` returns an artifact without `sessionId`. Persistence depends on `handleOpenInCanvas` receiving a non-null active UI session id.
 
-5. Canvas writes are direct filesystem writes.
-   - `canvas_apply_to_file` calls `fs.writeFileSync(filePath, content, 'utf8')`. It does not use File Explorer `safePath` validation.
+5. Canvas reads and writes are root-gated.
+   - `canvas_read_file` and `canvas_apply_to_file` resolve `filePath` through `resolveAllowedPath(filePath, 'file_path')` before touching disk, so paths outside configured allowed roots are rejected.
 
 6. Diff mode has a loading sentinel.
    - `SafeDiffEditor` mounts only when `viewMode === 'diff'` and `gitOriginal !== null`. `git_show_head` returns an empty string for new files; empty string means render a blank original side, while `null` means HEAD content has not arrived.
@@ -413,11 +413,9 @@ ORDER BY created_at DESC
   - `canvas_save saves artifact to DB`
   - `canvas_load returns artifacts`
   - `canvas_delete removes artifact`
-  - `canvas_read_file returns file content`
-  - `canvas_apply_to_file writes content`
-  - `canvas_read_file errors on missing path`
-  - `canvas_apply_to_file errors on missing filePath`
-  - `canvas_read_file uses resolvedPath when file does not exist on disk`
+  - `canvas_read_file returns file content after allowed-root validation`
+  - `canvas_apply_to_file writes content after allowed-root validation`
+  - `returns an error when path validation rejects traversal/outside-root access`
   - `canvas_read_file falls back to "text" language when file has no extension`
   - `handlers do not throw when called without a callback`
   - `error branches do not throw when called without a callback`
@@ -468,7 +466,7 @@ ORDER BY created_at DESC
   - `renders VS Code button when artifact has filePath`
   - `VS Code button emits open_in_editor`
   - `Apply button shows Applied state after successful apply`
-  - `Apply button shows alert on failure`
+  - `Apply button pushes failure into the Canvas error modal path`
   - `does not show Apply or VS Code buttons when no filePath`
   - `detects markdown from filePath ending in .md`
   - `editing content in monaco updates local state`
@@ -555,3 +553,4 @@ ORDER BY created_at DESC
 - `canvasHandlers` owns artifact CRUD plus direct filesystem read/write; `gitHandlers` owns git status, diffs, staging, unstaging, and HEAD content.
 - `CanvasPane` renders code, preview, and diff modes, and uses `git_show_head` plus current disk content for Monaco side-by-side diffs.
 - The critical contract is stable artifact shape, UI-session-keyed persistence, exact open deduplication, and careful separation between file refresh, artifact persistence, and terminal pane lifetime.
+

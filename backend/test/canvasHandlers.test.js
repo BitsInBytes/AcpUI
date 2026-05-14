@@ -5,29 +5,31 @@ vi.mock('../services/logger.js', () => ({ writeLog: vi.fn() }));
 
 vi.mock('fs', () => ({
   default: {
-    existsSync: vi.fn(),
     readFileSync: vi.fn(),
-    writeFileSync: vi.fn(),
-    realpathSync: vi.fn((p) => p),
+    writeFileSync: vi.fn()
   },
-  existsSync: vi.fn(),
   readFileSync: vi.fn(),
-  writeFileSync: vi.fn(),
-  realpathSync: vi.fn((p) => p),
+  writeFileSync: vi.fn()
 }));
 
 vi.mock('../database.js', () => ({
   saveCanvasArtifact: vi.fn(),
   getCanvasArtifactsForSession: vi.fn(),
-  deleteCanvasArtifact: vi.fn(),
+  deleteCanvasArtifact: vi.fn()
+}));
+
+vi.mock('../services/ioMcp/filesystem.js', () => ({
+  resolveAllowedPath: vi.fn((value) => value)
 }));
 
 import registerCanvasHandlers from '../sockets/canvasHandlers.js';
 import fs from 'fs';
 import * as db from '../database.js';
+import { resolveAllowedPath } from '../services/ioMcp/filesystem.js';
 
 describe('canvasHandlers', () => {
-  let mockIo, mockSocket;
+  let mockIo;
+  let mockSocket;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -49,13 +51,13 @@ describe('canvasHandlers', () => {
   });
 
   it('canvas_load returns artifacts', async () => {
-    const arts = [{ id: 'a1' }, { id: 'a2' }];
-    db.getCanvasArtifactsForSession.mockResolvedValue(arts);
+    const artifacts = [{ id: 'a1' }, { id: 'a2' }];
+    db.getCanvasArtifactsForSession.mockResolvedValue(artifacts);
     const callback = vi.fn();
 
     await mockSocket.listeners('canvas_load')[0]({ sessionId: 's1' }, callback);
 
-    expect(callback).toHaveBeenCalledWith({ artifacts: arts });
+    expect(callback).toHaveBeenCalledWith({ artifacts });
   });
 
   it('canvas_delete removes artifact', async () => {
@@ -68,66 +70,58 @@ describe('canvasHandlers', () => {
     expect(callback).toHaveBeenCalledWith({ success: true });
   });
 
-  it('canvas_read_file returns file content', async () => {
-    fs.existsSync.mockReturnValue(true);
+  it('canvas_read_file returns file content after allowed-root validation', async () => {
+    resolveAllowedPath.mockReturnValue('/workspace/test.js');
     fs.readFileSync.mockReturnValue('file content');
     const callback = vi.fn();
 
-    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/tmp/test.js' }, callback);
+    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/test.js' }, callback);
 
+    expect(resolveAllowedPath).toHaveBeenCalledWith('/workspace/test.js', 'file_path');
     expect(callback).toHaveBeenCalledWith({
-      artifact: expect.objectContaining({ content: 'file content', language: 'js', title: 'test.js' }),
+      artifact: expect.objectContaining({
+        content: 'file content',
+        language: 'js',
+        title: 'test.js',
+        filePath: '/workspace/test.js'
+      })
     });
   });
 
-  it('canvas_apply_to_file writes content', async () => {
+  it('canvas_apply_to_file writes content after allowed-root validation', async () => {
+    resolveAllowedPath.mockReturnValue('/workspace/out.js');
     const callback = vi.fn();
 
-    await mockSocket.listeners('canvas_apply_to_file')[0]({ filePath: '/tmp/out.js', content: 'new code' }, callback);
+    await mockSocket.listeners('canvas_apply_to_file')[0]({ filePath: '/workspace/out.js', content: 'new code' }, callback);
 
-    expect(fs.writeFileSync).toHaveBeenCalledWith('/tmp/out.js', 'new code', 'utf8');
+    expect(resolveAllowedPath).toHaveBeenCalledWith('/workspace/out.js', 'file_path');
+    expect(fs.writeFileSync).toHaveBeenCalledWith('/workspace/out.js', 'new code', 'utf8');
     expect(callback).toHaveBeenCalledWith({ success: true });
   });
 
-  it('canvas_read_file errors on missing path', async () => {
-    const callback = vi.fn();
-
-    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '' }, callback);
-
-    expect(callback).toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(String) }));
-  });
-
-  it('canvas_apply_to_file errors on missing filePath', async () => {
-    const callback = vi.fn();
-
-    await mockSocket.listeners('canvas_apply_to_file')[0]({ filePath: '', content: 'x' }, callback);
-
-    expect(callback).toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(String) }));
-  });
-
-  it('canvas_read_file uses resolvedPath when file does not exist on disk', async () => {
-    fs.existsSync.mockReturnValue(false);
-    fs.readFileSync.mockReturnValue('ghost content');
-    const callback = vi.fn();
-
-    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/tmp/ghost.js' }, callback);
-
-    expect(fs.realpathSync).not.toHaveBeenCalled();
-    expect(callback).toHaveBeenCalledWith(expect.objectContaining({
-      artifact: expect.objectContaining({ content: 'ghost content' }),
-    }));
-  });
-
   it('canvas_read_file falls back to "text" language when file has no extension', async () => {
-    fs.existsSync.mockReturnValue(true);
+    resolveAllowedPath.mockReturnValue('/workspace/Makefile');
     fs.readFileSync.mockReturnValue('raw content');
     const callback = vi.fn();
 
-    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/tmp/Makefile' }, callback);
+    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/Makefile' }, callback);
 
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({
-      artifact: expect.objectContaining({ language: 'text', title: 'Makefile' }),
+      artifact: expect.objectContaining({ language: 'text', title: 'Makefile' })
     }));
+  });
+
+  it('returns an error when path validation rejects traversal/outside-root access', async () => {
+    resolveAllowedPath.mockImplementationOnce(() => {
+      throw new Error('file_path is outside the configured MCP IO allowed roots: /etc/passwd');
+    });
+    const callback = vi.fn();
+
+    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/etc/passwd' }, callback);
+
+    expect(callback).toHaveBeenCalledWith({
+      error: expect.stringContaining('outside the configured MCP IO allowed roots')
+    });
   });
 
   it('canvas_save calls callback with error when DB fails', async () => {
@@ -161,21 +155,23 @@ describe('canvasHandlers', () => {
     db.saveCanvasArtifact.mockResolvedValue();
     db.getCanvasArtifactsForSession.mockResolvedValue([]);
     db.deleteCanvasArtifact.mockResolvedValue();
-    fs.existsSync.mockReturnValue(true);
+    resolveAllowedPath.mockReturnValue('/workspace/f.js');
     fs.readFileSync.mockReturnValue('content');
 
     await expect(mockSocket.listeners('canvas_save')[0]({ id: 'a1', sessionId: 's1' })).resolves.not.toThrow();
     await expect(mockSocket.listeners('canvas_load')[0]({ sessionId: 's1' })).resolves.not.toThrow();
     await expect(mockSocket.listeners('canvas_delete')[0]({ artifactId: 'a1' })).resolves.not.toThrow();
-    await expect(mockSocket.listeners('canvas_apply_to_file')[0]({ filePath: '/tmp/f.js', content: 'x' })).resolves.not.toThrow();
-    await expect(mockSocket.listeners('canvas_read_file')[0]({ filePath: '/tmp/f.js' })).resolves.not.toThrow();
+    await expect(mockSocket.listeners('canvas_apply_to_file')[0]({ filePath: '/workspace/f.js', content: 'x' })).resolves.not.toThrow();
+    await expect(mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/f.js' })).resolves.not.toThrow();
   });
 
   it('error branches do not throw when called without a callback', async () => {
     db.saveCanvasArtifact.mockRejectedValue(new Error('fail'));
     db.getCanvasArtifactsForSession.mockRejectedValue(new Error('fail'));
     db.deleteCanvasArtifact.mockRejectedValue(new Error('fail'));
-    fs.readFileSync.mockImplementation(() => { throw new Error('fail'); });
+    resolveAllowedPath.mockImplementation(() => {
+      throw new Error('fail');
+    });
 
     await expect(mockSocket.listeners('canvas_save')[0]({ id: 'a1', sessionId: 's1' })).resolves.not.toThrow();
     await expect(mockSocket.listeners('canvas_load')[0]({ sessionId: 's1' })).resolves.not.toThrow();

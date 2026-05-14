@@ -104,7 +104,7 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
   const [gitFiles, setGitFiles] = useState<{ path: string; status: string; staged: boolean }[]>([]);
   const [gitBranch, setGitBranch] = useState('');
   const { socket } = useSocket();
-  const { terminals, activeTerminalId, closeTerminal, setActiveTerminalId } = useCanvasStore();
+  const { terminals, activeTerminalId, closeTerminal, setActiveTerminalId, setCanvasError } = useCanvasStore();
   const activeSessionId = useSessionLifecycleStore(state => state.activeSessionId);
   const sessions = useSessionLifecycleStore(state => state.sessions);
   const sessionTerminals = terminals.filter(t => t.sessionId === activeSessionId);
@@ -157,7 +157,7 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
   const handleOpenGitFile = (filePath: string) => {
     if (!socket || !activeSessionId) return;
     const fullPath = buildFullPath(cwd, filePath);
-    socket.emit('canvas_read_file', { filePath: fullPath }, (res: { artifact?: CanvasArtifact }) => {
+    socket.emit('canvas_read_file', { filePath: fullPath }, (res: { artifact?: CanvasArtifact; error?: string }) => {
       if (res.artifact) {
         const artifactId = res.artifact.id;
         gitOpenRef.current = true;
@@ -173,6 +173,8 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
           if (current?.id !== artifactId && current?.filePath !== fullPath) return;
           setGitOriginal(headRes.content);
         });
+      } else if (res.error) {
+        setCanvasError('Failed to read file: ' + res.error);
       }
     });
   };
@@ -184,7 +186,7 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
           setIsApplied(true);
           setTimeout(() => setIsApplied(false), 2000);
         } else if (res.error) {
-          alert('Failed to apply changes: ' + res.error);
+          setCanvasError('Failed to apply changes: ' + res.error);
         }
       });
     }

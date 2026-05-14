@@ -128,7 +128,12 @@ vi.mock('../services/attachmentVault.js', () => ({ getAttachmentsRoot: () => '/t
 vi.mock('../mcp/acpCleanup.js', () => ({ cleanupAcpSession: vi.fn() }));
 vi.mock('../services/jsonlParser.js', () => ({ parseJsonlSession: vi.fn() }));
 vi.mock('crypto', () => ({ randomUUID: () => 'mock-uuid' }));
-vi.mock('child_process', () => ({ exec: vi.fn((cmd, cb) => cb?.(null)) }));
+vi.mock('child_process', () => ({
+  spawn: vi.fn(() => {
+    const child = new EventEmitter();
+    return child;
+  })
+}));
 
 describe('Session Handlers', () => {
   let mockIo, mockSocket;
@@ -376,18 +381,28 @@ describe('Session Handlers', () => {
     expect(mockDb.saveSession).toHaveBeenCalledWith(expect.objectContaining({ id: 'ui-1' }));
   });
 
-  it('handles open_in_editor with filePath', async () => {
-    const { exec } = await import('child_process');
+  it('handles open_in_editor with filePath using argument-array spawn', async () => {
+    const { spawn } = await import('child_process');
     const handler = mockSocket.listeners('open_in_editor')[0];
     handler({ filePath: '/some/file.js' });
-    expect(exec).toHaveBeenCalledWith(expect.stringContaining('/some/file.js'), expect.any(Function));
+    expect(spawn).toHaveBeenCalledWith('code', ['/some/file.js'], { shell: false, stdio: 'ignore' });
+  });
+
+  it('passes spaces, quotes, and shell metacharacters as a literal file path argument', async () => {
+    const { spawn } = await import('child_process');
+    const handler = mockSocket.listeners('open_in_editor')[0];
+    const trickyPath = '/tmp/with spaces/"quoted"/name;$(touch pwned)&.js';
+
+    handler({ filePath: trickyPath });
+
+    expect(spawn).toHaveBeenCalledWith('code', [trickyPath], { shell: false, stdio: 'ignore' });
   });
 
   it('handles open_in_editor without filePath (no-op)', async () => {
-    const { exec } = await import('child_process');
+    const { spawn } = await import('child_process');
     const handler = mockSocket.listeners('open_in_editor')[0];
     handler({ filePath: null });
-    expect(exec).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it('handles export_session successfully', async () => {

@@ -10,6 +10,7 @@ The feature is security-sensitive because it lets agent tool calls cross local f
 - Advertises optional IO tool schemas through `GET /api/mcp/tools` when `tools.io` is enabled.
 - Registers executable IO handlers in `createToolHandlers` when `tools.io` is enabled.
 - Reads, writes, edits, lists, globs, and greps local filesystem content within configured allowed roots.
+- Exposes shared root-containment helpers (`resolveAllowedPath`, `resolvePathWithinRoot`) reused by non-MCP backend filesystem handlers.
 - Fetches HTTP/HTTPS URLs with protocol, host, redirect, timeout, and response-size policy checks.
 - Wraps every handler result in MCP text content at `content[0].text`.
 - Returns structured JSON text for `ux_grep_search` and `ux_web_fetch`, which `renderToolOutput` recognizes for specialized UI rendering.
@@ -96,8 +97,9 @@ This is a backend MCP feature with frontend output rendering support. Source own
    - Titles come from `acpUiToolTitle`: file tools use file basenames, list uses the directory path, glob/grep prefer `description` and then `pattern`, and web fetch uses `url`.
 
 8. **Filesystem paths are resolved before filesystem access**
-   - File: `backend/services/ioMcp/filesystem.js` (Functions: `resolveAllowedPath`, `configuredAllowedRoots`, `configRootToAbsolute`, `isPathWithinRoot`)
-   - `resolveAllowedPath` resolves the target path, expands configured roots, applies the wildcard root `*`, and rejects paths outside allowed roots.
+   - File: `backend/services/ioMcp/filesystem.js` (Functions: `resolveAllowedPath`, `resolvePathWithinRoot`, `configuredAllowedRoots`, `configRootToAbsolute`, `isPathWithinRoot`)
+   - `resolveAllowedPath` resolves the target path, expands configured roots, applies the wildcard root `*`, canonicalizes existing targets/parents, and rejects paths outside allowed roots.
+   - `resolvePathWithinRoot` is the shared root-boundary helper used by non-MCP backend handlers (including File Explorer via `safePath`) and enforces non-empty absolute roots plus `path.relative` containment.
    - `io.autoAllowWorkspaceCwd` adds `DEFAULT_WORKSPACE_CWD` or `process.cwd()` to the allowed-root list.
    - Relative roots in config resolve from the repository root, not from the requested file path.
 
@@ -116,7 +118,8 @@ This is a backend MCP feature with frontend output rendering support. Source own
 11. **Directory, glob, and grep stay inside allowed roots**
     - File: `backend/services/ioMcp/filesystem.js` (Functions: `listDirectory`, `findFiles`, `grepSearch`, `parseRipgrepJson`, `limitGrepResult`)
     - `listDirectory` returns direct entries and appends `/` to directories.
-    - `findFiles` uses `glob` with `absolute: true` and `nodir: true` under the allowed `dir_path` or allowed `process.cwd()`.
+    - Relative `dir_path` and `file_path` inputs are resolved from `DEFAULT_WORKSPACE_CWD` (or `process.cwd()` when the env var is unset) before allowed-root checks.
+    - `findFiles` uses `glob` with `absolute: true` and `nodir: true` under the allowed `dir_path` or the allowed workspace cwd fallback.
     - `grepSearch` spawns the `@vscode/ripgrep` binary with `--json`, searches `.` under the allowed cwd, treats exit code `0` and `1` as successful, and rejects other exit codes.
     - `grepSearch` supports explicit safe search options (`case_mode`, include/exclude globs, file types, before/after context, word matching, multiline, regex engine mode, hidden/no-ignore, wildcard-root-gated follow-symlinks, and result mode) and accepts `case_sensitive`, `context`, and `fixed_strings` as compatibility aliases.
 
@@ -321,7 +324,7 @@ wrapToolHandlers begin
 | Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `buildServerInstructions`, `ListToolsRequestSchema`, `CallToolRequestSchema` | Fetches schemas for ACP sessions and forwards tool calls to backend API |
 | Handler registration | `backend/mcp/mcpServer.js` | `createToolHandlers`, `wrapToolHandlers`, `Object.assign(tools, createIoMcpToolHandlers())` | Registers IO handlers behind the feature flag and records Tool System V2 execution metadata |
 | IO handlers | `backend/mcp/ioMcpToolHandlers.js` | `createIoMcpToolHandlers`, `textResult` | Maps MCP args to filesystem/web services and returns MCP text content |
-| Filesystem services | `backend/services/ioMcp/filesystem.js` | `readFile`, `writeFile`, `replaceText`, `listDirectory`, `findFiles`, `grepSearch`, `resolveAllowedPath`, `limitTextOutput`, `parseRipgrepJson`, `limitGrepResult` | Implements path-gated local file, glob, and grep operations |
+| Filesystem services | `backend/services/ioMcp/filesystem.js` | `readFile`, `writeFile`, `replaceText`, `listDirectory`, `findFiles`, `grepSearch`, `resolveAllowedPath`, `resolvePathWithinRoot`, `isPathWithinRoot`, `limitTextOutput`, `parseRipgrepJson`, `limitGrepResult` | Implements path-gated local file, glob, and grep operations plus shared root-containment helpers |
 | Web fetch service | `backend/services/ioMcp/webFetch.js` | `webFetch`, `assertUrlAllowed`, `fetchWithRedirects`, `readResponseText`, `composeAbortSignal` | Implements policy-gated URL fetch and HTML text extraction |
 | Tool title builder | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `basenameForToolPath` | Builds user-facing titles from IO tool inputs |
 | Tool execution metadata | `backend/services/tools/mcpExecutionRegistry.js` | `begin`, `complete`, `fail`, `publicMcpToolInput`, `describeAcpUxToolExecution`, `invocationFromMcpExecution` | Records MCP execution identity, display metadata, category, file path, and output |
@@ -341,7 +344,7 @@ wrapToolHandlers begin
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Filesystem service tests | `backend/test/ioMcpFilesystem.test.js` | `IO MCP filesystem helpers`, `reads selected line ranges`, `writes parent directories recursively`, `lists direct children with slash suffixes for directories`, `finds files with glob patterns`, `searches file contents with ripgrep`, `blocks file access outside configured allowed roots`, `supports wildcard allowed roots`, `enforces read and write size caps`, `replaceText with fuzzy matching` | Covers file IO, root policy, grep shape, size caps, and replace behavior |
+| Filesystem service tests | `backend/test/ioMcpFilesystem.test.js` | `IO MCP filesystem helpers`, `path boundary helpers`, `reads selected line ranges`, `writes parent directories recursively`, `lists direct children with slash suffixes for directories`, `finds files with glob patterns`, `searches file contents with ripgrep`, `blocks file access outside configured allowed roots`, `supports wildcard allowed roots`, `enforces read and write size caps`, `replaceText with fuzzy matching` | Covers file IO, root policy, canonicalized containment checks (traversal/sibling-prefix/symlink), grep shape, size caps, and replace behavior |
 | Web fetch service tests | `backend/test/ioMcpWebFetch.test.js` | `IO MCP webFetch`, `returns structured non-HTML text`, `extracts structured normalized body text from HTML`, `throws for non-OK responses`, `blocks configured hosts before fetching`, `follows redirects through the configured policy checks`, `enforces response size caps` | Covers fetch result shape and network policy enforcement |
 | Config tests | `backend/test/mcpConfig.test.js` | `MCP config`, `disables config-controlled tools when the config is missing`, `disables config-controlled tools when the config is malformed`, `reads enabled tools from configuration/mcp.json shape`, `normalizes IO, web fetch, and Google search settings` | Covers config loading, flag normalization, and IO/web fetch config defaults |
 | MCP API tests | `backend/test/mcpApi.test.js` | `MCP API Routes`, `GET /tools hides optional IO and Google tools by default`, `GET /tools advertises IO tools when MCP config enables them`, `POST /tool-call with valid tool returns result`, `POST /tool-call passes resolved proxy context to handlers`, `POST /tool-call aborts the handler signal when the request fires the "aborted" event`, `POST /tool-call aborts the handler signal when the response closes before completion` | Covers schema advertisement, dispatch, context forwarding, and abort behavior |
@@ -364,7 +367,7 @@ wrapToolHandlers begin
    - `ACP_UX_IO_TOOL_CONFIG` includes metadata for `ux_google_web_search`, but `getIoMcpToolDefinitions` returns the seven IO tools in this guide. Google search schema, handler, config, and service details belong in `documents/[Feature Doc] - Google Search MCP Tool.md`.
 
 4. **Allowed roots are mandatory unless wildcard is configured**
-   - `resolveAllowedPath` rejects paths outside `io.allowedRoots` plus the optional auto-allowed workspace cwd. `allowedRoots: ["*"]` permits any local path.
+   - `resolveAllowedPath` rejects paths outside `io.allowedRoots` plus the optional auto-allowed workspace cwd. It canonicalizes existing targets and existing parent directories before `path.relative` containment checks. `allowedRoots: ["*"]` permits any local path.
 
 5. **Repo-relative roots are rooted at the repository**
    - `configRootToAbsolute` resolves relative roots against the repository root. Do not reason about relative roots from the target file's directory.

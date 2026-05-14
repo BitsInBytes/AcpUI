@@ -6,9 +6,11 @@ import path from 'path';
 import {
   findFiles,
   grepSearch,
+  isPathWithinRoot,
   listDirectory,
   readFile,
   replaceText,
+  resolvePathWithinRoot,
   writeFile
 } from '../services/ioMcp/filesystem.js';
 import { resetMcpConfigForTests } from '../services/mcpConfig.js';
@@ -44,6 +46,45 @@ describe('IO MCP filesystem helpers', () => {
     await fs.writeFile(filePath, content, 'utf8');
     return filePath;
   }
+
+  describe('path boundary helpers', () => {
+    it('uses relative checks that reject sibling-prefix bypasses', () => {
+      const root = path.resolve(testDir, 'workspace');
+      const sibling = path.resolve(testDir, 'workspace-sibling', 'secrets.txt');
+
+      expect(isPathWithinRoot(sibling, root)).toBe(false);
+      expect(() => resolvePathWithinRoot(root, '../workspace-sibling/secrets.txt', 'file_path'))
+        .toThrow(/outside the allowed root/);
+    });
+
+    it('rejects empty roots', () => {
+      expect(() => resolvePathWithinRoot('', 'file.txt', 'file_path')).toThrow(/root_path is required/);
+    });
+
+    it('rejects non-absolute roots', () => {
+      expect(() => resolvePathWithinRoot('relative/root', 'file.txt', 'file_path')).toThrow(/absolute path/);
+    });
+
+    it('blocks symlink escapes when parent directories resolve outside the root (if symlinks are supported)', async () => {
+      const root = path.join(testDir, 'symlink-root');
+      const insideLink = path.join(root, 'link');
+      const outsideDir = path.join(testDir, 'outside');
+
+      await fs.mkdir(root, { recursive: true });
+      await fs.mkdir(outsideDir, { recursive: true });
+
+      try {
+        await fs.symlink(outsideDir, insideLink, process.platform === 'win32' ? 'junction' : 'dir');
+      } catch (err) {
+        if (err?.code === 'EPERM' || err?.code === 'ENOTSUP' || err?.code === 'EACCES') {
+          return;
+        }
+        throw err;
+      }
+
+      expect(() => resolvePathWithinRoot(root, 'link/escape.txt', 'file_path')).toThrow(/outside the allowed root/);
+    });
+  });
 
   describe('basic file tools', () => {
     it('reads selected line ranges', async () => {
@@ -275,6 +316,48 @@ describe('IO MCP filesystem helpers', () => {
 
       await expect(readFile(filePath)).rejects.toThrow(/size cap/);
       await expect(writeFile(path.join(testDir, 'too-large-write.txt'), '12345')).rejects.toThrow(/size cap/);
+    });
+
+    it('allows workspace-CWD operations with autoAllowWorkspaceCwd and empty allowedRoots, while rejecting escapes', async () => {
+      useMcpConfig({
+        tools: { io: true },
+        io: {
+          autoAllowWorkspaceCwd: true,
+          allowedRoots: [],
+          maxReadBytes: 1024 * 1024,
+          maxWriteBytes: 1024 * 1024,
+          maxReplaceBytes: 1024 * 1024,
+          maxOutputBytes: 1024 * 1024
+        }
+      });
+
+      const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpui-io-workspace-'));
+      const siblingDir = path.join(path.dirname(workspaceDir), `${path.basename(workspaceDir)}-sibling`);
+      vi.stubEnv('DEFAULT_WORKSPACE_CWD', workspaceDir);
+
+      try {
+        const nestedDir = path.join(workspaceDir, 'src');
+        const insideFile = path.join(nestedDir, 'inside.txt');
+
+        await fs.mkdir(nestedDir, { recursive: true });
+        await fs.writeFile(insideFile, 'needle\n', 'utf8');
+        await fs.mkdir(siblingDir, { recursive: true });
+        await fs.writeFile(path.join(siblingDir, 'outside.txt'), 'outside\n', 'utf8');
+
+        await expect(listDirectory('.')).resolves.toEqual(expect.arrayContaining(['src/']));
+        await expect(findFiles('**/*.txt')).resolves.toEqual(expect.arrayContaining([insideFile]));
+
+        const grepOutput = await grepSearch('needle', undefined, { fixedStrings: true });
+        expect(grepOutput.matches).toEqual(expect.arrayContaining([
+          expect.objectContaining({ filePath: insideFile })
+        ]));
+
+        await expect(listDirectory(siblingDir)).rejects.toThrow(/allowed roots/);
+        await expect(listDirectory(path.join('..', path.basename(siblingDir)))).rejects.toThrow(/allowed roots/);
+      } finally {
+        await fs.rm(workspaceDir, { recursive: true, force: true });
+        await fs.rm(siblingDir, { recursive: true, force: true });
+      }
     });
   });
 

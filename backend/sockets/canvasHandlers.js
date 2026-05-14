@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { writeLog } from '../services/logger.js';
 import * as db from '../database.js';
+import { resolveAllowedPath } from '../services/ioMcp/filesystem.js';
 
 export default function registerCanvasHandlers(io, socket) {
   socket.on('canvas_save', async (artifact, callback) => {
@@ -39,9 +40,9 @@ export default function registerCanvasHandlers(io, socket) {
 
   socket.on('canvas_apply_to_file', async ({ filePath, content }, callback) => {
     try {
-      if (!filePath) throw new Error("No file path provided");
-      writeLog(`[FS] Applying canvas artifact to file: ${filePath}`);
-      fs.writeFileSync(filePath, content, 'utf8');
+      const allowedPath = resolveAllowedPath(filePath, 'file_path');
+      writeLog(`[FS] Applying canvas artifact to file: ${allowedPath}`);
+      fs.writeFileSync(allowedPath, content, 'utf8');
       if (callback) callback({ success: true });
     } catch (err) {
       writeLog(`[FS ERR] Failed to apply to file: ${err.message}`);
@@ -51,25 +52,21 @@ export default function registerCanvasHandlers(io, socket) {
 
   socket.on('canvas_read_file', async ({ filePath }, callback) => {
     try {
-      if (!filePath) throw new Error("No file path provided");
-      
-      const resolvedPath = path.resolve(filePath);
-      const finalPath = fs.existsSync(resolvedPath) ? fs.realpathSync(resolvedPath) : resolvedPath;
-      
-      writeLog(`[FS] Reading file for canvas: ${finalPath}`);
-      const content = fs.readFileSync(finalPath, 'utf8');
-      const language = path.extname(finalPath).slice(1) || 'text';
-      const title = path.basename(finalPath);
-      
-      callback({ 
+      const allowedPath = resolveAllowedPath(filePath, 'file_path');
+      writeLog(`[FS] Reading file for canvas: ${allowedPath}`);
+      const content = fs.readFileSync(allowedPath, 'utf8');
+      const language = path.extname(allowedPath).slice(1) || 'text';
+      const title = path.basename(allowedPath);
+
+      callback?.({
         artifact: {
           id: `canvas-fs-${Date.now()}`,
           title,
           content,
           language,
-          filePath: finalPath,
+          filePath: allowedPath,
           version: 1
-        } 
+        }
       });
     } catch (err) {
       writeLog(`[FS ERR] Failed to read file for canvas: ${err.message}`);

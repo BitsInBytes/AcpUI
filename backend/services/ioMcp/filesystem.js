@@ -1,3 +1,4 @@
+import fsSync from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
 import { spawn } from 'child_process';
@@ -49,35 +50,81 @@ function comparePath(value) {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
-function isPathWithinRoot(targetPath, rootPath) {
+function canonicalizeExistingPath(value) {
+  return fsSync.existsSync(value) ? fsSync.realpathSync(value) : value;
+}
+
+function canonicalizePathForCreate(value) {
+  const resolved = path.resolve(value);
+  if (fsSync.existsSync(resolved)) {
+    return fsSync.realpathSync(resolved);
+  }
+
+  const parent = path.dirname(resolved);
+  if (fsSync.existsSync(parent)) {
+    return path.join(fsSync.realpathSync(parent), path.basename(resolved));
+  }
+
+  return resolved;
+}
+
+function defaultWorkspaceCwd() {
+  return process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
+}
+
+export function isPathWithinRoot(targetPath, rootPath) {
   const target = comparePath(targetPath);
   const root = comparePath(rootPath);
-  return target === root || target.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`);
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+export function resolvePathWithinRoot(rootPath, requestedPath, pathLabel = 'path') {
+  const rootValue = requireString(rootPath, 'root_path').trim();
+  if (!path.isAbsolute(rootValue)) {
+    throw new Error('root_path must be an absolute path.');
+  }
+
+  const resolvedRoot = path.resolve(rootValue);
+  const canonicalRoot = canonicalizeExistingPath(resolvedRoot);
+  const resolvedTarget = path.resolve(canonicalRoot, requireString(requestedPath, pathLabel));
+  const canonicalTarget = canonicalizePathForCreate(resolvedTarget);
+
+  if (!isPathWithinRoot(canonicalTarget, canonicalRoot)) {
+    throw new Error(`${pathLabel} is outside the allowed root: ${resolvedTarget}`);
+  }
+
+  return canonicalTarget;
 }
 
 function configuredAllowedRoots() {
   const config = getIoMcpConfig();
   const roots = [...(config.allowedRoots || [])];
   if (config.autoAllowWorkspaceCwd) {
-    roots.push(process.env.DEFAULT_WORKSPACE_CWD || process.cwd());
+    roots.push(defaultWorkspaceCwd());
   }
   return roots;
 }
 
-function resolveAllowedPath(value, name) {
-  const resolvedPath = path.resolve(requireString(value, name));
+export function resolveAllowedPath(value, name) {
+  const requestedPath = requireString(value, name);
+  const resolvedPath = path.isAbsolute(requestedPath)
+    ? path.resolve(requestedPath)
+    : path.resolve(defaultWorkspaceCwd(), requestedPath);
   const roots = configuredAllowedRoots();
-  if (roots.includes('*')) return resolvedPath;
+  if (roots.includes('*')) return canonicalizePathForCreate(resolvedPath);
 
+  const canonicalTarget = canonicalizePathForCreate(resolvedPath);
   const allowed = roots
     .map(configRootToAbsolute)
-    .some(root => isPathWithinRoot(resolvedPath, root));
+    .map(root => canonicalizeExistingPath(path.resolve(root)))
+    .some(root => isPathWithinRoot(canonicalTarget, root));
 
   if (!allowed) {
     throw new Error(`${name} is outside the configured MCP IO allowed roots: ${resolvedPath}`);
   }
 
-  return resolvedPath;
+  return canonicalTarget;
 }
 
 function assertContentSize(content, maxBytes, operation) {
@@ -406,14 +453,16 @@ function getSimilarity(s1, s2) {
 }
 
 export async function listDirectory(dirPath) {
-  const resolvedPath = resolveAllowedPath(dirPath, 'dir_path');
+  const resolvedPath = resolveAllowedPath(dirPath ?? defaultWorkspaceCwd(), 'dir_path');
   const entries = await fs.readdir(resolvedPath, { withFileTypes: true });
   return entries.map(entry => `${entry.name}${entry.isDirectory() ? '/' : ''}`);
 }
 
 export async function findFiles(pattern, dirPath) {
   requireString(pattern, 'pattern');
-  const cwd = dirPath ? resolveAllowedPath(dirPath, 'dir_path') : resolveAllowedPath(process.cwd(), 'dir_path');
+  const cwd = dirPath
+    ? resolveAllowedPath(dirPath, 'dir_path')
+    : resolveAllowedPath(defaultWorkspaceCwd(), 'dir_path');
   return globModule(pattern, { cwd, absolute: true, nodir: true });
 }
 
@@ -735,7 +784,9 @@ export async function grepSearch(pattern, dirPath, options = {}) {
     }
 
     const config = getIoMcpConfig();
-    const cwd = dirPath ? resolveAllowedPath(dirPath, 'dir_path') : resolveAllowedPath(process.cwd(), 'dir_path');
+    const cwd = dirPath
+      ? resolveAllowedPath(dirPath, 'dir_path')
+      : resolveAllowedPath(defaultWorkspaceCwd(), 'dir_path');
     const args = buildRipgrepArgs(pattern, normalizedOptions);
 
     const child = spawn(rgPath, args, { cwd });

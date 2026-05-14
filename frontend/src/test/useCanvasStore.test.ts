@@ -11,7 +11,8 @@ describe('useCanvasStore', () => {
         terminals: [],
         activeTerminalId: null,
         canvasArtifacts: [],
-        activeCanvasArtifact: null
+        activeCanvasArtifact: null,
+        canvasError: null
       });
     });
   });
@@ -98,6 +99,23 @@ describe('useCanvasStore', () => {
     expect(useCanvasStore.getState().canvasArtifacts[0].id).toBe('f1');
   });
 
+
+  it('handleOpenFileInCanvas stores read errors in canvasError without alert', () => {
+    const mockSocket = {
+      emit: vi.fn((event, _params, cb) => {
+        if (event === 'canvas_read_file') cb({ error: 'path denied' });
+      })
+    } as any;
+    const alertMock = vi.spyOn(window, 'alert').mockImplementation(() => {});
+
+    act(() => {
+      useCanvasStore.getState().handleOpenFileInCanvas(mockSocket, 's1', 'forbidden.txt');
+    });
+
+    expect(useCanvasStore.getState().canvasError).toBe('Failed to read file: path denied');
+    expect(alertMock).not.toHaveBeenCalled();
+    alertMock.mockRestore();
+  });
   it('handleFileEdited updates watched artifacts', () => {
     const mockSocket = {
       emit: vi.fn((event, _params, cb) => {
