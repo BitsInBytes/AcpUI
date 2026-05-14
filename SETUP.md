@@ -241,11 +241,13 @@ This keeps shell commands, sub-agent spawning, and tool calls flowing through Ac
 ## 12. Run
 
 ```powershell
-.\scripts\run.ps1          # production: build frontend, start backend
-.\scripts\run.ps1 dev      # development: backend watch mode + Vite HMR
+.\scripts\run-no-hot-reload.ps1  # no hot reload: build frontend, start backend
+.\scripts\run-hot-reload.ps1     # hot reload: backend watch mode + Vite HMR
 ```
 
-In production mode, access the app at `https://localhost:3005`. In dev mode, use the Vite URL printed by the script, typically `https://localhost:5173`; the frontend connects to the backend on `BACKEND_PORT`.
+These wrappers call the canonical launcher. Equivalent forms are `.\scripts\run.ps1 prod` and `.\scripts\run.ps1 dev`.
+
+In no-hot-reload mode, access the app at `https://localhost:3005`. In hot-reload mode, use the Vite URL printed by the script, typically `https://localhost:5173`; the frontend connects to the backend on `BACKEND_PORT`.
 
 Backend-only scripts are available from `backend/`:
 
@@ -260,7 +262,7 @@ Frontend-only Vite development is available from `frontend/`:
 npm run dev
 ```
 
-For full-stack development, prefer the root launcher so backend watch mode and Vite HMR start together.
+For full-stack development with hot reload, prefer `.\scripts\run-hot-reload.ps1` so backend watch mode and Vite HMR start together.
 
 ## 13. Validate
 

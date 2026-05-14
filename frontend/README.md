@@ -19,7 +19,7 @@ npm install
 npm run dev
 ```
 
-For full-stack development, run `..\scripts\run.ps1 dev` from the repository root so the backend runs in watch mode and Vite serves the frontend with HMR.
+For full-stack development with hot reload, run `..\scripts\run-hot-reload.ps1` from the repository root so the backend runs in watch mode and Vite serves the frontend with HMR. For a stable full-stack process without backend watch mode or Vite HMR, run `..\scripts\run-no-hot-reload.ps1`.
 
 Common validation commands:
 

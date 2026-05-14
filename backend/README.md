@@ -22,7 +22,7 @@ npm run dev      # backend watch mode
 npm run start    # production backend process
 ```
 
-The repository launcher uses `npm run dev` for backend hot reload when you run `..\scripts\run.ps1 dev`.
+The repository hot-reload launcher (`..\scripts\run-hot-reload.ps1`, equivalent to `..\scripts\run.ps1 dev`) uses `npm run dev`. The no-hot-reload launcher (`..\scripts\run-no-hot-reload.ps1`) uses `npm run start`.
 
 Common validation commands:
 
