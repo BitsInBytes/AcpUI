@@ -91,6 +91,15 @@ describe('providerLoader', () => {
       expect(result).toHaveProperty('intercept');
   });
 
+  it('getProviderModule falls back to DEFAULT_MODULE when module import fails', async () => {
+    // existsSync remains true; import should fail for the mocked provider path.
+    const result = await providerLoader.getProviderModule('test');
+    expect(result.intercept('test')).toBe('test');
+    expect(typeof result.setConfigOption).toBe('function');
+    expect(typeof result.onPromptStarted).toBe('function');
+    expect(typeof result.onPromptCompleted).toBe('function');
+  });
+
   it('handles provider.json read error', () => {
     mockFs.readFileSync.mockImplementation((p) => {
       const pStr = String(p);
@@ -198,6 +207,9 @@ describe('providerLoader', () => {
     await expect(mod.prepareAcpEnvironment(payload)).resolves.toBe(payload);
     await expect(mod.performHandshake()).resolves.toBeUndefined();
     await expect(mod.setInitialAgent()).resolves.toBeUndefined();
+    await expect(mod.setConfigOption({}, 's1', 'option-id', 'value')).resolves.toBeUndefined();
+    expect(mod.onPromptStarted('s1')).toBeUndefined();
+    expect(mod.onPromptCompleted('s1')).toBeUndefined();
     expect(mod.buildSessionParams('any')).toBeUndefined();
     expect(mod.getSessionPaths()).toEqual({ jsonl: '', json: '', tasksDir: '' });
     expect(mod.cloneSession()).toBeUndefined();

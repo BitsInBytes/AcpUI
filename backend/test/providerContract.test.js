@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
+import { pathToFileURL } from 'url';
 
-const requiredExports = [
+const requiredCallableExports = [
   'intercept',
   'normalizeUpdate',
   'normalizeModelState',
@@ -18,6 +19,7 @@ const requiredExports = [
   'prepareAcpEnvironment',
   'performHandshake',
   'setInitialAgent',
+  'setConfigOption',
   'buildSessionParams',
   'getSessionPaths',
   'cloneSession',
@@ -35,23 +37,30 @@ const requiredExports = [
 ];
 
 describe('provider contract exports', () => {
-  it('every provider explicitly exports every contract function', () => {
+  it('every provider module exports callable contract hooks', async () => {
     const providersRoot = path.resolve(process.cwd(), '..', 'providers');
     const providers = fs.readdirSync(providersRoot, { withFileTypes: true })
-      .filter(entry => entry.isDirectory())
-      .map(entry => entry.name);
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
 
     expect(providers.length).toBeGreaterThan(0);
 
-    for (const provider of providers) {
-      const indexPath = path.join(providersRoot, provider, 'index.js');
+    let checkedCount = 0;
+    for (const providerId of providers) {
+      const indexPath = path.join(providersRoot, providerId, 'index.js');
       if (!fs.existsSync(indexPath)) continue;
 
-      const source = fs.readFileSync(indexPath, 'utf8');
-      for (const exportName of requiredExports) {
-        const pattern = new RegExp(`export\\s+(?:async\\s+)?function\\s+${exportName}\\b|export\\s+const\\s+${exportName}\\b`);
-        expect(source, `${provider} must explicitly export ${exportName}`).toMatch(pattern);
+      checkedCount += 1;
+      const moduleExports = await import(pathToFileURL(indexPath).href);
+
+      for (const exportName of requiredCallableExports) {
+        expect(
+          moduleExports[exportName],
+          `${providerId} must export callable ${exportName}`
+        ).toEqual(expect.any(Function));
       }
     }
+
+    expect(checkedCount).toBeGreaterThan(0);
   });
 });

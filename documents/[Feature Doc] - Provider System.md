@@ -265,20 +265,20 @@ If this contract breaks, events and DB state can attach to the wrong provider, t
 
 ### Contract: Provider Module Export Surface
 
-`backend/test/providerContract.test.js` verifies that every `providers/*/index.js` explicitly exports these functions:
+`backend/test/providerContract.test.js` imports every `providers/*/index.js` module and verifies these exports are callable functions:
 
 | Group | Required exports |
 |---|---|
 | Message/update hooks | `intercept`, `normalizeUpdate`, `normalizeModelState`, `normalizeConfigOptions`, `parseExtension`, `emitCachedContext` |
 | Tool hooks | `extractToolOutput`, `extractFilePath`, `extractDiffFromToolCall`, `extractToolInvocation`, `normalizeTool`, `categorizeToolCall` |
-| Daemon/session hooks | `prepareAcpEnvironment`, `performHandshake`, `setInitialAgent`, `buildSessionParams`, `getMcpServerMeta` |
+| Daemon/session hooks | `prepareAcpEnvironment`, `performHandshake`, `setInitialAgent`, `setConfigOption`, `buildSessionParams`, `getMcpServerMeta` |
 | File/session hooks | `getSessionPaths`, `cloneSession`, `archiveSessionFiles`, `restoreSessionFiles`, `deleteSessionFiles`, `parseSessionHistory` |
 | Directory/hook hooks | `getSessionDir`, `getAttachmentsDir`, `getAgentsDir`, `getHooksForAgent` |
 | Prompt lifecycle hooks | `onPromptStarted`, `onPromptCompleted` |
 
-Runtime fallback in `providerLoader.js` supplies `DEFAULT_MODULE` implementations for many hooks. The contract test is stricter than the fallback: real provider modules are expected to export the complete surface explicitly.
+Runtime fallback in `providerLoader.js` supplies `DEFAULT_MODULE` implementations for runtime-called hooks. The contract test is stricter than fallback behavior: shipped provider modules are expected to export the complete callable surface.
 
-`setConfigOption(acpClient, sessionId, optionId, value)` is used by `sessionManager.setProviderConfigOption`, `sessionHandlers` event `set_session_option`, and saved config reapply logic. Providers that advertise writable config options must export this hook even though it is not part of `providerContract.test.js` required exports.
+`setConfigOption(acpClient, sessionId, optionId, value)` is used by `sessionManager.setProviderConfigOption`, `sessionHandlers` event `set_session_option`, and saved config reapply logic.
 
 ### Contract: Intercept Return Value
 
@@ -496,11 +496,11 @@ Session create/load
 2. Provider module imports are cached.
    `getProviderModule` caches the bound module after import. Runtime code changes in `providers/*/index.js` require process restart to load again.
 
-3. `DEFAULT_MODULE` is not the provider contract test surface.
-   `DEFAULT_MODULE` keeps many runtime paths callable, but `providerContract.test.js` requires real provider modules to explicitly export the full contract, including prompt lifecycle hooks.
+3. `DEFAULT_MODULE` and provider contract strictness are different layers.
+   `DEFAULT_MODULE` keeps runtime paths callable when provider imports fail, while `providerContract.test.js` enforces callable exports on shipped provider modules.
 
-4. `setConfigOption` is conditional and direct.
-   Session option writes call `providerModule.setConfigOption` through `sessionManager.setProviderConfigOption`. Providers that expose writable options need this function even though the provider contract test does not list it.
+4. `setConfigOption` is direct.
+   Session option writes call `providerModule.setConfigOption` through `sessionManager.setProviderConfigOption`, and the provider contract test requires that callable export.
 
 5. `getProvider()` without an ID depends on context.
    Bound provider hooks run inside `runWithProvider`, so `getProvider()` resolves the active provider. Background work outside that context should pass `providerId` explicitly.
@@ -563,7 +563,7 @@ Session create/load
   - `DEFAULT_MODULE functions all have correct default behaviors`
 
 - `backend/test/providerContract.test.js`
-  - `every provider explicitly exports every contract function`
+  - `every provider module exports callable contract hooks`
 
 - `backend/test/jsonConfigDiagnostics.test.js`
   - `returns no errors when loaded JSON config files are valid`
