@@ -67,7 +67,7 @@ This is a backend MCP feature with frontend output rendering support. Source own
 
 4. **The stdio proxy registers the advertised schemas with the ACP client**
    - File: `backend/mcp/stdio-proxy.js` (Functions: `runProxy`, `backendFetch`, `buildServerInstructions`)
-   - The proxy calls `GET /api/mcp/tools` during `runProxy`, registers those tool definitions with the MCP SDK, and forwards tool calls to `POST /api/mcp/tool-call`.
+   - The proxy calls `GET /api/mcp/tools` during `runProxy`, registers those tool definitions with the MCP SDK, and forwards authenticated tool calls (`x-acpui-mcp-proxy-auth`) to `POST /api/mcp/tool-call`.
    - Tool visibility is tied to the schema list fetched by the proxy for that ACP session.
 
 5. **Runtime handlers are registered with the same gate**
@@ -84,8 +84,8 @@ This is a backend MCP feature with frontend output rendering support. Source own
    ```
 
 6. **Tool calls enter through the MCP API execution route**
-   - File: `backend/routes/mcpApi.js` (Route: `POST /tool-call`, Function: `createToolCallAbortSignal`, Function: `resolveToolContext`)
-   - The route finds `tools[toolName]`, augments args with provider/proxy context, forwards `mcpRequestId` and `requestMeta`, and always includes `abortSignal`.
+   - File: `backend/routes/mcpApi.js` (Route: `POST /tool-call`, Function: `createToolCallAbortSignal`, Function: `resolveExecutionContext`)
+   - The route requires a valid proxy id, matching proxy auth token, and bound ACP session, then finds `tools[toolName]`, augments args with provider/proxy context, forwards `mcpRequestId` and `requestMeta`, and always includes `abortSignal`.
    - Handler failures return text content shaped as `Error: <message>` unless the request/response is already aborted or destroyed.
 
 7. **Tool System V2 records stable display metadata**
@@ -317,7 +317,7 @@ wrapToolHandlers begin
 | Config normalization | `backend/services/mcpConfig.js` | `getMcpConfig`, `normalizeMcpConfig`, `boolSetting`, `numberSetting`, `stringArray`, `isIoMcpEnabled`, `getIoMcpConfig`, `getWebFetchMcpConfig` | Loads config, normalizes flags/limits, and exposes IO/web fetch config |
 | Tool names | `backend/services/tools/acpUxTools.js` | `ACP_UX_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`, `ACP_UX_IO_TOOL_NAMES`, `acpUxIoToolConfig`, `isAcpUxToolName` | Canonical names and UI metadata for optional AcpUI tools |
 | MCP schemas | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions` | Defines IO MCP schemas, annotations, and required inputs |
-| MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `GET /tools`, `POST /tool-call`, `resolveToolContext`, `createToolCallAbortSignal`, `canWriteResponse` | Advertises schemas, dispatches calls, attaches context and abort signals |
+| MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `GET /tools`, `POST /tool-call`, `resolveExecutionContext`, `createToolCallAbortSignal`, `canWriteResponse` | Advertises schemas, dispatches authenticated calls, attaches context and abort signals |
 | Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `buildServerInstructions`, `ListToolsRequestSchema`, `CallToolRequestSchema` | Fetches schemas for ACP sessions and forwards tool calls to backend API |
 | Handler registration | `backend/mcp/mcpServer.js` | `createToolHandlers`, `wrapToolHandlers`, `Object.assign(tools, createIoMcpToolHandlers())` | Registers IO handlers behind the feature flag and records Tool System V2 execution metadata |
 | IO handlers | `backend/mcp/ioMcpToolHandlers.js` | `createIoMcpToolHandlers`, `textResult` | Maps MCP args to filesystem/web services and returns MCP text content |

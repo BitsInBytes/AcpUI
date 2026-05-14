@@ -20,12 +20,59 @@ import {
 } from '../mcp/coreMcpToolDefinitions.js';
 import { getGoogleSearchMcpToolDefinitions, getIoMcpToolDefinitions } from '../mcp/ioMcpToolDefinitions.js';
 
+const MCP_PROXY_AUTH_HEADER = 'x-acpui-mcp-proxy-auth';
+
 function resolveToolContext(providerId, proxyId) {
   const proxy = resolveMcpProxy(proxyId);
   return {
     providerId: proxy?.providerId || providerId || null,
     acpSessionId: proxy?.acpSessionId || null,
     mcpProxyId: proxy?.proxyId || proxyId || null
+  };
+}
+
+function readProxyAuthToken(req) {
+  const headerValue = req.get?.(MCP_PROXY_AUTH_HEADER);
+  if (typeof headerValue === 'string' && headerValue.trim()) return headerValue.trim();
+
+  const raw = req?.headers?.[MCP_PROXY_AUTH_HEADER];
+  if (Array.isArray(raw)) return raw[0] || '';
+  if (typeof raw === 'string') return raw.trim();
+  return '';
+}
+
+function resolveExecutionContext(providerId, proxyId, proxyAuthToken) {
+  if (!proxyId) {
+    return { error: 'MCP proxy context is required', status: 401 };
+  }
+
+  const proxy = resolveMcpProxy(proxyId);
+  if (!proxy) {
+    return { error: `Unknown MCP proxy: ${proxyId}`, status: 403 };
+  }
+
+  if (!proxyAuthToken) {
+    return { error: 'Missing MCP proxy auth token', status: 401 };
+  }
+
+  if (!proxy.authToken || proxy.authToken !== proxyAuthToken) {
+    return { error: 'Invalid MCP proxy auth token', status: 403 };
+  }
+
+  if (!proxy.acpSessionId) {
+    return { error: `MCP proxy ${proxyId} is not bound to an ACP session`, status: 403 };
+  }
+
+  if (providerId && proxy.providerId !== providerId) {
+    return { error: `MCP proxy provider mismatch: expected ${proxy.providerId}`, status: 403 };
+  }
+
+  return {
+    context: {
+      providerId: proxy.providerId,
+      acpSessionId: proxy.acpSessionId,
+      mcpProxyId: proxy.proxyId
+    }
   };
 }
 
@@ -110,6 +157,13 @@ export default function createMcpApiRoutes(io) {
     const { tool: toolName, args, providerId, proxyId, mcpRequestId, requestMeta } = req.body;
     writeLog(`[MCP API] Tool call: ${toolName}`);
 
+    const proxyAuthToken = readProxyAuthToken(req);
+    const resolvedExecution = resolveExecutionContext(providerId || null, proxyId || null, proxyAuthToken);
+    if (resolvedExecution.error) {
+      res.status(resolvedExecution.status).json({ error: resolvedExecution.error });
+      return;
+    }
+
     const handler = tools[toolName];
     if (!handler) {
       res.status(404).json({ error: `Unknown tool: ${toolName}` });
@@ -119,7 +173,7 @@ export default function createMcpApiRoutes(io) {
     let abortSignal = null;
     try {
       abortSignal = createToolCallAbortSignal(req, res, toolName);
-      const context = resolveToolContext(providerId || null, proxyId || null);
+      const context = resolvedExecution.context;
       const handlerArgs = { ...(args || {}) };
       if (context.providerId) handlerArgs.providerId = context.providerId;
       if (context.acpSessionId) handlerArgs.acpSessionId = context.acpSessionId;

@@ -62,11 +62,14 @@ async function backendFetch(path, options = {}) {
 export async function runProxy() {
   const providerId = process.env.ACP_SESSION_PROVIDER_ID || '';
   const proxyId = process.env.ACP_UI_MCP_PROXY_ID || '';
+  const proxyAuthToken = process.env.ACP_UI_MCP_PROXY_AUTH_TOKEN || '';
+  const proxyAuthHeaders = proxyAuthToken ? { 'x-acpui-mcp-proxy-auth': proxyAuthToken } : {};
+
   const queryParts = [];
   if (providerId) queryParts.push(`providerId=${encodeURIComponent(providerId)}`);
   if (proxyId) queryParts.push(`proxyId=${encodeURIComponent(proxyId)}`);
   const query = queryParts.length > 0 ? `?${queryParts.join('&')}` : '';
-  const { tools, serverName } = await backendFetch(`/api/mcp/tools${query}`);
+  const { tools, serverName } = await backendFetch(`/api/mcp/tools${query}`, { headers: proxyAuthHeaders });
 
   const resolvedServerName = serverName || 'acpui-proxy';
   const instructions = buildServerInstructions(tools, resolvedServerName);
@@ -95,6 +98,7 @@ export async function runProxy() {
     const { name, arguments: args } = request.params;
     return await backendFetch('/api/mcp/tool-call', {
       method: 'POST',
+      headers: proxyAuthHeaders,
       body: JSON.stringify({
         tool: name,
         args: args || {},

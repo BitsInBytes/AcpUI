@@ -10,7 +10,7 @@ import {
   resolveModelSelection
 } from './modelOptions.js';
 import { mergeConfigOptions, normalizeConfigOptions } from './configOptions.js';
-import { bindMcpProxy, createMcpProxyBinding, getMcpProxyIdFromServers } from '../mcp/mcpProxyRegistry.js';
+import { bindMcpProxy, createMcpProxyBinding, getMcpProxyAuthToken, getMcpProxyIdFromServers } from '../mcp/mcpProxyRegistry.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +32,7 @@ export function getMcpServers(providerId, { acpSessionId = null } = {}) {
   const mcpServerMeta = providerModule.getMcpServerMeta?.();
   const proxyPath = path.resolve(__dirname, '..', 'mcp', 'stdio-proxy.js');
   const proxyId = createMcpProxyBinding({ providerId, acpSessionId });
+  const proxyAuthToken = getMcpProxyAuthToken(proxyId);
   return [{
     name,
     command: 'node',
@@ -39,6 +40,7 @@ export function getMcpServers(providerId, { acpSessionId = null } = {}) {
     env: [
       { name: 'ACP_SESSION_PROVIDER_ID', value: String(providerId) },
       { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
+      { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ],

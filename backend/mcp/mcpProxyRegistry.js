@@ -7,6 +7,10 @@ function cloneProxy(proxy) {
   return proxy ? { ...proxy } : null;
 }
 
+function generateProxyAuthToken() {
+  return `mcp-proxy-auth-${randomUUID()}`;
+}
+
 export function createMcpProxyBinding({ providerId, acpSessionId = null, now = Date.now() } = {}) {
   if (!providerId) {
     throw new Error('providerId is required to create an MCP proxy binding');
@@ -18,6 +22,7 @@ export function createMcpProxyBinding({ providerId, acpSessionId = null, now = D
     proxyId,
     providerId,
     acpSessionId,
+    authToken: generateProxyAuthToken(),
     createdAt: now,
     boundAt: acpSessionId ? now : null,
     lastSeenAt: now
@@ -53,6 +58,11 @@ export function resolveMcpProxy(proxyId, now = Date.now()) {
   return cloneProxy(existing);
 }
 
+export function getMcpProxyAuthToken(proxyId) {
+  if (!proxyId) return null;
+  return proxies.get(proxyId)?.authToken || null;
+}
+
 export function expireMcpProxyBindings(now = Date.now(), ttlMs = DEFAULT_UNBOUND_PROXY_TTL_MS) {
   let removed = 0;
   for (const [proxyId, proxy] of proxies.entries()) {
@@ -69,6 +79,15 @@ export function getMcpProxyIdFromServers(mcpServers = []) {
     const env = Array.isArray(server?.env) ? server.env : [];
     const proxyEntry = env.find(entry => entry?.name === 'ACP_UI_MCP_PROXY_ID');
     if (proxyEntry?.value) return String(proxyEntry.value);
+  }
+  return null;
+}
+
+export function getMcpProxyAuthTokenFromServers(mcpServers = []) {
+  for (const server of mcpServers || []) {
+    const env = Array.isArray(server?.env) ? server.env : [];
+    const tokenEntry = env.find(entry => entry?.name === 'ACP_UI_MCP_PROXY_AUTH_TOKEN');
+    if (tokenEntry?.value) return String(tokenEntry.value);
   }
   return null;
 }

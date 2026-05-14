@@ -86,6 +86,7 @@ return [{
   env: [
     { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
     { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
+    { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
     { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
     { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' }
   ],
@@ -97,7 +98,7 @@ return [{
 
 File: `backend/mcp/mcpProxyRegistry.js` (Functions: `createMcpProxyBinding`, `bindMcpProxy`, `resolveMcpProxy`, `getMcpProxyIdFromServers`)
 
-`createMcpProxyBinding` returns an id like `mcp-proxy-...` and stores provider id, optional ACP session id, creation time, bound time, and last-seen time. `resolveMcpProxy` is the primary lookup used by `/api/mcp/*`; request-provided provider values are fallback context only.
+`createMcpProxyBinding` returns an id like `mcp-proxy-...` and stores provider id, optional ACP session id, a per-proxy auth token, creation time, bound time, and last-seen time. `resolveMcpProxy` is the primary lookup used by `/api/mcp/*`; `/api/mcp/tool-call` now requires a valid proxy id, matching proxy auth token, and bound ACP session.
 
 ```javascript
 // FILE: backend/mcp/mcpProxyRegistry.js (Functions: createMcpProxyBinding, resolveMcpProxy)
@@ -116,12 +117,13 @@ proxies.set(proxyId, {
 
 File: `backend/mcp/stdio-proxy.js` (Functions: `runProxy`, `backendFetch`)
 
-The proxy reads `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, and `BACKEND_PORT`, then calls `GET /api/mcp/tools`. `backendFetch` retries ordinary fetch failures up to three attempts and immediately rethrows aborts.
+The proxy reads `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN`, and `BACKEND_PORT`, then calls `GET /api/mcp/tools`. It forwards `x-acpui-mcp-proxy-auth` on backend calls. `backendFetch` retries ordinary fetch failures up to three attempts and immediately rethrows aborts.
 
 ```javascript
 // FILE: backend/mcp/stdio-proxy.js (Function: runProxy)
 const providerId = process.env.ACP_SESSION_PROVIDER_ID || '';
 const proxyId = process.env.ACP_UI_MCP_PROXY_ID || '';
+const proxyAuthToken = process.env.ACP_UI_MCP_PROXY_AUTH_TOKEN || '';
 const { tools, serverName } = await backendFetch(`/api/mcp/tools${query}`);
 ```
 
@@ -172,7 +174,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 File: `backend/mcp/stdio-proxy.js` (Handler: `CallToolRequestSchema`)
 
-The proxy forwards the tool name, arguments, provider id, proxy id, MCP request id, request metadata, and cancellation signal to `POST /api/mcp/tool-call`.
+The proxy forwards the tool name, arguments, provider id, proxy id, MCP request id, request metadata, cancellation signal, and `x-acpui-mcp-proxy-auth` token to `POST /api/mcp/tool-call`.
 
 ```javascript
 // FILE: backend/mcp/stdio-proxy.js (Handler: CallToolRequestSchema)
@@ -190,7 +192,7 @@ return await backendFetch('/api/mcp/tool-call', {
 });
 ```
 
-9. `POST /api/mcp/tool-call` resolves context, disables timeouts, and invokes the handler.
+9. `POST /api/mcp/tool-call` authenticates the proxy boundary, resolves bound context, disables timeouts, and invokes the handler.
 
 File: `backend/routes/mcpApi.js` (Route: `POST /tool-call`, Functions: `createToolCallAbortSignal`, `canWriteResponse`)
 
@@ -202,7 +204,9 @@ req.setTimeout(0);
 res.setTimeout(0);
 if (req.socket) req.socket.setTimeout(0);
 
-const context = resolveToolContext(providerId || null, proxyId || null);
+const resolvedExecution = resolveExecutionContext(providerId || null, proxyId || null, proxyAuthToken);
+if (resolvedExecution.error) return res.status(resolvedExecution.status).json({ error: resolvedExecution.error });
+const context = resolvedExecution.context;
 const handlerArgs = { ...(args || {}) };
 if (context.providerId) handlerArgs.providerId = context.providerId;
 if (context.acpSessionId) handlerArgs.acpSessionId = context.acpSessionId;
@@ -314,8 +318,9 @@ The MCP server contract has four synchronized layers:
 
 2. Proxy-scoped context.
 - `ACP_UI_MCP_PROXY_ID` is the stable key across the stdio boundary.
-- `resolveToolContext` must prefer `resolveMcpProxy(proxyId)` over request fallback provider values.
-- Handler arguments must include `providerId`, `acpSessionId`, and `mcpProxyId` when a binding exists.
+- `ACP_UI_MCP_PROXY_AUTH_TOKEN` authenticates stdio proxy calls into `/api/mcp/tool-call`.
+- `/api/mcp/tool-call` must reject missing/invalid proxy ids, auth tokens, unbound proxy sessions, and provider mismatches.
+- Handler arguments must include `providerId`, `acpSessionId`, and `mcpProxyId` from the resolved proxy binding.
 
 3. Cancellation and timeout behavior.
 - The proxy forwards MCP cancellation through `fetch(..., { signal })`.
@@ -369,6 +374,7 @@ MCP server entry passed to ACP:
   "env": [
     { "name": "ACP_SESSION_PROVIDER_ID", "value": "provider-id" },
     { "name": "ACP_UI_MCP_PROXY_ID", "value": "mcp-proxy-id" },
+    { "name": "ACP_UI_MCP_PROXY_AUTH_TOKEN", "value": "mcp-proxy-auth-token" },
     { "name": "BACKEND_PORT", "value": "3005" },
     { "name": "NODE_TLS_REJECT_UNAUTHORIZED", "value": "0" }
   ],
@@ -502,9 +508,9 @@ Tool state projection written by `mcpExecutionRegistry`:
 - Problem: a `session/new` MCP server entry has a proxy id before the ACP session id exists.
 - Detection: confirm `bindMcpProxy(getMcpProxyIdFromServers(newMcpServers), ...)` runs after `session/new`, and confirm `mcpProxyRegistry.test.js` covers pending-to-bound transitions.
 
-4. Prefer proxy binding over fallback request fields.
-- Problem: `providerId` in the proxy request is a fallback and can be incomplete without `proxyId` resolution.
-- Detection: `POST /tool-call passes resolved proxy context to handlers` should show provider/session values from `resolveMcpProxy`.
+4. Enforce proxy auth and bound-session context for tool execution.
+- Problem: direct HTTP callers can bypass the intended stdio MCP boundary if `/tool-call` accepts unbound context.
+- Detection: `POST /tool-call rejects unauthenticated direct calls`, `rejects unknown proxy ids`, `rejects proxies missing session context`, and `rejects fallback provider mismatches` should all pass.
 
 5. Preserve timeout disabling for long-running tools.
 - Problem: shell, sub-agent, and counsel calls can run longer than default HTTP timeouts.
@@ -601,10 +607,10 @@ cd backend; npx vitest run test/mcpApi.test.js test/mcpServer.test.js test/stdio
 
 ### For debugging issues with this feature
 1. Check `backend/server.js` route order and readiness if `/api/mcp/*` returns `503` or a static fallback response.
-2. Inspect the `mcpServers` payload sent with ACP `session/new` or `session/load`; verify `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `BACKEND_PORT`, and optional `_meta`.
+2. Inspect the `mcpServers` payload sent with ACP `session/new` or `session/load`; verify `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN`, `BACKEND_PORT`, and optional `_meta`.
 3. Resolve the proxy id with `resolveMcpProxy(proxyId)` to confirm provider/session scope.
 4. Compare `/api/mcp/tools` output with `createToolHandlers(io)` for the same config flags.
-5. Trace a `POST /api/mcp/tool-call` request and verify enriched handler args include context and `abortSignal`.
+5. Trace a `POST /api/mcp/tool-call` request and verify `x-acpui-mcp-proxy-auth` is present, proxy validation succeeds, and enriched handler args include context and `abortSignal`.
 6. Check `mcpExecutionRegistry.find(...)` and `toolCallState.get(...)` when timeline tool titles, categories, or outputs are missing.
 7. Check `toolInvocationResolver.resolveToolInvocation` when provider tool events do not match MCP execution metadata.
 8. Run the required backend test targets before changing broader MCP behavior.

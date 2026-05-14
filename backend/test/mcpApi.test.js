@@ -24,6 +24,13 @@ vi.mock('../services/logger.js', () => ({ writeLog: vi.fn() }));
 import createMcpApiRoutes from '../routes/mcpApi.js';
 import { resetMcpConfigForTests } from '../services/mcpConfig.js';
 
+const DEFAULT_PROXY = {
+  proxyId: 'proxy-1',
+  providerId: 'provider-a',
+  acpSessionId: 'acp-1',
+  authToken: 'proxy-auth-token'
+};
+
 const BASE_MCP_CONFIG = {
   tools: {
     invokeShell: true,
@@ -59,7 +66,7 @@ describe('MCP API Routes', () => {
     for (const key of Object.keys(mockHandlers)) delete mockHandlers[key];
     useMcpConfig();
     mockResolveMcpProxy.mockReset();
-    mockResolveMcpProxy.mockReturnValue(null);
+    mockResolveMcpProxy.mockReturnValue({ ...DEFAULT_PROXY });
   });
 
   afterEach(() => {
@@ -71,9 +78,16 @@ describe('MCP API Routes', () => {
     return router.stack.find(l => l.route?.path === path && l.route.methods[method]);
   }
 
-  function mockReq(body = {}) {
+  function mockReq(body = {}, { includeAuth = true, headers = {} } = {}) {
     const req = new EventEmitter();
-    req.body = body;
+    req.body = {
+      proxyId: DEFAULT_PROXY.proxyId,
+      providerId: DEFAULT_PROXY.providerId,
+      ...body
+    };
+    const authHeader = includeAuth ? { 'x-acpui-mcp-proxy-auth': DEFAULT_PROXY.authToken } : {};
+    req.headers = { ...authHeader, ...headers };
+    req.get = vi.fn((name) => req.headers[(name || '').toLowerCase()]);
     req.setTimeout = vi.fn();
     req.socket = { setTimeout: vi.fn() };
     return req;
@@ -312,6 +326,9 @@ describe('MCP API Routes', () => {
 
     expect(mockHandlers.good_tool).toHaveBeenCalledWith({
       x: 1,
+      providerId: 'provider-a',
+      acpSessionId: 'acp-1',
+      mcpProxyId: 'proxy-1',
       abortSignal: expect.objectContaining({ aborted: false })
     });
     expect(res.json).toHaveBeenCalledWith(expected);
@@ -322,7 +339,8 @@ describe('MCP API Routes', () => {
     mockResolveMcpProxy.mockReturnValue({
       proxyId: 'proxy-1',
       providerId: 'provider-a',
-      acpSessionId: 'acp-1'
+      acpSessionId: 'acp-1',
+      authToken: 'proxy-auth-token'
     });
     mockHandlers.good_tool = vi.fn().mockResolvedValue(expected);
 
@@ -332,7 +350,7 @@ describe('MCP API Routes', () => {
     await route.route.stack[0].handle(mockReq({
       tool: 'good_tool',
       args: { x: 1 },
-      providerId: 'fallback-provider',
+      providerId: 'provider-a',
       proxyId: 'proxy-1',
       mcpRequestId: 42,
       requestMeta: { source: 'test' }
@@ -349,6 +367,69 @@ describe('MCP API Routes', () => {
       abortSignal: expect.objectContaining({ aborted: false })
     });
     expect(res.json).toHaveBeenCalledWith(expected);
+  });
+
+  it('POST /tool-call rejects unauthenticated direct calls', async () => {
+    mockHandlers.good_tool = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'done' }] });
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'post', '/tool-call');
+    const res = mockRes();
+
+    await route.route.stack[0].handle(
+      mockReq({ tool: 'good_tool', args: { x: 1 } }, { includeAuth: false }),
+      res,
+      vi.fn()
+    );
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(mockHandlers.good_tool).not.toHaveBeenCalled();
+  });
+
+  it('POST /tool-call rejects unknown proxy ids', async () => {
+    mockResolveMcpProxy.mockReturnValue(null);
+    mockHandlers.good_tool = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'done' }] });
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'post', '/tool-call');
+    const res = mockRes();
+
+    await route.route.stack[0].handle(mockReq({ tool: 'good_tool', args: { x: 1 } }), res, vi.fn());
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(mockHandlers.good_tool).not.toHaveBeenCalled();
+  });
+
+  it('POST /tool-call rejects proxies missing session context', async () => {
+    mockResolveMcpProxy.mockReturnValue({
+      proxyId: 'proxy-1',
+      providerId: 'provider-a',
+      acpSessionId: null,
+      authToken: 'proxy-auth-token'
+    });
+    mockHandlers.good_tool = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'done' }] });
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'post', '/tool-call');
+    const res = mockRes();
+
+    await route.route.stack[0].handle(mockReq({ tool: 'good_tool', args: { x: 1 } }), res, vi.fn());
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(mockHandlers.good_tool).not.toHaveBeenCalled();
+  });
+
+  it('POST /tool-call rejects fallback provider mismatches', async () => {
+    mockHandlers.good_tool = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'done' }] });
+    const router = createMcpApiRoutes(io, acpClient);
+    const route = getRoute(router, 'post', '/tool-call');
+    const res = mockRes();
+
+    await route.route.stack[0].handle(
+      mockReq({ tool: 'good_tool', args: { x: 1 }, providerId: 'provider-b' }),
+      res,
+      vi.fn()
+    );
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(mockHandlers.good_tool).not.toHaveBeenCalled();
   });
 
   it('POST /tool-call aborts the handler signal when the request fires the "aborted" event', async () => {

@@ -27,6 +27,7 @@ describe('stdio-proxy', () => {
     process.env.BACKEND_PORT = '3005';
     process.env.ACP_SESSION_PROVIDER_ID = 'provider-a';
     process.env.ACP_UI_MCP_PROXY_ID = 'proxy-1';
+    process.env.ACP_UI_MCP_PROXY_AUTH_TOKEN = 'proxy-auth-token';
   });
 
   it('runs the proxy lifecycle', async () => {
@@ -35,7 +36,12 @@ describe('stdio-proxy', () => {
     });
     
     await runProxy();
-    expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tools?providerId=provider-a&proxyId=proxy-1'), expect.any(Object));
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/mcp/tools?providerId=provider-a&proxyId=proxy-1'),
+      expect.objectContaining({
+        headers: expect.objectContaining({ 'x-acpui-mcp-proxy-auth': 'proxy-auth-token' })
+      })
+    );
   });
 
   it('handles fetch errors with retry', async () => {
@@ -103,6 +109,9 @@ describe('stdio-proxy', () => {
       }));
       expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tool-call'), expect.objectContaining({
         signal: controller.signal
+      }));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/mcp/tool-call'), expect.objectContaining({
+        headers: expect.objectContaining({ 'x-acpui-mcp-proxy-auth': 'proxy-auth-token' })
       }));
     }
   });

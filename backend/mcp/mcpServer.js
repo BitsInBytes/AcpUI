@@ -19,7 +19,7 @@ import path from 'path';
 import { createHash } from 'crypto';
 import { subAgentInvocationManager } from './subAgentInvocationManager.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
-import { createMcpProxyBinding } from './mcpProxyRegistry.js';
+import { createMcpProxyBinding, getMcpProxyAuthToken } from './mcpProxyRegistry.js';
 import { shellRunManager } from '../services/shellRunManager.js';
 import {
   mcpExecutionRegistry,
@@ -116,6 +116,7 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
   const mcpServerMeta = providerModule.getMcpServerMeta?.();
   const proxyPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'stdio-proxy.js');
   const proxyId = createMcpProxyBinding({ providerId: provider.id, acpSessionId });
+  const proxyAuthToken = getMcpProxyAuthToken(proxyId);
   return [{
     name,
     command: 'node',
@@ -123,6 +124,7 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
     env: [
       { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
       { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
+      { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
       { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
     ],

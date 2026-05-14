@@ -113,10 +113,10 @@ export const subAgentToolHandler = {
 ### 3. The Stdio Proxy Forwards MCP Context
 
 File: `backend/mcp/stdio-proxy.js` (Function: `runProxy`, MCP handler: `CallToolRequestSchema`)
-File: `backend/routes/mcpApi.js` (Route: `POST /tool-call`, Functions: `resolveToolContext`, `createToolCallAbortSignal`)
+File: `backend/routes/mcpApi.js` (Route: `POST /tool-call`, Functions: `resolveExecutionContext`, `createToolCallAbortSignal`)
 File: `backend/mcp/mcpProxyRegistry.js` (Functions: `createMcpProxyBinding`, `resolveMcpProxy`, `bindMcpProxy`)
 
-`getMcpServers` creates a per-session stdio proxy with `ACP_SESSION_PROVIDER_ID` and `ACP_UI_MCP_PROXY_ID`. The proxy fetches tool definitions from `/api/mcp/tools` and forwards tool calls to `/api/mcp/tool-call` with the MCP request ID, request metadata, provider ID, proxy ID, and abort signal.
+`getMcpServers` creates a per-session stdio proxy with `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, and `ACP_UI_MCP_PROXY_AUTH_TOKEN`. The proxy fetches tool definitions from `/api/mcp/tools` and forwards tool calls to `/api/mcp/tool-call` with the MCP request ID, request metadata, provider ID, proxy ID, abort signal, and `x-acpui-mcp-proxy-auth` token.
 
 ```javascript
 // FILE: backend/mcp/stdio-proxy.js (MCP handler: CallToolRequestSchema)
@@ -134,7 +134,7 @@ return await backendFetch('/api/mcp/tool-call', {
 });
 ```
 
-`POST /tool-call` resolves the proxy binding to `providerId` and `acpSessionId`, then injects those fields into the handler args. The route also creates an `AbortSignal` that fires when the request aborts or the response closes before completion.
+`POST /tool-call` requires a valid proxy id, matching proxy auth token, and bound proxy session, then resolves the proxy binding to `providerId` and `acpSessionId` and injects those fields into the handler args. The route also creates an `AbortSignal` that fires when the request aborts or the response closes before completion.
 
 ### 4. The MCP Handler Starts a Tracked Execution
 

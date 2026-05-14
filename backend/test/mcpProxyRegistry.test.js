@@ -4,6 +4,8 @@ import {
   clearMcpProxyRegistry,
   createMcpProxyBinding,
   expireMcpProxyBindings,
+  getMcpProxyAuthToken,
+  getMcpProxyAuthTokenFromServers,
   getMcpProxyIdFromServers,
   resolveMcpProxy
 } from '../mcp/mcpProxyRegistry.js';
@@ -21,6 +23,7 @@ describe('mcpProxyRegistry', () => {
       proxyId,
       providerId: 'provider-a',
       acpSessionId: null,
+      authToken: expect.stringMatching(/^mcp-proxy-auth-/),
       createdAt: 1000,
       lastSeenAt: 1001
     }));
@@ -83,5 +86,22 @@ describe('mcpProxyRegistry', () => {
         ]
       }
     ])).toBe('mcp-proxy-test');
+  });
+
+  it('reads proxy auth token by proxy id', () => {
+    const proxyId = createMcpProxyBinding({ providerId: 'provider-a' });
+    expect(getMcpProxyAuthToken(proxyId)).toMatch(/^mcp-proxy-auth-/);
+  });
+
+  it('extracts proxy auth token from MCP server env', () => {
+    expect(getMcpProxyAuthTokenFromServers([
+      {
+        env: [
+          { name: 'ACP_SESSION_PROVIDER_ID', value: 'provider-a' },
+          { name: 'ACP_UI_MCP_PROXY_ID', value: 'mcp-proxy-test' },
+          { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: 'proxy-auth-test' }
+        ]
+      }
+    ])).toBe('proxy-auth-test');
   });
 });

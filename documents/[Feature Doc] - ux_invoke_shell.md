@@ -51,6 +51,7 @@ return [{
   env: [
     { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
     { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
+    { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
     { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
     { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' }
   ],
@@ -93,11 +94,11 @@ The definition tells the agent that `description` and `command` are required and
 ### 3. The proxy forwards MCP calls to the backend API
 
 File: `backend/mcp/stdio-proxy.js` (MCP handler: `CallToolRequestSchema`)  
-File: `backend/routes/mcpApi.js` (Route: `POST /api/mcp/tool-call`, Functions: `resolveToolContext`, `createToolCallAbortSignal`)
+File: `backend/routes/mcpApi.js` (Route: `POST /api/mcp/tool-call`, Functions: `resolveExecutionContext`, `createToolCallAbortSignal`)
 
 When the ACP daemon calls `ux_invoke_shell`, the proxy posts the tool name, public arguments, provider ID, proxy ID, MCP request ID, and request metadata to `/api/mcp/tool-call`.
 
-`POST /api/mcp/tool-call` resolves provider/session context from `resolveMcpProxy(proxyId)`, disables HTTP request timeouts for long-running commands, creates an `AbortSignal` for client disconnects, and calls the handler returned by `createToolHandlers(io)`.
+`POST /api/mcp/tool-call` validates `x-acpui-mcp-proxy-auth`, requires a bound proxy session, resolves provider/session context from `resolveMcpProxy(proxyId)`, disables HTTP request timeouts for long-running commands, creates an `AbortSignal` for client disconnects, and calls the handler returned by `createToolHandlers(io)`.
 
 ### 4. The MCP handler records public execution metadata
 
@@ -475,6 +476,7 @@ File: `backend/services/shellRunManager.js` (Functions: `getMaxShellResultLines`
 - `BACKEND_PORT`: passed to the stdio proxy so it can reach the backend API.
 - `ACP_SESSION_PROVIDER_ID`: provider context passed into the stdio proxy.
 - `ACP_UI_MCP_PROXY_ID`: proxy binding key used by `resolveMcpProxy`.
+- `ACP_UI_MCP_PROXY_AUTH_TOKEN`: per-proxy secret forwarded as `x-acpui-mcp-proxy-auth` for `/api/mcp/tool-call` authorization.
 - `NODE_TLS_REJECT_UNAUTHORIZED=0`: lets the local stdio proxy call the self-signed HTTPS backend.
 - `SHELL_V2_ENABLED`: exported and tested by `isShellV2Enabled`; it is not a runtime gate in the shell execution path.
 - PTY env override `GIT_PAGER=cat`: prevents Git commands from launching an interactive pager while preserving the shell tool's stdin path for commands that genuinely need input.

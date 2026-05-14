@@ -84,7 +84,7 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
    File: `backend/services/sessionManager.js` (Function: `getMcpServers`)
    File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)
 
-   Main session create/load/fork flows call `sessionManager.getMcpServers`. Sub-agent invocation code uses `mcpServer.getMcpServers`. Both functions return a `node backend/mcp/stdio-proxy.js` server config when the provider has `config.mcpName`, create an MCP proxy binding, and pass `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `BACKEND_PORT`, and `NODE_TLS_REJECT_UNAUTHORIZED` in the server env.
+   Main session create/load/fork flows call `sessionManager.getMcpServers`. Sub-agent invocation code uses `mcpServer.getMcpServers`. Both functions return a `node backend/mcp/stdio-proxy.js` server config when the provider has `config.mcpName`, create an MCP proxy binding, and pass `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN`, `BACKEND_PORT`, and `NODE_TLS_REJECT_UNAUTHORIZED` in the server env.
 
    ```js
    // FILE: backend/services/sessionManager.js (Function: getMcpServers)
@@ -97,7 +97,7 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
 
    File: `backend/mcp/stdio-proxy.js` (Function: `runProxy`, MCP request: `ListToolsRequestSchema`)
 
-   `runProxy` requests `GET /api/mcp/tools` with `providerId` and `proxyId` query parameters. It stores the returned tool definitions in the proxy process and returns those definitions from its MCP `ListTools` handler.
+   `runProxy` requests `GET /api/mcp/tools` with `providerId` and `proxyId` query parameters. It also forwards `x-acpui-mcp-proxy-auth` from `ACP_UI_MCP_PROXY_AUTH_TOKEN` on backend calls. It stores the returned tool definitions in the proxy process and returns those definitions from its MCP `ListTools` handler.
 
    ```js
    // FILE: backend/mcp/stdio-proxy.js (Function: runProxy)
@@ -111,7 +111,7 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
 
    File: `backend/routes/mcpApi.js` (Function: `createMcpApiRoutes`, Route: `GET /tools`, Mounted route: `GET /api/mcp/tools`)
 
-   The route resolves provider context with `resolveToolContext`, builds a provider-specific subagent model description from `modelOptionsFromProviderConfig`, and appends definitions only when the matching feature helper returns `true`.
+   The route resolves provider context for advertisement with `resolveToolContext`, builds a provider-specific subagent model description from `modelOptionsFromProviderConfig`, and appends definitions only when the matching feature helper returns `true`.
 
    ```js
    // FILE: backend/routes/mcpApi.js (Route: GET /tools)
@@ -138,7 +138,7 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
     File: `backend/mcp/stdio-proxy.js` (Function: `runProxy`, MCP request: `CallToolRequestSchema`)
     File: `backend/routes/mcpApi.js` (Route: `POST /tool-call`, Mounted route: `POST /api/mcp/tool-call`)
 
-    The proxy sends the called tool name, arguments, provider id, proxy id, MCP request id, request metadata, and abort signal to the backend API. The route resolves proxy context, injects `providerId`, `acpSessionId`, and `mcpProxyId` into handler args, and returns either the handler result, a 404 for unknown tools, or MCP text error content.
+    The proxy sends the called tool name, arguments, provider id, proxy id, MCP request id, request metadata, abort signal, and `x-acpui-mcp-proxy-auth` token to the backend API. `POST /api/mcp/tool-call` requires a valid proxy id, matching proxy auth token, and bound ACP session, then injects `providerId`, `acpSessionId`, and `mcpProxyId` into handler args. It returns either the handler result, a 404 for unknown tools, or MCP text error content.
 
 11. **Handler registration follows the same flags**
 
@@ -346,8 +346,8 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
 | Server mount | `backend/server.js` | `app.use('/api/mcp', ...)`, `mcpApiRouter`, `createMcpApiRoutes(io)` | Mounts the MCP API before the static route stack. |
-| Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `ListToolsRequestSchema`, `CallToolRequestSchema`, `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID` | Fetches tool definitions and forwards tool calls to the backend API. |
-| MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `resolveToolContext`, `createToolCallAbortSignal`, `GET /tools`, `POST /tool-call` | Advertises enabled tools and dispatches tool calls. |
+| Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `ListToolsRequestSchema`, `CallToolRequestSchema`, `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN` | Fetches tool definitions and forwards authenticated tool calls to the backend API. |
+| MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `resolveToolContext`, `resolveExecutionContext`, `createToolCallAbortSignal`, `GET /tools`, `POST /tool-call` | Advertises enabled tools and dispatches authenticated tool calls. |
 | Core definitions | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition` | Defines core MCP tool schemas and metadata. |
 | IO definitions | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions` | Defines IO, web fetch, and Google search schemas and metadata. |
 | Handler registration | `backend/mcp/mcpServer.js` | `createToolHandlers`, `wrapToolHandlers`, `runShellInvocation`, `runSubagentInvocation`, `runCheckSubagentsInvocation`, `runAbortSubagentsInvocation`, `runCounselInvocation`, `getMaxShellResultLines` | Registers enabled backend handlers under canonical tool names. |
@@ -403,7 +403,7 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 
 10. **Runtime context still matters after a flag is enabled**
 
-    `POST /api/mcp/tool-call` resolves proxy context and injects provider/session fields. Shell and sub-agent execution depend on those fields even when their feature flags are enabled.
+    `POST /api/mcp/tool-call` requires valid proxy auth and a bound proxy session, then injects provider/session fields. Shell and sub-agent execution depend on those fields even when their feature flags are enabled.
 
 ## Unit Tests
 
@@ -509,7 +509,7 @@ File: `backend/test/ioMcpGoogleSearch.test.js`
 4. Confirm the provider config has `mcpName` so `getMcpServers` returns a stdio proxy server config.
 5. Inspect `GET /api/mcp/tools?providerId=<provider>&proxyId=<proxy>` to confirm the advertised tool list.
 6. Inspect `createToolHandlers(io)` to confirm the backend has a handler under the same canonical tool name.
-7. For tool-call failures, inspect `POST /api/mcp/tool-call` handling in `backend/routes/mcpApi.js`, especially `resolveToolContext` and the `Unknown tool` branch.
+7. For tool-call failures, inspect `POST /api/mcp/tool-call` handling in `backend/routes/mcpApi.js`, especially `resolveExecutionContext`, proxy auth header handling, and the `Unknown tool` branch.
 8. Use the unit tests listed above as the fastest executable reference for the contract under investigation.
 
 ## Summary

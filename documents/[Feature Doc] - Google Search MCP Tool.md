@@ -51,11 +51,11 @@ Feature role: backend MCP tool, backend service, route-mounted MCP API, Tool Sys
 
 3. **ACP sessions receive a stdio proxy server config**
    - File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)
-   - The provider's `mcpName` controls the MCP server name. `getMcpServers` points the ACP session at `backend/mcp/stdio-proxy.js` and passes `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, and `BACKEND_PORT` through environment entries.
+   - The provider's `mcpName` controls the MCP server name. `getMcpServers` points the ACP session at `backend/mcp/stdio-proxy.js` and passes `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN`, and `BACKEND_PORT` through environment entries.
 
 4. **The stdio proxy fetches tool definitions from the backend**
    - File: `backend/mcp/stdio-proxy.js` (Function: `runProxy`, Handlers: `ListToolsRequestSchema`, `CallToolRequestSchema`)
-   - `runProxy` calls `GET /api/mcp/tools` with provider/proxy query values, registers the returned tools with the MCP SDK, and forwards tool calls to `POST /api/mcp/tool-call`.
+   - `runProxy` calls `GET /api/mcp/tools` with provider/proxy query values, registers the returned tools with the MCP SDK, and forwards tool calls to `POST /api/mcp/tool-call` with `x-acpui-mcp-proxy-auth`.
    - The ListTools response preserves `name`, `title`, `description`, `inputSchema`, `annotations`, `execution`, `outputSchema`, and `_meta` when present.
 
 5. **`GET /tools` advertises Google search only when enabled**
@@ -102,8 +102,8 @@ Feature role: backend MCP tool, backend service, route-mounted MCP API, Tool Sys
    ```
 
 8. **`POST /tool-call` augments context and executes the handler**
-   - File: `backend/routes/mcpApi.js` (Route handler: `POST /tool-call`, Helpers: `resolveToolContext`, `createToolCallAbortSignal`)
-   - The route resolves proxy context, adds `providerId`, `acpSessionId`, `mcpProxyId`, `mcpRequestId`, `requestMeta`, and `abortSignal`, then calls the named handler from the `createToolHandlers(io)` map.
+   - File: `backend/routes/mcpApi.js` (Route handler: `POST /tool-call`, Helpers: `resolveExecutionContext`, `createToolCallAbortSignal`)
+   - The route requires a valid proxy id, matching proxy auth token, and bound ACP session, then adds `providerId`, `acpSessionId`, `mcpProxyId`, `mcpRequestId`, `requestMeta`, and `abortSignal` before calling the named handler from the `createToolHandlers(io)` map.
    - Unknown tool names return `404`. Handler errors return MCP text content shaped as `Error: <message>` unless the request/response is already aborted.
 
 9. **Tool System V2 records public input and display metadata**
@@ -383,7 +383,7 @@ Service errors:
 | Backend config | `backend/services/mcpConfig.js` | `getMcpConfig`, `normalizeMcpConfig`, `isGoogleSearchMcpEnabled`, `getGoogleSearchMcpConfig`, `resetMcpConfigForTests` | Loads, caches, normalizes, and gates MCP config |
 | MCP session config | `backend/mcp/mcpServer.js` | `getMcpServers`, `createToolHandlers`, `wrapToolHandlers` | Creates stdio proxy config, registers handlers, and records executions |
 | Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `ListToolsRequestSchema`, `CallToolRequestSchema`, `backendFetch` | Fetches tool definitions and forwards MCP calls to backend routes |
-| MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `GET /tools`, `POST /tool-call`, `resolveToolContext`, `createToolCallAbortSignal` | Advertises tool schemas and executes tool calls |
+| MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `GET /tools`, `POST /tool-call`, `resolveExecutionContext`, `createToolCallAbortSignal` | Advertises tool schemas and executes authenticated tool calls |
 | MCP schema | `backend/mcp/ioMcpToolDefinitions.js` | `getGoogleSearchMcpToolDefinitions`, `ACP_UX_TOOL_NAMES.googleWebSearch` | Defines `ux_google_web_search` schema, title, description, and annotations |
 | MCP handler | `backend/mcp/ioMcpToolHandlers.js` | `createGoogleSearchMcpToolHandlers`, `textResult` | Converts `{ query }` into `googleWebSearch(query)` and MCP text content |
 | Search service | `backend/services/ioMcp/googleWebSearch.js` | `googleWebSearch`, `withTimeout`, `limitOutput`, `truncateUtf8` | Executes grounded GenAI call, formats sources/citations, and bounds output |
