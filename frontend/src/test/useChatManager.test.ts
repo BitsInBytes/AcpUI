@@ -1052,4 +1052,41 @@ describe('useChatManager hook', () => {
     
     expect(onStreamDone).toHaveBeenCalled();
   });
+
+  it('plays completion sound once for a background token_done event', () => {
+    const play = vi.fn(() => Promise.resolve());
+    const audioCtor = vi.fn(function MockAudio() { return { play }; });
+    const originalAudio = globalThis.Audio;
+    // @ts-expect-error test stub
+    globalThis.Audio = audioCtor;
+
+    const onStreamDone = vi.fn(() => {
+      try { new Audio('/memory-sound.mp3').play()?.catch(() => {}); }
+      catch { /* test env fallback */ }
+    });
+
+    act(() => {
+      useStreamStore.setState({ onStreamDone });
+      useSystemStore.setState({ notificationSound: true, notificationDesktop: false } as any);
+      useSessionLifecycleStore.setState({
+        activeSessionId: 's1',
+        sessions: [
+          { id: 's1', acpSessionId: 'acp-active', name: 'Active', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, provider: 'provider-a' } as any,
+          { id: 's2', acpSessionId: 'acp-background', name: 'Background', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, provider: 'provider-a' } as any,
+        ]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'token_done')[1];
+    act(() => {
+      handler({ sessionId: 'acp-background' });
+    });
+
+    expect(onStreamDone).toHaveBeenCalledTimes(1);
+    expect(audioCtor).toHaveBeenCalledTimes(1);
+
+    globalThis.Audio = originalAudio;
+  });
 });

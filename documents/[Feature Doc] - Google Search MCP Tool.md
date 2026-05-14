@@ -114,13 +114,13 @@ Feature role: backend MCP tool, backend service, route-mounted MCP API, Tool Sys
 
 10. **The Google handler delegates to the service**
     - File: `backend/mcp/ioMcpToolHandlers.js` (Function: `createGoogleSearchMcpToolHandlers`)
-    - The handler destructures `query`, calls `googleWebSearch(query)`, and wraps the returned string in MCP text content.
-    - The route-provided `abortSignal` is not passed into `googleWebSearch`; service duration is bounded by `googleSearch.timeoutMs`.
+    - The handler destructures `query`, passes `abortSignal`, calls `googleWebSearch(query, { abortSignal })`, and wraps the returned string in MCP text content.
+    - Service duration is bounded by `googleSearch.timeoutMs`, and route abort now short-circuits in-flight handler waits.
 
     ```javascript
     // FILE: backend/mcp/ioMcpToolHandlers.js (Function: createGoogleSearchMcpToolHandlers)
-    [ACP_UX_TOOL_NAMES.googleWebSearch]: async ({ query }) => {
-      return textResult(await googleWebSearch(query));
+    [ACP_UX_TOOL_NAMES.googleWebSearch]: async ({ query, abortSignal }) => {
+      return textResult(await googleWebSearch(query, { abortSignal }));
     }
     ```
 
@@ -420,8 +420,8 @@ Service errors:
 6. **Tool input is `query` only**
    - `api_key`, timeout, and output limit are not accepted by the MCP schema. Direct service tests may pass options to `googleWebSearch`, but MCP calls do not.
 
-7. **The route abort signal does not cancel the Google SDK call**
-   - `POST /tool-call` adds `abortSignal`, but `createGoogleSearchMcpToolHandlers` only passes `query` to the service. Service duration is bounded by `withTimeout` and `googleSearch.timeoutMs`.
+7. **Route abort now short-circuits in-flight search calls**
+   - `POST /tool-call` adds `abortSignal`, `createGoogleSearchMcpToolHandlers` passes it to `googleWebSearch`, and `withTimeout` races the SDK promise against timeout and abort. This stops waiting immediately on abort even when the SDK call itself has no direct cancellation hook.
 
 8. **Empty SDK text uses a different output shape**
    - Empty `response.text` returns `No search results or information found for query: "<query>"` without the `Web search results for` prefix.
@@ -442,6 +442,7 @@ Service errors:
   - `formats grounded results with citations and sources`
   - `wraps SDK failures with tool-specific context`
   - `reads the API key configured in mcp.json`
+  - `aborts search requests when abortSignal is triggered`
   - `truncates oversized search output`
 
 ### Config normalization and gating tests
@@ -473,6 +474,7 @@ Service errors:
   - `registers Google search handler when MCP config enables Google search`
   - `does not register Google search handler when enabled without an MCP config API key`
   - `emits web search query title for google_web_search`
+  - `passes abortSignal into google web search handler calls`
 
 ### Invocation resolution tests
 

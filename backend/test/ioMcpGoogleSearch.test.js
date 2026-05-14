@@ -101,6 +101,20 @@ describe('IO MCP googleWebSearch', () => {
     await expect(googleWebSearch('configured key')).resolves.toContain('configured result');
   });
 
+  it('aborts search requests when abortSignal is triggered', async () => {
+    mockGenerateContent.mockImplementation(() => new Promise(() => {}));
+    const controller = new AbortController();
+
+    const promise = googleWebSearch('abort me', {
+      apiKey: 'test-key',
+      timeoutMs: 10_000,
+      abortSignal: controller.signal
+    });
+    controller.abort(new Error('request aborted'));
+
+    await expect(promise).rejects.toThrow('Google Web Search failed: request aborted');
+  });
+
   it('truncates oversized search output', async () => {
     mockGenerateContent.mockResolvedValue({ text: '1234567890' });
 

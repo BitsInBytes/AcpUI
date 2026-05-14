@@ -320,11 +320,8 @@ export function useChatManager(
       const session = useSessionLifecycleStore.getState().sessions.find(s => s.acpSessionId === data.sessionId);
       if (session && !session.isSubAgent) {
         const result = shouldNotifyHelper(data.sessionId, activeAcpId, session.name, workspaceCwds as readonly { path: string; label: string }[], session.cwd, { notificationSound, notificationDesktop });
-        if (result) {
-          if (result.shouldSound) { try { new Audio('/memory-sound.mp3').play()?.catch(() => {}); } catch { /* audio unavailable */ } }
-          if (result.shouldDesktop && Notification.permission === 'granted') {
-            new Notification(branding.notificationTitle, { body: result.body, icon: '/vite.svg' });
-          }
+        if (result?.shouldDesktop && Notification.permission === 'granted') {
+          new Notification(branding.notificationTitle, { body: result.body, icon: '/vite.svg' });
         }
       }
     });

@@ -221,7 +221,7 @@ if (canWriteResponse(res, abortSignal)) res.json(result);
 File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`, Handler anchors: `runShellInvocation`, `runSubagentInvocation`, `runCheckSubagentsInvocation`, `runAbortSubagentsInvocation`, `runCounselInvocation`)
 File: `backend/mcp/ioMcpToolHandlers.js` (Functions: `createIoMcpToolHandlers`, `createGoogleSearchMcpToolHandlers`)
 
-Core tools are registered behind `tools.invokeShell`, `tools.subagents`, and `tools.counsel`. `ux_check_subagents` and `ux_abort_subagents` are registered whenever sub-agents or counsel are enabled. Optional IO and Google search handlers are registered behind `tools.io` and `tools.googleSearch`. Shell execution delegates to `shellRunManager.startPreparedRun`; sub-agent start calls delegate to `subAgentInvocationManager.runInvocation`; status calls delegate to `subAgentInvocationManager.getInvocationStatus` with `waitForCompletion` deciding whether the configured wait timeout is used; status tool titles include either `Check Subagents: Waiting for agents to finish` or `Check Subagents: Quick status check`; abort calls delegate to `subAgentInvocationManager.cancelInvocation` and then return an immediate status payload; counsel builds configured role prompts and delegates through the sub-agent invocation path.
+Core tools are registered behind `tools.invokeShell`, `tools.subagents`, and `tools.counsel`. `ux_check_subagents` and `ux_abort_subagents` are registered whenever sub-agents or counsel are enabled. Optional IO and Google search handlers are registered behind `tools.io` and `tools.googleSearch`. Shell execution delegates to `shellRunManager.startPreparedRun` and forwards route abort signals so cancelled MCP calls stop active shell runs; sub-agent start calls delegate to `subAgentInvocationManager.runInvocation`; status calls delegate to `subAgentInvocationManager.getInvocationStatus` with `waitForCompletion` deciding whether the configured wait timeout is used; status tool titles include either `Check Subagents: Waiting for agents to finish` or `Check Subagents: Quick status check`; abort calls delegate to `subAgentInvocationManager.cancelInvocation` and then return an immediate status payload; counsel builds configured role prompts and delegates through the sub-agent invocation path.
 
 ```javascript
 // FILE: backend/mcp/mcpServer.js (Function: createToolHandlers)
@@ -518,7 +518,7 @@ Tool state projection written by `mcpExecutionRegistry`:
 
 6. Cancellation crosses two boundaries.
 - Problem: MCP cancellation reaches the proxy as `extra.signal`, while browser/backend disconnects appear as request or response events.
-- Detection: `stdio-proxy.test.js` checks fetch `signal`; `mcpApi.test.js` checks request `aborted` and response `close` behavior.
+- Detection: `stdio-proxy.test.js` checks fetch `signal`; `mcpApi.test.js` checks request `aborted` and response `close` behavior; `mcpServer.test.js`, `shellRunManager.test.js`, and `ioMcpGoogleSearch.test.js` verify shell and search handlers consume forwarded abort signals.
 
 7. Handler wrapping owns UI metadata.
 - Problem: bypassing `wrapToolHandlers` skips `mcpExecutionRegistry` and loses canonical names, titles, file paths, categories, and output projection.

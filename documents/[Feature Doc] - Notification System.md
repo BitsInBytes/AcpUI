@@ -22,7 +22,7 @@ This guide matters because notification behavior is split across backend socket 
 
 - Background agents can finish while the user is reading another session, so completion feedback must use ACP session identity rather than UI tab identity.
 - Desktop notification permission is browser-owned state, while notification defaults are backend-owned environment state.
-- Audio has more than one call site; completion sounds and permission-request sounds are controlled by different paths.
+- Completion audio is owned by stream finalization, while permission-request audio is a separate path.
 - Provider branding supplies the desktop notification title, so the UI must avoid hardcoded provider names.
 - Tests cover the pure helper and several socket events, but browser API side effects need focused tests when behavior changes.
 
@@ -223,20 +223,14 @@ export function shouldNotify(
 
 ### 9. Completion Side Effects Use Browser APIs
 
-File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket event: `token_done`, Browser APIs: `Audio`, `Notification`)
+File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket event: `token_done`, Browser API: `Notification`)
 
-When `shouldNotifyHelper` returns a result, `useChatManager` plays the same MP3 if `result.shouldSound` is true. It creates a native desktop notification only when `result.shouldDesktop` is true and browser permission is `granted`.
+When `shouldNotifyHelper` returns a result, `useChatManager` handles only the desktop-notification branch. Completion sound remains in `useStreamStore.onStreamDone`.
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager, Socket event: token_done)
-if (result) {
-  if (result.shouldSound) {
-    try { new Audio('/memory-sound.mp3').play()?.catch(() => {}); }
-    catch { /* audio unavailable */ }
-  }
-  if (result.shouldDesktop && Notification.permission === 'granted') {
-    new Notification(branding.notificationTitle, { body: result.body, icon: '/vite.svg' });
-  }
+if (result?.shouldDesktop && Notification.permission === 'granted') {
+  new Notification(branding.notificationTitle, { body: result.body, icon: '/vite.svg' });
 }
 ```
 
@@ -318,7 +312,7 @@ graph TB
 
 ### Audio Contract
 
-- Completion audio is controlled by `notificationSound` in both `useStreamStore.onStreamDone` and the `useChatManager` `token_done` result path.
+- Completion audio is controlled by `notificationSound` in `useStreamStore.onStreamDone`.
 - Main-chat `permission_request` audio is independent of `notificationSound` and `notificationDesktop`.
 - All audio paths use `/memory-sound.mp3`, served by `frontend/public/memory-sound.mp3`.
 - Audio playback failures are caught or ignored; no UI error is shown.
@@ -409,7 +403,7 @@ Notification store hydration still flows through `sidebar_settings`; existing so
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
 | Socket singleton | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `sidebar_settings`, `workspace_cwds`, `branding`, `Notification.requestPermission` | Receives backend settings and starts browser permission flow |
-| Completion dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `token_done`, `permission_request`, `shouldNotifyHelper`, `new Audio`, `new Notification` | Handles completion side effects and permission-request audio |
+| Completion dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `token_done`, `permission_request`, `shouldNotifyHelper`, `new Notification` | Handles desktop completion notifications and permission-request audio |
 | Stream finalization | `frontend/src/store/useStreamStore.ts` | `useStreamStore`, `onStreamDone`, `isBackground`, `save_snapshot`, `fetchStats` | Marks responses complete, sets unread state, saves snapshots, plays background completion sound |
 | Notification helper | `frontend/src/utils/notificationHelper.ts` | `NotificationSettings`, `NotificationResult`, `shouldNotify` | Pure completion eligibility and body builder |
 | System state | `frontend/src/store/useSystemStore.ts` | `notificationSound`, `notificationDesktop`, `setNotificationSettings`, `branding.notificationTitle`, `setProviderBranding`, `setWorkspaceCwds` | Holds notification settings, branding title, and workspace labels |
@@ -427,11 +421,11 @@ Notification store hydration still flows through `sidebar_settings`; existing so
 
 Search anchors: `frontend/src/hooks/useChatManager.ts` (`token_done`, `activeAcpId`), `frontend/src/utils/notificationHelper.ts` (`shouldNotify`).
 
-### 2. Completion Audio Has Two Call Sites
+### 2. Completion Audio Is Owned By Stream Finalization
 
-`useStreamStore.onStreamDone` can play the background completion sound after queue drain. `useChatManager` can also play sound from the `shouldNotify` result. Keep both paths in sync when changing completion sound semantics.
+`useStreamStore.onStreamDone` plays the background completion sound after queue drain. `useChatManager` handles the desktop notification branch for completion events.
 
-Search anchors: `frontend/src/store/useStreamStore.ts` (`onStreamDone`, `isBackground`), `frontend/src/hooks/useChatManager.ts` (`token_done`, `result.shouldSound`).
+Search anchors: `frontend/src/store/useStreamStore.ts` (`onStreamDone`, `isBackground`), `frontend/src/hooks/useChatManager.ts` (`token_done`, `shouldNotifyHelper`).
 
 ### 3. Permission-Request Audio Is Separate From Completion Settings
 
@@ -491,7 +485,7 @@ Search anchors: `frontend/src/store/useSystemStore.ts` (`branding.notificationTi
 |---|---|---|
 | `frontend/src/test/notificationHelper.test.ts` | `returns null when sessionId matches activeAcpId`; `returns notification result for background session`; `includes workspace label in body when cwd matches`; `excludes workspace label when no cwd match`; `respects sound/desktop settings independently`; `returns null when sessionName is undefined` | Pure `shouldNotify` eligibility, body generation, workspace labels, and settings propagation |
 | `frontend/src/test/useSocket.test.ts` | `handles "sidebar_settings" event` | `setDeletePermanent` and `setNotificationSettings` are called from socket payload |
-| `frontend/src/test/useChatManager.test.ts` | `handles "token_done" event`; `handles "permission_request" for sub-agent` | `token_done` dispatches to `onStreamDone`; sub-agent permission requests route to sub-agent state |
+| `frontend/src/test/useChatManager.test.ts` | `handles "token_done" event`; `plays completion sound once for a background token_done event`; `handles "permission_request" for sub-agent` | `token_done` dispatches to `onStreamDone`; completion sound path is single-owner; sub-agent permission requests route to sub-agent state |
 | `frontend/src/test/useStreamStore.test.ts` | `ensureAssistantMessage creates a placeholder message`; `onStreamToken queues text and triggers typewriter`; stream finalization tests around `onStreamDone` behavior | Stream store lifecycle that completion notification sound depends on |
 
 Run focused frontend tests:
@@ -531,7 +525,7 @@ cd backend; .\node_modules\.bin\vitest.cmd run test/sockets-index.test.js test/p
 2. Update `frontend/src/hooks/useSocket.ts` (`sidebar_settings`) when adding a frontend store field or browser permission behavior.
 3. Update `frontend/src/store/useSystemStore.ts` (`notificationSound`, `notificationDesktop`, `setNotificationSettings`) when changing notification state shape.
 4. Use `frontend/src/utils/notificationHelper.ts` (`shouldNotify`) for pure eligibility or body-format changes.
-5. Update both completion audio call sites when changing sound semantics: `frontend/src/store/useStreamStore.ts` (`onStreamDone`) and `frontend/src/hooks/useChatManager.ts` (`token_done`).
+5. Update completion sound semantics in `frontend/src/store/useStreamStore.ts` (`onStreamDone`) and keep `frontend/src/hooks/useChatManager.ts` (`token_done`) focused on desktop notification eligibility/display.
 6. Keep permission-request audio changes separate in `frontend/src/hooks/useChatManager.ts` (`permission_request`).
 7. Use `frontend/src/types.ts` (`StreamDoneData`, `ProviderBranding`) when changing payload or branding type contracts.
 8. Add or update tests in the frontend and backend test files listed above.

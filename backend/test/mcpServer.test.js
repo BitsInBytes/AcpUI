@@ -621,6 +621,23 @@ describe('mcpServer', () => {
         titleSource: 'mcp_handler'
       }));
     });
+
+    it('passes abortSignal into google web search handler calls', async () => {
+      useMcpConfig({ tools: { googleSearch: true }, googleSearch: { apiKey: 'configured-key' } });
+      mockGoogleWebSearch.mockResolvedValue('search result');
+      const handlers = createToolHandlers(mockIo);
+      const controller = new AbortController();
+
+      await handlers.ux_google_web_search({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        requestMeta: { toolCallId: 'tool-search-2' },
+        query: 'abortable search',
+        abortSignal: controller.signal
+      });
+
+      expect(mockGoogleWebSearch).toHaveBeenCalledWith('abortable search', { abortSignal: controller.signal });
+    });
   });
 
   describe('ux_invoke_shell', () => {
@@ -668,6 +685,29 @@ describe('mcpServer', () => {
         identity: expect.objectContaining({ canonicalName: 'ux_invoke_shell', mcpServer: 'TestUI' }),
         input: expect.objectContaining({ description: 'Run test suite', command: 'npm test', cwd: 'D:/repo' }),
         display: expect.objectContaining({ title: 'Invoke Shell: Run test suite', titleSource: 'mcp_handler' })
+      }));
+    });
+
+    it('passes abortSignal to shellRunManager when provided', async () => {
+      const handlers = createToolHandlers(mockIo);
+      const controller = new AbortController();
+
+      await handlers.ux_invoke_shell({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        mcpRequestId: 43,
+        requestMeta: { toolCallId: 'tool-2' },
+        description: 'Abortable shell',
+        command: 'npm test',
+        cwd: 'D:/repo',
+        abortSignal: controller.signal
+      });
+
+      expect(mockShellRunManager.startPreparedRun).toHaveBeenCalledWith(expect.objectContaining({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        toolCallId: 'tool-2',
+        abortSignal: controller.signal
       }));
     });
 

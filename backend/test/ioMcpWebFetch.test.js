@@ -107,6 +107,20 @@ describe('IO MCP webFetch', () => {
     }));
   });
 
+  it('aborts in-flight fetch requests when abortSignal is triggered', async () => {
+    global.fetch.mockImplementation((_url, options = {}) => new Promise((_, reject) => {
+      options.signal?.addEventListener('abort', () => {
+        reject(options.signal.reason || new Error('aborted'));
+      }, { once: true });
+    }));
+
+    const controller = new AbortController();
+    const promise = webFetch('https://example.test/slow', { abortSignal: controller.signal });
+    controller.abort(new Error('request aborted'));
+
+    await expect(promise).rejects.toThrow('request aborted');
+  });
+
   it('enforces response size caps', async () => {
     useMcpConfig({ webFetch: { maxResponseBytes: 4 } });
     global.fetch.mockResolvedValue(mockResponse({ text: '12345' }));

@@ -15,6 +15,17 @@ const ACTIVE_AGENT_STATUSES = new Set(['spawning', 'prompting', 'running', 'wait
 const TERMINAL_AGENT_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 120000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 1000;
+const DEFAULT_COMPLETED_INVOCATION_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_COMPLETED_INVOCATION_MAX_ENTRIES = 200;
+const DEFAULT_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 500;
+
+function positiveIntegerOrDefault(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  const floored = Math.floor(numeric);
+  return floored > 0 ? floored : fallback;
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -54,6 +65,22 @@ export class SubAgentInvocationManager {
     this.modelOptionsFromProviderConfigFn = deps.modelOptionsFromProviderConfigFn || modelOptionsFromProviderConfig;
     this.getAttachmentsRootFn = deps.getAttachmentsRootFn || getAttachmentsRoot;
     this.subAgentParentLinks = new Map();
+    this.completedInvocationTtlMs = positiveIntegerOrDefault(
+      deps.completedInvocationTtlMs,
+      DEFAULT_COMPLETED_INVOCATION_TTL_MS
+    );
+    this.completedInvocationMaxEntries = positiveIntegerOrDefault(
+      deps.completedInvocationMaxEntries,
+      DEFAULT_COMPLETED_INVOCATION_MAX_ENTRIES
+    );
+    this.idempotencyTtlMs = positiveIntegerOrDefault(
+      deps.idempotencyTtlMs,
+      DEFAULT_IDEMPOTENCY_TTL_MS
+    );
+    this.idempotencyMaxEntries = positiveIntegerOrDefault(
+      deps.idempotencyMaxEntries,
+      DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+    );
   }
 
   setIo(io) {
@@ -118,6 +145,7 @@ export class SubAgentInvocationManager {
   async startInvocation({ requests, model, providerId, parentAcpSessionId: explicitParentAcpSessionId = null, idempotencyKey = null, abortSignal = null }) {
     if (!this.io) return textResult('Error: Sub-agent system not available');
     const safeRequests = Array.isArray(requests) ? requests : [];
+    this.pruneCompletedState();
 
     const provider = this.getProviderFn(providerId);
     const resolvedProviderId = provider.id;
@@ -153,9 +181,11 @@ export class SubAgentInvocationManager {
     this.idempotentInvocations.set(idempotencyKey, { promise, startedAt: this.now() });
     return promise.then(result => {
       this.idempotentInvocations.set(idempotencyKey, { result, completedAt: this.now() });
+      this.pruneCompletedState();
       return result;
     }).catch(err => {
       this.idempotentInvocations.delete(idempotencyKey);
+      this.pruneCompletedState();
       throw err;
     });
   }
@@ -539,6 +569,7 @@ export class SubAgentInvocationManager {
       statusToolName: invocationRecord.statusToolName
     });
     this.notifyInvocationChanged(invocationRecord.invocationId);
+    this.pruneCompletedState();
   }
 
   completedAgentCount(invocationRecord) {
@@ -589,6 +620,7 @@ export class SubAgentInvocationManager {
 
   async getInvocationStatus({ providerId, invocationId, waitTimeoutMs = DEFAULT_STATUS_WAIT_TIMEOUT_MS, pollIntervalMs = DEFAULT_STATUS_POLL_INTERVAL_MS, abortSignal = null }) {
     if (!invocationId) return textResult('Error: invocationId is required.');
+    this.pruneCompletedState();
     const timeoutAt = this.now() + Math.max(0, waitTimeoutMs);
     let snapshot = await this.db.getSubAgentInvocationWithAgents(providerId, invocationId);
     if (!snapshot) return this.buildMissingInvocationResult(invocationId);
@@ -628,6 +660,79 @@ export class SubAgentInvocationManager {
     const inv = this.invocations.get(invocationId);
     if (!inv?.waiters) return;
     for (const waiter of [...inv.waiters]) waiter();
+  }
+
+  pruneCompletedState(nowTs = this.now()) {
+    this.pruneCompletedInvocations(nowTs);
+    this.pruneCompletedIdempotency(nowTs);
+  }
+
+  evictInvocation(invocationId) {
+    const inv = this.invocations.get(invocationId);
+    if (!inv) return false;
+    if (inv.waiters?.size) {
+      for (const waiter of [...inv.waiters]) waiter();
+      inv.waiters.clear();
+    }
+    this.invocations.delete(invocationId);
+    return true;
+  }
+
+  pruneCompletedInvocations(nowTs = this.now()) {
+    const completed = [];
+
+    for (const [invocationId, inv] of this.invocations.entries()) {
+      if (!isTerminalStatus(inv.status)) continue;
+      const completedAt = Number.isFinite(inv.completedAt) ? inv.completedAt : nowTs;
+      inv.completedAt = completedAt;
+
+      if (nowTs - completedAt > this.completedInvocationTtlMs) {
+        this.evictInvocation(invocationId);
+        continue;
+      }
+
+      completed.push({ invocationId, completedAt });
+    }
+
+    if (completed.length <= this.completedInvocationMaxEntries) return;
+
+    completed
+      .sort((a, b) => a.completedAt - b.completedAt)
+      .slice(0, completed.length - this.completedInvocationMaxEntries)
+      .forEach(({ invocationId }) => {
+        this.evictInvocation(invocationId);
+      });
+  }
+
+  pruneCompletedIdempotency(nowTs = this.now()) {
+    const completed = [];
+
+    for (const [key, entry] of this.idempotentInvocations.entries()) {
+      if (entry?.promise) continue;
+      const hasResult = Object.prototype.hasOwnProperty.call(entry || {}, 'result');
+      if (!hasResult) {
+        this.idempotentInvocations.delete(key);
+        continue;
+      }
+      const completedAt = Number.isFinite(entry.completedAt) ? entry.completedAt : nowTs;
+      entry.completedAt = completedAt;
+
+      if (nowTs - completedAt > this.idempotencyTtlMs) {
+        this.idempotentInvocations.delete(key);
+        continue;
+      }
+
+      completed.push({ key, completedAt });
+    }
+
+    if (completed.length <= this.idempotencyMaxEntries) return;
+
+    completed
+      .sort((a, b) => a.completedAt - b.completedAt)
+      .slice(0, completed.length - this.idempotencyMaxEntries)
+      .forEach(({ key }) => {
+        this.idempotentInvocations.delete(key);
+      });
   }
 
   async cancelInvocation(providerId, invocationId) {

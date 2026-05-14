@@ -19,15 +19,36 @@ function limitOutput(value, maxBytes) {
   return `${truncateUtf8(text, maxBytes)}\n\n[ux_google_web_search output truncated after ${maxBytes} bytes; original output was ${totalBytes} bytes.]`;
 }
 
-async function withTimeout(promise, timeoutMs) {
+function abortReasonToError(reason) {
+  if (reason instanceof Error) return reason;
+  if (reason === undefined || reason === null) return new Error('aborted');
+  return new Error(String(reason));
+}
+
+async function withTimeout(promise, timeoutMs, abortSignal = null) {
   let timeout;
+  let abortListener = null;
   const timeoutPromise = new Promise((_, reject) => {
     timeout = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs);
   });
+
+  const abortPromise = new Promise((_, reject) => {
+    if (!abortSignal) return;
+    if (abortSignal.aborted) {
+      reject(abortReasonToError(abortSignal.reason));
+      return;
+    }
+    abortListener = () => reject(abortReasonToError(abortSignal.reason));
+    abortSignal.addEventListener('abort', abortListener, { once: true });
+  });
+
   try {
-    return await Promise.race([promise, timeoutPromise]);
+    return await Promise.race([promise, timeoutPromise, abortPromise]);
   } finally {
     clearTimeout(timeout);
+    if (abortListener && abortSignal?.removeEventListener) {
+      abortSignal.removeEventListener('abort', abortListener);
+    }
   }
 }
 
@@ -36,6 +57,7 @@ export async function googleWebSearch(query, options = {}) {
   const apiKey = options.apiKey || config.apiKey;
   const timeoutMs = options.timeoutMs || config.timeoutMs;
   const maxOutputBytes = options.maxOutputBytes || config.maxOutputBytes;
+  const abortSignal = options.abortSignal || null;
 
   if (!apiKey) {
     throw new Error('googleSearch.apiKey is missing in MCP config.');
@@ -51,7 +73,7 @@ export async function googleWebSearch(query, options = {}) {
         tools: [{ googleSearch: {} }],
         temperature: 0.3
       }
-    }), timeoutMs);
+    }), timeoutMs, abortSignal);
 
     const responseText = response.text || '';
     const groundingMetadata = response.candidates?.[0]?.groundingMetadata;

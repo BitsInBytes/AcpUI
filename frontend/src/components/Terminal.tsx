@@ -19,7 +19,15 @@ const Terminal: React.FC<TerminalProps> = ({ socket, cwd, terminalId, visible, o
   const xtermRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const terminalIdRef = useRef(terminalId);
-  terminalIdRef.current = terminalId;
+  const socketRef = useRef<Socket | null>(socket);
+
+  useEffect(() => {
+    terminalIdRef.current = terminalId;
+  }, [terminalId]);
+
+  useEffect(() => {
+    socketRef.current = socket;
+  }, [socket]);
 
   const handleOutput = useCallback((msg: { terminalId: string; data: string }) => {
     if (msg.terminalId === terminalIdRef.current) xtermRef.current?.write(msg.data);
@@ -33,7 +41,7 @@ const Terminal: React.FC<TerminalProps> = ({ socket, cwd, terminalId, visible, o
     }
   }, [onExit]);
 
-  // Initialize xterm once on mount
+  // Initialize xterm once on mount.
   useEffect(() => {
     if (!containerRef.current || xtermRef.current) return;
 
@@ -57,7 +65,9 @@ const Terminal: React.FC<TerminalProps> = ({ socket, cwd, terminalId, visible, o
       if (e.type === 'keydown' && e.ctrlKey && e.key === 'v') {
         isPasting = true;
         navigator.clipboard.readText().then(text => {
-          if (text) socket?.emit('terminal_input', { terminalId, data: text });
+          if (text) {
+            socketRef.current?.emit('terminal_input', { terminalId: terminalIdRef.current, data: text });
+          }
           isPasting = false;
         });
         return false;
@@ -66,44 +76,66 @@ const Terminal: React.FC<TerminalProps> = ({ socket, cwd, terminalId, visible, o
     });
 
     term.onData((data) => {
-      if (!isPasting) socket?.emit('terminal_input', { terminalId, data });
+      if (!isPasting) {
+        socketRef.current?.emit('terminal_input', { terminalId: terminalIdRef.current, data });
+      }
     });
 
-    socket?.on('terminal_output', handleOutput);
-    socket?.on('terminal_exit', handleExit);
-
-    // Spawn PTY only if not already spawned
-    if (socket && cwd && !hasSpawnedTerminal(terminalId)) {
-      addSpawnedTerminal(terminalId);
-      setTimeout(() => {
-        socket.emit('terminal_spawn', { cwd, terminalId }, (res: { error?: string }) => {
-          if (res?.error) term.writeln(`\x1b[31mFailed to start terminal: ${res.error}\x1b[0m`);
-        });
-      }, 100);
-    }
-
     return () => {
-      socket?.off('terminal_output', handleOutput);
-      socket?.off('terminal_exit', handleExit);
-      // Don't kill PTY — it persists for reconnection
       term.dispose();
       xtermRef.current = null;
       fitRef.current = null;
-      // Keep spawnedRef true so we don't re-spawn on remount
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fit when becoming visible
+  // Keep socket listeners current so reconnect/replacement sockets still receive terminal events.
   useEffect(() => {
-    if (visible && fitRef.current) {
-      setTimeout(() => {
-        fitRef.current?.fit();
-        const term = xtermRef.current;
-        if (term && socket) socket.emit('terminal_resize', { terminalId, cols: term.cols, rows: term.rows });
-      }, 50);
-    }
-  }, [visible, socket, terminalId]);
+    if (!socket) return;
+    socket.on('terminal_output', handleOutput);
+    socket.on('terminal_exit', handleExit);
+    return () => {
+      socket.off('terminal_output', handleOutput);
+      socket.off('terminal_exit', handleExit);
+    };
+  }, [socket, handleOutput, handleExit]);
+
+  // Spawn when dependencies are ready; this also supports late socket/cwd availability.
+  useEffect(() => {
+    if (!socket || !cwd || !xtermRef.current) return;
+    if (hasSpawnedTerminal(terminalId)) return;
+
+    addSpawnedTerminal(terminalId);
+    const timer = window.setTimeout(() => {
+      socket.emit('terminal_spawn', { cwd, terminalId }, (res: { error?: string }) => {
+        if (res?.error) {
+          xtermRef.current?.writeln(`\x1b[31mFailed to start terminal: ${res.error}\x1b[0m`);
+          clearSpawnedTerminal(terminalId);
+        }
+      });
+    }, 100);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [socket, cwd, terminalId]);
+
+  // Fit when becoming visible.
+  useEffect(() => {
+    if (!visible || !fitRef.current) return;
+
+    const timer = window.setTimeout(() => {
+      fitRef.current?.fit();
+      const term = xtermRef.current;
+      const currentSocket = socketRef.current;
+      if (term && currentSocket) {
+        currentSocket.emit('terminal_resize', { terminalId: terminalIdRef.current, cols: term.cols, rows: term.rows });
+      }
+    }, 50);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [visible]);
 
   return <div ref={containerRef} className="git-terminal" style={{ display: visible ? 'block' : 'none', height: '100%' }} />;
 };

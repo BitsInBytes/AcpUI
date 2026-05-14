@@ -831,6 +831,10 @@ model/current_model_id/model_options_json = resolved model state
 
     `cleanupAcpSession` removes ephemeral ACP files and `sessionMetadata.delete(subAcpId)` removes runtime buffers. The SQLite session remains available for sidebar inspection until deleted.
 
+13. Completed invocation and idempotency memory is bounded.
+
+    `SubAgentInvocationManager` now prunes terminal in-memory invocation entries and completed idempotency entries by TTL and max-entry caps. Durable history remains in SQLite (`subagent_invocations`, `subagent_invocation_agents`) for status polling and reconnect behavior.
+
 ---
 
 ## Unit Tests
@@ -879,6 +883,8 @@ model/current_model_id/model_options_json = resolved model state
   - `starts asynchronously and returns completed results through the status call`
   - `joins an active invocation when the idempotency key repeats`
   - `returns a cached result when a completed invocation key repeats`
+  - `prunes completed invocation and idempotency entries after TTL while preserving active idempotency promises`
+  - `prunes oldest completed invocation and idempotency entries when max-size limits are exceeded`
   - `reports the active invocation instead of starting another batch for the same parent chat`
   - `cleans active idempotency state when invocation setup rejects`
   - `uses explicit parent ACP session before stale client parent tracking`

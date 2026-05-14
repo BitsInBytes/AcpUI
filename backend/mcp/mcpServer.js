@@ -139,7 +139,7 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
 export function createToolHandlers(io) {
   const tools = {};
 
-  const runShellInvocation = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta }) => {
+  const runShellInvocation = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta, abortSignal }) => {
     const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
     const maxLines = getMaxShellResultLines();
 
@@ -151,7 +151,7 @@ export function createToolHandlers(io) {
       });
       shellRunManager.setIo?.(io);
       writeLog(`[MCP SHELL] Running: ${command} in ${workingDir}`);
-      return shellRunManager.startPreparedRun({
+      const startArgs = {
         providerId,
         acpSessionId,
         toolCallId,
@@ -160,7 +160,9 @@ export function createToolHandlers(io) {
         command,
         cwd: workingDir,
         maxLines
-      });
+      };
+      if (abortSignal) startArgs.abortSignal = abortSignal;
+      return shellRunManager.startPreparedRun(startArgs);
     }
 
     writeLog('[MCP SHELL] Missing provider/session context; tool call aborted');

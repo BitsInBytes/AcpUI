@@ -135,8 +135,8 @@ export function createIoMcpToolHandlers() {
 
 export function createGoogleSearchMcpToolHandlers() {
   return {
-    [ACP_UX_TOOL_NAMES.googleWebSearch]: async ({ query }) => {
-      return textResult(await googleWebSearch(query));
+    [ACP_UX_TOOL_NAMES.googleWebSearch]: async ({ query, abortSignal }) => {
+      return textResult(await googleWebSearch(query, { abortSignal }));
     }
   };
 }

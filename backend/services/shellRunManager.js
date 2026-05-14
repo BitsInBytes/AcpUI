@@ -226,7 +226,8 @@ export class ShellRunManager {
     description = '',
     command,
     cwd = null,
-    maxLines = getMaxShellResultLines()
+    maxLines = getMaxShellResultLines(),
+    abortSignal = null
   }) {
     const resolvedSessionId = sessionId || acpSessionId;
     let run = this.findPreparedRun({ providerId, sessionId: resolvedSessionId, toolCallId, mcpRequestId, command, cwd });
@@ -241,7 +242,22 @@ export class ShellRunManager {
     run.maxLines = maxLines || run.maxLines;
     run.mcpRequestId = mcpRequestId ?? run.mcpRequestId;
 
-    return this.startRun(run);
+    if (abortSignal?.aborted) {
+      this.runs.delete(run.runId);
+      throw new Error('Shell run aborted');
+    }
+
+    const startPromise = this.startRun(run);
+    if (!abortSignal?.addEventListener) return startPromise;
+
+    const abortHandler = () => {
+      this.killRun(run.runId);
+    };
+    abortSignal.addEventListener('abort', abortHandler, { once: true });
+
+    return startPromise.finally(() => {
+      abortSignal.removeEventListener?.('abort', abortHandler);
+    });
   }
 
   findRun({ providerId, sessionId, toolCallId = null, mcpRequestId = null, command = null, cwd = null, statuses = null, allowToolCallIdMismatch = false }) {

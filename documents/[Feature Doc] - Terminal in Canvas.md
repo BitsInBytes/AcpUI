@@ -65,8 +65,10 @@ return { terminals: [...prev.terminals, { id, label: `Terminal ${num}`, sessionI
 
 5. The frontend spawn guard emits `terminal_spawn` once per terminal id lifecycle.
    - File: `frontend/src/utils/terminalState.ts` (Functions: `hasSpawnedTerminal`, `addSpawnedTerminal`, `clearSpawnedTerminal`)
-   - File: `frontend/src/components/Terminal.tsx` (Mount effect: `terminal_spawn` emit)
-   - If `socket`, `cwd`, and an unspawned terminal id are present, `Terminal` marks the id spawned and emits `terminal_spawn` after a short timer. Unmount removes socket listeners and disposes xterm, but keeps the spawned-id guard intact.
+   - File: `frontend/src/components/Terminal.tsx` (Spawn effect: `terminal_spawn` emit)
+   - `Terminal` attempts spawn whenever `socket`, `cwd`, and xterm are available and the terminal id is not already guarded. This makes spawn retry-safe when `socket` or `cwd` become available after mount.
+   - If the backend spawn callback returns an error, `Terminal` writes the error to xterm and clears the spawned-id guard so a later retry can occur.
+   - Unmount still disposes xterm but does not emit `terminal_kill`; PTY cleanup stays on explicit close, exit, or disconnect.
 
 6. The backend owns PTY creation and socket-scoped process identity.
    - File: `backend/sockets/index.js` (Function: `registerSocketHandlers`, Registration: `registerTerminalHandlers`)
@@ -182,10 +184,12 @@ activeTerminalId: string | null;
 ### Spawn Request
 
 ```ts
-// FILE: frontend/src/components/Terminal.tsx (Mount effect: terminal_spawn)
+// FILE: frontend/src/components/Terminal.tsx (Spawn effect: terminal_spawn)
 if (socket && cwd && !hasSpawnedTerminal(terminalId)) {
   addSpawnedTerminal(terminalId);
-  socket.emit('terminal_spawn', { cwd, terminalId }, callback);
+  socket.emit('terminal_spawn', { cwd, terminalId }, (res) => {
+    if (res?.error) clearSpawnedTerminal(terminalId);
+  });
 }
 ```
 
@@ -251,7 +255,7 @@ closeTerminal(t.id);
 ## Gotchas & Important Notes
 
 1. Spawn guard is module-scoped memory.
-   - `terminalState` tracks spawned ids outside React. Explicit close and PTY exit must call `clearSpawnedTerminal`, or a terminal id can be blocked from spawning again.
+   - `terminalState` tracks spawned ids outside React. Explicit close, PTY exit, and backend spawn-failure callbacks must call `clearSpawnedTerminal`, or a terminal id can be blocked from spawning again.
 
 2. Unmount is not process cleanup.
    - `Terminal` cleanup removes listeners and disposes xterm. It does not emit `terminal_kill`; PTY cleanup belongs to close, exit, or disconnect paths.
@@ -306,6 +310,8 @@ closeTerminal(t.id);
   - `renders container div when visible`
   - `hides container when not visible`
   - `calls socket.emit terminal_spawn on mount`
+  - `clears spawn guard on backend spawn failure so a later retry can occur`
+  - `spawns when socket/cwd become available after mount`
 
 - `frontend/src/test/terminalState.test.ts`
   - `hasSpawnedTerminal returns false for unknown id`

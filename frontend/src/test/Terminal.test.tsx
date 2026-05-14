@@ -20,13 +20,17 @@ vi.mock('@xterm/addon-fit', () => ({
 vi.mock('@xterm/addon-web-links', () => ({
   WebLinksAddon: class { dispose = vi.fn(); },
 }));
-vi.mock('../utils/terminalState', () => ({
-  addSpawnedTerminal: vi.fn(),
-  hasSpawnedTerminal: vi.fn(() => false),
-  clearSpawnedTerminal: vi.fn(),
-}));
+vi.mock('../utils/terminalState', () => {
+  const spawned = new Set<string>();
+  return {
+    addSpawnedTerminal: vi.fn((id: string) => { spawned.add(id); }),
+    hasSpawnedTerminal: vi.fn((id: string) => spawned.has(id)),
+    clearSpawnedTerminal: vi.fn((id: string) => { spawned.delete(id); }),
+  };
+});
 
 import Terminal from '../components/Terminal';
+import { addSpawnedTerminal, clearSpawnedTerminal } from '../utils/terminalState';
 
 describe('Terminal', () => {
   let mockSocket: any;
@@ -34,6 +38,7 @@ describe('Terminal', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    clearSpawnedTerminal('t1');
     mockSocket = { emit: vi.fn(), on: vi.fn(), off: vi.fn() };
   });
 
@@ -66,6 +71,45 @@ describe('Terminal', () => {
     expect(mockSocket.emit).toHaveBeenCalledWith(
       'terminal_spawn',
       { cwd: '/test', terminalId: 't1' },
+      expect.any(Function)
+    );
+  });
+
+  it('clears spawn guard on backend spawn failure so a later retry can occur', () => {
+    const { rerender } = render(
+      <Terminal socket={mockSocket} cwd="/test" terminalId="t1" visible={true} />
+    );
+
+    vi.advanceTimersByTime(200);
+    const firstSpawnCall = mockSocket.emit.mock.calls.find((call: any[]) => call[0] === 'terminal_spawn');
+    expect(firstSpawnCall).toBeDefined();
+    expect(addSpawnedTerminal).toHaveBeenCalledWith('t1');
+
+    const firstCallback = firstSpawnCall?.[2] as ((res: { error?: string }) => void);
+    firstCallback({ error: 'spawn failed' });
+    expect(clearSpawnedTerminal).toHaveBeenCalledWith('t1');
+
+    rerender(<Terminal socket={mockSocket} cwd="/test-retry" terminalId="t1" visible={true} />);
+    vi.advanceTimersByTime(200);
+
+    const spawnCalls = mockSocket.emit.mock.calls.filter((call: any[]) => call[0] === 'terminal_spawn');
+    expect(spawnCalls).toHaveLength(2);
+  });
+
+  it('spawns when socket/cwd become available after mount', () => {
+    const { rerender } = render(
+      <Terminal socket={null} cwd="" terminalId="t1" visible={true} />
+    );
+
+    vi.advanceTimersByTime(200);
+    expect(mockSocket.emit).not.toHaveBeenCalledWith('terminal_spawn', expect.anything(), expect.any(Function));
+
+    rerender(<Terminal socket={mockSocket} cwd="/late-cwd" terminalId="t1" visible={true} />);
+    vi.advanceTimersByTime(200);
+
+    expect(mockSocket.emit).toHaveBeenCalledWith(
+      'terminal_spawn',
+      { cwd: '/late-cwd', terminalId: 't1' },
       expect.any(Function)
     );
   });

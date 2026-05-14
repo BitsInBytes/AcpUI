@@ -258,6 +258,71 @@ describe('SubAgentInvocationManager', () => {
     expect(mockAcpClient.transport.sendRequest.mock.calls.filter(call => call[0] === 'session/new')).toHaveLength(1);
   });
 
+  it('prunes completed invocation and idempotency entries after TTL while preserving active idempotency promises', () => {
+    let nowValue = 1_000;
+    manager = new SubAgentInvocationManager({
+      ...deps,
+      now: () => nowValue,
+      completedInvocationTtlMs: 50,
+      completedInvocationMaxEntries: 10,
+      idempotencyTtlMs: 50,
+      idempotencyMaxEntries: 10
+    });
+
+    manager.invocations.set('inv-old', {
+      invocationId: 'inv-old',
+      providerId: 'provider-a',
+      status: 'completed',
+      completedAt: 900,
+      waiters: new Set()
+    });
+    manager.idempotentInvocations.set('key-old', { result: { ok: true }, completedAt: 900 });
+    manager.idempotentInvocations.set('key-active', { promise: Promise.resolve({ ok: true }), startedAt: 900 });
+
+    nowValue = 1_000;
+    manager.pruneCompletedState();
+
+    expect(manager.invocations.has('inv-old')).toBe(false);
+    expect(manager.idempotentInvocations.has('key-old')).toBe(false);
+    expect(manager.idempotentInvocations.has('key-active')).toBe(true);
+  });
+
+  it('prunes oldest completed invocation and idempotency entries when max-size limits are exceeded', () => {
+    manager = new SubAgentInvocationManager({
+      ...deps,
+      now: () => 250,
+      completedInvocationTtlMs: 10_000,
+      completedInvocationMaxEntries: 1,
+      idempotencyTtlMs: 10_000,
+      idempotencyMaxEntries: 1
+    });
+
+    manager.invocations.set('inv-old', {
+      invocationId: 'inv-old',
+      providerId: 'provider-a',
+      status: 'completed',
+      completedAt: 100,
+      waiters: new Set()
+    });
+    manager.invocations.set('inv-new', {
+      invocationId: 'inv-new',
+      providerId: 'provider-a',
+      status: 'completed',
+      completedAt: 200,
+      waiters: new Set()
+    });
+
+    manager.idempotentInvocations.set('key-old', { result: { ok: true }, completedAt: 100 });
+    manager.idempotentInvocations.set('key-new', { result: { ok: true }, completedAt: 200 });
+
+    manager.pruneCompletedState();
+
+    expect(manager.invocations.has('inv-old')).toBe(false);
+    expect(manager.invocations.has('inv-new')).toBe(true);
+    expect(manager.idempotentInvocations.has('key-old')).toBe(false);
+    expect(manager.idempotentInvocations.has('key-new')).toBe(true);
+  });
+
   it('reports the active invocation instead of starting another batch for the same parent chat', async () => {
     mockDb.getActiveSubAgentInvocationForParent.mockResolvedValueOnce({
       invocationId: 'inv-active',

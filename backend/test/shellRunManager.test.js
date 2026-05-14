@@ -435,6 +435,26 @@ describe('shellRunManager', () => {
     });
   });
 
+  it('kills runs when abortSignal is triggered', async () => {
+    const prepared = manager.prepareRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'abortable' });
+    const controller = new AbortController();
+    const promise = manager.startPreparedRun({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      command: 'abortable',
+      abortSignal: controller.signal
+    });
+
+    controller.abort(new Error('request aborted'));
+    expect(ptyMock.proc.kill).toHaveBeenCalled();
+
+    ptyMock.proc.exitCb({ exitCode: null });
+    await expect(promise).resolves.toEqual({
+      content: [{ type: 'text', text: '$ abortable\n\nCommand terminated by user' }]
+    });
+    expect(manager.snapshot(prepared.runId)).toEqual(expect.objectContaining({ reason: 'user_terminated' }));
+  });
+
   it('classifies Ctrl+C followed by exit as user termination', async () => {
     const prepared = manager.prepareRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'long' });
     const promise = manager.startPreparedRun({ providerId: 'provider-a', sessionId: 'acp-1', command: 'long' });
