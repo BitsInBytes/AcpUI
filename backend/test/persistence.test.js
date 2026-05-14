@@ -99,6 +99,31 @@ describe('Persistence (Database)', () => {
     expect(s.id).toBe('s9');
   });
 
+  it('does not cross-resolve shared acp ids across providers', async () => {
+    const aid = `a-shared-${Math.random()}`;
+    await db.saveSession({ id: 's-shared-b', acpSessionId: aid, provider: 'provider-b', messages: [] });
+    await db.saveSession({ id: 's-shared-null', acpSessionId: aid, messages: [] });
+
+    const wrongProvider = await db.getSessionByAcpId('provider-a', aid);
+    const rightProvider = await db.getSessionByAcpId('provider-b', aid);
+
+    expect(wrongProvider).toBeNull();
+    expect(rightProvider?.id).toBe('s-shared-b');
+  });
+
+  it('applies saveConfigOptions only to the matching provider row for shared acp ids', async () => {
+    const aid = `a-config-shared-${Math.random()}`;
+    await db.saveSession({ id: 's-config-a', acpSessionId: aid, provider: 'provider-a', messages: [] });
+    await db.saveSession({ id: 's-config-b', acpSessionId: aid, provider: 'provider-b', messages: [] });
+
+    await db.saveConfigOptions('provider-a', aid, [{ id: 'effort', currentValue: 'high' }]);
+
+    const sessionA = await db.getSession('s-config-a');
+    const sessionB = await db.getSession('s-config-b');
+    expect(sessionA.configOptions).toEqual([{ id: 'effort', currentValue: 'high' }]);
+    expect(sessionB.configOptions).toEqual([]);
+  });
+
   it('handles notes', async () => {
     await db.saveSession({ id: 'sn', messages: [] });
     await db.saveNotes('sn', 'notes');

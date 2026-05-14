@@ -93,7 +93,7 @@ Files:
 - `backend/database.js` (Functions: `getAllSessions`, `deleteSession`, `getActiveSubAgentInvocationForParent`, `deleteSubAgentInvocationsForParent`)
 - `backend/mcp/subAgentInvocationManager.js` (Method: `cancelInvocation`)
 
-Before descendant deletion, the archive handler cancels any active sub-agent invocation rooted at the parent UI session and removes its SQL invocation registry rows. It then loads all sessions and recursively collects descendants by matching `forkedFrom` to the parent UI id. Each descendant is permanently removed through the same provider module used for the parent archive, its attachment directory is removed, and its SQLite row is deleted.
+Before descendant deletion, the archive handler cancels any active sub-agent invocation rooted at the parent UI session and removes its SQL invocation registry rows. It then loads all sessions and recursively collects descendants by matching `forkedFrom` to the parent UI id. Each descendant is permanently removed through the descendant session's resolved provider module, its provider-scoped attachment directory is removed, and its SQLite row is deleted.
 
 ```javascript
 // FILE: backend/sockets/archiveHandlers.js (Socket event: archive_session)
@@ -287,7 +287,7 @@ fs.rmSync(archiveDir, { recursive: true, force: true });
 callback({ success: true, uiId: newUiId, acpSessionId: saved.acpSessionId });
 ```
 
-The restore handler ignores the return value from `restoreSessionFiles`. The database row receives a new UI id and the archived ACP session id. The save payload does not include a `provider` field, so the stored provider is `NULL` for restored sessions.
+The restore handler ignores the return value from `restoreSessionFiles`. The database row receives a new UI id, the archived ACP session id, and the restored provider id (`session.json.provider` when present, otherwise the restore payload provider/default provider).
 
 ### 11. User Permanently Deletes an Archive
 
@@ -404,7 +404,8 @@ File: `backend/sockets/archiveHandlers.js` (Socket events: `archive_session`, `r
   "messages": [],
   "isPinned": false,
   "cwd": "workspace-path-or-null",
-  "configOptions": []
+  "configOptions": [],
+  "provider": "provider-id"
 }
 ```
 
@@ -468,7 +469,7 @@ Each provider config supplies an archive path through its merged provider config
 |---|---|---|
 | `archive_session` | `db.getSession(uiId).provider` through `getProvider(providerId)` | Frontend sends `providerId`, but the handler destructures only `uiId`. |
 | `list_archives` | `payload.providerId` or default provider | Supports callback-only form. |
-| `restore_archive` | `payload.providerId` or default provider | Uses provider path for archive lookup and `getProviderModule(providerId)` for file restore. |
+| `restore_archive` | `payload.providerId` or default provider for archive lookup; restored session provider from `session.json.provider` fallback to payload/default | Uses the resolved restore provider for file restore, attachment destination root, and restored DB row provider. |
 | `delete_archive` | `payload.providerId` or default provider | Requires payload with `folderName`. |
 | `delete_session` | `db.getSession(uiId).provider` or default provider | Permanent delete path lives in `backend/sockets/sessionHandlers.js`. |
 
@@ -545,9 +546,9 @@ Archive copies `getAttachmentsRoot()/uiId` to `archiveDir/attachments` and remov
 
 The restore handler creates `newUiId` with `Date.now().toString()` and stores `saved.acpSessionId` in the restored row. `restoreSessionFiles` return values are ignored. Provider hooks should restore files for the saved ACP id unless the backend restore contract is changed together with tests.
 
-### 2. Restored Rows Do Not Persist Provider Id
+### 2. Restore Persists Provider Id
 
-`restore_archive` calls `db.saveSession` without `provider`. The restored row has `provider` set to `NULL` in SQLite. Sidebar grouping treats missing provider as the active/default provider path in `Sidebar`, but backend provider-specific session loading should be checked when changing restore behavior.
+`restore_archive` writes `provider` on `db.saveSession`. The restore path prefers `session.json.provider` and falls back to the restore payload provider/default provider when archive metadata does not include a provider.
 
 ### 3. Descendant Cascade Follows `forkedFrom` Only
 
@@ -565,9 +566,9 @@ The archive directory is based on sanitized session name, truncated to 80 charac
 
 Archive creation sanitizes `safeName`, but `restore_archive` and `delete_archive` join `payload.folderName` directly under the archive path. Archive names come from `list_archives` in the normal UI flow. Any new external restore/delete entry point should validate folder names.
 
-### 7. Archive Handler Calls Attachment Root Without Provider Id
+### 7. Archive Handler Uses Provider-Scoped Attachment Roots
 
-`archiveHandlers.js` calls `getAttachmentsRoot()` with no provider argument for archive and restore attachment copies. `getAttachmentsRoot` can resolve provider-specific roots, but the archive handler relies on the ambient/default provider path for these calls.
+`archiveHandlers.js` resolves provider IDs for parent, descendant, and restore operations and passes them to `getAttachmentsRoot(providerId)` so attachment cleanup/copy does not cross provider roots.
 
 ### 8. Provider Hooks Are Invoked Synchronously
 

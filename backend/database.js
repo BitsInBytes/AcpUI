@@ -368,7 +368,7 @@ export function getSessionByAcpId(providerOrAcpId, maybeAcpId = null) {
 
   return new Promise((resolve, reject) => {
     const query = provider
-      ? `SELECT * FROM sessions WHERE acp_id = ? AND (provider = ? OR provider IS NULL) ORDER BY provider IS NULL ASC, last_active DESC LIMIT 1`
+      ? `SELECT * FROM sessions WHERE acp_id = ? AND provider = ? ORDER BY last_active DESC LIMIT 1`
       : `SELECT * FROM sessions WHERE acp_id = ? ORDER BY last_active DESC LIMIT 1`;
     const params = provider ? [acpId, provider] : [acpId];
     db.get(query, params, (err, row) => {
@@ -940,7 +940,7 @@ export function saveConfigOptions(providerOrAcpId, acpIdOrConfigOptions, configO
 
   return new Promise((resolve, reject) => {
     const selectQuery = provider
-      ? `SELECT config_options_json FROM sessions WHERE acp_id = ? AND (provider = ? OR provider IS NULL) ORDER BY provider IS NULL ASC, last_active DESC LIMIT 1`
+      ? `SELECT config_options_json FROM sessions WHERE acp_id = ? AND provider = ? ORDER BY last_active DESC LIMIT 1`
       : `SELECT config_options_json FROM sessions WHERE acp_id = ? ORDER BY last_active DESC LIMIT 1`;
     const selectParams = provider ? [acpId, provider] : [acpId];
     db.get(selectQuery, selectParams, (selectErr, row) => {

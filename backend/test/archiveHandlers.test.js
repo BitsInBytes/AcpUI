@@ -9,10 +9,8 @@ vi.mock('fs', () => ({
     readdirSync: vi.fn(),
     statSync: vi.fn(),
     mkdirSync: vi.fn(),
-    copyFileSync: vi.fn(),
     cpSync: vi.fn(),
     rmSync: vi.fn(),
-    unlinkSync: vi.fn(),
     readFileSync: vi.fn(),
     writeFileSync: vi.fn(),
   },
@@ -20,10 +18,8 @@ vi.mock('fs', () => ({
   readdirSync: vi.fn(),
   statSync: vi.fn(),
   mkdirSync: vi.fn(),
-  copyFileSync: vi.fn(),
   cpSync: vi.fn(),
   rmSync: vi.fn(),
-  unlinkSync: vi.fn(),
   readFileSync: vi.fn(),
   writeFileSync: vi.fn(),
 }));
@@ -37,53 +33,70 @@ vi.mock('../database.js', () => ({
   deleteSubAgentInvocationsForParent: vi.fn().mockResolvedValue(),
 }));
 
-vi.mock('../services/providerLoader.js', () => ({
-  getProvider: () => ({
-    config: {
-      name: 'Test',
-      command: 'test-cli',
-      args: ['acp'],
-      protocolPrefix: '_test.dev/',
-      paths: { sessions: '/tmp/test-sessions', agents: '/tmp/test-agents', attachments: '/tmp/test-attachments', archive: '/tmp/archives' },
-      clientInfo: { name: 'TestUI', version: '1.0.0' },
-      branding: { assistantName: 'Test' },
-      models: { flagship: { id: 'test-flagship', displayName: 'Flagship' }, balanced: { id: 'test-balanced', displayName: 'Balanced' }, titleGeneration: 'test-balanced' },
-    }
-  }),
-  getProviderModule: vi.fn().mockResolvedValue({
+vi.mock('../mcp/subAgentInvocationManager.js', () => ({
+  subAgentInvocationManager: {
+    cancelInvocation: vi.fn().mockResolvedValue(),
+  },
+}));
+
+const providerModules = {
+  'provider-a': {
     deleteSessionFiles: vi.fn(),
     archiveSessionFiles: vi.fn(),
-    restoreSessionFiles: vi.fn()
-  })
+    restoreSessionFiles: vi.fn(),
+  },
+  'provider-b': {
+    deleteSessionFiles: vi.fn(),
+    archiveSessionFiles: vi.fn(),
+    restoreSessionFiles: vi.fn(),
+  },
+};
+
+const providers = {
+  'provider-a': {
+    id: 'provider-a',
+    config: { paths: { archive: '/tmp/archives/provider-a' } },
+  },
+  'provider-b': {
+    id: 'provider-b',
+    config: { paths: { archive: '/tmp/archives/provider-b' } },
+  },
+};
+
+vi.mock('../services/providerLoader.js', () => ({
+  getProvider: vi.fn((id) => providers[id || 'provider-a']),
+  getProviderModule: vi.fn(async (id) => providerModules[id || 'provider-a']),
 }));
 
 vi.mock('../services/attachmentVault.js', () => ({
-  getAttachmentsRoot: () => '/tmp/test-attachments',
+  getAttachmentsRoot: vi.fn((providerId = null) => `/tmp/attachments/${providerId || 'default'}`),
   upload: { array: () => (req, res, next) => next() },
-  handleUpload: vi.fn()
+  handleUpload: vi.fn(),
 }));
 
 import registerArchiveHandlers from '../sockets/archiveHandlers.js';
 import fs from 'fs';
 import * as db from '../database.js';
+import { writeLog } from '../services/logger.js';
+import { getAttachmentsRoot } from '../services/attachmentVault.js';
 import { getProviderModule } from '../services/providerLoader.js';
+import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
 
 describe('archiveHandlers', () => {
-  let mockIo, mockSocket, mockProviderModule;
+  let mockIo;
+  let mockSocket;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     vi.clearAllMocks();
-    process.env.HOME = '/home/test';
     mockIo = new EventEmitter();
     mockSocket = new EventEmitter();
     mockSocket.id = 'test-socket';
-    mockProviderModule = await getProviderModule();
     registerArchiveHandlers(mockIo, mockSocket);
   });
 
   describe('list_archives', () => {
     it('returns folder names that contain session.json', () => {
-      fs.existsSync.mockImplementation((p) => true);
+      fs.existsSync.mockImplementation(() => true);
       fs.readdirSync.mockReturnValue(['chat1', 'chat2']);
       fs.statSync.mockReturnValue({ isDirectory: () => true });
 
@@ -100,43 +113,145 @@ describe('archiveHandlers', () => {
       expect(callback).toHaveBeenCalledWith({ archives: [] });
     });
 
-    it('returns empty archives on error', () => {
+    it('returns empty archives on list error', () => {
       fs.existsSync.mockReturnValue(true);
-      fs.readdirSync.mockImplementation(() => { throw new Error('EACCES'); });
+      fs.readdirSync.mockImplementation(() => {
+        throw new Error('EACCES');
+      });
+
       const callback = vi.fn();
       mockSocket.listeners('list_archives')[0](callback);
+
+      expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('[ARCHIVE ERR] list_archives: EACCES'));
       expect(callback).toHaveBeenCalledWith({ archives: [] });
     });
   });
 
   describe('restore_archive', () => {
-    it('copies files via provider and creates DB record', async () => {
-      const saved = { acpSessionId: 'acp-1', name: 'Test', model: 'flagship', messages: [] };
-      fs.existsSync.mockReturnValue(true);
+    it('preserves saved provider identity and uses provider-scoped attachment root', async () => {
+      const saved = {
+        acpSessionId: 'acp-1',
+        name: 'Restored',
+        model: 'flagship',
+        messages: [],
+        provider: 'provider-b',
+      };
+      fs.existsSync.mockImplementation((p) => p.includes('session.json') || p.endsWith('attachments'));
       fs.readFileSync.mockReturnValue(JSON.stringify(saved));
       db.saveSession.mockResolvedValue();
 
       const callback = vi.fn();
-      await mockSocket.listeners('restore_archive')[0]({ folderName: 'Test' }, callback);
+      await mockSocket.listeners('restore_archive')[0]({ folderName: 'RestoreMe', providerId: 'provider-a' }, callback);
 
-      expect(mockProviderModule.restoreSessionFiles).toHaveBeenCalledWith('acp-1', expect.stringContaining('Test'));
-      expect(db.saveSession).toHaveBeenCalledWith(expect.objectContaining({ name: 'Test', acpSessionId: 'acp-1' }));
-      expect(callback).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+      const providerBModule = await getProviderModule('provider-b');
+      expect(providerBModule.restoreSessionFiles).toHaveBeenCalledWith('acp-1', expect.stringContaining('RestoreMe'));
+      expect(getAttachmentsRoot).toHaveBeenCalledWith('provider-b');
+      expect(db.saveSession).toHaveBeenCalledWith(expect.objectContaining({
+        acpSessionId: 'acp-1',
+        provider: 'provider-b',
+      }));
+      expect(callback).toHaveBeenCalledWith(expect.objectContaining({ success: true, providerId: 'provider-b' }));
     });
 
-    it('returns error when session.json not found in archive', async () => {
+    it('returns error when session.json is missing', async () => {
       fs.existsSync.mockReturnValue(false);
       const callback = vi.fn();
-      await mockSocket.listeners('restore_archive')[0]({ folderName: 'missing' }, callback);
-      expect(callback).toHaveBeenCalledWith({ error: expect.stringContaining('session.json not found') });
+
+      await mockSocket.listeners('restore_archive')[0]({ folderName: 'missing', providerId: 'provider-a' }, callback);
+
+      expect(callback).toHaveBeenCalledWith({ error: 'session.json not found in archive' });
     });
 
-    it('returns error when restore throws', async () => {
+    it('returns callback error when restore throws', async () => {
       fs.existsSync.mockReturnValue(true);
-      fs.readFileSync.mockImplementation(() => { throw new Error('read failed'); });
+      fs.readFileSync.mockImplementation(() => {
+        throw new Error('read failed');
+      });
       const callback = vi.fn();
-      await mockSocket.listeners('restore_archive')[0]({ folderName: 'bad' }, callback);
-      expect(callback).toHaveBeenCalledWith({ error: expect.stringContaining('read failed') });
+
+      await mockSocket.listeners('restore_archive')[0]({ folderName: 'broken', providerId: 'provider-a' }, callback);
+
+      expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('[RESTORE ERR] read failed'));
+      expect(callback).toHaveBeenCalledWith({ error: 'read failed' });
+    });
+  });
+
+  describe('archive_session', () => {
+    it('archives via provider and saves session.json with provider id', async () => {
+      db.getSession.mockResolvedValue({
+        id: 'ui-1',
+        acpSessionId: 'acp-1',
+        name: 'My Chat',
+        model: 'flagship',
+        messages: [],
+        isPinned: false,
+        provider: 'provider-a',
+      });
+      fs.existsSync.mockImplementation((p) => !p.includes('My Chat'));
+
+      await mockSocket.listeners('archive_session')[0]({ uiId: 'ui-1' });
+
+      const providerAModule = await getProviderModule('provider-a');
+      expect(providerAModule.archiveSessionFiles).toHaveBeenCalledWith('acp-1', expect.stringContaining('My Chat'));
+      expect(getAttachmentsRoot).toHaveBeenCalledWith('provider-a');
+      const savedJson = fs.writeFileSync.mock.calls[0][1];
+      expect(savedJson).toContain('"provider": "provider-a"');
+      expect(db.deleteSession).toHaveBeenCalledWith('ui-1');
+    });
+
+    it('cancels active sub-agent invocation before archive cleanup', async () => {
+      db.getSession.mockResolvedValue({
+        id: 'ui-1',
+        acpSessionId: 'acp-1',
+        name: 'My Chat',
+        model: 'flagship',
+        messages: [],
+        isPinned: false,
+        provider: 'provider-a',
+      });
+      db.getActiveSubAgentInvocationForParent.mockResolvedValueOnce({ invocationId: 'inv-1' });
+      fs.existsSync.mockReturnValue(false);
+
+      await mockSocket.listeners('archive_session')[0]({ uiId: 'ui-1' });
+
+      expect(subAgentInvocationManager.cancelInvocation).toHaveBeenCalledWith('provider-a', 'inv-1');
+    });
+
+    it('uses each descendant provider for cleanup and attachment deletion', async () => {
+      db.getSession.mockResolvedValue({
+        id: 'parent',
+        acpSessionId: 'acp-parent',
+        name: 'Parent Chat',
+        model: 'flagship',
+        messages: [],
+        isPinned: false,
+        provider: 'provider-a',
+      });
+      db.getAllSessions.mockResolvedValue([
+        { id: 'parent', acpSessionId: 'acp-parent', provider: 'provider-a' },
+        { id: 'child-a', acpSessionId: 'acp-child-a', forkedFrom: 'parent', provider: 'provider-a' },
+        { id: 'child-b', acpSessionId: 'acp-child-b', forkedFrom: 'parent', provider: 'provider-b' },
+      ]);
+      fs.existsSync.mockImplementation((p) => (p.includes('provider-a') && p.includes('child-a')) || (p.includes('provider-b') && p.includes('child-b')));
+
+      await mockSocket.listeners('archive_session')[0]({ uiId: 'parent' });
+
+      const providerAModule = await getProviderModule('provider-a');
+      const providerBModule = await getProviderModule('provider-b');
+      expect(providerAModule.deleteSessionFiles).toHaveBeenCalledWith('acp-child-a');
+      expect(providerBModule.deleteSessionFiles).toHaveBeenCalledWith('acp-child-b');
+      expect(getAttachmentsRoot).toHaveBeenCalledWith('provider-a');
+      expect(getAttachmentsRoot).toHaveBeenCalledWith('provider-b');
+      expect(db.deleteSession).toHaveBeenCalledWith('child-a');
+      expect(db.deleteSession).toHaveBeenCalledWith('child-b');
+    });
+
+    it('logs archive error when session lookup throws', async () => {
+      db.getSession.mockRejectedValueOnce(new Error('db down'));
+
+      await mockSocket.listeners('archive_session')[0]({ uiId: 'ui-err' });
+
+      expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('[ARCHIVE ERR] db down'));
     });
   });
 
@@ -144,74 +259,23 @@ describe('archiveHandlers', () => {
     it('removes folder', () => {
       fs.existsSync.mockReturnValue(true);
       const callback = vi.fn();
-      mockSocket.listeners('delete_archive')[0]({ folderName: 'old-chat' }, callback);
+      mockSocket.listeners('delete_archive')[0]({ folderName: 'old-chat', providerId: 'provider-a' }, callback);
 
       expect(fs.rmSync).toHaveBeenCalledWith(expect.stringContaining('old-chat'), { recursive: true, force: true });
       expect(callback).toHaveBeenCalledWith({ success: true });
     });
 
-    it('returns error when rmSync throws', () => {
+    it('returns callback error when delete throws', () => {
       fs.existsSync.mockReturnValue(true);
-      fs.rmSync.mockImplementationOnce(() => { throw new Error('permission denied'); });
+      fs.rmSync.mockImplementation(() => {
+        throw new Error('permission denied');
+      });
+
       const callback = vi.fn();
-      mockSocket.listeners('delete_archive')[0]({ folderName: 'locked-chat' }, callback);
+      mockSocket.listeners('delete_archive')[0]({ folderName: 'locked-chat', providerId: 'provider-a' }, callback);
+
+      expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('[ARCHIVE ERR] delete failed: permission denied'));
       expect(callback).toHaveBeenCalledWith({ error: 'permission denied' });
-    });
-  });
-
-  describe('archive_session', () => {
-    it('archives via provider and saves session.json', async () => {
-      db.getSession.mockResolvedValue({ id: 'ui-1', acpSessionId: 'acp-1', name: 'My Chat', model: 'flagship', messages: [], isPinned: false });
-      // archiveDir doesn't exist yet (triggers mkdir), but session files and attach dir do
-      fs.existsSync.mockImplementation((p) => !p.endsWith('My Chat'));
-
-      await mockSocket.listeners('archive_session')[0]({ uiId: 'ui-1' });
-
-      expect(fs.mkdirSync).toHaveBeenCalled();
-      expect(mockProviderModule.archiveSessionFiles).toHaveBeenCalledWith('acp-1', expect.stringContaining('My Chat'));
-      expect(fs.writeFileSync).toHaveBeenCalledWith(expect.stringContaining('session.json'), expect.any(String));
-      expect(db.deleteSession).toHaveBeenCalledWith('ui-1');
-    });
-
-    it('recursively deletes descendant sessions before archiving parent', async () => {
-      db.getSession.mockResolvedValue({ id: 'parent', acpSessionId: 'acp-parent', name: 'Parent Chat', model: 'flagship', messages: [], isPinned: false });
-      db.getAllSessions.mockResolvedValue([
-        { id: 'parent', acpSessionId: 'acp-parent', name: 'Parent Chat' },
-        { id: 'child', acpSessionId: 'acp-child', forkedFrom: 'parent' },
-        { id: 'grandchild', acpSessionId: 'acp-grandchild', forkedFrom: 'child' },
-        { id: 'other', acpSessionId: 'acp-other' },
-      ]);
-      fs.existsSync.mockReturnValue(false);
-
-      await mockSocket.listeners('archive_session')[0]({ uiId: 'parent' });
-
-      expect(mockProviderModule.deleteSessionFiles).toHaveBeenCalledWith('acp-child');
-      expect(mockProviderModule.deleteSessionFiles).toHaveBeenCalledWith('acp-grandchild');
-      expect(db.deleteSession).toHaveBeenCalledWith('child');
-      expect(db.deleteSession).toHaveBeenCalledWith('grandchild');
-      expect(db.deleteSession).not.toHaveBeenCalledWith('other');
-    });
-
-    it('logs error when getSession throws', async () => {
-      const { writeLog } = await import('../services/logger.js');
-      db.getSession.mockRejectedValueOnce(new Error('DB down'));
-      await mockSocket.listeners('archive_session')[0]({ uiId: 'ui-err' });
-      expect(writeLog).toHaveBeenCalledWith(expect.stringContaining('DB down'));
-    });
-
-    it('does not call deleteSession for descendants when there are none', async () => {
-      db.getSession.mockResolvedValue({ id: 'solo', acpSessionId: 'acp-solo', name: 'Solo Chat', model: 'flagship', messages: [], isPinned: false });
-      db.getAllSessions.mockResolvedValue([
-        { id: 'solo', acpSessionId: 'acp-solo', name: 'Solo Chat' },
-        { id: 'unrelated', acpSessionId: 'acp-unrelated' },
-      ]);
-      fs.existsSync.mockReturnValue(false);
-
-      await mockSocket.listeners('archive_session')[0]({ uiId: 'solo' });
-
-      // Only the parent itself should be deleted (from archiveHandlers after move)
-      expect(db.deleteSession).toHaveBeenCalledWith('solo');
-      expect(db.deleteSession).not.toHaveBeenCalledWith('unrelated');
     });
   });
 });

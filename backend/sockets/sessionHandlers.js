@@ -63,6 +63,7 @@ async function captureModelState(acpClient, sessionId, source, providerModels, f
 }
 
 const loadingSessions = new Set();
+const loadingSessionCallbacks = new Map();
 
 function emitCachedContext(providerModule, sessionId) {
   if (!sessionId) return;
@@ -287,16 +288,40 @@ export default function registerSessionHandlers(io, socket) {
   });
 
   socket.on('create_session', async ({ providerId, model, existingAcpId, cwd: requestCwd, agent: requestAgent }, callback) => {
-    if (existingAcpId && loadingSessions.has(existingAcpId)) {
-      writeLog(`[SESSION] session ${existingAcpId} already loading; skipping duplicate request`);
-      return;
+    if (existingAcpId) {
+      const queuedCallbacks = loadingSessionCallbacks.get(existingAcpId) || [];
+      if (typeof callback === 'function') queuedCallbacks.push(callback);
+      loadingSessionCallbacks.set(existingAcpId, queuedCallbacks);
+
+      if (loadingSessions.has(existingAcpId)) {
+        writeLog(`[SESSION] session ${existingAcpId} already loading; joining duplicate request`);
+        return;
+      }
+
+      loadingSessions.add(existingAcpId);
     }
-    if (existingAcpId) loadingSessions.add(existingAcpId);
+
+    const completeCreateSession = (payload) => {
+      if (existingAcpId) {
+        const queuedCallbacks = loadingSessionCallbacks.get(existingAcpId) || [];
+        loadingSessionCallbacks.delete(existingAcpId);
+        for (const queuedCallback of queuedCallbacks) {
+          try {
+            queuedCallback(payload);
+          } catch (err) {
+            writeLog(`[SESSION] duplicate callback failed for ${existingAcpId}: ${err.message}`);
+          }
+        }
+        return;
+      }
+
+      callback?.(payload);
+    };
 
     try {
       const runtime = providerRuntimeManager.getRuntime(providerId);
       const acpClient = runtime.client;
-      if (!acpClient.isHandshakeComplete) return callback({ error: 'Daemon not ready' });
+      if (!acpClient.isHandshakeComplete) return completeCreateSession({ error: 'Daemon not ready' });
 
       const resolvedProviderId = runtime.providerId;
       const provider = getProvider(resolvedProviderId);
@@ -390,7 +415,7 @@ modelOptions: knownModelOptions, toolCalls: 0, successTools: 0, startTime: Date.
         if (context && finalMeta) finalMeta.spawnContext = context;
       }
 
-      callback({
+      completeCreateSession({
         success: true, providerId: resolvedProviderId, acpSessionId: result.sessionId, sessionId: result.sessionId,
         model: selectedModelState?.model || model,
         currentModelId: finalMeta?.currentModelId || selectedModelState?.currentModelId,
@@ -399,7 +424,7 @@ modelOptions: knownModelOptions, toolCalls: 0, successTools: 0, startTime: Date.
       });
     } catch (err) {
       writeLog(`[ACP ERR] create_session failed: ${err.message}`);
-      callback({ error: err.message });
+      completeCreateSession({ error: err.message });
     } finally {
       if (existingAcpId) loadingSessions.delete(existingAcpId);
     }
@@ -477,7 +502,7 @@ modelOptions: knownModelOptions, toolCalls: 0, successTools: 0, startTime: Date.
       const optionsFromResult = getConfigOptionsFromSetResult(result, optionId, value, providerModule);
       const meta = acpClient.sessionMetadata.get(session.acpSessionId);
       if (meta) meta.configOptions = mergeConfigOptions(meta.configOptions, optionsFromResult);
-      await db.saveConfigOptions(session.acpSessionId, optionsFromResult);
+      await db.saveConfigOptions(pid, session.acpSessionId, optionsFromResult);
     } catch (err) {
       writeLog(`[OPTION ERR] ${err.message}`);
     }

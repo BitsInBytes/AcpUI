@@ -215,7 +215,7 @@ Supporting workflows use provider hooks directly:
 
 - `parseJsonlSession` calls `getSessionPaths(acpSessionId)` and `parseSessionHistory(filePath, Diff)`.
 - `cleanupAcpSession` calls `deleteSessionFiles(acpSessionId)`.
-- Archive handlers call `archiveSessionFiles`, `restoreSessionFiles`, and `deleteSessionFiles`.
+- Archive handlers call `archiveSessionFiles`, `restoreSessionFiles`, and `deleteSessionFiles`, and they resolve provider-scoped attachment roots and restored session provider identity from archive metadata.
 - Attachment upload storage calls `getAttachmentsDir()`.
 - `runHooks` calls `getHooksForAgent(agentName, hookType)` unless `cliManagedHooks` includes the hook type.
 - Prompt execution calls `onPromptStarted(sessionId)` before `session/prompt` and `onPromptCompleted(sessionId)` in the prompt completion path.

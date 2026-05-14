@@ -96,7 +96,8 @@ export async function reapplySavedConfigOptions(acpClient, sessionId, savedOptio
       const updatedOptions = mergeConfigOptions(meta.configOptions, optionsFromResult);
       meta.configOptions = updatedOptions;
       if (typeof db.saveConfigOptions === 'function') {
-        await db.saveConfigOptions(sessionId, optionsFromResult);
+        const providerId = acpClient.getProviderId?.() || meta?.provider || null;
+        await db.saveConfigOptions(providerId, sessionId, optionsFromResult);
       }
     } catch (err) {
       writeLog(`[OPTION ERR] Failed to reapply ${savedOption.id} for ${sessionId}: ${err.message}`);

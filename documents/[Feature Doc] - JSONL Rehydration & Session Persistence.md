@@ -293,7 +293,7 @@ ACP `session/load` can emit historical updates. `StreamController` and `handleUp
 
 ### Contract 7: Model, config, and context state are separate from messages
 
-`saveModelState`, `saveConfigOptions`, `stats_push`, and provider `emitCachedContext` update metadata paths that are independent from JSONL message rehydration. Rehydrating messages does not replace saved model or config option state.
+`saveModelState`, provider-scoped `saveConfigOptions` calls, `stats_push`, and provider `emitCachedContext` update metadata paths that are independent from JSONL message rehydration. Rehydrating messages does not replace saved model or config option state.
 
 ## Configuration / Provider Support
 
@@ -493,9 +493,9 @@ Table: `sessions`
 
    `create_session` checks `acpClient.sessionMetadata.has(existingAcpId)`. Hot sessions return metadata and emit cached context without a load RPC.
 
-6. **Cold resume is duplicate-protected**
+6. **Cold resume is duplicate-protected with deterministic callbacks**
 
-   `loadingSessions` in `sessionHandlers.js` prevents duplicate `create_session` work for the same `existingAcpId`. A missing callback on a skipped duplicate request is part of that guard's current behavior.
+   `loadingSessions` in `sessionHandlers.js` prevents duplicate `create_session` work for the same `existingAcpId`, and duplicate callers are queued to receive the same final callback payload when the in-flight resume completes.
 
 7. **Config reapply is advertised-option gated**
 

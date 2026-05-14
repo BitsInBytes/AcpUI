@@ -201,7 +201,7 @@ This is a backend-led feature with a small frontend socket listener. Providers p
     ```javascript
     // FILE: backend/database.js (Function: getSessionByAcpId)
     const query = provider
-      ? `SELECT * FROM sessions WHERE acp_id = ? AND (provider = ? OR provider IS NULL) ORDER BY provider IS NULL ASC, last_active DESC LIMIT 1`
+      ? `SELECT * FROM sessions WHERE acp_id = ? AND provider = ? ORDER BY last_active DESC LIMIT 1`
       : `SELECT * FROM sessions WHERE acp_id = ? ORDER BY last_active DESC LIMIT 1`;
     ```
 

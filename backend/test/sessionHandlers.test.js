@@ -439,6 +439,37 @@ describe('Session Handlers', () => {
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
   });
 
+  it('returns deterministic callback behavior for duplicate in-flight create_session resume', async () => {
+    const firstCallback = vi.fn();
+    const secondCallback = vi.fn();
+    let resolveLoad;
+    const loadPromise = new Promise((resolve) => {
+      resolveLoad = resolve;
+    });
+
+    mockAcpClient.transport.sendRequest.mockImplementation((method) => {
+      if (method === 'session/load') return loadPromise;
+      if (method === 'session/set_model') return Promise.resolve({});
+      return Promise.resolve({});
+    });
+
+    const handler = mockSocket.listeners('create_session')[0];
+    const firstCall = handler({ providerId: 'provider-a', model: 'test-balanced', existingAcpId: 'acp-resume' }, firstCallback);
+    const secondCall = handler({ providerId: 'provider-a', model: 'test-balanced', existingAcpId: 'acp-resume' }, secondCallback);
+
+    await vi.waitFor(() => {
+      expect(mockAcpClient.transport.sendRequest).toHaveBeenCalledWith('session/load', expect.any(Object));
+      expect(mockAcpClient.transport.sendRequest).toHaveBeenCalledTimes(1);
+    });
+
+    resolveLoad({ sessionId: 'acp-resume' });
+    await firstCall;
+    await secondCall;
+
+    expect(firstCallback).toHaveBeenCalledWith(expect.objectContaining({ success: true, sessionId: 'acp-resume' }));
+    expect(secondCallback).toHaveBeenCalledWith(expect.objectContaining({ success: true, sessionId: 'acp-resume' }));
+  });
+
   it('reapplies saved config options on resume when the provider still advertises them', async () => {
     const callback = vi.fn();
     mockDb.getSessionByAcpId.mockResolvedValueOnce({
@@ -469,7 +500,7 @@ describe('Session Handlers', () => {
 
     expect(mockProviderModule.setConfigOption).toHaveBeenCalledTimes(1);
     expect(mockProviderModule.setConfigOption).toHaveBeenCalledWith(mockAcpClient, 'acp-resume', 'effort', 'low');
-    expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('acp-resume', [{ id: 'effort', currentValue: 'low' }]);
+    expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('provider-a', 'acp-resume', [{ id: 'effort', currentValue: 'low' }]);
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({
       success: true,
       configOptions: expect.arrayContaining([expect.objectContaining({ id: 'effort', currentValue: 'low' })])
@@ -654,7 +685,7 @@ describe('Session Handlers', () => {
     await handler({ uiId: 'ui-1', optionId: 'effort', value: 'high' });
 
     expect(mockProviderModule.setConfigOption).toHaveBeenCalledWith(mockAcpClient, 'acp-1', 'effort', 'high');
-    expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('acp-1', expect.arrayContaining([
+    expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('provider-a', 'acp-1', expect.arrayContaining([
       expect.objectContaining({ id: 'effort', currentValue: 'high' })
     ]));
   });
@@ -672,7 +703,7 @@ describe('Session Handlers', () => {
     const handler = mockSocket.listeners('set_session_option')[0];
     await handler({ uiId: 'ui-1', optionId: 'effort', value: 'max' });
 
-    expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('acp-1', returnedOptions);
+    expect(mockDb.saveConfigOptions).toHaveBeenCalledWith('provider-a', 'acp-1', returnedOptions);
     expect(mockAcpClient.sessionMetadata.get('acp-1').configOptions).toEqual(returnedOptions);
   });
 
