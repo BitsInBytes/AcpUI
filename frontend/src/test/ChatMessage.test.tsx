@@ -4,16 +4,24 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ChatMessage from '../components/ChatMessage';
 import type { Message, TimelineStep } from '../types';
 import { useCanvasStore } from '../store/useCanvasStore';
+import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSubAgentStore } from '../store/useSubAgentStore';
+import { useSystemStore } from '../store/useSystemStore';
 
 
 // More sophisticated mock to allow testing custom components
 vi.mock('react-markdown', () => ({
+  defaultUrlTransform: (value: string) => value,
   default: ({ children, components }: any) => {
     if (typeof children === 'string') {
       if (children.includes(':::RESPONSE_DIVIDER:::') || children.includes('---')) {
         const Hr = components?.hr || (() => <hr />);
         return <div><Hr /></div>;
+      }
+      const linkMatch = children.match(/\[([^\]]+)]\(([^)]+)\)/);
+      if (linkMatch && components?.a) {
+        const Anchor = components.a;
+        return <Anchor href={linkMatch[2]}>{linkMatch[1]}</Anchor>;
       }
       if (children.includes('```')) {
         const codeContent = children.replace(/```\w*\n?/, '').replace(/```/, '');
@@ -42,6 +50,8 @@ vi.mock('../components/ShellToolTerminal', () => ({
 describe('ChatMessage', () => {
   beforeEach(() => {
     useCanvasStore.setState({ isCanvasOpen: false });
+    useSystemStore.setState({ socket: null });
+    useSessionLifecycleStore.setState({ activeSessionId: null });
     useSubAgentStore.getState().clear();
   });
 
@@ -396,6 +406,33 @@ describe('ChatMessage', () => {
     expect(canvasHoistBtn).toBeInTheDocument();
   });
 
+  it('opens local markdown file links in canvas', () => {
+    const mockOpenFile = vi.fn();
+    const mockSocket = { emit: vi.fn() } as any;
+    useSystemStore.setState({ socket: mockSocket });
+    useSessionLifecycleStore.setState({ activeSessionId: 'session-ui' });
+    useCanvasStore.setState({ handleOpenFileInCanvas: mockOpenFile });
+
+    const message: Message = {
+      id: '8b',
+      role: 'assistant',
+      content: '',
+      timeline: [
+        { type: 'text', content: 'See [report](D:/Git/AcpUI/.devFiles/work-done/report.md:1)' }
+      ]
+    };
+
+    render(<ChatMessage message={message} />);
+
+    fireEvent.click(screen.getByRole('link', { name: 'report' }));
+
+    expect(mockOpenFile).toHaveBeenCalledWith(
+      mockSocket,
+      'session-ui',
+      'D:/Git/AcpUI/.devFiles/work-done/report.md'
+    );
+  });
+
   it('renders permission requests and allows response', () => {
     const mockRespond = vi.fn();
     useChatStore.setState({ handleRespondPermission: mockRespond });
@@ -604,6 +641,8 @@ describe('ChatMessage', () => {
 describe('ChatMessage - additional coverage', () => {
   beforeEach(() => {
     useCanvasStore.setState({ isCanvasOpen: false });
+    useSystemStore.setState({ socket: null });
+    useSessionLifecycleStore.setState({ activeSessionId: null });
     useSubAgentStore.getState().clear();
   });
 
@@ -755,6 +794,8 @@ describe('ChatMessage - additional coverage', () => {
 
 describe('ChatMessage - Collapse Fix (Regression)', () => {
   beforeEach(() => {
+    useSystemStore.setState({ socket: null });
+    useSessionLifecycleStore.setState({ activeSessionId: null });
     useSubAgentStore.getState().clear();
   });
 

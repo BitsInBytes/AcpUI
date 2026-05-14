@@ -2,7 +2,7 @@
 
 The Canvas system is the right-side workspace for session-scoped file artifacts, Monaco editing, markdown preview, git-aware diff viewing, and terminal tab hosting. The feature spans React/Zustand state, Socket.IO file/git handlers, and SQLite `canvas_artifacts` persistence.
 
-This area is easy to break because canvas state is keyed by UI session id while chat streaming is keyed by ACP session id, and because file artifacts can enter the canvas from code blocks, tool timeline steps, stream callbacks, git status rows, and persisted database rows.
+This area is easy to break because canvas state is keyed by UI session id while chat streaming is keyed by ACP session id, and because file artifacts can enter the canvas from code blocks, local Markdown file links, tool timeline steps, stream callbacks, git status rows, and persisted database rows.
 
 ---
 
@@ -14,7 +14,7 @@ This area is easy to break because canvas state is keyed by UI session id while 
 - Loads saved artifacts for the active UI session with `canvas_load` and `getCanvasArtifactsForSession`.
 - Reads current file contents through `canvas_read_file`, writes editor content through `canvas_apply_to_file`, and opens files in VS Code through `open_in_editor`.
 - Renders artifact content in Monaco code view, ReactMarkdown preview, or a Monaco `SafeDiffEditor` diff view.
-- Opens files from assistant code blocks, tool timeline file paths, completed tool events, and git status rows.
+- Opens files from assistant code blocks, local Markdown file links, tool timeline file paths, completed tool events, and git status rows.
 - Shows workspace git status, detects whether the active artifact has changes, and loads HEAD content with `git_show_head` for side-by-side diffs.
 - Hosts session-scoped terminal tabs in the same pane and keeps the pane open while terminals exist.
 
@@ -53,6 +53,8 @@ handleOpenInCanvas(socket, activeSessionId, {
   version: 1
 });
 ```
+
+Assistant Markdown links with Windows absolute or `file:` file destinations also open files through the canvas. `frontend/src/components/ChatMessage.tsx` handles `markdownComponents.a`, `frontend/src/components/MemoizedMarkdown.tsx` preserves those local hrefs through `urlTransform`, and `frontend/src/utils/localFileLinks.ts` strips optional `:line` / `:line:column` suffixes before `handleOpenFileInCanvas` reads the file.
 
 2. Tool timeline steps can open the current file state.
    - File: `frontend/src/components/AssistantMessage.tsx` (Component: `AssistantMessage`, Prop: `ToolStep.onOpenInCanvas`)
@@ -331,7 +333,8 @@ ORDER BY created_at DESC
 | Pop-out Shell | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `useChatManager(...)`, `CanvasPane`, `ErrorBoundary`, `computeResizeWidthNoSidebar` | Pop-out canvas rendering and stream-file callbacks |
 | Stream | `frontend/src/store/useStreamStore.ts` | `processBuffer`, `onStreamEvent` | Merges tool file paths, triggers file refresh, opens `plan.md` artifacts |
 | Socket Hook | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, socket event `system_event`, typewriter loop effect | Connects stream processing to canvas callbacks supplied by app shells |
-| Code Blocks | `frontend/src/components/ChatMessage.tsx` | `CodeBlock`, `handleOpenCanvas`, `markdownComponents.code` | Creates snippet artifacts from rendered markdown code blocks |
+| Code Blocks And Links | `frontend/src/components/ChatMessage.tsx` | `CodeBlock`, `handleOpenCanvas`, `markdownComponents.code`, `markdownComponents.a` | Creates snippet artifacts from rendered markdown code blocks and routes local file links to canvas file opening |
+| Local Link Parser | `frontend/src/utils/localFileLinks.ts` | `parseLocalFileLinkHref` | Detects local file hrefs and removes line suffixes before canvas reads |
 | Tool Timeline | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `ToolStep.onOpenInCanvas` | Bridges tool-step hoist buttons to `handleOpenFileInCanvas` |
 | Tool Timeline | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `canvas-hoist-btn` | Extracts file paths from tool events and renders file-state hoist button |
 | Helpers | `frontend/src/utils/canvasHelpers.ts` | `isFileChanged`, `buildFullPath` | Git changed-file matching and cwd/path joining |
@@ -354,7 +357,8 @@ ORDER BY created_at DESC
 | Frontend Pane | `frontend/src/test/CanvasPane.test.tsx` | suites `CanvasPane Component`, `CanvasPane - additional coverage`, `CanvasPane - Terminal Tab`, `CanvasPane - prevArtifactIdRef behavior`, `CanvasPane - multiple terminals and tab interactions` | Rendering modes, apply/open editor actions, tab behavior, language mapping, terminal tabs, same-artifact view-mode preservation |
 | Frontend Helpers | `frontend/src/test/canvasHelpers.test.ts` | suites `isFileChanged`, `buildFullPath` | Path normalization and git file-change matching |
 | Frontend Tool Timeline | `frontend/src/test/ToolStep.test.tsx` | suite `ToolStep`, suite `ToolStep - getFilePathFromEvent extraction` | Canvas hoist button rules and file path extraction |
-| Frontend Chat | `frontend/src/test/ChatMessage.test.tsx` | tests `renders Open in Canvas button on code blocks and calls callback`, `does not render Open in Canvas button for truncated paths with ellipses`, `renders Open in Canvas button for valid full paths`, `code block shows Canvas button when canvas is open`, `code block does NOT show Canvas button when canvas is closed` | Code-block entry point and tool hoist visibility through assistant rendering |
+| Frontend Chat | `frontend/src/test/ChatMessage.test.tsx` | tests `renders Open in Canvas button on code blocks and calls callback`, `opens local markdown file links in canvas`, `does not render Open in Canvas button for truncated paths with ellipses`, `renders Open in Canvas button for valid full paths`, `code block shows Canvas button when canvas is open`, `code block does NOT show Canvas button when canvas is closed` | Code-block, local-link, and tool-hoist visibility through assistant rendering |
+| Frontend Link Helpers | `frontend/src/test/localFileLinks.test.ts` | suite `parseLocalFileLinkHref` | Local file href detection, percent decoding, and line-suffix stripping |
 | Frontend App | `frontend/src/test/App.test.tsx` | tests `persists canvas open state per session`, `auto-opens canvas for plans when awaiting permission`, `handles resize handle mouse events` | Main app canvas lifecycle, plan auto-open, resize handle |
 | Frontend Stream | `frontend/src/test/useStreamStore.test.ts` | suite `useStreamStore (Pure Logic)` | Tool event merging and stream queue processing that drives file callbacks |
 | Backend Canvas | `backend/test/canvasHandlers.test.js` | suite `canvasHandlers` | Canvas socket success paths, filesystem read/write, error paths, no-callback safety |
@@ -388,12 +392,15 @@ ORDER BY created_at DESC
    - `CanvasPane` uses active session `cwd` first and then `workspaceCwds[0].path`. Missing session `cwd` can make the git panel show the first configured workspace.
 
 8. Code-block canvas actions require an open canvas.
-   - `CodeBlock` hides its Canvas button when `isCanvasOpen` is false. ToolStep hoist buttons are independent of that code-block condition because they open files through `AssistantMessage` and `handleOpenFileInCanvas`.
+   - `CodeBlock` hides its Canvas button when `isCanvasOpen` is false. ToolStep hoist buttons and local Markdown file links are independent of that code-block condition because they open files through `handleOpenFileInCanvas`.
 
-9. Pop-out canvas does not issue `canvas_load` during bootstrap.
+9. Local Markdown file links must remove editor line suffixes.
+   - `parseLocalFileLinkHref` strips trailing `:line` and `:line:column` before `canvas_read_file` so a rendered file link opens the file path, not a non-existent path with editor coordinates.
+
+10. Pop-out canvas does not issue `canvas_load` during bootstrap.
    - `PopOutApp` wires stream callbacks and renders `CanvasPane`, but the persisted artifact load path is in `App`.
 
-10. Terminal tabs keep the pane open.
+11. Terminal tabs keep the pane open.
     - `closeTerminal`, `resetCanvas`, and `handleCloseArtifact` all preserve `isCanvasOpen` when terminals remain for the active session.
 
 ---

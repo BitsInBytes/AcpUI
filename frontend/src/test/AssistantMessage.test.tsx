@@ -5,6 +5,7 @@ import type { Message, TimelineStep } from '../types';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 
 vi.mock('react-markdown', () => ({
+  defaultUrlTransform: (value: string) => value,
   default: ({ children }: any) => <div>{children}</div>
 }));
 vi.mock('remark-gfm', () => ({ default: () => {} }));

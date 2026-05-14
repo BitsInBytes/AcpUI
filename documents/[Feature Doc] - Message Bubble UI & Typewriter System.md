@@ -270,7 +270,7 @@ Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message ti
 - File: `frontend/src/components/ChatMessage.tsx` (Component: `ChatMessage`)
 - File: `frontend/src/components/AssistantMessage.tsx` (Component: `AssistantMessage`)
 
-`MessageList` selects the active session and slices messages by `visibleCount`. `HistoryList` memoizes message iteration. `ChatMessage` routes divider, user, and assistant messages. Assistant messages receive `localCollapsed`, `toggleCollapse`, `markdownComponents`, `acpSessionId`, and `providerId`.
+`MessageList` selects the active session and slices messages by `visibleCount`. `HistoryList` memoizes message iteration. `ChatMessage` routes divider, user, and assistant messages, and its markdown overrides handle code blocks, response dividers, and local file links. Assistant messages receive `localCollapsed`, `toggleCollapse`, `markdownComponents`, `acpSessionId`, and `providerId`.
 
 17. Collapse policy is computed in `ChatMessage`
 - File: `frontend/src/components/ChatMessage.tsx` (State: `localCollapsed`, Ref: `manuallyToggled`)
@@ -324,7 +324,7 @@ const { settled, active } = useMemo(
 );
 ```
 
-Streaming content is parsed into top-level mdast blocks. All blocks except the last one render through `MemoizedBlock`; the last block renders in `.streaming-block`. Completed messages render as a single markdown document.
+Streaming content is parsed into top-level mdast blocks. All blocks except the last one render through `MemoizedBlock`; the last block renders in `.streaming-block`. Completed messages render as a single markdown document. `MemoizedMarkdown` uses a targeted `urlTransform` that preserves local file hrefs recognized by `parseLocalFileLinkHref` while leaving normal URL sanitization to `react-markdown`.
 
 20. Tool steps route specialized terminals and output formatting
 - File: `frontend/src/components/ToolStep.tsx` (Component: `ToolStep`, Function: `getFilePathFromEvent`)
@@ -557,9 +557,10 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 |---|---|---|---|
 | Message list | `frontend/src/components/MessageList/MessageList.tsx` | `MessageList`, `visibleCount`, `HistoryList` | Selects active session messages, supports lazy visible-count expansion, and renders the chat scroll area. |
 | Message iteration | `frontend/src/components/HistoryList.tsx` | `HistoryList`, `React.memo`, `ChatMessage` | Memoized mapping from `Message[]` to `ChatMessage` components. |
-| Message router | `frontend/src/components/ChatMessage.tsx` | `ChatMessage`, `CodeBlock`, `copyToClipboard`, `localCollapsed`, `manuallyToggled`, `markdownComponents` | Routes message roles, computes collapse defaults, renders code-block copy/canvas controls, and passes markdown overrides. |
+| Message router | `frontend/src/components/ChatMessage.tsx` | `ChatMessage`, `CodeBlock`, `copyToClipboard`, `localCollapsed`, `manuallyToggled`, `markdownComponents`, `markdownComponents.a` | Routes message roles, computes collapse defaults, renders code-block copy/canvas controls, opens local file links in canvas, and passes markdown overrides. |
 | Assistant renderer | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `getPinnedSubAgentInvocationIds`, `renderContentWithErrors`, `handleCopyAll`, `handleFork` | Renders timeline steps, bottom-pinned sub-agent panels, provider branding, copy, fork, archive, hook-running, elapsed-turn, and fallback content states. |
-| Markdown renderer | `frontend/src/components/MemoizedMarkdown.tsx` | `MemoizedMarkdown`, `splitIntoBlocks`, `MemoizedBlock` | Parses markdown to mdast, memoizes settled streaming blocks, and renders active markdown tails. |
+| Markdown renderer | `frontend/src/components/MemoizedMarkdown.tsx` | `MemoizedMarkdown`, `splitIntoBlocks`, `MemoizedBlock`, `markdownUrlTransform` | Parses markdown to mdast, memoizes settled streaming blocks, preserves local file hrefs, and renders active markdown tails. |
+| Local file link parser | `frontend/src/utils/localFileLinks.ts` | `parseLocalFileLinkHref` | Detects canvas-openable local file hrefs and removes editor line suffixes. |
 | Tool renderer | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent`, `ShellToolTerminal`, `renderToolOutput` | Renders tool headers, collapse content, canvas hoist buttons, shell terminals, sub-agent start output suppression, and formatted output. |
 | Permission renderer | `frontend/src/components/PermissionStep.tsx` | `PermissionStep`, `onRespond`, `PermissionTimelineStep` | Renders permission options and disables buttons when a response is recorded. |
 | Shell terminal | `frontend/src/components/ShellToolTerminal.tsx` | `ShellToolTerminal`, `fallbackRunFromEvent`, `getReadOnlyTerminalHtml`, `getTranscriptWritePlan`, `emitResize`, `stopRun` | Renders live xterm sessions, read-only terminal output, stdin, paste, resize, and kill controls. |
@@ -622,7 +623,12 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
    - Why it happens: `handleRespondPermission` filters sessions by `acpSessionId` and emits `respond_permission` with `sessionId`.
    - How to avoid it: pass `acpSessionId` from `AssistantMessage` to `handleRespondPermission`.
 
-10. Sub-agent panels filter by invocation ID and active panels stay visible.
+10. Local file links need both URL preservation and path cleanup.
+    - What goes wrong: a Windows drive-letter link is sanitized or opens as browser navigation, or `canvas_read_file` receives a path ending in `:line`.
+    - Why it happens: `react-markdown` treats `D:` as a URL protocol unless `MemoizedMarkdown.markdownUrlTransform` preserves recognized local file hrefs, and editor-style line suffixes are not filesystem paths.
+    - How to avoid it: keep `parseLocalFileLinkHref` aligned with `markdownComponents.a` and `markdownUrlTransform`, and strip line suffixes before calling `handleOpenFileInCanvas`.
+
+11. Sub-agent panels filter by invocation ID and active panels stay visible.
     - What goes wrong: a response bubble displays agents from another invocation, the panel stays attached to an early tool call and gets lost below later work, the live orchestration step collapses while agents are still running, or a completed historical panel flashes open before collapsing.
     - Why it happens: `SubAgentPanel` filters by `invocationId`, `useChatManager` stamps that field onto the in-progress tool step, `AssistantMessage` pins matching panels at the response bottom, collapse policy checks `useSubAgentStore.isInvocationActive`, and `PinnedSubAgentPanel` separates observed live activity from already-terminal hydration.
     - How to avoid it: keep `sub_agent_started` invocation stamping, keep `AssistantMessage.getPinnedSubAgentInvocationIds` aligned with sub-agent tool identities, preserve the active-invocation collapse guard, and keep terminal hydration collapsed until the user explicitly opens it.
@@ -724,6 +730,7 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `keeps completed bottom-pinned sub-agent orchestration collapsed when terminal agents hydrate after render`
   - `keeps active sub-agent orchestration expanded after remount`
   - `renders response dividers`
+  - `opens local markdown file links in canvas`
   - `respects manual toggle during timeline updates while streaming`
   - `respects manual toggle after streaming stops`
 - `frontend/src/test/AssistantMessage.test.tsx`
@@ -749,10 +756,16 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `passes undefined as toolCallId when toolCall is absent`
   - `all buttons are disabled once step.response is set`
   - `shows the selected option in a confirmation message after response`
+- `frontend/src/test/localFileLinks.test.ts`
+  - `parses Windows drive paths and removes line suffixes`
+  - `decodes spaces and strips angle brackets`
+  - `supports file URLs`
+  - `ignores non-local links`
 - `frontend/src/test/MemoizedMarkdown.test.tsx`
   - `renders markdown content`
   - `memoizes completed blocks during streaming`
   - `renders full content when not streaming`
+  - `preserves local file hrefs through the markdown URL transform`
   - `when isStreaming=true with multiple blocks, only the last block has streaming-block class`
 
 ### Tool output, shell terminal, and sub-agent rendering

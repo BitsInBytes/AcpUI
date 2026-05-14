@@ -5,6 +5,7 @@ import UserMessage from '../components/UserMessage';
 // Mock ReactMarkdown to render children as plain text so tests aren't
 // coupled to its internals or to markdown parsing behaviour.
 vi.mock('react-markdown', () => ({
+  defaultUrlTransform: (value: string) => value,
   default: ({ children }: { children: string }) => (
     <div data-testid="markdown-content">{children}</div>
   ),

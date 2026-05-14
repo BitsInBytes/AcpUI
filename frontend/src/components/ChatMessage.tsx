@@ -10,6 +10,7 @@ import { useCanvasStore } from '../store/useCanvasStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useSubAgentStore } from '../store/useSubAgentStore';
 import { isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
+import { parseLocalFileLinkHref } from '../utils/localFileLinks';
 import UserMessage from './UserMessage';
 import AssistantMessage from './AssistantMessage';
 
@@ -124,6 +125,9 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
   const manuallyToggled = useRef<Set<number>>(new Set());
   const latestTimelineRef = useRef<TimelineStep[] | undefined>(timeline);
   const shellAutoCollapseTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const socket = useSystemStore(state => state.socket);
+  const activeSessionId = useSessionLifecycleStore(state => state.activeSessionId);
+  const handleOpenFileInCanvas = useCanvasStore(state => state.handleOpenFileInCanvas);
   const activeSubAgentInvocationIds = useSubAgentStore(state => {
     const activeIds = new Set<string>();
     for (const invocation of state.invocations) {
@@ -224,6 +228,23 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, acpSessionId, provid
   const markdownComponents = {
     hr() {
       return <div className="response-divider"><div className="response-divider-dot" /></div>;
+    },
+    a({ href, children, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement> & { children?: React.ReactNode }) {
+      const filePath = parseLocalFileLinkHref(href);
+      if (!filePath) return <a href={href} {...props}>{children}</a>;
+
+      return (
+        <a
+          href={href}
+          {...props}
+          onClick={(event) => {
+            event.preventDefault();
+            handleOpenFileInCanvas(socket, activeSessionId, filePath);
+          }}
+        >
+          {children}
+        </a>
+      );
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars
     code({ node: _node, inline, className, children, ...props }: any) {

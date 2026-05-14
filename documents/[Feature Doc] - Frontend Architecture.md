@@ -178,7 +178,7 @@ If this contract is broken, background streams can write into the wrong chat, sh
 | Scroll | `frontend/src/hooks/useScroll.ts` | `useScroll`, `scrollToBottom`, `handleScroll`, `handleWheel` | Auto-scroll stickiness and manual override behavior |
 | Types | `frontend/src/types.ts` | `ChatSession`, `Message`, `TimelineStep`, `SystemEvent`, `ProviderSummary`, `ProviderBranding` | Shared frontend/backend contract shapes |
 | Message viewport | `frontend/src/components/MessageList/MessageList.tsx`, `frontend/src/components/HistoryList.tsx` | `MessageList`, `HistoryList` | Active-session message slicing and memoized message mapping |
-| Message rendering | `frontend/src/components/ChatMessage.tsx`, `frontend/src/components/AssistantMessage.tsx` | `ChatMessage`, `AssistantMessage` | Role routing, assistant timeline rendering, actions, collapse behavior |
+| Message rendering | `frontend/src/components/ChatMessage.tsx`, `frontend/src/components/AssistantMessage.tsx` | `ChatMessage`, `AssistantMessage` | Role routing, assistant timeline rendering, local file links, actions, collapse behavior |
 | Tool rendering | `frontend/src/components/ToolStep.tsx`, `frontend/src/components/renderToolOutput.tsx` | `ToolStep`, `renderToolOutput` | Tool headers, shell terminals, canvas hoist, output formatting |
 | Permission rendering | `frontend/src/components/PermissionStep.tsx` | `PermissionStep` | Permission response UI |
 | Shell UI | `frontend/src/components/ShellToolTerminal.tsx`, `frontend/src/store/useShellRunStore.ts` | `ShellToolTerminal`, `useShellRunStore` | Live shell transcript and terminal controls |

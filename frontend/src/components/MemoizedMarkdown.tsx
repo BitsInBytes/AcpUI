@@ -1,6 +1,7 @@
 import React, { memo, useMemo } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { parseLocalFileLinkHref } from '../utils/localFileLinks';
 import { fromMarkdown } from 'mdast-util-from-markdown';
 import { gfm } from 'micromark-extension-gfm';
 import { gfmFromMarkdown } from 'mdast-util-gfm';
@@ -12,10 +13,14 @@ interface MemoizedMarkdownProps {
   components?: any;
 }
 
+function markdownUrlTransform(value: string) {
+  return parseLocalFileLinkHref(value) ? value : defaultUrlTransform(value);
+}
+
 /** A single completed markdown block — never re-renders once content is stable */
 const MemoizedBlock = memo(
   ({ content, components }: { content: string; components?: MemoizedMarkdownProps['components'] }) => (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={markdownUrlTransform}>
       {content}
     </ReactMarkdown>
   ),
@@ -97,7 +102,7 @@ const MemoizedMarkdown: React.FC<MemoizedMarkdownProps> = ({ content, isStreamin
   if (settled.length === 0) {
     return (
       <div className="streaming-block">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={markdownUrlTransform}>
           {active}
         </ReactMarkdown>
       </div>
@@ -111,7 +116,7 @@ const MemoizedMarkdown: React.FC<MemoizedMarkdownProps> = ({ content, isStreamin
       ))}
       {active && (
         <div className="streaming-block">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={markdownUrlTransform}>
             {active}
           </ReactMarkdown>
         </div>

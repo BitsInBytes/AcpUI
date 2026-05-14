@@ -4,6 +4,7 @@ import ToolStep from '../components/ToolStep';
 import type { SystemEvent } from '../types';
 
 vi.mock('react-markdown', () => ({
+  defaultUrlTransform: (value: string) => value,
   default: ({ children }: any) => <div>{children}</div>
 }));
 vi.mock('remark-gfm', () => ({ default: () => {} }));

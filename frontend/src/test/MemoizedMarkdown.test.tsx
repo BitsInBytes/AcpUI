@@ -3,7 +3,20 @@ import { render, screen } from '@testing-library/react';
 import MemoizedMarkdown from '../components/MemoizedMarkdown';
 
 vi.mock('react-markdown', () => ({
-  default: ({ children }: any) => <div data-testid="md-block">{children}</div>
+  defaultUrlTransform: () => '',
+  default: ({ children, components, urlTransform }: any) => {
+    const content = String(children || '');
+    const linkMatch = content.match(/\[([^\]]+)]\(([^)]+)\)/);
+    if (linkMatch) {
+      const Anchor = components?.a || 'a';
+      return (
+        <div data-testid="md-block">
+          <Anchor href={urlTransform ? urlTransform(linkMatch[2]) : linkMatch[2]}>{linkMatch[1]}</Anchor>
+        </div>
+      );
+    }
+    return <div data-testid="md-block">{children}</div>;
+  }
 }));
 vi.mock('remark-gfm', () => ({ default: () => {} }));
 
@@ -31,6 +44,12 @@ describe('MemoizedMarkdown', () => {
     expect(blocks.length).toBe(1);
     expect(blocks[0].textContent).toContain('First');
     expect(blocks[0].textContent).toContain('Second');
+  });
+
+  it('preserves local file hrefs through the markdown URL transform', () => {
+    render(<MemoizedMarkdown content="[report](D:/Git/AcpUI/report.md:1)" isStreaming={false} />);
+
+    expect(screen.getByRole('link', { name: 'report' })).toHaveAttribute('href', 'D:/Git/AcpUI/report.md:1');
   });
 });
 
