@@ -15,6 +15,46 @@ function textResult(text) {
   return { content: [{ type: 'text', text: text || '' }] };
 }
 
+const INTERNAL_TOOL_ARG_KEYS = new Set([
+  'providerId',
+  'acpSessionId',
+  'mcpProxyId',
+  'mcpRequestId',
+  'requestMeta',
+  'abortSignal'
+]);
+
+const GREP_SEARCH_ARG_KEYS = new Set([
+  'description',
+  'pattern',
+  'dir_path',
+  'case_mode',
+  'include_globs',
+  'exclude_globs',
+  'file_types',
+  'before_context',
+  'after_context',
+  'max_matches',
+  'result_mode',
+  'word_match',
+  'multiline',
+  'regex_engine',
+  'hidden',
+  'no_ignore',
+  'follow_symlinks',
+  'case_sensitive',
+  'context',
+  'fixed_strings',
+  ...INTERNAL_TOOL_ARG_KEYS
+]);
+
+function assertSupportedArgs(args, allowedKeys, toolName) {
+  const unsupportedKeys = Object.keys(args || {}).filter(key => !allowedKeys.has(key));
+  if (unsupportedKeys.length) {
+    throw new Error(`${toolName} received unsupported option(s): ${unsupportedKeys.join(', ')}`);
+  }
+}
+
 export function createIoMcpToolHandlers() {
   return {
     [ACP_UX_TOOL_NAMES.readFile]: async ({ file_path, start_line, end_line }) => {
@@ -40,8 +80,45 @@ export function createIoMcpToolHandlers() {
       return textResult(limitTextOutput(files.join('\n') || 'No files found.', undefined, `${ACP_UX_TOOL_NAMES.glob} output`));
     },
 
-    [ACP_UX_TOOL_NAMES.grepSearch]: async ({ pattern, dir_path, case_sensitive, context, fixed_strings, abortSignal }) => {
+    [ACP_UX_TOOL_NAMES.grepSearch]: async (args = {}) => {
+      assertSupportedArgs(args, GREP_SEARCH_ARG_KEYS, ACP_UX_TOOL_NAMES.grepSearch);
+      const {
+        pattern,
+        dir_path,
+        case_mode,
+        include_globs,
+        exclude_globs,
+        file_types,
+        before_context,
+        after_context,
+        max_matches,
+        result_mode,
+        word_match,
+        multiline,
+        regex_engine,
+        hidden,
+        no_ignore,
+        follow_symlinks,
+        case_sensitive,
+        context,
+        fixed_strings,
+        abortSignal
+      } = args;
       const result = await grepSearch(pattern, dir_path, {
+        caseMode: case_mode,
+        includeGlobs: include_globs,
+        excludeGlobs: exclude_globs,
+        fileTypes: file_types,
+        beforeContext: before_context,
+        afterContext: after_context,
+        maxMatches: max_matches,
+        resultMode: result_mode,
+        wordMatch: word_match,
+        multiline,
+        regexEngine: regex_engine,
+        hidden,
+        noIgnore: no_ignore,
+        followSymlinks: follow_symlinks,
         caseSensitive: case_sensitive,
         context,
         fixedStrings: fixed_strings,

@@ -11,14 +11,18 @@ It is intentionally provider-agnostic: provider identity, branding, models, and 
 - Persists sessions/folders/artifacts/notes in SQLite.
 - Routes ACP updates into the normalized timeline/events the UI expects.
 - Hosts MCP tool execution endpoints and related orchestration helpers.
+- Serves read-only repository Markdown documentation through Socket.IO callbacks.
 - Propagates MCP cancellation/disconnect signals so long-running tools can stop their descendant work.
 
 ## Quick Start
 
 ```bash
 npm install
-npm run dev
+npm run dev      # backend watch mode
+npm run start    # production backend process
 ```
+
+The repository launcher uses `npm run dev` for backend hot reload when you run `..\scripts\run.ps1 dev`.
 
 Common validation commands:
 
@@ -58,6 +62,7 @@ MCP tools are controlled by `configuration/mcp.json`, or the JSON file reference
 Feature docs are now the source of truth for implementation detail and stable file/function/event anchors:
 
 - [Feature Doc - Backend Architecture](../documents/%5BFeature%20Doc%5D%20-%20Backend%20Architecture.md)
+- [Feature Doc - Help Docs Modal](../documents/%5BFeature%20Doc%5D%20-%20Help%20Docs%20Modal.md)
 - [Feature Doc - Provider System](../documents/%5BFeature%20Doc%5D%20-%20Provider%20System.md)
 - [Feature Doc - JSONL Rehydration & Session Persistence](../documents/%5BFeature%20Doc%5D%20-%20JSONL%20Rehydration%20%26%20Session%20Persistence.md)
 - [Feature Doc - MCP Server System](../documents/%5BFeature%20Doc%5D%20-%20MCP%20Server.md)

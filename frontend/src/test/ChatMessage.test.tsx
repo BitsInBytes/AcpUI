@@ -964,6 +964,58 @@ describe('ChatMessage - Collapse Fix (Regression)', () => {
     }
   });
 
+  it('keeps completed bottom-pinned sub-agent orchestration collapsed when terminal agents hydrate after render', () => {
+    const message: Message = {
+      id: 'msg-loaded-completed-subagents',
+      role: 'assistant',
+      content: 'Parent finished after spawning agents',
+      isStreaming: false,
+      timeline: [
+        {
+          type: 'tool',
+          event: {
+            id: 'tool-subagents-loaded',
+            title: 'Invoke Subagents',
+            toolName: 'ux_invoke_subagents',
+            canonicalName: 'ux_invoke_subagents',
+            invocationId: 'inv-loaded-completed',
+            status: 'completed',
+            isAcpUxTool: true
+          }
+        } as TimelineStep
+      ]
+    };
+
+    const { container } = render(<ChatMessage message={message} />);
+    expect(container.querySelector('.sub-agent-pinned-panel')).toBeNull();
+
+    act(() => {
+      useSubAgentStore.getState().startInvocation({
+        invocationId: 'inv-loaded-completed',
+        providerId: 'test-provider',
+        parentUiId: 'parent-ui',
+        parentSessionId: 'parent-acp',
+        statusToolName: 'ux_check_subagents',
+        totalCount: 1,
+        status: 'completed'
+      });
+      useSubAgentStore.getState().addAgent({
+        providerId: 'test-provider',
+        acpSessionId: 'sub-acp-loaded-completed',
+        parentSessionId: 'parent-acp',
+        invocationId: 'inv-loaded-completed',
+        index: 0,
+        name: 'Research',
+        prompt: 'Inspect the issue',
+        agent: 'test-agent'
+      });
+      useSubAgentStore.getState().setStatus('sub-acp-loaded-completed', 'completed');
+    });
+
+    expect(screen.getByRole('button', { name: /show sub-agents/i })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText(/1: Research/)).not.toBeInTheDocument();
+  });
+
   it('allows the bottom-pinned sub-agent orchestration to be manually opened and closed', () => {
     useSubAgentStore.getState().startInvocation({
       invocationId: 'inv-manual-toggle',

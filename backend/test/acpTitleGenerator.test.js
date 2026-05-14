@@ -15,7 +15,7 @@ vi.mock('../services/providerLoader.js', () => ({
 
 vi.mock('../database.js', () => ({
   getSession: vi.fn(),
-  getSessionByAcpId: vi.fn().mockResolvedValue({ id: 'ui-1', name: 'New Chat' }),
+  getSessionByAcpId: vi.fn().mockResolvedValue({ id: 'ui-1', name: 'New Chat', messages: [] }),
   updateSessionName: vi.fn().mockResolvedValue({}),
   saveSession: vi.fn().mockResolvedValue({})
 }));
@@ -25,6 +25,8 @@ describe('acpTitleGenerator', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.ALWAYS_RENAME_CHATS;
+    db.getSessionByAcpId.mockResolvedValue({ id: 'ui-1', name: 'New Chat', messages: [] });
     const mockEmit = vi.fn();
     acpClient = {
       transport: { 
@@ -56,12 +58,95 @@ describe('acpTitleGenerator', () => {
       return {};
     });
 
-    await generateTitle(acpClient, 'ui-1', { userPrompt: 'hello', provider: 'p1' });
+    await generateTitle(acpClient, 'acp-1', { userPrompt: 'hello', provider: 'p1', promptCount: 1 });
 
     expect(acpClient.transport.sendRequest).toHaveBeenCalledWith('session/new', expect.any(Object));
     expect(acpClient.transport.sendRequest).toHaveBeenCalledWith('session/prompt', expect.any(Object));
     expect(db.updateSessionName).toHaveBeenCalledWith('ui-1', 'Mock Title');
     expect(acpClient.io.emit).toHaveBeenCalledWith('session_renamed', expect.objectContaining({ newName: 'Mock Title' }));
+  });
+
+  it('should include current title and last two prompts for progressive rename', async () => {
+    process.env.ALWAYS_RENAME_CHATS = 'true';
+    let titlePrompt;
+    db.getSessionByAcpId.mockResolvedValueOnce({
+      id: 'ui-1',
+      name: 'Feature X',
+      messages: [{ role: 'user', content: 'Older setup prompt' }]
+    });
+    acpClient.transport.sendRequest.mockImplementation(async (method, params) => {
+      if (method === 'session/new') return { sessionId: 'title-sess' };
+      if (method === 'session/prompt') {
+        titlePrompt = params.prompt[0].text;
+        acpClient.stream.statsCaptures.set('title-sess', { buffer: 'Feature Y' });
+      }
+      return {};
+    });
+
+    await generateTitle(acpClient, 'acp-1', {
+      titlePromptHistory: ['Keep working on Feature X', 'Switch focus to Feature Y'],
+      promptCount: 2
+    });
+
+    expect(titlePrompt).toContain('Current title: "Feature X"');
+    expect(titlePrompt).toContain('Prompt 1: Keep working on Feature X');
+    expect(titlePrompt).toContain('Prompt 2: Switch focus to Feature Y');
+    expect(titlePrompt).not.toContain('Older setup prompt');
+    expect(titlePrompt).toContain('return the current title exactly');
+    expect(db.updateSessionName).toHaveBeenCalledWith('ui-1', 'Feature Y');
+  });
+
+  it('should not emit rename when generated title matches the current title', async () => {
+    process.env.ALWAYS_RENAME_CHATS = 'true';
+    db.getSessionByAcpId.mockResolvedValueOnce({ id: 'ui-1', name: 'Feature X', messages: [] });
+    acpClient.transport.sendRequest.mockImplementation(async (method) => {
+      if (method === 'session/new') return { sessionId: 'title-sess' };
+      if (method === 'session/prompt') {
+        acpClient.stream.statsCaptures.set('title-sess', { buffer: 'Feature X' });
+      }
+      return {};
+    });
+
+    await generateTitle(acpClient, 'acp-1', { titlePromptHistory: ['Refine Feature X'], promptCount: 2 });
+
+    expect(db.updateSessionName).not.toHaveBeenCalled();
+    expect(acpClient.io.emit).not.toHaveBeenCalledWith('session_renamed', expect.any(Object));
+  });
+
+  it('should limit title prompt context to 400 characters per prompt', async () => {
+    const longPrompt = 'a'.repeat(450);
+    let titlePrompt;
+    acpClient.transport.sendRequest.mockImplementation(async (method, params) => {
+      if (method === 'session/new') return { sessionId: 'title-sess' };
+      if (method === 'session/prompt') {
+        titlePrompt = params.prompt[0].text;
+        acpClient.stream.statsCaptures.set('title-sess', { buffer: 'Long Prompt Title' });
+      }
+      return {};
+    });
+
+    await generateTitle(acpClient, 'acp-1', { titlePromptHistory: [longPrompt], promptCount: 1 });
+
+    expect(titlePrompt).toContain(`Prompt 1: ${'a'.repeat(400)}...`);
+    expect(titlePrompt).not.toContain('a'.repeat(401));
+  });
+
+  it('should skip stale progressive titles when another prompt starts first', async () => {
+    process.env.ALWAYS_RENAME_CHATS = 'true';
+    const meta = { titlePromptHistory: ['Rename this work'], promptCount: 2 };
+    acpClient.transport.sendRequest.mockImplementation(async (method) => {
+      if (method === 'session/new') return { sessionId: 'title-sess' };
+      if (method === 'session/prompt') {
+        meta.promptCount = 3;
+        acpClient.stream.statsCaptures.set('title-sess', { buffer: 'Stale Title' });
+      }
+      return {};
+    });
+
+    await generateTitle(acpClient, 'acp-1', meta);
+
+    expect(db.updateSessionName).not.toHaveBeenCalled();
+    expect(acpClient.io.emit).not.toHaveBeenCalledWith('session_renamed', expect.any(Object));
   });
 
   it('should not rename if name is not New Chat and ALWAYS_RENAME_CHATS is false', async () => {
@@ -74,8 +159,8 @@ describe('acpTitleGenerator', () => {
       return {};
     });
 
-    db.getSessionByAcpId.mockResolvedValueOnce({ id: 'ui-1', name: 'Existing Name' });
-    await generateTitle(acpClient, 'ui-1', { userPrompt: 'hello', provider: 'p1', name: 'Existing Name' });
+    db.getSessionByAcpId.mockResolvedValueOnce({ id: 'ui-1', name: 'Existing Name', messages: [] });
+    await generateTitle(acpClient, 'acp-1', { userPrompt: 'hello', provider: 'p1', name: 'Existing Name', promptCount: 1 });
     expect(db.updateSessionName).not.toHaveBeenCalled();
   });
 });

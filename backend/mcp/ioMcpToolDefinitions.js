@@ -122,11 +122,26 @@ export function getIoMcpToolDefinitions() {
           description: { type: 'string', description: 'Optional short user-facing description for the tool header.' },
           pattern: { type: 'string', description: 'The regular expression or fixed string to search for.' },
           dir_path: { type: 'string', description: 'Optional directory to search within. Defaults to the current backend working directory.' },
-          case_sensitive: { type: 'boolean', description: 'If true, search is case-sensitive.' },
-          context: { type: 'number', description: 'Number of context lines to include around each match.' },
+          case_mode: { type: 'string', enum: ['smart', 'sensitive', 'insensitive'], description: 'Case handling mode. Defaults to smart.' },
+          include_globs: { type: 'array', items: { type: 'string' }, description: 'Optional include globs. Each entry is passed as --glob <glob>.' },
+          exclude_globs: { type: 'array', items: { type: 'string' }, description: 'Optional exclude globs. Each entry is passed as --glob !<glob>.' },
+          file_types: { type: 'array', items: { type: 'string' }, description: 'Optional ripgrep file types to include (for example: ts, js, md).' },
+          before_context: { type: 'number', description: 'Optional number of context lines before each match.' },
+          after_context: { type: 'number', description: 'Optional number of context lines after each match.' },
+          max_matches: { type: 'number', description: 'Optional maximum matches per file, mapped to ripgrep --max-count.' },
+          result_mode: { type: 'string', enum: ['matches', 'files', 'count'], description: 'Result shape: detailed matches, unique files, or aggregate count.' },
+          word_match: { type: 'boolean', description: 'If true, only match complete words.' },
+          multiline: { type: 'boolean', description: 'If true, allow matches across line boundaries.' },
+          regex_engine: { type: 'string', enum: ['default', 'pcre2', 'auto'], description: 'Regex engine mode. auto maps to ripgrep auto-hybrid mode.' },
+          hidden: { type: 'boolean', description: 'If true, include hidden files and directories.' },
+          no_ignore: { type: 'boolean', description: 'If true, do not respect ignore files.' },
+          follow_symlinks: { type: 'boolean', description: 'If true, follow symbolic links. Requires io.allowedRoots to include * because symlinks can leave configured roots.' },
+          case_sensitive: { type: 'boolean', description: 'Backward-compatible shorthand for case_mode (true => sensitive, false => insensitive).' },
+          context: { type: 'number', description: 'Backward-compatible shorthand for before_context and after_context.' },
           fixed_strings: { type: 'boolean', description: 'If true, treat the pattern as a literal string.' }
         },
-        required: ['pattern']
+        required: ['pattern'],
+        additionalProperties: false
       }
     },
     {

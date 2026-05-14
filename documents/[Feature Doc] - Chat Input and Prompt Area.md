@@ -79,7 +79,7 @@ This feature matters because it is the frontend boundary that creates `prompt` s
 
     Files: `backend/sockets/promptHandlers.js` (Function: `registerPromptHandlers`, Socket event: `prompt`), `backend/services/modelOptions.js` (Function: `resolveModelSelection`)
 
-    The prompt handler resolves the runtime through `providerRuntimeManager.getRuntime(providerId)`. It requires `sessionMetadata` for the ACP session. It resolves the requested model against provider config and session model options, sends ACP `session/set_model` when the metadata model differs, updates `meta.model`, increments `meta.promptCount`, and records `meta.userPrompt` for the first string prompt.
+    The prompt handler resolves the runtime through `providerRuntimeManager.getRuntime(providerId)`. It requires `sessionMetadata` for the ACP session. It resolves the requested model against provider config and session model options, sends ACP `session/set_model` when the metadata model differs, updates `meta.model`, increments `meta.promptCount`, records the rolling last two string prompts in `meta.titlePromptHistory`, and retains `meta.userPrompt` for the first string prompt.
 
 11. Attachments become ACP prompt parts.
 

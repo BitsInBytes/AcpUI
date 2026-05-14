@@ -68,6 +68,8 @@ export class AcpClient {
     this.restartAttempts = 0;
     this.lastRestartTime = 0;
     this.handshakePromise = null;
+    this.isStopping = false;
+    this.restartTimer = null;
 
     this.transport = new JsonRpcTransport();
     this.permissions = new PermissionManager();
@@ -112,6 +114,12 @@ export class AcpClient {
       return;
     }
     if (this.startPromise) return this.startPromise;
+
+    this.isStopping = false;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
 
     const providerId = this.getProviderId();
     this.startPromise = withProviderContext(providerId, async () => {
@@ -193,6 +201,11 @@ export class AcpClient {
         this.acpProcess = null;
         this.transport.reset();
 
+        if (this.isStopping) {
+          writeLog(`[${providerId}] ACP daemon stopped during backend shutdown; restart suppressed.`);
+          return;
+        }
+
         // Exponential back-off for restart (2s, 4s, 8s, 16s, max 30s)
         const now = Date.now();
         if (now - this.lastRestartTime < 60000) {
@@ -204,7 +217,10 @@ export class AcpClient {
 
         const delay = Math.min(Math.pow(2, this.restartAttempts) * 1000, 30000);
         writeLog(`[${providerId}] Restarting ACP daemon in ${delay}ms (Attempt ${this.restartAttempts})...`);
-        setTimeout(() => this.start(), delay);
+        this.restartTimer = setTimeout(() => {
+          this.restartTimer = null;
+          if (!this.isStopping) this.start();
+        }, delay);
       });
 
       this.performHandshake();
@@ -214,6 +230,52 @@ export class AcpClient {
     } finally {
       this.startPromise = null;
     }
+  }
+
+  async stop() {
+    this.isStopping = true;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+
+    this.isHandshakeComplete = false;
+    this.handshakePromise = null;
+    this.startPromise = null;
+
+    const proc = this.acpProcess;
+    if (!proc) {
+      this.transport.reset();
+      return;
+    }
+
+    if (proc.exitCode !== null && proc.exitCode !== undefined) {
+      this.acpProcess = null;
+      this.transport.reset();
+      return;
+    }
+
+    await new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(done, 1000);
+      timer.unref?.();
+      proc.once?.('exit', done);
+      try {
+        proc.kill?.();
+      } catch (err) {
+        writeLog(`[${this.getProviderId()}] Failed to stop ACP daemon: ${err.message}`);
+        done();
+      }
+    });
+
+    this.acpProcess = null;
+    this.transport.reset();
   }
 
   async performHandshake() {

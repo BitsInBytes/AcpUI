@@ -14,6 +14,9 @@ describe('useUIStore (Pure Logic)', () => {
             isSidebarPinned: false,
             isSettingsOpen: false,
             isSystemSettingsOpen: false,
+            isNotesOpen: false,
+            isFileExplorerOpen: false,
+            isHelpDocsOpen: false,
             visibleCount: 3,
             isAutoScrollDisabled: false
         });
@@ -67,12 +70,15 @@ describe('useUIStore (Pure Logic)', () => {
     expect(useUIStore.getState().isModelDropdownOpen).toBe(true);
   });
 
-  it('setNotesOpen and setFileExplorerOpen update state', () => {
+  it('setNotesOpen, setFileExplorerOpen, and setHelpDocsOpen update state', () => {
     act(() => { useUIStore.getState().setNotesOpen(true); });
     expect(useUIStore.getState().isNotesOpen).toBe(true);
 
     act(() => { useUIStore.getState().setFileExplorerOpen(true); });
     expect(useUIStore.getState().isFileExplorerOpen).toBe(true);
+
+    act(() => { useUIStore.getState().setHelpDocsOpen(true); });
+    expect(useUIStore.getState().isHelpDocsOpen).toBe(true);
   });
 
   it('toggleAutoScroll updates state and localStorage', () => {

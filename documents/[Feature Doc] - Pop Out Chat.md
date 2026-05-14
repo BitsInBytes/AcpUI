@@ -198,7 +198,7 @@ return (
 );
 ```
 
-The detached shell has no `Sidebar`, `SessionSettingsModal`, `SystemSettingsModal`, `NotesModal`, or `FileExplorer` component roots. It still mounts `ConfigErrorModal`, registers chat socket listeners through `useChatManager`, scroll behavior through `useScroll`, canvas file handlers through `useCanvasStore`, and resize behavior through `computeResizeWidthNoSidebar`.
+The detached shell has no `Sidebar`, `SessionSettingsModal`, `SystemSettingsModal`, `NotesModal`, `FileExplorer`, or `HelpDocsModal` component roots. It still mounts `ConfigErrorModal`, registers chat socket listeners through `useChatManager`, scroll behavior through `useScroll`, canvas file handlers through `useCanvasStore`, and resize behavior through `computeResizeWidthNoSidebar`.
 
 ### 8. `ChatHeader` switches controls by pop-out mode
 
@@ -217,12 +217,13 @@ const isPopout = new URLSearchParams(window.location.search).has('popout');
 {!isPopout && (
   <div className="header-actions">
     <button title="File Explorer">...</button>
+    <button title="Help">...</button>
     <button title="System Settings">...</button>
   </div>
 )}
 ```
 
-Pop-out headers keep the status indicator, provider/session title, sub-agent label, and workspace label. They hide the mobile sidebar menu plus the File Explorer and System Settings header actions because those shells are only mounted by `App`.
+Pop-out headers keep the status indicator, provider/session title, sub-agent label, and workspace label. They hide the mobile sidebar menu plus the File Explorer, Help, and System Settings header actions because those shells are only mounted by `App`.
 
 ### 9. `ChatInput` keeps normal chat controls in the detached window
 
@@ -418,7 +419,7 @@ PopOutApp reads popout UI session ID
 
 ### Header and Input Rendering in Pop-Out Mode
 
-- `ChatHeader` reads `new URLSearchParams(window.location.search).has('popout')` and hides only the sidebar menu, File Explorer action, and System Settings action.
+- `ChatHeader` reads `new URLSearchParams(window.location.search).has('popout')` and hides only the sidebar menu, File Explorer action, Help action, and System Settings action.
 - `ChatHeader` still renders `StatusIndicator`, provider title, session name, sub-agent suffix, and workspace label.
 - `ChatInput` does not read the `popout` query parameter. It uses `activeSessionId`, `activeSession`, provider branding, input store state, canvas store state, and system connectivity exactly as it does in the main shell.
 - `ChatInput` can open Terminal and Canvas because `PopOutApp` renders `CanvasPane` and wires canvas handlers.
@@ -437,7 +438,7 @@ PopOutApp reads popout UI session ID
 | Main root | `frontend/src/App.tsx` | `App`, `setOwnershipChangeCallback`, `watch_session`, `unwatch_session`, `canvas_load` | Rerenders sidebar on ownership changes and manages main-window socket room membership. |
 | Ownership | `frontend/src/lib/sessionOwnership.ts` | `CHANNEL_NAME`, `OwnershipMessage`, `setOwnershipChangeCallback`, `claimSession`, `releaseSession`, `isSessionPoppedOut`, `getWindowId`, `openPopout`, `focusPopout`, `beforeunload` listener | Coordinates cross-window ownership with BroadcastChannel and opener window references. |
 | Sidebar row | `frontend/src/components/SessionItem.tsx` | `SessionItem`, `openPopout`, `isSessionPoppedOut`, `focusPopout`, `popped-out` class | Displays the pop-out action and gates sidebar selection for popped sessions. |
-| Header | `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, `isPopout`, `StatusIndicator`, `setSidebarOpen`, `setFileExplorerOpen`, `setSystemSettingsOpen` | Renders title/status and hides main-window-only controls in pop-out mode. |
+| Header | `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, `isPopout`, `StatusIndicator`, `setSidebarOpen`, `setFileExplorerOpen`, `setHelpDocsOpen`, `setSystemSettingsOpen` | Renders title/status and hides main-window-only controls in pop-out mode. |
 | Input | `frontend/src/components/ChatInput/ChatInput.tsx` | `ChatInput`, `handleSubmit`, `handleCancel`, `setInput`, `openTerminal`, `setIsCanvasOpen`, `toggleAutoScroll`, `handleMergeFork` | Sends prompts, controls drafts/attachments, and exposes terminal/canvas/model controls in the detached window. |
 | Model footer | `frontend/src/components/ChatInput/ModelSelector.tsx` | `ModelSelector`, `onModelSelect`, `onOpenSettings`, `isModelDropdownOpen` | Shows active model/context state and emits model changes. |
 | Socket singleton | `frontend/src/hooks/useSocket.ts` | `useSocket`, `getOrCreateSocket`, Socket events `config_errors`, `ready`, `providers`, `branding`, `session_model_options`, `provider_extension` | Creates the per-window Socket.IO client and stores backend/provider state, including startup JSON diagnostics. |
@@ -493,7 +494,7 @@ BroadcastChannel `announce` can mark a session as popped out even when the curre
 
 ### 5. Header controls and modal roots are different in the detached shell
 
-`ChatHeader` hides File Explorer and System Settings controls in pop-out mode. `ChatInput` still renders Scratch Pad and chat config triggers through normal input controls, but `PopOutApp` does not mount `NotesModal` or `SessionSettingsModal`.
+`ChatHeader` hides File Explorer, Help, and System Settings controls in pop-out mode. `ChatInput` still renders Scratch Pad and chat config triggers through normal input controls, but `PopOutApp` does not mount `NotesModal`, `SessionSettingsModal`, or `HelpDocsModal`.
 
 ### 6. Canvas resize uses the no-sidebar helper
 

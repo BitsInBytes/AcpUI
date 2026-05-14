@@ -42,6 +42,17 @@ export function startSTTServer() {
   });
 }
 
+export function stopSTTServer() {
+  if (!serverProcess) return;
+  const proc = serverProcess;
+  serverProcess = null;
+  try {
+    proc.kill?.();
+  } catch (err) {
+    writeLog(`[VOICE] Failed to stop whisper-server: ${err.message}`);
+  }
+}
+
 export async function transcribeAudio(audioBuffer, log, sessionId) {
   if (!isSTTEnabled()) return null;
   if (!audioBuffer) { log('[VOICE] No audio buffer received.'); return null; }

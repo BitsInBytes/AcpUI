@@ -67,6 +67,15 @@ class ProviderRuntimeManager {
     return this.getRuntimes();
   }
 
+  async stopAll() {
+    const runtimes = this.getRuntimes();
+    await Promise.allSettled(runtimes.map(runtime => runtime.client.stop?.()));
+    this.runtimes.clear();
+    this.initialized = false;
+    this.io = null;
+    this.serverBootId = null;
+  }
+
   getRuntime(providerId = null) {
     const resolvedId = resolveProviderId(providerId);
     const runtime = this.runtimes.get(resolvedId);

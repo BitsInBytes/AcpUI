@@ -21,9 +21,9 @@ describe('renderToolOutput', () => {
   });
 
   it('renders error block if present', () => {
-      const output = ':::ERROR:::\nfail\n:::END_ERROR:::';
-      const { container } = render(<>{renderToolOutput(output, {})}</>);
-      expect(container).toHaveTextContent('fail');
+    const output = ':::ERROR:::\nfail\n:::END_ERROR:::';
+    const { container } = render(<>{renderToolOutput(output, {})}</>);
+    expect(container).toHaveTextContent('fail');
   });
 
   it('renders structured web fetch output', () => {
@@ -50,7 +50,9 @@ describe('renderToolOutput', () => {
       type: 'ux_grep_search_result',
       pattern: 'TODO',
       dirPath: 'D:/Git/AcpUI',
+      resultMode: 'matches',
       matchCount: 1,
+      totalMatches: 1,
       matches: [{
         filePath: 'D:/Git/AcpUI/src/app.ts',
         lineNumber: 12,
@@ -66,5 +68,39 @@ describe('renderToolOutput', () => {
     expect(container).toHaveTextContent('D:/Git/AcpUI/src/app.ts');
     expect(container).toHaveTextContent('const value = "TODO";');
     expect(container.querySelector('.grep-match-highlight')).not.toBeNull();
+  });
+
+  it('renders structured grep file and count result modes', () => {
+    const filesOutput = JSON.stringify({
+      type: 'ux_grep_search_result',
+      pattern: 'TODO',
+      dirPath: 'D:/Git/AcpUI',
+      resultMode: 'files',
+      matchCount: 2,
+      totalMatches: 5,
+      files: ['D:/Git/AcpUI/src/app.ts', 'D:/Git/AcpUI/src/main.tsx'],
+      matches: []
+    });
+
+    const countOutput = JSON.stringify({
+      type: 'ux_grep_search_result',
+      pattern: 'TODO',
+      dirPath: 'D:/Git/AcpUI',
+      resultMode: 'count',
+      matchCount: 5,
+      totalMatches: 5,
+      matches: []
+    });
+
+    const { container: filesContainer } = render(<>{renderToolOutput(filesOutput, {})}</>);
+    expect(filesContainer).toHaveTextContent('2 files');
+    expect(filesContainer).toHaveTextContent('5 total matches');
+    expect(filesContainer).toHaveTextContent('files mode');
+    expect(filesContainer).toHaveTextContent('D:/Git/AcpUI/src/main.tsx');
+
+    const { container: countContainer } = render(<>{renderToolOutput(countOutput, {})}</>);
+    expect(countContainer).toHaveTextContent('5 matches');
+    expect(countContainer).toHaveTextContent('count mode');
+    expect(countContainer).toHaveTextContent('5 total matches.');
   });
 });

@@ -6,8 +6,8 @@ Auto chat title generation creates short, human-readable session names for new c
 
 ### What It Does
 
-- Captures the first string prompt for a chat in session metadata.
-- Starts new-chat title generation on the first non-empty `agent_message_chunk` from the main ACP session.
+- Captures the first string prompt as `meta.userPrompt` and maintains the rolling last two string prompts in `meta.titlePromptHistory`.
+- Starts new-chat title generation on the first non-empty `agent_message_chunk`, and starts later prompt title generation when `ALWAYS_RENAME_CHATS=true`.
 - Starts fork title generation after `fork_session` creates and loads the forked ACP session.
 - Uses `models.titleGeneration`, then `models.default`, then the first `models.quickAccess[]` entry as the title model selection chain.
 - Buffers title-session tokens through `StreamController.statsCaptures` so title text is not rendered in the Unified Timeline.
@@ -39,17 +39,26 @@ This is a backend-led feature with a small frontend socket listener. Providers p
    selectedModelState = await setSessionModel(acpClient, result.sessionId, model || requestedModel.modelId, models, knownModelOptions);
    ```
 
-2. **The first prompt records user intent**
+2. **Prompt handling records rolling title context**
 
    File: `backend/sockets/promptHandlers.js` (Function: `registerPromptHandlers`, Socket event: `prompt`)
 
-   The prompt handler increments `meta.promptCount`. When the first prompt is a string, it stores that string as `meta.userPrompt`; array prompts are forwarded to ACP but do not populate `userPrompt`.
+   The prompt handler increments `meta.promptCount`. String prompts update `meta.titlePromptHistory` with the last two non-empty prompts. The first string prompt is also retained as `meta.userPrompt`, which `getMetadataTitlePrompts` uses when no title history is available; array prompts are forwarded to ACP but do not populate title prompt history.
 
    ```javascript
    // FILE: backend/sockets/promptHandlers.js (Socket event: prompt)
    meta.promptCount = (meta.promptCount || 0) + 1;
-   if (meta.promptCount === 1 && typeof prompt === 'string') {
-     meta.userPrompt = prompt;
+   if (typeof prompt === 'string') {
+     const promptForTitle = prompt.trim();
+     if (promptForTitle) {
+       const previousPrompts = Array.isArray(meta.titlePromptHistory)
+         ? meta.titlePromptHistory
+         : (typeof meta.userPrompt === 'string' && meta.userPrompt.trim() ? [meta.userPrompt] : []);
+       meta.titlePromptHistory = [...previousPrompts, promptForTitle].slice(-2);
+     }
+     if (meta.promptCount === 1) {
+       meta.userPrompt = prompt;
+     }
    }
    ```
 
@@ -67,21 +76,22 @@ This is a backend-led feature with a small frontend socket listener. Providers p
    await acpClient.transport.sendRequest('session/prompt', { sessionId, prompt: acpPromptParts });
    ```
 
-4. **The first assistant chunk triggers the generator**
+4. **Assistant chunks trigger eligible title generation**
 
    File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`, Update type: `agent_message_chunk`)
 
-   `handleUpdate` normalizes provider output, estimates token usage, appends to `meta.lastResponseBuffer`, emits the token to the session room, and starts title generation once per eligible main chat.
+   `handleUpdate` normalizes provider output, estimates token usage, appends to `meta.lastResponseBuffer`, emits the token to the session room, and starts title generation once per eligible prompt. The first prompt is always eligible; later prompts are eligible only when `ALWAYS_RENAME_CHATS=true`.
 
    ```javascript
    // FILE: backend/services/acpUpdateHandler.js (Function: handleUpdate, Update type: agent_message_chunk)
-   if (meta && meta.promptCount === 1 && !meta.titleGenerated && !meta.isSubAgent) {
+   if (shouldGenerateTitle(meta)) {
      meta.titleGenerated = true;
+     meta.lastTitleGeneratedPromptCount = Number(meta.promptCount || 0);
      acpClient.generateTitle(sessionId, meta).catch(err => writeLog(`[TITLE ERR] ${err.message}`));
    }
    ```
 
-   The trigger uses `meta.titleGenerated`, not a service-level lock. It fires only outside `statsCaptures`, so internal title sessions cannot recursively generate more titles.
+   The trigger uses `meta.lastTitleGeneratedPromptCount` and falls back to `meta.titleGenerated` when per-prompt count metadata is absent. It fires only outside `statsCaptures`, so internal title sessions cannot recursively generate more titles.
 
 5. **AcpClient delegates to the service**
 
@@ -100,16 +110,20 @@ This is a backend-led feature with a small frontend socket listener. Providers p
 
    File: `backend/services/acpTitleGenerator.js` (Function: `generateTitle`)
 
-   `generateTitle` resolves the provider ID from the client, exits early when `meta.userPrompt` is missing, and creates a separate ACP session with an empty MCP server list.
+   `generateTitle` resolves the provider ID from the client, exits early when metadata has no title prompt context, resolves the current UI session title, and creates a separate ACP session with an empty MCP server list.
 
    ```javascript
    // FILE: backend/services/acpTitleGenerator.js (Function: generateTitle)
    const providerId = acpClient.getProviderId?.() || acpClient.providerId;
-   if (!meta.userPrompt) return;
+   if (getMetadataTitlePrompts(meta).length === 0) return;
+
+   let titleSessionId;
+   const uiSession = await db.getSessionByAcpId(providerId, sessionId);
+   if (!uiSession) return;
 
    const cwd = process.env.DEFAULT_WORKSPACE_CWD || process.env.HOME || process.cwd();
    const result = await acpClient.transport.sendRequest('session/new', { cwd, mcpServers: [] });
-   const titleSessionId = result.sessionId;
+   titleSessionId = result.sessionId;
    ```
 
 7. **The service selects the title model and registers silent capture**
@@ -135,11 +149,11 @@ This is a backend-led feature with a small frontend socket listener. Providers p
 
    File: `backend/services/acpTitleGenerator.js` (Function: `generateTitle`, ACP methods: `session/set_model`, `session/prompt`)
 
-   If a title model ID exists, the service sets that model on the ephemeral session. It then prompts ACP for a short title based on `meta.userPrompt`.
+   If a title model ID exists, the service sets that model on the ephemeral session. It then prompts ACP with the current session title and the last two user prompts, oldest to newest. The prompt instructs the model to return the current title unchanged when it still fits the active work.
 
    ```javascript
    // FILE: backend/services/acpTitleGenerator.js (Function: generateTitle)
-   const titlePrompt = `Generate a short chat title (max 6 words, no quotes) for this user message: "${meta.userPrompt}"`;
+   const titlePrompt = buildTitlePrompt(currentTitle, recentPrompts);
    if (titleModelId) {
      await acpClient.transport.sendRequest('session/set_model', { sessionId: titleSessionId, modelId: titleModelId });
    }
@@ -161,18 +175,21 @@ This is a backend-led feature with a small frontend socket listener. Providers p
    }
    ```
 
-10. **The service reads the buffer and performs normal-path cleanup**
+10. **The service reads the buffer and performs cleanup**
 
-    File: `backend/services/acpTitleGenerator.js` (Function: `generateTitle`)
+    File: `backend/services/acpTitleGenerator.js` (Function: `generateTitle`, Function: `cleanupTitleSession`)
 
-    After `session/prompt` resolves, the service trims the capture buffer, deletes the in-memory capture and metadata entries, and calls `cleanupAcpSession` for provider-owned ACP session files.
+    After `session/prompt` resolves, the service trims the capture buffer. In `finally`, `cleanupTitleSession` deletes the in-memory capture and metadata entries, then starts `cleanupAcpSession` for provider-owned ACP session files with a logged rejection handler.
 
     ```javascript
     // FILE: backend/services/acpTitleGenerator.js (Function: generateTitle)
     const title = acpClient.stream.statsCaptures.get(titleSessionId)?.buffer?.trim();
+
+    // FILE: backend/services/acpTitleGenerator.js (Function: cleanupTitleSession)
     acpClient.stream.statsCaptures.delete(titleSessionId);
     acpClient.sessionMetadata.delete(titleSessionId);
-    cleanupAcpSession(titleSessionId, acpClient.providerId, 'title-generation');
+    void cleanupAcpSession(titleSessionId, acpClient.providerId, reason)
+      .catch(err => writeLog(`[TITLE ERR] Cleanup ${reason}: ${err.message}`));
     ```
 
 11. **The database row is looked up by provider and ACP session ID**
@@ -192,19 +209,16 @@ This is a backend-led feature with a small frontend socket listener. Providers p
 
     File: `backend/services/acpTitleGenerator.js` (Function: `generateTitle`, Env var: `ALWAYS_RENAME_CHATS`)
 
-    New-chat titles are accepted only when they are non-empty and shorter than 100 characters. The session is renamed only when its current DB name is `New Chat` or `ALWAYS_RENAME_CHATS` is exactly `true`.
+    New-chat titles are accepted only when they are non-empty, shorter than 100 characters, and different from the current title. The service looks up the current DB name before creating the ephemeral session. It generates and renames only when the current DB name is `New Chat` or `ALWAYS_RENAME_CHATS` is exactly `true`.
 
     ```javascript
     // FILE: backend/services/acpTitleGenerator.js (Function: generateTitle)
-    if (title && title.length > 0 && title.length < 100) {
-      const uiSession = await db.getSessionByAcpId(providerId, sessionId);
-      if (uiSession) {
-        const alwaysRename = process.env.ALWAYS_RENAME_CHATS === 'true';
-        if (alwaysRename || uiSession.name === 'New Chat') {
-          await db.updateSessionName(uiSession.id, title);
-          acpClient.io.emit('session_renamed', { providerId, uiId: uiSession.id, newName: title });
-        }
-      }
+    const alwaysRename = process.env.ALWAYS_RENAME_CHATS === 'true';
+    if (!alwaysRename && uiSession.name !== 'New Chat') return;
+
+    if (isValidTitle(title) && title !== currentTitle) {
+      await db.updateSessionName(uiSession.id, title);
+      acpClient.io.emit('session_renamed', { providerId, uiId: uiSession.id, newName: title });
     }
     ```
 
@@ -292,7 +306,7 @@ This is a backend-led feature with a small frontend socket listener. Providers p
 ```mermaid
 flowchart TD
   User[User sends prompt] --> PromptHandler[backend/sockets/promptHandlers.js\nregisterPromptHandlers / prompt]
-  PromptHandler --> Metadata[sessionMetadata\npromptCount and userPrompt]
+  PromptHandler --> Metadata[sessionMetadata\npromptCount and titlePromptHistory]
   PromptHandler --> ACPMain[ACP main session\nsession/prompt]
   ACPMain --> UpdateHandler[backend/services/acpUpdateHandler.js\nhandleUpdate / agent_message_chunk]
   UpdateHandler -->|normal chat session| TokenRoom[Socket room session:acpSessionId\ntoken]
@@ -346,9 +360,11 @@ The trigger depends on these metadata fields:
 
 | Field | Owner | Contract |
 |---|---|---|
-| `promptCount` | `registerPromptHandlers` | Incremented before each ACP prompt; title trigger requires `1`. |
-| `userPrompt` | `registerPromptHandlers` | Captured only from the first string prompt; `generateTitle` exits when absent. |
-| `titleGenerated` | `handleUpdate` | Set to `true` before calling `acpClient.generateTitle` to prevent duplicate generation. |
+| `promptCount` | `registerPromptHandlers` | Incremented before each ACP prompt; first prompt title generation is always eligible and later prompt generation requires `ALWAYS_RENAME_CHATS=true`. |
+| `userPrompt` | `registerPromptHandlers` | Captured from the first string prompt and used as fallback title prompt metadata when `titlePromptHistory` is absent. |
+| `titlePromptHistory` | `registerPromptHandlers` | Rolling last two non-empty string prompts used as title context. |
+| `titleGenerated` | `handleUpdate` | Boolean fallback guard set to `true` before calling `acpClient.generateTitle`. |
+| `lastTitleGeneratedPromptCount` | `handleUpdate` | Last prompt count that started title generation; prevents duplicate generation for the same prompt. |
 | `isSubAgent` | Sub-agent creation flow | Truthy values exclude sub-agent sessions from new-chat title generation. |
 | `lastResponseBuffer` | `handleUpdate` | Appended during assistant message chunks; reset by prompt handling and thought chunks. |
 | `lastThoughtBuffer` | `handleUpdate` | Appended during thought chunks; reset by prompt handling. |
@@ -432,14 +448,14 @@ getProvider(providerId).config.models
 |---|---|---|
 | `DEFAULT_WORKSPACE_CWD` | `generateTitle`, `generateForkTitle`, `create_session` | Preferred working directory for ephemeral and normal ACP sessions. |
 | `HOME` | `generateTitle`, `generateForkTitle` | Fallback working directory for title sessions when `DEFAULT_WORKSPACE_CWD` is unset. |
-| `ALWAYS_RENAME_CHATS` | `generateTitle` | Exact string `true` allows new-chat title generation to overwrite non-`New Chat` names. |
+| `ALWAYS_RENAME_CHATS` | `handleUpdate`, `generateTitle` | Exact string `true` enables title generation after every prompt and allows `generateTitle` to update non-`New Chat` names. |
 
 ### New Chat Data Flow
 
 ```text
 User prompt string
-  -> backend/sockets/promptHandlers.js stores meta.userPrompt
-  -> backend/services/acpUpdateHandler.js sees first agent_message_chunk
+  -> backend/sockets/promptHandlers.js stores meta.titlePromptHistory and first-prompt meta.userPrompt
+  -> backend/services/acpUpdateHandler.js sees an eligible agent_message_chunk
   -> backend/services/acpClient.js delegates generateTitle
   -> backend/services/acpTitleGenerator.js creates ephemeral ACP title session
   -> backend/services/acpUpdateHandler.js buffers title chunks in statsCaptures
@@ -472,9 +488,9 @@ Socket event fork_session
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
 | Title service | `backend/services/acpTitleGenerator.js` | `getConfiguredModelId`, `generateTitle`, `generateForkTitle` | Creates ephemeral ACP sessions, captures title text, applies rename rules, emits socket updates. |
-| Streaming router | `backend/services/acpUpdateHandler.js` | `handleUpdate`, update type `agent_message_chunk`, field `statsCaptures`, field `titleGenerated` | Buffers internal title chunks and triggers new-chat title generation. |
+| Streaming router | `backend/services/acpUpdateHandler.js` | `handleUpdate`, update type `agent_message_chunk`, field `statsCaptures`, fields `titleGenerated` and `lastTitleGeneratedPromptCount` | Buffers internal title chunks and triggers eligible title generation. |
 | ACP client wrapper | `backend/services/acpClient.js` | Class `AcpClient`, method `generateTitle` | Delegates title generation from update handling to the service module. |
-| Prompt socket handler | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, socket event `prompt`, fields `promptCount`, `userPrompt` | Captures first string prompt and resets stream buffers. |
+| Prompt socket handler | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, socket event `prompt`, fields `promptCount`, `userPrompt`, `titlePromptHistory` | Captures rolling title prompt history and resets stream buffers. |
 | Session socket handler | `backend/sockets/sessionHandlers.js` | `registerSessionHandlers`, socket events `create_session`, `fork_session`, function `captureModelState` | Seeds metadata for sessions and launches fork title generation. |
 | Stream state | `backend/services/streamController.js` | Class `StreamController`, field `statsCaptures`, method `reset` | Owns the capture map used for silent title output. |
 | Persistence | `backend/database.js` | Table `sessions`, functions `getSessionByAcpId`, `updateSessionName` | Resolves ACP session IDs to UI rows and updates `sessions.name`. |
@@ -501,17 +517,17 @@ Socket event fork_session
 
 ## Gotchas
 
-1. **`titleGenerated`, not `titleStarted`, is the trigger guard**
+1. **`lastTitleGeneratedPromptCount` is the duplicate guard**
 
-   The current metadata flag is `meta.titleGenerated`. Searching for `titleStarted` finds stale documentation, not the active trigger. Use `handleUpdate` in `backend/services/acpUpdateHandler.js` as the source anchor.
+   The active per-prompt guard is `meta.lastTitleGeneratedPromptCount`. `meta.titleGenerated` is the boolean fallback used when per-prompt count metadata is absent. Use `handleUpdate` in `backend/services/acpUpdateHandler.js` as the source anchor.
 
 2. **Title generation starts from assistant output, not prompt submission**
 
-   `registerPromptHandlers` captures `userPrompt`, but `handleUpdate` starts generation only after a non-empty `agent_message_chunk`. Failed prompts and sessions that never produce assistant text do not start the new-chat title path.
+   `registerPromptHandlers` captures `titlePromptHistory` and `userPrompt`, but `handleUpdate` starts generation only after a non-empty `agent_message_chunk`. Failed prompts and sessions that never produce assistant text do not start the new-chat title path.
 
 3. **Array prompts skip new-chat title generation**
 
-   `meta.userPrompt` is captured only when the first prompt is a string. If the first prompt is an array of ACP prompt parts, `generateTitle` exits before creating an ephemeral ACP session.
+   `meta.titlePromptHistory` is populated only when prompts are strings. If prompts arrive as arrays of ACP prompt parts, `generateTitle` exits before creating an ephemeral ACP session unless `meta.userPrompt` supplies a fallback string.
 
 4. **`statsCaptures` must be registered before `session/prompt`**
 
@@ -523,15 +539,15 @@ Socket event fork_session
 
 6. **New chats and forks have different rename gates**
 
-   `generateTitle` renames only `New Chat` sessions unless `ALWAYS_RENAME_CHATS` is exactly `true`. `generateForkTitle` updates the fork UI ID directly whenever the generated title is valid.
+   `generateTitle` creates a title session only for `New Chat` sessions unless `ALWAYS_RENAME_CHATS` is exactly `true`. When progressive rename is enabled, returning the current title is a no-op. `generateForkTitle` updates the fork UI ID directly whenever the generated title is valid.
 
 7. **Title length validation is intentionally simple**
 
    Both title paths accept `title.length > 0 && title.length < 100`. Empty output and output with 100 or more characters leave the current session name unchanged.
 
-8. **Cleanup is on the normal success path**
+8. **Cleanup runs from `finally`**
 
-   `generateTitle` and `generateForkTitle` delete `statsCaptures` and `sessionMetadata` after `session/prompt` resolves and the buffer is read. The call to `cleanupAcpSession` is made without awaiting its returned promise. Code that changes this area must account for errors after capture registration.
+   `generateTitle` and `generateForkTitle` delete `statsCaptures` and `sessionMetadata` from `cleanupTitleSession` after a title session ID exists. The call to `cleanupAcpSession` is made without awaiting its returned promise, but rejected cleanup promises are logged. Code that changes this area must account for errors after capture registration.
 
 9. **Sub-agents are excluded by metadata**
 
@@ -547,17 +563,22 @@ Socket event fork_session
 
 | File | Test Names | Coverage |
 |---|---|---|
-| `backend/test/acpTitleGenerator.test.js` | `should not generate if no userPrompt on meta` | Verifies the missing-`userPrompt` guard in `generateTitle`. |
+| `backend/test/acpTitleGenerator.test.js` | `should not generate if no userPrompt on meta` | Verifies the missing title-context guard in `generateTitle`. |
 | `backend/test/acpTitleGenerator.test.js` | `should create session, send prompt, capture response, update DB` | Covers new-chat ephemeral session creation, prompt send, buffer readback, DB update, and `session_renamed` emit. |
+| `backend/test/acpTitleGenerator.test.js` | `should include current title and last two prompts for progressive rename` | Covers progressive prompt construction with current title and rolling prompt context. |
+| `backend/test/acpTitleGenerator.test.js` | `should not emit rename when generated title matches the current title` | Covers the keep-current-title no-op path. |
 | `backend/test/acpTitleGenerator.test.js` | `should not rename if name is not New Chat and ALWAYS_RENAME_CHATS is false` | Covers the custom-name rename gate for new chats. |
 | `backend/test/acpTitleGenerator.test.js` | `generates title from last 2 user and assistant messages` | Covers fork context construction and fork rename emit. |
 | `backend/test/acpTitleGenerator.test.js` | `does nothing when messages are empty` | Covers fork empty-context guard. |
 | `backend/test/acpTitleGenerator.test.js` | `only uses messages up to forkPoint` | Covers fork point slicing before title prompt construction. |
 | `backend/test/acpUpdateHandler.test.js` | `handles generateTitle failure gracefully` | Verifies `handleUpdate` catches rejected title generation promises through the trigger path. |
 | `backend/test/acpUpdateHandler.test.js` | `buffers text in statsCaptures if present` | Verifies capture sessions buffer message chunks and suppress token emits. |
-| `backend/test/acpUpdateHandler.test.js` | `fires title generation on first message chunk` | Verifies first-chunk trigger conditions and `meta.titleGenerated` mutation. |
-| `backend/test/promptHandlers.test.js` | `should store userPrompt on metadata for first prompt` | Verifies first string prompt capture and `promptCount` increment. |
-| `backend/test/promptHandlers.test.js` | `should not store userPrompt on subsequent prompts` | Verifies the first prompt remains the title source. |
+| `backend/test/acpUpdateHandler.test.js` | `fires title generation on first message chunk` | Verifies first-chunk trigger conditions and `meta.titleGenerated`/`meta.lastTitleGeneratedPromptCount` mutation. |
+| `backend/test/acpUpdateHandler.test.js` | `fires progressive title generation on later prompts when enabled` | Verifies `ALWAYS_RENAME_CHATS=true` enables later-prompt generation. |
+| `backend/test/acpUpdateHandler.test.js` | `does not fire progressive title generation on later prompts when disabled` | Verifies default later-prompt suppression. |
+| `backend/test/promptHandlers.test.js` | `should store userPrompt and title prompt history on metadata for first prompt` | Verifies first string prompt fallback capture, title history capture, and `promptCount` increment. |
+| `backend/test/promptHandlers.test.js` | `should keep userPrompt and append title prompt history on subsequent prompts` | Verifies the first prompt remains fallback metadata while title history rolls forward. |
+| `backend/test/promptHandlers.test.js` | `should keep only the last two title prompts` | Verifies rolling prompt history length. |
 | `backend/test/promptHandlers.test.js` | `should delete from statsCaptures and not emit error token when error occurs during stats capture` | Covers prompt error behavior while a session is in `statsCaptures`. |
 | `backend/test/sessionHandlers.test.js` | `handles fork_session` | Covers fork handler setup around clone, save, ACP load, and callback flow. |
 | `backend/test/streamController.test.js` | `should isolate stats capture buffers between sessions` | Verifies capture map isolation. |
@@ -586,8 +607,8 @@ cd frontend; npx vitest run src/test/useChatManager.test.ts src/test/SessionItem
 ### For Implementing Or Extending This Feature
 
 1. Start with `backend/services/acpTitleGenerator.js` and identify whether the change belongs in `generateTitle`, `generateForkTitle`, or `getConfiguredModelId`.
-2. Check `backend/services/acpUpdateHandler.js` before changing trigger conditions; the active guard is `promptCount === 1`, `!titleGenerated`, and `!isSubAgent` inside the `agent_message_chunk` path.
-3. Check `backend/sockets/promptHandlers.js` before changing prompt capture; `userPrompt` is populated only from first string prompts.
+2. Check `backend/services/acpUpdateHandler.js` before changing trigger conditions; the active guard uses `shouldGenerateTitle(meta)`, `lastTitleGeneratedPromptCount`, `titleGenerated`, `isSubAgent`, and `ALWAYS_RENAME_CHATS`.
+3. Check `backend/sockets/promptHandlers.js` before changing prompt capture; `titlePromptHistory` is populated from the rolling last two string prompts and `userPrompt` is retained as the first-prompt fallback.
 4. Preserve the `statsCaptures` registration before `session/prompt` for every internal ACP title session.
 5. Preserve the `session_renamed` payload fields and the UI-ID-based match in `frontend/src/hooks/useChatManager.ts`.
 6. Update backend tests in `backend/test/acpTitleGenerator.test.js` or `backend/test/acpUpdateHandler.test.js` for title service or trigger changes.
@@ -597,7 +618,7 @@ cd frontend; npx vitest run src/test/useChatManager.test.ts src/test/SessionItem
 
 1. **New chats stay named `New Chat`**
 
-   Check `backend/sockets/promptHandlers.js` for `meta.userPrompt`, then check `backend/services/acpUpdateHandler.js` for `meta.promptCount`, `meta.titleGenerated`, and `meta.isSubAgent`. If the trigger runs, inspect `backend/services/acpTitleGenerator.js` for the title length gate, DB lookup through `getSessionByAcpId`, and the `New Chat` or `ALWAYS_RENAME_CHATS` rename gate.
+   Check `backend/sockets/promptHandlers.js` for `meta.titlePromptHistory` or compatible `meta.userPrompt`, then check `backend/services/acpUpdateHandler.js` for `meta.promptCount`, `meta.titleGenerated`, `meta.lastTitleGeneratedPromptCount`, and `meta.isSubAgent`. If the trigger runs, inspect `backend/services/acpTitleGenerator.js` for the title length gate, DB lookup through `getSessionByAcpId`, and the `New Chat` or `ALWAYS_RENAME_CHATS` rename gate.
 
 2. **Title text appears in the chat timeline**
 
@@ -617,11 +638,11 @@ cd frontend; npx vitest run src/test/useChatManager.test.ts src/test/SessionItem
 
 ## Summary
 
-- New-chat titles are captured from the first string prompt and triggered by the first assistant message chunk.
+- New-chat titles use rolling string prompt context and are triggered by assistant message chunks; later-prompt generation requires `ALWAYS_RENAME_CHATS=true`.
 - Fork titles are generated after the fork ACP session is cloned, loaded, drained, and returned to the caller.
 - Title generation uses ephemeral ACP sessions with `mcpServers: []` and optional `session/set_model` from `models.titleGeneration` fallback rules.
 - `StreamController.statsCaptures` is the critical mechanism that keeps title-session output out of the Unified Timeline.
-- New-chat rename uses `getSessionByAcpId(providerId, acpSessionId)` and respects the `New Chat` gate unless `ALWAYS_RENAME_CHATS=true`.
+- New-chat rename uses `getSessionByAcpId(providerId, acpSessionId)`, includes the current title in the prompt, respects the `New Chat` gate unless `ALWAYS_RENAME_CHATS=true`, and skips emitting when the generated title matches the current title.
 - Fork rename writes directly to the fork UI session ID when the title passes the length gate.
 - `session_renamed` carries `providerId`, `uiId`, and `newName`; frontend state updates match by `ChatSession.id`.
 - The most important anchors are `generateTitle`, `generateForkTitle`, `handleUpdate`, `registerPromptHandlers`, `fork_session`, and the `session_renamed` listener in `useChatManager`.

@@ -423,6 +423,62 @@ describe('mcpServer', () => {
       }
     });
 
+    it('maps advanced grep schema args into structured search results', async () => {
+      useMcpConfig({ tools: { io: true } });
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpui-io-mcp-'));
+      try {
+        await fs.writeFile(path.join(tmpDir, 'grep.ts'), 'Needle\nneedle\nneedle\n', 'utf8');
+        await fs.writeFile(path.join(tmpDir, 'grep.js'), 'needle\n', 'utf8');
+        const handlers = createToolHandlers(mockIo);
+
+        const result = await handlers.ux_grep_search({
+          providerId: 'provider-a',
+          acpSessionId: 'acp-1',
+          requestMeta: { toolCallId: 'tool-grep-advanced' },
+          pattern: 'needle',
+          dir_path: tmpDir,
+          fixed_strings: true,
+          case_mode: 'insensitive',
+          include_globs: ['**/*.ts'],
+          max_matches: 1,
+          result_mode: 'files'
+        });
+
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload).toEqual(expect.objectContaining({
+          type: 'ux_grep_search_result',
+          resultMode: 'files',
+          matchCount: 1,
+          files: [expect.stringContaining('grep.ts')],
+          matches: []
+        }));
+        expect(payload.files[0]).not.toContain('grep.js');
+        expect(toolCallState.get('provider-a', 'acp-1', 'tool-grep-advanced')).toEqual(expect.objectContaining({
+          input: expect.objectContaining({
+            case_mode: 'insensitive',
+            include_globs: ['**/*.ts'],
+            max_matches: 1,
+            result_mode: 'files'
+          })
+        }));
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects unsupported grep options instead of silently ignoring them', async () => {
+      useMcpConfig({ tools: { io: true } });
+      const handlers = createToolHandlers(mockIo);
+
+      await expect(handlers.ux_grep_search({
+        providerId: 'provider-a',
+        acpSessionId: 'acp-1',
+        requestMeta: { toolCallId: 'tool-grep-unsupported' },
+        pattern: 'needle',
+        rg_args: ['--hidden']
+      })).rejects.toThrow(/unsupported option\(s\): rg_args/);
+    });
+
     it('returns written content from write_file', async () => {
       useMcpConfig({ tools: { io: true } });
       const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpui-io-mcp-'));

@@ -58,6 +58,7 @@ This guide matters because File Explorer combines UI state, provider selection, 
    <SystemSettingsModal />
    <NotesModal />
    <FileExplorer />
+   <HelpDocsModal />
    ```
 
    `FileExplorer` returns `null` while `isFileExplorerOpen` is false, so the modal state is controlled entirely through the UI store.

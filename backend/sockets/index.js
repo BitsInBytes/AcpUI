@@ -8,6 +8,7 @@ import registerVoiceHandlers from './voiceHandlers.js';
 import registerSystemSettingsHandlers from './systemSettingsHandlers.js';
 import registerFolderHandlers from './folderHandlers.js';
 import registerFileExplorerHandlers from './fileExplorerHandlers.js';
+import registerHelpDocsHandlers from './helpDocsHandlers.js';
 import registerGitHandlers from './gitHandlers.js';
 import registerTerminalHandlers from './terminalHandlers.js';
 import registerShellRunHandlers, { emitShellRunSnapshotsForSession } from './shellRunHandlers.js';
@@ -178,6 +179,7 @@ export default function registerSocketHandlers(io) {
     registerSystemSettingsHandlers(io, socket);
     registerFolderHandlers(io, socket);
     registerFileExplorerHandlers(io, socket);
+    registerHelpDocsHandlers(io, socket);
     registerGitHandlers(io, socket);
     registerTerminalHandlers(io, socket);
     registerShellRunHandlers(io, socket);

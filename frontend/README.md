@@ -10,7 +10,7 @@ It is designed to stay provider-agnostic. Branding, model metadata, and provider
 - Streaming output display (thoughts, tools, assistant text).
 - Sidebar/folder/session UX flows.
 - Canvas/editor/terminal surfaces, plus Shell V2 tool terminals rendered inside shell ToolSteps when `shellRunId` metadata is present, with sanitized read-only transcript rendering after command exit and green sidebar waiting state when a shell prompt needs user input.
-- Settings, attachments, and utility modals.
+- Settings, attachments, documentation browsing, and utility modals.
 
 ## Quick Start
 
@@ -18,6 +18,8 @@ It is designed to stay provider-agnostic. Branding, model metadata, and provider
 npm install
 npm run dev
 ```
+
+For full-stack development, run `..\scripts\run.ps1 dev` from the repository root so the backend runs in watch mode and Vite serves the frontend with HMR.
 
 Common validation commands:
 
@@ -49,5 +51,6 @@ Feature docs are now the source of truth for implementation detail and stable fi
 - [Feature Doc - Frontend Architecture](../documents/%5BFeature%20Doc%5D%20-%20Frontend%20Architecture.md)
 - [Feature Doc - Message Bubble UI & Typewriter System](../documents/%5BFeature%20Doc%5D%20-%20Message%20Bubble%20UI%20%26%20Typewriter%20System.md)
 - [Feature Doc - Chat Header](../documents/%5BFeature%20Doc%5D%20-%20Chat%20Header.md)
+- [Feature Doc - Help Docs Modal](../documents/%5BFeature%20Doc%5D%20-%20Help%20Docs%20Modal.md)
 - [Feature Doc - Chat Input and Prompt Area](../documents/%5BFeature%20Doc%5D%20-%20Chat%20Input%20and%20Prompt%20Area.md)
 - [Feature Doc - Sidebar Rendering](../documents/%5BFeature%20Doc%5D%20-%20Sidebar%20Rendering.md)

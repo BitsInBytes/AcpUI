@@ -23,6 +23,7 @@ import SessionSettingsModal from './components/SessionSettingsModal';
 import SystemSettingsModal from './components/SystemSettingsModal';
 import NotesModal from './components/NotesModal';
 import FileExplorer from './components/FileExplorer';
+import HelpDocsModal from './components/HelpDocsModal';
 import CanvasPane from './components/CanvasPane/CanvasPane';
 import ConfigErrorModal from './components/ConfigErrorModal';
 
@@ -249,6 +250,7 @@ function App() {
       <SystemSettingsModal />
       <NotesModal />
       <FileExplorer />
+      <HelpDocsModal />
       <ConfigErrorModal />
     </div>
   );

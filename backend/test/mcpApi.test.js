@@ -240,6 +240,16 @@ describe('MCP API Routes', () => {
     const grepTool = tools.find(tool => tool.name === 'ux_grep_search');
     expect(globTool.inputSchema.properties.description.description).toContain('tool header');
     expect(grepTool.inputSchema.properties.description.description).toContain('tool header');
+    expect(grepTool.inputSchema.properties.case_mode.enum).toEqual(['smart', 'sensitive', 'insensitive']);
+    expect(grepTool.inputSchema.properties.result_mode.enum).toEqual(['matches', 'files', 'count']);
+    expect(grepTool.inputSchema.properties.regex_engine.enum).toEqual(['default', 'pcre2', 'auto']);
+    expect(grepTool.inputSchema.properties.include_globs.type).toBe('array');
+    expect(grepTool.inputSchema.properties.exclude_globs.type).toBe('array');
+    expect(grepTool.inputSchema.properties.file_types.type).toBe('array');
+    expect(grepTool.inputSchema.additionalProperties).toBe(false);
+    expect(grepTool.inputSchema.properties.case_sensitive).toBeDefined();
+    expect(grepTool.inputSchema.properties.context).toBeDefined();
+    expect(grepTool.inputSchema.properties.fixed_strings).toBeDefined();
   });
 
   it('GET /tools advertises Google search only when MCP config enables it', () => {

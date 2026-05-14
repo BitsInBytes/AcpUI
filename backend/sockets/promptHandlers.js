@@ -46,11 +46,20 @@ export default function registerPromptHandlers(io, socket) {
       }
 
       meta.promptCount = (meta.promptCount || 0) + 1;
-      if (meta.promptCount === 1 && typeof prompt === 'string') {
-        meta.userPrompt = prompt;
+      if (typeof prompt === 'string') {
+        const promptForTitle = prompt.trim();
+        if (promptForTitle) {
+          const previousPrompts = Array.isArray(meta.titlePromptHistory)
+            ? meta.titlePromptHistory
+            : (typeof meta.userPrompt === 'string' && meta.userPrompt.trim() ? [meta.userPrompt] : []);
+          meta.titlePromptHistory = [...previousPrompts, promptForTitle].slice(-2);
+        }
+        if (meta.promptCount === 1) {
+          meta.userPrompt = prompt;
+        }
       }
 
-      // Background Title Generation — triggered on first agent_message_chunk in acpClient.js
+      // Background title generation is triggered from response chunks.
 
       const acpPromptParts = [];
 

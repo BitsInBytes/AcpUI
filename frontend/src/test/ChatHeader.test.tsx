@@ -32,6 +32,7 @@ describe('ChatHeader Component', () => {
         activeSessionId: 's1',
         sessions: [{ id: 's1', name: 'Test Chat', model: 'balanced', acpSessionId: 'a1', provider: 'p1' } as any]
       });
+      useUIStore.setState({ isSystemSettingsOpen: false, isFileExplorerOpen: false, isHelpDocsOpen: false });
     });
   });
 
@@ -54,6 +55,13 @@ describe('ChatHeader Component', () => {
     expect(useUIStore.getState().isFileExplorerOpen).toBe(true);
   });
 
+  it('handles "Help" button click', () => {
+    render(<ChatHeader />);
+    const helpBtn = screen.getByTitle('Help');
+    fireEvent.click(helpBtn);
+    expect(useUIStore.getState().isHelpDocsOpen).toBe(true);
+  });
+
   it('renders app header fallback if no active session', () => {
     act(() => {
        useSessionLifecycleStore.setState({ activeSessionId: null });
@@ -72,6 +80,7 @@ describe('ChatHeader Component', () => {
     
     expect(screen.queryByTitle('Open Sidebar')).not.toBeInTheDocument();
     expect(screen.queryByTitle('File Explorer')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Help')).not.toBeInTheDocument();
     expect(screen.queryByTitle('System Settings')).not.toBeInTheDocument();
 
     // Restore location

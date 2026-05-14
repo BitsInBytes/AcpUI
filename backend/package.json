@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch --watch-preserve-output server.js",
     "test": "vitest run",
     "lint": "eslint ."
   },

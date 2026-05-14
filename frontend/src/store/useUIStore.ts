@@ -13,6 +13,7 @@ interface UIState {
   isSystemSettingsOpen: boolean;
   isNotesOpen: boolean;
   isFileExplorerOpen: boolean;
+  isHelpDocsOpen: boolean;
   settingsSessionId: string | null;
   settingsInitialTab: SettingsTab;
   isRestartModalOpen: boolean;
@@ -33,6 +34,7 @@ interface UIState {
   setSystemSettingsOpen: (isOpen: boolean) => void;
   setNotesOpen: (isOpen: boolean) => void;
   setFileExplorerOpen: (isOpen: boolean) => void;
+  setHelpDocsOpen: (isOpen: boolean) => void;
   setRestartModalOpen: (isOpen: boolean) => void;
   setModelDropdownOpen: (isOpen: boolean) => void;
   incrementVisibleCount: (amount: number) => void;
@@ -51,6 +53,7 @@ export const useUIStore = create<UIState>((set) => ({
   isSystemSettingsOpen: false,
   isNotesOpen: false,
   isFileExplorerOpen: false,
+  isHelpDocsOpen: false,
   settingsSessionId: null,
   settingsInitialTab: 'session',
   isRestartModalOpen: false,
@@ -82,6 +85,7 @@ export const useUIStore = create<UIState>((set) => ({
   setSystemSettingsOpen: (isOpen) => set({ isSystemSettingsOpen: isOpen }),
   setNotesOpen: (isOpen) => set({ isNotesOpen: isOpen }),
   setFileExplorerOpen: (isOpen) => set({ isFileExplorerOpen: isOpen }),
+  setHelpDocsOpen: (isOpen) => set({ isHelpDocsOpen: isOpen }),
   
   setRestartModalOpen: (isOpen) => set({ isRestartModalOpen: isOpen }),
   setModelDropdownOpen: (isOpen) => set({ isModelDropdownOpen: isOpen }),

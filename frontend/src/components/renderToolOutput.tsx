@@ -62,7 +62,10 @@ type GrepSearchResult = {
   type: typeof ACP_UX_RESULT_TYPES.grepSearch;
   pattern?: string;
   dirPath?: string;
+  resultMode?: 'matches' | 'files' | 'count';
   matchCount?: number;
+  totalMatches?: number;
+  files?: string[];
   matches?: GrepSearchMatch[];
   context?: Array<{
     filePath?: string;
@@ -199,15 +202,39 @@ export const renderToolOutput = (output: string | undefined, _markdownComponents
 
   if (isGrepSearchResult(structuredObject)) {
     const matches = structuredObject.matches || [];
+    const files = structuredObject.files || [];
+    const resultMode = structuredObject.resultMode || 'matches';
+    const totalMatches = structuredObject.totalMatches ?? structuredObject.matchCount ?? matches.length;
+    const countLabel = resultMode === 'files'
+      ? `${structuredObject.matchCount ?? files.length} files`
+      : `${structuredObject.matchCount ?? matches.length} matches`;
+    const totalLabel = structuredObject.totalMatches !== undefined && structuredObject.totalMatches !== structuredObject.matchCount
+      ? <span>{structuredObject.totalMatches} total matches</span>
+      : null;
+
     return (
       <div className="grep-output">
         <div className="grep-output-meta">
-          <span>{structuredObject.matchCount ?? matches.length} matches</span>
+          <span>{countLabel}</span>
+          {totalLabel}
+          {resultMode !== 'matches' ? <span>{resultMode} mode</span> : null}
           {structuredObject.pattern ? <span>Pattern {structuredObject.pattern}</span> : null}
           {structuredObject.dirPath ? <span>{structuredObject.dirPath}</span> : null}
           {structuredObject.truncated ? <span>Truncated</span> : null}
         </div>
-        {matches.length ? (
+        {resultMode === 'files' && files.length ? (
+          <div className="grep-match-list">
+            {files.map((file, index) => (
+              <div className="grep-match-row" key={`${file}-${index}`}>
+                <div className="grep-match-location">
+                  <span>{file}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : resultMode === 'count' ? (
+          <div className="grep-no-matches">{totalMatches ? `${totalMatches} total matches.` : 'No matches found.'}</div>
+        ) : matches.length ? (
           <div className="grep-match-list">
             {matches.map((match, index) => (
               <div className="grep-match-row" key={`${match.filePath || 'match'}-${match.lineNumber || index}-${index}`}>
@@ -215,7 +242,7 @@ export const renderToolOutput = (output: string | undefined, _markdownComponents
                   <span>{match.filePath || '(unknown file)'}</span>
                   {match.lineNumber ? <span>:{match.lineNumber}</span> : null}
                 </div>
-                <pre className="grep-match-line">{renderHighlightedMatch(match.line || '', match.submatches)}</pre>
+                {match.line ? <pre className="grep-match-line">{renderHighlightedMatch(match.line, match.submatches)}</pre> : null}
               </div>
             ))}
           </div>

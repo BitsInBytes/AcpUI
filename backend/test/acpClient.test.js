@@ -192,6 +192,27 @@ describe('AcpClient Service', () => {
       expect(client.acpProcess).toBeNull();
     });
 
+    it('stops the ACP daemon without scheduling a restart', async () => {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = { write: vi.fn() };
+      proc.kill = vi.fn(() => proc.emit('exit', 0));
+      spawn.mockImplementationOnce(() => proc);
+
+      const AcpClientClass = acpClient.constructor;
+      const localClient = new AcpClientClass('test-p');
+      localClient.io = mockIo;
+
+      await localClient.start();
+      await localClient.stop();
+
+      expect(proc.kill).toHaveBeenCalled();
+      expect(localClient.acpProcess).toBeNull();
+      expect(localClient.restartTimer).toBeNull();
+      expect(localClient.isHandshakeComplete).toBe(false);
+    });
+
     it('should handle handshake failure', async () => {
       // Use real timers for this one to avoid complex interaction with start() logic
       const AcpClientClass = acpClient.constructor;

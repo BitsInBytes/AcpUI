@@ -12,7 +12,7 @@ Why this matters: the feature crosses browser media APIs, frontend state, Socket
 - Advertises feature availability through the `voice_enabled` socket event and `useVoiceStore.isVoiceEnabled`.
 - Renders a mic control in `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`, Handler: `onMicClick`) when voice is enabled.
 - Sends the recorded `ArrayBuffer` through the `process_voice` socket event.
-- Spawns `backend/whisper/whisper-server.exe` from `backend/voiceService.js` (Function: `startSTTServer`) when `VOICE_STT_ENABLED=true`.
+- Spawns `backend/whisper/whisper-server.exe` from `backend/voiceService.js` (Function: `startSTTServer`) when `VOICE_STT_ENABLED=true`, and stops it through `stopSTTServer` during backend shutdown.
 - Posts the WAV file to whisper-server's `/inference` endpoint and returns `{ text }` through the socket callback.
 - Replaces the active session input with the transcript through `useInputStore.setInput()`.
 
@@ -28,11 +28,11 @@ Architectural role: frontend recording and UI state, backend Socket.IO routing, 
 ## How It Works - End-to-End Flow
 
 ### 1. Backend Loads STT Configuration and Starts whisper-server
-File: `backend/server.js` (Startup block: `startSTTServer()`)
-File: `backend/voiceService.js` (Functions: `isSTTEnabled`, `startSTTServer`; Config keys: `VOICE_STT_ENABLED`, `STT_PORT`)
+File: `backend/server.js` (Startup block: `startSTTServer()`, Shutdown path: `shutdownServer`)
+File: `backend/voiceService.js` (Functions: `isSTTEnabled`, `startSTTServer`, `stopSTTServer`; Config keys: `VOICE_STT_ENABLED`, `STT_PORT`)
 
 ```javascript
-// FILE: backend/voiceService.js (Functions: isSTTEnabled, startSTTServer)
+// FILE: backend/voiceService.js (Functions: isSTTEnabled, startSTTServer, stopSTTServer)
 const WHISPER_SERVER = path.join(__dirname, 'whisper', 'whisper-server.exe');
 const WHISPER_MODEL = path.join(__dirname, 'whisper', 'ggml-small.bin');
 const STT_PORT = process.env.STT_PORT || '9877';
@@ -49,9 +49,16 @@ export function startSTTServer() {
     '-t', '4'
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 }
+
+export function stopSTTServer() {
+  if (!serverProcess) return;
+  const proc = serverProcess;
+  serverProcess = null;
+  proc.kill?.();
+}
 ```
 
-`backend/server.js` calls `startSTTServer()` during backend initialization. The service checks `VOICE_STT_ENABLED`, keeps a module-level `serverProcess` guard, and launches the whisper server with the configured port, `ggml-small.bin`, and four worker threads.
+`backend/server.js` calls `startSTTServer()` during backend initialization and calls `stopSTTServer()` through `shutdownServer`. The service checks `VOICE_STT_ENABLED`, keeps a module-level `serverProcess` guard, launches the whisper server with the configured port, `ggml-small.bin`, and four worker threads, and clears/kills the process reference during controlled backend shutdown.
 
 ### 2. Backend Advertises Voice Availability
 File: `backend/sockets/index.js` (Socket event: `voice_enabled`)
@@ -412,10 +419,10 @@ ChatInput.onMicClick
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Server startup | `backend/server.js` | `startSTTServer`, Socket.IO option `maxHttpBufferSize` | Starts STT service and permits large socket payloads. |
+| Server startup/shutdown | `backend/server.js` | `startSTTServer`, `shutdownServer`, Socket.IO option `maxHttpBufferSize` | Starts STT service, stops it during backend shutdown, and permits large socket payloads. |
 | Socket connection | `backend/sockets/index.js` | `registerSocketHandlers`, socket event `voice_enabled`, `registerVoiceHandlers` | Advertises voice support and registers voice handlers. |
 | Voice socket handler | `backend/sockets/voiceHandlers.js` | `registerVoiceHandlers`, socket event `process_voice` | Routes audio buffers to the STT service and replies with `{ text }`. |
-| STT service | `backend/voiceService.js` | `isSTTEnabled`, `startSTTServer`, `transcribeAudio`, `WHISPER_SERVER`, `WHISPER_MODEL`, `STT_PORT` | Manages whisper-server and transcription requests. |
+| STT service | `backend/voiceService.js` | `isSTTEnabled`, `startSTTServer`, `stopSTTServer`, `transcribeAudio`, `WHISPER_SERVER`, `WHISPER_MODEL`, `STT_PORT` | Manages whisper-server lifecycle and transcription requests. |
 | Attachment root | `backend/services/attachmentVault.js` | `getAttachmentsRoot` | Provides the base directory for temporary WAV files. |
 | Provider handshake | `backend/services/acpClient.js` | `performHandshake`, socket event `voice_enabled` | Re-emits voice availability after provider readiness. |
 
@@ -457,7 +464,10 @@ ChatInput.onMicClick
 9. **whisper-server output logging is selective**
    `startSTTServer()` ignores stdout and writes stderr only when the message contains `error`. Port binding, model loading, and process exit debugging starts in `backend/voiceService.js` logs.
 
-10. **Temp file cleanup depends on process continuity**
+10. **Controlled backend shutdown stops whisper-server**
+   `shutdownServer()` calls `stopSTTServer()` so backend watch restarts and normal process termination clear the module-level child process reference and send a kill signal to whisper-server.
+
+11. **Temp file cleanup depends on process continuity**
    `transcribeAudio()` removes the temp WAV file in `finally`. A Node process exit during transcription can leave `stt-*.wav` files under the attachment vault.
 
 ## Unit Tests
@@ -478,7 +488,7 @@ ChatInput.onMicClick
 | File | Test Names | Coverage |
 |---|---|---|
 | `backend/test/voiceService.test.js` | `returns null if no audio buffer is provided`; `returns null if STT is not enabled`; `isSTTEnabled returns true when env var is true`; `isSTTEnabled returns false when env var is not true`; `startSTTServer does nothing when STT is disabled`; `startSTTServer starts when STT is enabled`; `transcribeAudio returns result or null on error` | Feature flag, empty input, startup guard, broad transcription behavior. |
-| `backend/test/voiceService.test.js` | `transcribeAudio catches fetch error and returns null`; `transcribeAudio returns null when sessionId is undefined`; `startSTTServer registers exit handler on server process`; `exit handler body logs and clears serverProcess`; `transcribeAudio returns transcribed text on successful whisper-server response`; `transcribeAudio returns null when server response text is blank`; `transcribeAudio returns null and logs error when server returns non-ok status` | Fetch failures, fallback `voice` temp directory, process exit handler, successful text trimming, blank output, and HTTP error handling. |
+| `backend/test/voiceService.test.js` | `transcribeAudio catches fetch error and returns null`; `transcribeAudio returns null when sessionId is undefined`; `startSTTServer registers exit handler on server process`; `exit handler body logs and clears serverProcess`; `stopSTTServer kills an active whisper-server process once`; `transcribeAudio returns transcribed text on successful whisper-server response`; `transcribeAudio returns null when server response text is blank`; `transcribeAudio returns null and logs error when server returns non-ok status` | Fetch failures, fallback `voice` temp directory, process exit handler, controlled stop, successful text trimming, blank output, and HTTP error handling. |
 | `backend/test/voiceHandlers.test.js` | `should call transcribeAudio and return text` | `process_voice` socket handler callback shape. |
 | `backend/test/coverage-boost.test.js` | server import coverage with `startSTTServer` mocked | Confirms server startup imports without launching the real STT process in that test path. |
 
@@ -500,7 +510,7 @@ cd frontend && npx vitest run src/test/useVoice.test.ts src/test/useVoiceStore.t
 2. Follow `frontend/src/hooks/useVoice.ts` (Functions: `startRecording`, `stopRecording`) before changing socket payloads, processing state, or duration gating.
 3. Follow `frontend/src/utils/wavRecorder.ts` (Methods: `downsample`, `encodeWAV`) before changing sample rate, channels, bit depth, or recording APIs.
 4. Follow `backend/sockets/voiceHandlers.js` (Socket event: `process_voice`) before changing the callback contract.
-5. Follow `backend/voiceService.js` (Functions: `startSTTServer`, `transcribeAudio`) before changing whisper-server startup, temp file handling, endpoint shape, or null/error behavior.
+5. Follow `backend/voiceService.js` (Functions: `startSTTServer`, `stopSTTServer`, `transcribeAudio`) before changing whisper-server startup/shutdown, temp file handling, endpoint shape, or null/error behavior.
 6. Update the tests listed in the Unit Tests section when changing state keys, socket payloads, WAV format, or backend STT behavior.
 
 ### For Debugging This Feature
@@ -516,7 +526,7 @@ cd frontend && npx vitest run src/test/useVoice.test.ts src/test/useVoiceStore.t
 ## Summary
 
 - Voice-to-text is an optional, provider-independent path from microphone recording to prompt text insertion.
-- Backend enablement comes from `VOICE_STT_ENABLED`; runtime endpoint selection comes from `STT_PORT` or the `9877` fallback in `backend/voiceService.js`.
+- Backend enablement comes from `VOICE_STT_ENABLED`; runtime endpoint selection comes from `STT_PORT` or the `9877` fallback in `backend/voiceService.js`, and controlled backend shutdown stops the whisper-server child process.
 - The browser recorder must produce 16 kHz mono 16-bit PCM WAV data.
 - `process_voice` carries `{ audioBuffer }` from the frontend and replies with `{ text: string | null }`.
 - `transcribeAudio()` treats failure as `null`, logs errors, and cleans up the temp WAV file when the process remains alive.

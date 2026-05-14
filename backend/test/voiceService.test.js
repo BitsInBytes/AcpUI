@@ -152,6 +152,26 @@ describe('voiceService - error paths and server exit', () => {
     capturedExitCb(0);
   });
 
+  it('stopSTTServer kills an active whisper-server process once', async () => {
+    const { spawn } = await import('child_process');
+    const mockProc = {
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn(),
+      kill: vi.fn()
+    };
+    spawn.mockReturnValue(mockProc);
+
+    vi.resetModules();
+    process.env.VOICE_STT_ENABLED = 'true';
+    const { startSTTServer, stopSTTServer } = await import('../voiceService.js');
+    startSTTServer();
+    stopSTTServer();
+    stopSTTServer();
+
+    expect(mockProc.kill).toHaveBeenCalledTimes(1);
+  });
+
   it('transcribeAudio returns transcribed text on successful whisper-server response', async () => {
     process.env.VOICE_STT_ENABLED = 'true';
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({

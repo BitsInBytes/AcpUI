@@ -11,6 +11,7 @@ vi.mock('../sockets/voiceHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/systemSettingsHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/folderHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/fileExplorerHandlers.js', () => ({ default: vi.fn() }));
+vi.mock('../sockets/helpDocsHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/gitHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/terminalHandlers.js', () => ({ default: vi.fn() }));
 vi.mock('../sockets/shellRunHandlers.js', () => ({
@@ -103,9 +104,11 @@ describe('Socket Index Handler', () => {
     connectSocket(mockIo);
     const promptHandlers = (await import('../sockets/promptHandlers.js')).default;
     const sessionHandlers = (await import('../sockets/sessionHandlers.js')).default;
+    const helpDocsHandlers = (await import('../sockets/helpDocsHandlers.js')).default;
     const shellRunHandlers = (await import('../sockets/shellRunHandlers.js')).default;
     expect(promptHandlers).toHaveBeenCalled();
     expect(sessionHandlers).toHaveBeenCalled();
+    expect(helpDocsHandlers).toHaveBeenCalled();
     expect(shellRunHandlers).toHaveBeenCalled();
   });
 

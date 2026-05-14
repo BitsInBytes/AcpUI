@@ -118,7 +118,7 @@ This is a backend MCP feature with frontend output rendering support. Source own
     - `listDirectory` returns direct entries and appends `/` to directories.
     - `findFiles` uses `glob` with `absolute: true` and `nodir: true` under the allowed `dir_path` or allowed `process.cwd()`.
     - `grepSearch` spawns the `@vscode/ripgrep` binary with `--json`, searches `.` under the allowed cwd, treats exit code `0` and `1` as successful, and rejects other exit codes.
-    - Grep defaults to case-insensitive search (`-i`) unless `case_sensitive` is true. `fixed_strings` adds `-F`; positive `context` adds `-C<n>`.
+    - `grepSearch` supports explicit safe search options (`case_mode`, include/exclude globs, file types, before/after context, word matching, multiline, regex engine mode, hidden/no-ignore, wildcard-root-gated follow-symlinks, and result mode) and accepts `case_sensitive`, `context`, and `fixed_strings` as compatibility aliases.
 
 12. **Web fetch applies URL policy before network access**
     - File: `backend/services/ioMcp/webFetch.js` (Functions: `webFetch`, `assertUrlAllowed`, `fetchWithRedirects`, `readResponseText`, `composeAbortSignal`)
@@ -129,7 +129,7 @@ This is a backend MCP feature with frontend output rendering support. Source own
 13. **Structured outputs render in the frontend**
     - File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutput`, Type guards: `isWebFetchResult`, `isGrepSearchResult`)
     - `ux_grep_search` and `ux_web_fetch` handlers return JSON strings in `content[0].text`.
-    - `renderToolOutput` parses those JSON objects and renders grep matches with file/line rows plus highlighted submatches, or web fetch output with title, URL, status, content type, and text.
+    - `renderToolOutput` parses those JSON objects and renders grep match rows, file-only result rows, count-only summaries, highlighted submatches, or web fetch output with title, URL, status, content type, and text.
 
 ## Architecture Diagram
 
@@ -250,7 +250,10 @@ MCP request args
   "type": "ux_grep_search_result",
   "pattern": "needle",
   "dirPath": "D:/Git/AcpUI",
+  "resultMode": "matches",
   "matchCount": 1,
+  "totalMatches": 1,
+  "files": ["D:/Git/AcpUI/src/app.ts"],
   "matches": [
     {
       "filePath": "D:/Git/AcpUI/src/app.ts",
@@ -272,7 +275,9 @@ MCP request args
 }
 ```
 
-When `limitGrepResult` must shrink output to fit `io.maxOutputBytes`, it sets `truncated: true`, adds `maxOutputBytes`, drops `context` entries first, then drops `matches`, and updates `matchCount` to the number of returned matches.
+`resultMode` supports `matches`, `files`, and `count`. In `files` mode, `matchCount` is the number of matched files and `files` is populated. In `count` mode, `matchCount` equals `totalMatches` and `matches/context` are empty.
+
+When `limitGrepResult` must shrink output to fit `io.maxOutputBytes`, it sets `truncated: true`, adds `maxOutputBytes`, then drops `context`, `matches`, and `files` until the payload fits.
 
 ### Web Fetch Output Shape
 
@@ -340,11 +345,11 @@ wrapToolHandlers begin
 | Web fetch service tests | `backend/test/ioMcpWebFetch.test.js` | `IO MCP webFetch`, `returns structured non-HTML text`, `extracts structured normalized body text from HTML`, `throws for non-OK responses`, `blocks configured hosts before fetching`, `follows redirects through the configured policy checks`, `enforces response size caps` | Covers fetch result shape and network policy enforcement |
 | Config tests | `backend/test/mcpConfig.test.js` | `MCP config`, `disables config-controlled tools when the config is missing`, `disables config-controlled tools when the config is malformed`, `reads enabled tools from configuration/mcp.json shape`, `normalizes IO, web fetch, and Google search settings` | Covers config loading, flag normalization, and IO/web fetch config defaults |
 | MCP API tests | `backend/test/mcpApi.test.js` | `MCP API Routes`, `GET /tools hides optional IO and Google tools by default`, `GET /tools advertises IO tools when MCP config enables them`, `POST /tool-call with valid tool returns result`, `POST /tool-call passes resolved proxy context to handlers`, `POST /tool-call aborts the handler signal when the request fires the "aborted" event`, `POST /tool-call aborts the handler signal when the response closes before completion` | Covers schema advertisement, dispatch, context forwarding, and abort behavior |
-| MCP server tests | `backend/test/mcpServer.test.js` | `optional IO MCP tools`, `does not register optional IO or Google handlers by default`, `registers IO handlers when MCP config enables IO`, `uses glob description for cached tool headers`, `uses grep description for cached tool headers`, `returns written content from write_file`, `returns a diff from replace`, `emits full directory path in list_directory title`, `emits fetch URL title and structured web_fetch output` | Covers handler registration and Tool System V2 title/category output |
+| MCP server tests | `backend/test/mcpServer.test.js` | `optional IO MCP tools`, `does not register optional IO or Google handlers by default`, `registers IO handlers when MCP config enables IO`, `uses glob description for cached tool headers`, `uses grep description for cached tool headers`, `rejects unsupported grep options instead of silently ignoring them`, `returns written content from write_file`, `returns a diff from replace`, `emits full directory path in list_directory title`, `emits fetch URL title and structured web_fetch output` | Covers handler registration and Tool System V2 title/category output |
 | Tool metadata tests | `backend/test/ioToolHandler.test.js` | `IO Tool System V2 handler`, `applies file metadata for ux_write_file`, `uses grep description for the visual title`, `uses fetch URL for the visual title` | Covers IO lifecycle metadata projection |
 | Invocation resolver tests | `backend/test/toolInvocationResolver.test.js` | `marks registered AcpUI UX tool names without relying on a ux prefix`, `can claim a recent MCP execution when the provider tool id arrives later` | Covers centralized MCP execution metadata and delayed provider tool IDs |
 | Provider normalization tests | `backend/test/providerToolNormalization.test.js` | `resolveToolNameFromCandidates`, `resolveToolNameFromAcpUiMcpTitle` | Covers canonical name recovery from provider MCP tool labels/IDs, including colon-suffixed display titles |
-| Frontend renderer tests | `frontend/src/test/renderToolOutput.test.tsx` | `renders structured web fetch output`, `renders structured grep search output` | Covers structured JSON rendering contracts |
+| Frontend renderer tests | `frontend/src/test/renderToolOutput.test.tsx` | `renders structured web fetch output`, `renders structured grep search output`, `renders structured grep file and count result modes` | Covers structured JSON rendering contracts |
 | Frontend stream tests | `frontend/src/test/useStreamStore.test.ts` | grep title preservation tests around `ux_grep_search` tool events | Covers preserving Tool System V2 titles through frontend stream merging |
 
 ## Gotchas
@@ -371,18 +376,21 @@ wrapToolHandlers begin
    - `allow_multiple=true` works only for exact matches. Fuzzy fallback rejects multi-replace because it cannot prove every replacement location is intended.
 
 8. **Grep match counts can shrink during truncation**
-   - `limitGrepResult` drops context first, then matches. `matchCount` reflects the returned matches after truncation, not the original ripgrep total when truncation occurs.
+   - `limitGrepResult` drops context, then matches, then files. In `matches` mode, `matchCount` reflects returned matches after truncation. In `files` mode, it reflects returned files.
 
-9. **Grep is case-insensitive unless requested otherwise**
-   - `grepSearch` adds `-i` when `case_sensitive` is falsy. Set `case_sensitive: true` when regex case must be preserved.
+9. **Grep defaults to smart case mode**
+   - `grepSearch` defaults to `case_mode: smart`. Use `case_mode: sensitive` or `case_mode: insensitive` to force behavior. `case_sensitive` is accepted as a compatibility alias.
 
-10. **Web fetch CIDR blocking applies to literal IPv4 hosts**
+10. **Some grep options are intentionally gated**
+    - `regex_engine` is rejected when `fixed_strings` is true because ripgrep treats those modes as incompatible. `follow_symlinks` is rejected unless `io.allowedRoots` contains `*` because symlinks can leave configured roots.
+
+11. **Web fetch CIDR blocking applies to literal IPv4 hosts**
     - `hostMatchesCidr` compares the URL hostname directly when it is an IPv4 address. It does not perform DNS resolution before CIDR checks.
 
-11. **Redirect targets receive the same URL policy checks**
+12. **Redirect targets receive the same URL policy checks**
     - `fetchWithRedirects` calls `assertUrlAllowed` for each target before fetching it. Blocked redirect hosts fail before the next network request.
 
-12. **Existing ACP sessions keep their registered tool list**
+13. **Existing ACP sessions keep their registered tool list**
     - `stdio-proxy.js` fetches `GET /api/mcp/tools` during `runProxy`. Config changes affect sessions whose MCP proxy starts after the change.
 
 ## Unit Tests
@@ -440,7 +448,7 @@ npx vitest run src/test/renderToolOutput.test.tsx src/test/useStreamStore.test.t
 - Canonical `ux_*` names must match across tool metadata, schemas, handlers, API dispatch, Tool System V2, and tests.
 - Filesystem operations must pass through `resolveAllowedPath` and the operation-specific byte caps before touching disk.
 - `ux_replace` uses exact-first matching with quote, whitespace, and fuzzy fallback behavior for single replacements.
-- `ux_grep_search` returns structured `ux_grep_search_result` JSON text and may truncate context/matches to fit `io.maxOutputBytes`.
+- `ux_grep_search` returns structured `ux_grep_search_result` JSON text, supports safe ripgrep options (including `case_mode`, globs, file types, context split, and `result_mode`), and may truncate context/matches/files to fit `io.maxOutputBytes`.
 - `ux_web_fetch` returns structured `web_fetch_result` JSON text after URL policy checks, redirect checks, timeout handling, and response-size enforcement.
-- Frontend rendering depends on the `type` fields in the grep and web fetch JSON payloads.
+- Frontend rendering depends on the `type` and grep `resultMode` fields in the grep and web fetch JSON payloads.
 - The highest-risk contract is schema/handler/policy/output parity for each canonical IO tool.

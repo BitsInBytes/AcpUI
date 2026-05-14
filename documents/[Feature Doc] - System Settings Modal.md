@@ -27,7 +27,7 @@ Architectural role: frontend modal plus backend Socket.IO configuration handlers
 
 1. **The app root mounts the modal shell**
    - File: `frontend/src/App.tsx` (Component: `App`)
-   - `App` renders `<SystemSettingsModal />` alongside `SessionSettingsModal`, `NotesModal`, and `FileExplorer`. The modal component returns `null` when `useUIStore.isSystemSettingsOpen` is false.
+   - `App` renders `<SystemSettingsModal />` alongside `SessionSettingsModal`, `NotesModal`, `FileExplorer`, and `HelpDocsModal`. The modal component returns `null` when `useUIStore.isSystemSettingsOpen` is false.
 
 2. **The header opens System Settings**
    - File: `frontend/src/components/ChatHeader/ChatHeader.tsx` (Component: `ChatHeader`, Button title: `System Settings`)

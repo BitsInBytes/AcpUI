@@ -421,12 +421,177 @@ function stripTrailingLineEnding(value = '') {
   return String(value).replace(/\r?\n$/, '');
 }
 
-function parseRipgrepJson(stdout, cwd, pattern) {
-  const matches = [];
-  const context = [];
+const GREP_CASE_MODES = new Set(['smart', 'sensitive', 'insensitive']);
+const GREP_RESULT_MODES = new Set(['matches', 'files', 'count']);
+const GREP_REGEX_ENGINES = new Set(['default', 'pcre2', 'auto']);
+const RIPGREP_FILE_TYPE_PATTERN = /^[a-z0-9][a-z0-9_+-]*$/i;
+
+function parseTextOrBytes(value) {
+  if (!value || typeof value !== 'object') return '';
+  if (typeof value.text === 'string') return value.text;
+  if (typeof value.bytes === 'string') {
+    try {
+      return Buffer.from(value.bytes, 'base64').toString('utf8');
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+function parseOptionalBoolean(value, name) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+  throw new Error(`${name} must be a boolean.`);
+}
+
+function parseOptionalInteger(value, name, min = 0) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min) {
+    throw new Error(`${name} must be an integer greater than or equal to ${min}.`);
+  }
+  return parsed;
+}
+
+function parseEnumValue(value, name, allowed, defaultValue) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  const normalized = String(value).trim().toLowerCase();
+  if (!allowed.has(normalized)) {
+    throw new Error(`${name} must be one of: ${Array.from(allowed).join(', ')}.`);
+  }
+  return normalized;
+}
+
+function normalizeStringArray(value, name) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(`${name} must be an array of strings.`);
+  }
+  return value.map((entry, index) => requireString(entry, `${name}[${index}]`).trim());
+}
+
+function normalizeFileTypes(value) {
+  return normalizeStringArray(value, 'file_types').map(fileType => {
+    if (!RIPGREP_FILE_TYPE_PATTERN.test(fileType)) {
+      throw new Error(`file_types contains invalid ripgrep type: ${fileType}`);
+    }
+    return fileType;
+  });
+}
+
+function normalizeGrepOptions(rawOptions = {}) {
+  const legacyCaseSensitive = parseOptionalBoolean(rawOptions.caseSensitive, 'case_sensitive');
+  const caseModeFromLegacy = legacyCaseSensitive === undefined
+    ? undefined
+    : (legacyCaseSensitive ? 'sensitive' : 'insensitive');
+  const caseMode = parseEnumValue(rawOptions.caseMode ?? caseModeFromLegacy, 'case_mode', GREP_CASE_MODES, 'smart');
+
+  const legacyContext = parseOptionalInteger(rawOptions.context, 'context', 0);
+  const beforeContext = parseOptionalInteger(rawOptions.beforeContext, 'before_context', 0);
+  const afterContext = parseOptionalInteger(rawOptions.afterContext, 'after_context', 0);
+
+  const normalizedBeforeContext = beforeContext ?? legacyContext;
+  const normalizedAfterContext = afterContext ?? legacyContext;
+
+  const normalized = {
+    caseMode,
+    includeGlobs: normalizeStringArray(rawOptions.includeGlobs, 'include_globs'),
+    excludeGlobs: normalizeStringArray(rawOptions.excludeGlobs, 'exclude_globs'),
+    fileTypes: normalizeFileTypes(rawOptions.fileTypes),
+    beforeContext: normalizedBeforeContext,
+    afterContext: normalizedAfterContext,
+    maxMatches: parseOptionalInteger(rawOptions.maxMatches, 'max_matches', 1),
+    resultMode: parseEnumValue(rawOptions.resultMode, 'result_mode', GREP_RESULT_MODES, 'matches'),
+    wordMatch: parseOptionalBoolean(rawOptions.wordMatch, 'word_match') || false,
+    multiline: parseOptionalBoolean(rawOptions.multiline, 'multiline') || false,
+    regexEngine: parseEnumValue(rawOptions.regexEngine, 'regex_engine', GREP_REGEX_ENGINES, 'default'),
+    hidden: parseOptionalBoolean(rawOptions.hidden, 'hidden') || false,
+    noIgnore: parseOptionalBoolean(rawOptions.noIgnore, 'no_ignore') || false,
+    followSymlinks: parseOptionalBoolean(rawOptions.followSymlinks, 'follow_symlinks') || false,
+    fixedStrings: parseOptionalBoolean(rawOptions.fixedStrings, 'fixed_strings') || false,
+    abortSignal: rawOptions.abortSignal
+  };
+
+  if (normalized.fixedStrings && normalized.regexEngine !== 'default') {
+    throw new Error('regex_engine cannot be used when fixed_strings is true.');
+  }
+  if (normalized.followSymlinks && !getIoMcpConfig().allowedRoots.includes('*')) {
+    throw new Error('follow_symlinks requires io.allowedRoots to include "*" because symlinks can leave configured roots.');
+  }
+
+  return normalized;
+}
+
+function buildRipgrepArgs(pattern, normalizedOptions) {
+  const args = ['--json'];
+
+  if (normalizedOptions.caseMode === 'sensitive') args.push('--case-sensitive');
+  if (normalizedOptions.caseMode === 'insensitive') args.push('--ignore-case');
+  if (normalizedOptions.caseMode === 'smart') args.push('--smart-case');
+
+  if (normalizedOptions.beforeContext !== undefined) args.push(`-B${normalizedOptions.beforeContext}`);
+  if (normalizedOptions.afterContext !== undefined) args.push(`-A${normalizedOptions.afterContext}`);
+  if (normalizedOptions.maxMatches !== undefined) args.push('--max-count', String(normalizedOptions.maxMatches));
+
+  if (normalizedOptions.fixedStrings) args.push('--fixed-strings');
+  if (normalizedOptions.wordMatch) args.push('--word-regexp');
+  if (normalizedOptions.multiline) args.push('--multiline');
+  if (normalizedOptions.hidden) args.push('--hidden');
+  if (normalizedOptions.noIgnore) args.push('--no-ignore');
+  if (normalizedOptions.followSymlinks) args.push('--follow');
+
+  if (normalizedOptions.regexEngine === 'pcre2') args.push('--pcre2');
+  if (normalizedOptions.regexEngine === 'auto') args.push('--auto-hybrid-regex');
+
+  for (const fileType of normalizedOptions.fileTypes) {
+    args.push('--type', fileType);
+  }
+
+  for (const includeGlob of normalizedOptions.includeGlobs) {
+    args.push('--glob', includeGlob);
+  }
+
+  for (const excludeGlob of normalizedOptions.excludeGlobs) {
+    const normalizedGlob = excludeGlob.replace(/^!+/, '').trim();
+    if (!normalizedGlob) {
+      throw new Error('exclude_globs entries must include a glob pattern.');
+    }
+    args.push('--glob', `!${normalizedGlob}`);
+  }
+
+  args.push('--', pattern, '.');
+  return args;
+}
+
+function createBaseGrepResult(pattern, cwd, resultMode) {
+  return {
+    type: 'ux_grep_search_result',
+    pattern,
+    dirPath: cwd,
+    resultMode,
+    matchCount: 0,
+    matches: [],
+    context: [],
+    files: [],
+    totalMatches: 0,
+    truncated: false
+  };
+}
+
+function parseRipgrepJson(stdout, cwd, pattern, normalizedOptions) {
+  const result = createBaseGrepResult(pattern, cwd, normalizedOptions.resultMode);
+  const filesWithMatches = new Set();
+  let summaryMatches = null;
 
   for (const line of stdout.split(/\r?\n/)) {
     if (!line.trim()) continue;
+
     let event;
     try {
       event = JSON.parse(line);
@@ -434,58 +599,119 @@ function parseRipgrepJson(stdout, cwd, pattern) {
       continue;
     }
 
-    const data = event.data || {};
-    const filePath = data.path?.text ? path.resolve(cwd, data.path.text) : null;
-    if (!filePath || !data.line_number) continue;
+    if (event.type === 'summary') {
+      const matches = event.data?.stats?.matches;
+      if (Number.isInteger(matches)) {
+        summaryMatches = matches;
+      }
+      continue;
+    }
 
-    const entry = {
-      filePath,
-      lineNumber: data.line_number,
-      line: stripTrailingLineEnding(data.lines?.text || '')
-    };
+    const data = event.data || {};
+    const lineNumber = Number.isInteger(data.line_number) ? data.line_number : null;
+    const filePathText = parseTextOrBytes(data.path);
+    const filePath = filePathText ? path.resolve(cwd, filePathText) : null;
 
     if (event.type === 'match') {
-      matches.push({
-        ...entry,
-        submatches: (data.submatches || []).map(match => ({
-          text: match.match?.text || '',
+      if (!filePath) continue;
+      filesWithMatches.add(filePath);
+
+      const submatches = Array.isArray(data.submatches)
+        ? data.submatches.map(match => ({
+          text: parseTextOrBytes(match.match),
           start: match.start,
           end: match.end
         }))
+        : [];
+
+      const lineText = stripTrailingLineEnding(parseTextOrBytes(data.lines));
+      const matchIncrement = submatches.length || 1;
+      result.totalMatches += matchIncrement;
+
+      if (normalizedOptions.resultMode === 'matches') {
+        result.matches.push({
+          filePath,
+          lineNumber,
+          line: lineText,
+          submatches
+        });
+      }
+      continue;
+    }
+
+    if (event.type === 'context' && normalizedOptions.resultMode === 'matches') {
+      if (!filePath || !lineNumber) continue;
+      result.context.push({
+        filePath,
+        lineNumber,
+        line: stripTrailingLineEnding(parseTextOrBytes(data.lines))
       });
-    } else if (event.type === 'context') {
-      context.push(entry);
     }
   }
 
-  return {
-    type: 'ux_grep_search_result',
-    pattern,
-    dirPath: cwd,
-    matchCount: matches.length,
-    matches,
-    context,
-    truncated: false
-  };
+  result.files = Array.from(filesWithMatches);
+
+  if (summaryMatches !== null) {
+    result.totalMatches = summaryMatches;
+  }
+
+  if (normalizedOptions.resultMode === 'matches') {
+    result.matchCount = result.matches.length;
+  } else if (normalizedOptions.resultMode === 'files') {
+    result.matchCount = result.files.length;
+    result.matches = [];
+    result.context = [];
+  } else {
+    result.matchCount = result.totalMatches;
+    result.matches = [];
+    result.context = [];
+  }
+
+  return result;
 }
 
 function limitGrepResult(result, maxBytes) {
   let limited = result;
   if (utf8Bytes(JSON.stringify(limited)) <= maxBytes) return limited;
 
-  limited = { ...result, matches: [...result.matches], context: [...result.context], truncated: true, maxOutputBytes: maxBytes };
+  limited = {
+    ...result,
+    matches: [...result.matches],
+    context: [...result.context],
+    files: [...result.files],
+    truncated: true,
+    maxOutputBytes: maxBytes
+  };
+
   while (limited.context.length && utf8Bytes(JSON.stringify(limited)) > maxBytes) {
     limited.context.pop();
   }
   while (limited.matches.length && utf8Bytes(JSON.stringify(limited)) > maxBytes) {
     limited.matches.pop();
   }
-  limited.matchCount = limited.matches.length;
+  while (limited.files.length && utf8Bytes(JSON.stringify(limited)) > maxBytes) {
+    limited.files.pop();
+  }
+
+  if (limited.resultMode === 'matches') {
+    limited.matchCount = limited.matches.length;
+  } else if (limited.resultMode === 'files') {
+    limited.matchCount = limited.files.length;
+    limited.matches = [];
+    limited.context = [];
+  } else {
+    limited.matchCount = limited.totalMatches;
+    limited.matches = [];
+    limited.context = [];
+  }
 
   if (utf8Bytes(JSON.stringify(limited)) > maxBytes) {
     limited.matches = [];
     limited.context = [];
-    limited.matchCount = 0;
+    limited.files = [];
+    if (limited.resultMode === 'matches' || limited.resultMode === 'files') {
+      limited.matchCount = 0;
+    }
   }
 
   return limited;
@@ -499,18 +725,18 @@ export async function grepSearch(pattern, dirPath, options = {}) {
       reject(err);
       return;
     }
+
+    let normalizedOptions;
+    try {
+      normalizedOptions = normalizeGrepOptions(options);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
     const config = getIoMcpConfig();
     const cwd = dirPath ? resolveAllowedPath(dirPath, 'dir_path') : resolveAllowedPath(process.cwd(), 'dir_path');
-    const args = [];
-
-    if (!options.caseSensitive) args.push('-i');
-    if (options.context) args.push(`-C${Math.max(0, Number.parseInt(options.context, 10) || 0)}`);
-    if (options.fixedStrings) args.push('-F');
-
-    args.push('--json');
-    args.push('--');
-    args.push(pattern);
-    args.push('.');
+    const args = buildRipgrepArgs(pattern, normalizedOptions);
 
     const child = spawn(rgPath, args, { cwd });
     let stdout = '';
@@ -518,7 +744,7 @@ export async function grepSearch(pattern, dirPath, options = {}) {
     let settled = false;
 
     const cleanupAbort = () => {
-      options.abortSignal?.removeEventListener?.('abort', abortHandler);
+      normalizedOptions.abortSignal?.removeEventListener?.('abort', abortHandler);
     };
     const finish = (fn, value) => {
       if (settled) return;
@@ -531,18 +757,19 @@ export async function grepSearch(pattern, dirPath, options = {}) {
       finish(reject, new Error('ux_grep_search aborted'));
     };
 
-    if (options.abortSignal?.aborted) {
+    if (normalizedOptions.abortSignal?.aborted) {
       abortHandler();
       return;
     }
-    options.abortSignal?.addEventListener?.('abort', abortHandler, { once: true });
+    normalizedOptions.abortSignal?.addEventListener?.('abort', abortHandler, { once: true });
 
     child.stdout.on('data', data => { stdout += data.toString(); });
     child.stderr.on('data', data => { stderr += data.toString(); });
     child.on('error', err => finish(reject, err));
     child.on('close', code => {
       if (code === 0 || code === 1) {
-        finish(resolve, limitGrepResult(parseRipgrepJson(stdout, cwd, pattern), config.maxOutputBytes));
+        const parsed = parseRipgrepJson(stdout, cwd, pattern, normalizedOptions);
+        finish(resolve, limitGrepResult(parsed, config.maxOutputBytes));
       } else {
         finish(reject, new Error(`ripgrep failed with code ${code}: ${stderr}`));
       }

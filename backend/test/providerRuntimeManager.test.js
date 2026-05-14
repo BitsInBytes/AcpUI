@@ -4,11 +4,13 @@ const { mockDefaultClient, mockAcpClientInstance, mockProvider, mockLogger, mock
   mockDefaultClient: {
     setProviderId: vi.fn(),
     init: vi.fn(),
+    stop: vi.fn().mockResolvedValue(),
     isHandshakeComplete: false
   },
   mockAcpClientInstance: {
     setProviderId: vi.fn(),
     init: vi.fn(),
+    stop: vi.fn().mockResolvedValue(),
     isHandshakeComplete: true
   },
   mockProvider: {
@@ -151,6 +153,20 @@ describe('providerRuntimeManager', () => {
 
     expect(mockDefaultClient.init).toHaveBeenCalledTimes(1);
     expect(mockLogger.writeLog).toHaveBeenCalledWith(expect.stringContaining('Init ignored'));
+  });
+
+  it('stops all runtimes and allows initialization again', async () => {
+    const io = { emit: vi.fn() };
+    providerRuntimeManager.init(io, 'boot-1');
+
+    await providerRuntimeManager.stopAll();
+
+    expect(mockDefaultClient.stop).toHaveBeenCalled();
+    expect(mockAcpClientInstance.stop).toHaveBeenCalled();
+    expect(providerRuntimeManager.getRuntimes()).toEqual([]);
+
+    providerRuntimeManager.init(io, 'boot-2');
+    expect(mockDefaultClient.init).toHaveBeenCalledTimes(2);
   });
 
   it('getRuntime returns the correct runtime', () => {

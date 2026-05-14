@@ -459,7 +459,7 @@ File: `frontend/src/components/FolderItem.tsx` (Function: `renderForkTree`)
 File: `frontend/src/components/SessionItem.tsx` (Component: `SessionItem`)
 File: `frontend/src/components/ChatInput/ChatInput.tsx` (Component: `ChatInput`)
 
-`AssistantMessage` scans the message timeline for `ux_invoke_subagents` and `ux_invoke_counsel` tool steps with an `invocationId`, then renders `SubAgentPanel` inside `.sub-agent-pinned-panels` at the bottom of the assistant response bubble. This keeps the orchestration visible even when later parent text or tool calls appear after the spawn tool. `ToolStep` still identifies sub-agent start tools so successful instructional MCP output is hidden; failed start output still renders for diagnosis. `ux_check_subagents` and `ux_abort_subagents` remain ordinary output-only status/result tools. `AssistantMessage` and `useStreamStore` keep an active sub-agent orchestration ToolStep expanded until all agents are terminal, unless the user manually collapses it. The pinned panel auto-collapses after the invocation reaches a terminal state unless the user manually toggles it.
+`AssistantMessage` scans the message timeline for `ux_invoke_subagents` and `ux_invoke_counsel` tool steps with an `invocationId`, then renders `SubAgentPanel` inside `.sub-agent-pinned-panels` at the bottom of the assistant response bubble. This keeps the orchestration visible even when later parent text or tool calls appear after the spawn tool. `ToolStep` still identifies sub-agent start tools so successful instructional MCP output is hidden; failed start output still renders for diagnosis. `ux_check_subagents` and `ux_abort_subagents` remain ordinary output-only status/result tools. `AssistantMessage` and `useStreamStore` keep an active sub-agent orchestration ToolStep expanded until all agents are terminal, unless the user manually collapses it. The pinned panel stays open while agents are observed active, auto-collapses after live terminal completion unless the user manually toggles it, and renders already-terminal invocations collapsed when terminal agents hydrate during chat load.
 
 ```typescript
 // FILE: frontend/src/components/AssistantMessage.tsx (Component: AssistantMessage)
@@ -965,6 +965,8 @@ model/current_model_id/model_options_json = resolved model state
 
 - `frontend/src/test/ChatMessage.test.tsx`
   - `pins active sub-agent orchestration to the bottom after later parent work`
+  - `auto-collapses bottom-pinned sub-agent orchestration two seconds after completion`
+  - `keeps completed bottom-pinned sub-agent orchestration collapsed when terminal agents hydrate after render`
   - `keeps active sub-agent orchestration expanded after remount`
 
 - `frontend/src/test/useStreamStore.test.ts`
@@ -1035,5 +1037,5 @@ model/current_model_id/model_options_json = resolved model state
 - `invocationId` is the critical rendering contract that ties a parent ToolStep, the bottom-pinned `SubAgentPanel`, and status calls to the exact batch of agents they reference.
 - Sidebar chat sessions are created lazily on the first token or tool event and are read-only once selected.
 - Permission requests from sub-agents render in `SubAgentPanel` and are answered through the provider runtime's permission manager.
-- Active orchestration ToolSteps stay expanded until every agent is terminal unless the user manually collapses them; the panel Stop action emits `cancel_subagents`.
+- Active orchestration ToolSteps stay expanded until every agent is terminal unless the user manually collapses them; bottom-pinned panels stay open for observed live activity and load already-terminal invocations collapsed; the panel Stop action emits `cancel_subagents`.
 - Changing this feature requires updating backend MCP tests, manager tests, socket tests, frontend hook tests, store tests, and component rendering tests that cover the same contract.

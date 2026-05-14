@@ -262,7 +262,7 @@ Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message ti
 - File: `frontend/src/store/useSubAgentStore.ts` (Actions: `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent`)
 - File: `frontend/src/components/SubAgentPanel.tsx` (Component: `SubAgentPanel`, Prop: `invocationId`, Handler: `handleStop`)
 
-`sub_agent_started` stores agent metadata and stamps `invocationId` onto the in-progress `ux_invoke_subagents` or `ux_invoke_counsel` tool step. `AssistantMessage` finds those stamped timeline steps and passes each `invocationId` to a bottom-pinned `SubAgentPanel`, which filters visible agents to the invocation that created the panel. The start tools hide successful instructional output in the timeline; `ux_check_subagents` and `ux_abort_subagents` keep normal output rendering for status and results. Active invocation state also prevents automatic collapse of the orchestration step until every agent is terminal unless the user manually collapses it. The bottom-pinned panel auto-collapses after the invocation reaches a terminal state unless the user manually toggles the panel.
+`sub_agent_started` stores agent metadata and stamps `invocationId` onto the in-progress `ux_invoke_subagents` or `ux_invoke_counsel` tool step. `AssistantMessage` finds those stamped timeline steps and passes each `invocationId` to a bottom-pinned `SubAgentPanel`, which filters visible agents to the invocation that created the panel. The start tools hide successful instructional output in the timeline; `ux_check_subagents` and `ux_abort_subagents` keep normal output rendering for status and results. Active invocation state also prevents automatic collapse of the orchestration step until every agent is terminal unless the user manually collapses it. The bottom-pinned panel stays open for live active agents, auto-collapses after live terminal completion unless the user manually toggles it, and renders already-terminal invocations collapsed immediately when terminal agent state hydrates during chat load.
 
 16. Message rendering flows through message-list components
 - File: `frontend/src/components/MessageList/MessageList.tsx` (Component: `MessageList`)
@@ -525,7 +525,7 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 2. ANSI terminal output with terminal-control cleanup.
 3. Shell JSON objects containing `stdout` or `stderr`.
 4. Structured `web_fetch_result` JSON.
-5. Structured `ux_grep_search_result` JSON.
+5. Structured `ux_grep_search_result` JSON, including match rows, file-only rows, and count-only summaries.
 6. File-read syntax highlighting by extension from `filePath` with optional displayed line numbers.
 7. Generic JSON pretty print.
 8. Plain `<pre>` output.
@@ -623,9 +623,9 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
    - How to avoid it: pass `acpSessionId` from `AssistantMessage` to `handleRespondPermission`.
 
 10. Sub-agent panels filter by invocation ID and active panels stay visible.
-    - What goes wrong: a response bubble displays agents from another invocation, the panel stays attached to an early tool call and gets lost below later work, or the live orchestration step collapses while agents are still running.
-    - Why it happens: `SubAgentPanel` filters by `invocationId`, `useChatManager` stamps that field onto the in-progress tool step, `AssistantMessage` pins matching panels at the response bottom, and collapse policy checks `useSubAgentStore.isInvocationActive`.
-    - How to avoid it: keep `sub_agent_started` invocation stamping, keep `AssistantMessage.getPinnedSubAgentInvocationIds` aligned with sub-agent tool identities, and preserve the active-invocation collapse guard.
+    - What goes wrong: a response bubble displays agents from another invocation, the panel stays attached to an early tool call and gets lost below later work, the live orchestration step collapses while agents are still running, or a completed historical panel flashes open before collapsing.
+    - Why it happens: `SubAgentPanel` filters by `invocationId`, `useChatManager` stamps that field onto the in-progress tool step, `AssistantMessage` pins matching panels at the response bottom, collapse policy checks `useSubAgentStore.isInvocationActive`, and `PinnedSubAgentPanel` separates observed live activity from already-terminal hydration.
+    - How to avoid it: keep `sub_agent_started` invocation stamping, keep `AssistantMessage.getPinnedSubAgentInvocationIds` aligned with sub-agent tool identities, preserve the active-invocation collapse guard, and keep terminal hydration collapsed until the user explicitly opens it.
 
 ---
 
@@ -720,6 +720,8 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `respects explicit thought collapse state from the streaming timeline`
   - `keeps only the last 3 tool calls and last 3 thought bubbles expanded while streaming`
   - `pins active sub-agent orchestration to the bottom after later parent work`
+  - `auto-collapses bottom-pinned sub-agent orchestration two seconds after completion`
+  - `keeps completed bottom-pinned sub-agent orchestration collapsed when terminal agents hydrate after render`
   - `keeps active sub-agent orchestration expanded after remount`
   - `renders response dividers`
   - `respects manual toggle during timeline updates while streaming`
@@ -776,6 +778,7 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `handles empty or null output`
   - `renders structured web fetch output`
   - `renders structured grep search output`
+  - `renders structured grep file and count result modes`
 - `frontend/src/test/renderToolOutput-ansi.test.tsx`
   - `renders ANSI colored output as HTML with color spans`
   - `strips terminal noise (cursor, window title) but keeps colors`

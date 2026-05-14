@@ -1,15 +1,16 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import request from 'supertest';
-import { app, httpServer, startServer } from '../server.js';
+import { app, httpServer, io, shutdownServer, startServer } from '../server.js';
 import providerRuntimeManager from '../services/providerRuntimeManager.js';
+import { stopSTTServer } from '../voiceService.js';
 
 // Mock dependencies
 vi.mock('../services/logger.js', () => ({ writeLog: vi.fn(), setIo: vi.fn() }));
 vi.mock('../services/providerRuntimeManager.js', () => ({
-  default: { init: vi.fn() },
-  providerRuntimeManager: { init: vi.fn() }
+  default: { init: vi.fn(), stopAll: vi.fn().mockResolvedValue() },
+  providerRuntimeManager: { init: vi.fn(), stopAll: vi.fn().mockResolvedValue() }
 }));
-vi.mock('../voiceService.js', () => ({ startSTTServer: vi.fn() }));
+vi.mock('../voiceService.js', () => ({ startSTTServer: vi.fn(), stopSTTServer: vi.fn() }));
 vi.mock('../sockets/index.js', () => ({ default: vi.fn() }));
 
 describe('Server Coverage Boost', () => {
@@ -20,6 +21,23 @@ describe('Server Coverage Boost', () => {
     });
     startServer();
     expect(listenSpy).toHaveBeenCalled();
+  });
+
+  it('shutdownServer stops provider runtimes, voice, and Socket.IO', async () => {
+    const ioCloseSpy = vi.spyOn(io, 'close').mockImplementation((callback) => {
+      if (typeof callback === 'function') callback();
+      return io;
+    });
+
+    try {
+      await shutdownServer({ signal: 'test-shutdown' });
+
+      expect(providerRuntimeManager.stopAll).toHaveBeenCalled();
+      expect(stopSTTServer).toHaveBeenCalled();
+      expect(ioCloseSpy).toHaveBeenCalled();
+    } finally {
+      ioCloseSpy.mockRestore();
+    }
   });
 
   it('should exercise CORS origin logic', async () => {

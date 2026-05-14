@@ -1,5 +1,5 @@
 import React from 'react';
-import { Terminal, Menu, Settings, FolderOpen } from 'lucide-react';
+import { Terminal, Menu, Settings, FolderOpen, CircleHelp } from 'lucide-react';
 import StatusIndicator from '../Status/StatusIndicator';
 import './ChatHeader.css';
 import { useSessionLifecycleStore } from '../../store/useSessionLifecycleStore';
@@ -58,6 +58,13 @@ const ChatHeader: React.FC = () => {
             title="File Explorer"
           >
             <FolderOpen size={18} />
+          </button>
+          <button
+            onClick={() => useUIStore.getState().setHelpDocsOpen(true)}
+            className="icon-button"
+            title="Help"
+          >
+            <CircleHelp size={18} />
           </button>
           <button
             onClick={() => useUIStore.getState().setSystemSettingsOpen(true)}

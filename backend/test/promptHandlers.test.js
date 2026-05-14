@@ -165,7 +165,7 @@ describe('Prompt Handlers', () => {
     expect(runHooks).not.toHaveBeenCalledWith(expect.anything(), 'stop', expect.anything(), expect.anything());
   });
 
-  it('should store userPrompt on metadata for first prompt', async () => {
+  it('should store userPrompt and title prompt history on metadata for first prompt', async () => {
     mockAcpClient.sessionMetadata.set('sess-1', { model: 'test-balanced', promptCount: 0, lastResponseBuffer: '', lastThoughtBuffer: '' });
     mockAcpClient.transport.sendRequest.mockResolvedValue({ success: true });
 
@@ -174,10 +174,11 @@ describe('Prompt Handlers', () => {
 
     const meta = mockAcpClient.sessionMetadata.get('sess-1');
     expect(meta.userPrompt).toBe('Explain quantum computing');
+    expect(meta.titlePromptHistory).toEqual(['Explain quantum computing']);
     expect(meta.promptCount).toBe(1);
   });
 
-  it('should not store userPrompt on subsequent prompts', async () => {
+  it('should keep userPrompt and append title prompt history on subsequent prompts', async () => {
     mockAcpClient.sessionMetadata.set('sess-1', { model: 'test-balanced', promptCount: 1, userPrompt: 'first', lastResponseBuffer: '', lastThoughtBuffer: '' });
     mockAcpClient.transport.sendRequest.mockResolvedValue({ success: true });
 
@@ -186,6 +187,69 @@ describe('Prompt Handlers', () => {
 
     const meta = mockAcpClient.sessionMetadata.get('sess-1');
     expect(meta.userPrompt).toBe('first');
+    expect(meta.titlePromptHistory).toEqual(['first', 'second message']);
+    expect(meta.promptCount).toBe(2);
+  });
+
+  it('should keep only the last two title prompts', async () => {
+    mockAcpClient.sessionMetadata.set('sess-1', {
+      model: 'test-balanced',
+      promptCount: 2,
+      userPrompt: 'first',
+      titlePromptHistory: ['first', 'second'],
+      lastResponseBuffer: '',
+      lastThoughtBuffer: ''
+    });
+    mockAcpClient.transport.sendRequest.mockResolvedValue({ success: true });
+
+    const handler = mockSocket.listeners('prompt')[0];
+    await handler({ uiId: 'ui-1', sessionId: 'sess-1', prompt: 'third message', model: 'test-balanced' });
+
+    const meta = mockAcpClient.sessionMetadata.get('sess-1');
+    expect(meta.titlePromptHistory).toEqual(['second', 'third message']);
+    expect(meta.promptCount).toBe(3);
+  });
+
+  it('should not append blank prompts to title prompt history', async () => {
+    mockAcpClient.sessionMetadata.set('sess-blank', {
+      model: 'test-balanced',
+      promptCount: 1,
+      userPrompt: 'first',
+      titlePromptHistory: ['first'],
+      lastResponseBuffer: '',
+      lastThoughtBuffer: ''
+    });
+    mockAcpClient.transport.sendRequest.mockResolvedValue({ success: true });
+
+    const handler = mockSocket.listeners('prompt')[0];
+    await handler({ uiId: 'ui-blank', sessionId: 'sess-blank', prompt: '   ', model: 'test-balanced' });
+
+    const meta = mockAcpClient.sessionMetadata.get('sess-blank');
+    expect(meta.titlePromptHistory).toEqual(['first']);
+    expect(meta.promptCount).toBe(2);
+  });
+
+  it('should not mutate title prompt history for array prompt parts', async () => {
+    mockAcpClient.sessionMetadata.set('sess-array-title', {
+      model: 'test-balanced',
+      promptCount: 1,
+      userPrompt: 'first',
+      titlePromptHistory: ['first'],
+      lastResponseBuffer: '',
+      lastThoughtBuffer: ''
+    });
+    mockAcpClient.transport.sendRequest.mockResolvedValue({ success: true });
+
+    const handler = mockSocket.listeners('prompt')[0];
+    await handler({
+      uiId: 'ui-array-title',
+      sessionId: 'sess-array-title',
+      prompt: [{ type: 'text', text: 'array prompt text' }],
+      model: 'test-balanced'
+    });
+
+    const meta = mockAcpClient.sessionMetadata.get('sess-array-title');
+    expect(meta.titlePromptHistory).toEqual(['first']);
     expect(meta.promptCount).toBe(2);
   });
 

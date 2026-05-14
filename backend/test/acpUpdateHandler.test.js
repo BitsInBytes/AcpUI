@@ -75,6 +75,7 @@ describe('acpUpdateHandler', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.ALWAYS_RENAME_CHATS;
     toolCallState.clear();
     client = makeClient();
     client.sessionMetadata.set(sid, { toolCalls: 0, usedTokens: 0 });
@@ -534,6 +535,30 @@ describe('acpUpdateHandler', () => {
     await handleUpdate(client, sid, update);
     expect(client.generateTitle).toHaveBeenCalledWith(sid, meta);
     expect(meta.titleGenerated).toBe(true);
+    expect(meta.lastTitleGeneratedPromptCount).toBe(1);
+  });
+
+  it('fires progressive title generation on later prompts when enabled', async () => {
+    process.env.ALWAYS_RENAME_CHATS = 'true';
+    const meta = client.sessionMetadata.get(sid);
+    meta.promptCount = 2;
+    meta.titleGenerated = true;
+    meta.lastTitleGeneratedPromptCount = 1;
+    const update = { sessionUpdate: 'agent_message_chunk', content: { text: 'Second chunk' } };
+    await handleUpdate(client, sid, update);
+    expect(client.generateTitle).toHaveBeenCalledWith(sid, meta);
+    expect(meta.lastTitleGeneratedPromptCount).toBe(2);
+  });
+
+  it('does not fire progressive title generation on later prompts when disabled', async () => {
+    const meta = client.sessionMetadata.get(sid);
+    meta.promptCount = 2;
+    meta.titleGenerated = true;
+    meta.lastTitleGeneratedPromptCount = 1;
+    const update = { sessionUpdate: 'agent_message_chunk', content: { text: 'Second chunk' } };
+    await handleUpdate(client, sid, update);
+    expect(client.generateTitle).not.toHaveBeenCalled();
+    expect(meta.lastTitleGeneratedPromptCount).toBe(1);
   });
 
   it('restores tool title from cache if missing in update', async () => {

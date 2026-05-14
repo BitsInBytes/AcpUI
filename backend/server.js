@@ -78,7 +78,7 @@ const io = new Server(httpServer, {
   maxHttpBufferSize: 100 * 1024 * 1024
 });
 
-import { startSTTServer } from './voiceService.js';
+import { startSTTServer, stopSTTServer } from './voiceService.js';
 
 // Global error handlers
 process.on('unhandledRejection', (reason, promise) => {
@@ -98,8 +98,33 @@ startSTTServer();
 registerSocketHandlers(io);
 
 const PORT = process.env.BACKEND_PORT || 3005;
+let isShuttingDown = false;
+
+export async function shutdownServer({ signal = 'shutdown', exit = false } = {}) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  writeLog(`[SERVER] ${signal} received; shutting down backend runtime.`);
+
+  await providerRuntimeManager.stopAll?.();
+  stopSTTServer();
+
+  await new Promise((resolve) => {
+    io.close(() => {
+      if (!httpServer.listening) {
+        resolve();
+        return;
+      }
+      httpServer.close(() => resolve());
+    });
+  });
+
+  writeLog('[SERVER] Backend shutdown complete.');
+  if (!exit) isShuttingDown = false;
+  if (exit) process.exit(0);
+}
 
 export function startServer() {
+  isShuttingDown = false;
   httpServer.listen(PORT, '0.0.0.0', () => {
     writeLog(`Backend server listening on https://localhost:${PORT} and https://0.0.0.0:${PORT}`);
     // Init ACP after server is listening so MCP API is reachable by the stdio proxy
@@ -111,6 +136,8 @@ export function startServer() {
 // Only start if this file is run directly AND not in test environment
 const expectedUrl = pathToFileURL(__filename).href;
 if (import.meta.url === expectedUrl && !process.env.VITEST) {
+  process.once('SIGINT', () => shutdownServer({ signal: 'SIGINT', exit: true }));
+  process.once('SIGTERM', () => shutdownServer({ signal: 'SIGTERM', exit: true }));
   startServer();
 }
 

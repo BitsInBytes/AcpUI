@@ -20,6 +20,7 @@ vi.mock('../components/SessionSettingsModal', () => ({ default: () => null }));
 vi.mock('../components/SystemSettingsModal', () => ({ default: () => null }));
 vi.mock('../components/NotesModal', () => ({ default: () => null }));
 vi.mock('../components/FileExplorer', () => ({ default: () => null }));
+vi.mock('../components/HelpDocsModal', () => ({ default: () => null }));
 vi.mock('../components/CanvasPane/CanvasPane', () => ({ default: () => <div data-testid="canvas-pane">Canvas</div> }));
 
 vi.mock('../hooks/useSocket', () => ({

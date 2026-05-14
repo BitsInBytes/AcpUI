@@ -17,6 +17,18 @@ function contextUsagePercentageFromTokens(usedValue, totalValue) {
   return Math.max(0, Math.min(100, (used / total) * 100));
 }
 
+function shouldGenerateTitle(meta) {
+  if (!meta || meta.isSubAgent) return false;
+
+  const promptCount = Number(meta.promptCount || 0);
+  if (promptCount < 1) return false;
+
+  const generatedPromptCount = Number(meta.lastTitleGeneratedPromptCount || (meta.titleGenerated ? 1 : 0));
+  if (generatedPromptCount >= promptCount) return false;
+
+  return promptCount === 1 || process.env.ALWAYS_RENAME_CHATS === 'true';
+}
+
 /**
  * Routes ACP session/update events to the UI via socket.io.
  * Handles two bypass paths: draining sessions (swallow all chunks) and
@@ -127,10 +139,11 @@ export async function handleUpdate(acpClient, sessionId, update) {
       } else {
         acpClient.io.to('session:' + sessionId).emit('token', { providerId, sessionId, text });
 
-        // Title generation fires on first response chunk (not prompt submission)
-        // so we know the model is actually responding — avoids titling failed/empty sessions.
-        if (meta && meta.promptCount === 1 && !meta.titleGenerated && !meta.isSubAgent) {
+        // Title generation fires on response chunks so failed/empty prompts are not titled.
+        // With ALWAYS_RENAME_CHATS=true, it can run once for each prompt.
+        if (shouldGenerateTitle(meta)) {
           meta.titleGenerated = true;
+          meta.lastTitleGeneratedPromptCount = Number(meta.promptCount || 0);
           acpClient.generateTitle(sessionId, meta).catch(err => writeLog(`[TITLE ERR] ${err.message}`));
         }
       }

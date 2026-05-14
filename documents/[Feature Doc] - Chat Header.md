@@ -11,8 +11,8 @@ This feature is easy to regress because it composes state from `useSessionLifecy
 - Resolves the active `ChatSession` from `useSessionLifecycleStore.sessions` and `useSessionLifecycleStore.activeSessionId`.
 - Builds the session title from provider metadata, optional sub-agent suffix, session name, and optional workspace label.
 - Uses `useSystemStore.getBranding(activeSession?.provider)` for fallback header branding when the component is mounted without an active session name.
-- Suppresses sidebar, file explorer, and system settings controls when `window.location.search` contains the `popout` query key.
-- Dispatches only shallow UI actions: `setSidebarOpen(true)`, `setFileExplorerOpen(true)`, and `setSystemSettingsOpen(true)`.
+- Suppresses sidebar, file explorer, help docs, and system settings controls when `window.location.search` contains the `popout` query key.
+- Dispatches only shallow UI actions: `setSidebarOpen(true)`, `setFileExplorerOpen(true)`, `setHelpDocsOpen(true)`, and `setSystemSettingsOpen(true)`.
 - Relies on socket-hydrated provider, branding, readiness, and workspace state rather than hardcoded provider labels.
 
 ### Why This Matters
@@ -279,7 +279,7 @@ Sub-agent status is a display suffix derived from `ChatSession.isSubAgent`. Work
 11. Header buttons dispatch UI store toggles and are hidden in pop-out mode.
 
 ```tsx
-// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Component: ChatHeader, Store actions: setSidebarOpen, setFileExplorerOpen, setSystemSettingsOpen)
+// FILE: frontend/src/components/ChatHeader/ChatHeader.tsx (Component: ChatHeader, Store actions: setSidebarOpen, setFileExplorerOpen, setHelpDocsOpen, setSystemSettingsOpen)
 {!isPopout && (
   <button onClick={() => setSidebarOpen(true)} className="mobile-header-menu-btn" title="Open Sidebar">
     <Menu size={20} />
@@ -291,6 +291,9 @@ Sub-agent status is a display suffix derived from `ChatSession.isSubAgent`. Work
     <button onClick={() => useUIStore.getState().setFileExplorerOpen(true)} className="icon-button" title="File Explorer">
       <FolderOpen size={18} />
     </button>
+    <button onClick={() => useUIStore.getState().setHelpDocsOpen(true)} className="icon-button" title="Help">
+      <CircleHelp size={18} />
+    </button>
     <button onClick={() => useUIStore.getState().setSystemSettingsOpen(true)} className="icon-button" title="System Settings">
       <Settings size={18} />
     </button>
@@ -298,7 +301,7 @@ Sub-agent status is a display suffix derived from `ChatSession.isSubAgent`. Work
 )}
 ```
 
-The header opens existing surfaces. `App` owns `SystemSettingsModal`, `NotesModal`, and `FileExplorer`; the header does not manage modal internals.
+The header opens existing surfaces. `App` owns `SystemSettingsModal`, `NotesModal`, `FileExplorer`, and `HelpDocsModal`; the header does not manage modal internals.
 
 ## Architecture Diagram
 
@@ -320,7 +323,7 @@ flowchart LR
   subgraph Stores
     SYS[useSystemStore\nprovidersById / branding / workspaceCwds\nconnected / isEngineReady]
     SES[useSessionLifecycleStore\nsessions / activeSessionId]
-    UI[useUIStore\nsetSidebarOpen\nsetFileExplorerOpen\nsetSystemSettingsOpen]
+    UI[useUIStore\nsetSidebarOpen\nsetFileExplorerOpen\nsetHelpDocsOpen\nsetSystemSettingsOpen]
   end
 
   subgraph Roots
@@ -359,7 +362,7 @@ The header depends on a three-store display contract plus a URL mode contract.
 - `ChatSession.provider` must match a `useSystemStore.providersById` key to render provider branding title or label.
 - `ChatSession.cwd` must exactly match `WorkspaceCwd.path` to render `WorkspaceCwd.label` in parentheses.
 - `useSystemStore.connected` and `useSystemStore.isEngineReady` must reflect socket and active/default provider readiness for `StatusIndicator`.
-- `useUIStore` must expose `setSidebarOpen`, `setFileExplorerOpen`, and `setSystemSettingsOpen` because the header dispatches those actions directly.
+- `useUIStore` must expose `setSidebarOpen`, `setFileExplorerOpen`, `setHelpDocsOpen`, and `setSystemSettingsOpen` because the header dispatches those actions directly.
 
 ### URL Mode Contract
 - `new URLSearchParams(window.location.search).has('popout')` is the only header-side pop-out check.
@@ -495,10 +498,10 @@ Fallback component path:  Engine Ready | ACP UI
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Header | `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, `StatusIndicator`, `setSidebarOpen`, `setFileExplorerOpen`, `setSystemSettingsOpen`, `popout` query key | Renders readiness, session title, workspace label, and header actions |
+| Header | `frontend/src/components/ChatHeader/ChatHeader.tsx` | `ChatHeader`, `StatusIndicator`, `setSidebarOpen`, `setFileExplorerOpen`, `setHelpDocsOpen`, `setSystemSettingsOpen`, `popout` query key | Renders readiness, session title, workspace label, and header actions |
 | Header styles | `frontend/src/components/ChatHeader/ChatHeader.css` | `.header`, `.header.disconnected`, `.header-session-name`, `.header-cwd-label`, `.mobile-header-menu-btn`, `.header-actions` | Layout, truncation, disconnected coloring, responsive sidebar button visibility |
 | Status | `frontend/src/components/Status/StatusIndicator.tsx` | `StatusIndicator`, props `connected`, `isEngineReady`, classes `ready`, `connected`, `disconnected` | Converts socket readiness into dot class and status text |
-| Main root | `frontend/src/App.tsx` | `App`, `ChatHeader`, `SystemSettingsModal`, `FileExplorer`, active-session conditional render | Mounts header for active sessions and owns the toggled modal surfaces |
+| Main root | `frontend/src/App.tsx` | `App`, `ChatHeader`, `SystemSettingsModal`, `FileExplorer`, `HelpDocsModal`, active-session conditional render | Mounts header for active sessions and owns the toggled modal surfaces |
 | Pop-out root | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `popoutSessionId`, `claimSession`, `load_sessions`, `watch_session`, `hydrateSession`, `ChatHeader` | Loads a single detached session and renders the same header with controls hidden |
 | Pop-out ownership | `frontend/src/lib/sessionOwnership.ts` | `openPopout`, `claimSession`, `releaseSession`, `isSessionPoppedOut`, `setOwnershipChangeCallback`, BroadcastChannel `acpui-session-ownership` | Coordinates session ownership across main and detached windows |
 
@@ -509,7 +512,7 @@ Fallback component path:  Engine Ready | ACP UI
 | Socket | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, listeners `connect`, `ready`, `workspace_cwds`, `providers`, `branding`, `disconnect` | Hydrates system state consumed by the header |
 | System store | `frontend/src/store/useSystemStore.ts` | `connected`, `isEngineReady`, `providersById`, `workspaceCwds`, `setProviders`, `setProviderReady`, `setProviderBranding`, `setWorkspaceCwds`, `getBranding` | Source of readiness, provider display data, and workspace labels |
 | Session store | `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId`, `setActiveSessionId`, `handleInitialLoad`, `handleSessionSelect`, `hydrateSession` | Source of active session identity and session path/provider fields |
-| UI store | `frontend/src/store/useUIStore.ts` | `setSidebarOpen`, `setSystemSettingsOpen`, `setFileExplorerOpen`, `isSidebarOpen`, `isSystemSettingsOpen`, `isFileExplorerOpen` | Header action target store |
+| UI store | `frontend/src/store/useUIStore.ts` | `setSidebarOpen`, `setSystemSettingsOpen`, `setFileExplorerOpen`, `setHelpDocsOpen`, `isSidebarOpen`, `isSystemSettingsOpen`, `isFileExplorerOpen`, `isHelpDocsOpen` | Header action target store |
 | Types | `frontend/src/types.ts` | `ProviderSummary`, `ProviderBranding`, `WorkspaceCwd`, `ChatSession` | Data contracts used by socket hydration and title rendering |
 
 ### Backend Inputs
@@ -525,10 +528,10 @@ Fallback component path:  Engine Ready | ACP UI
 
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Header component | `frontend/src/test/ChatHeader.test.tsx` | `renders provider title and session name correctly`, `handles "System Settings" button click`, `handles "File Explorer" button click`, `renders app header fallback if no active session`, `hides sidebar menu and action buttons in pop-out mode` | Verifies title fallback chain, UI actions, fallback title, and pop-out suppression |
+| Header component | `frontend/src/test/ChatHeader.test.tsx` | `renders provider title and session name correctly`, `handles "System Settings" button click`, `handles "File Explorer" button click`, `handles "Help" button click`, `renders app header fallback if no active session`, `hides sidebar menu and action buttons in pop-out mode` | Verifies title fallback chain, UI actions, fallback title, and pop-out suppression |
 | Socket hook | `frontend/src/test/useSocket.test.ts` | `handles "ready" event with providerId`, `handles "ready" event without providerId`, `handles "branding" event`, `handles "workspace_cwds" event`, `handles "providers" event`, `handles "disconnect" event` | Verifies socket events that populate header-facing system state |
 | System store | `frontend/src/test/useSystemStore.test.ts`, `frontend/src/test/useSystemStoreExtended.test.ts` | `setProviders calculates active provider and branding`, `setProviderBranding updates branding if provider is active`, `setProviderReady updates isEngineReady state`, `setProviderReady updates isEngineReady if it is the active provider` | Verifies provider branding and readiness state used by the header |
-| UI store | `frontend/src/test/useUIStore.test.ts` | `setSidebarOpen updates state`, `setNotesOpen and setFileExplorerOpen update state` | Verifies store actions used by header controls |
+| UI store | `frontend/src/test/useUIStore.test.ts` | `setSidebarOpen updates state`, `setNotesOpen, setFileExplorerOpen, and setHelpDocsOpen update state` | Verifies store actions used by header controls |
 | Main root | `frontend/src/test/App.test.tsx` | `renders Sidebar and ChatInput`, `switches between sessions and emits watch events`, `toggles sidebar when clicking bubble` | Verifies main root composition and active-session shell behavior around the header |
 | Pop-out root | `frontend/src/test/PopOutApp.test.tsx` | `renders ChatHeader and ChatInput when ready`, `does NOT render Sidebar`, `hydrates session and emits watch_session when ready`, `claims session ownership on mount` | Verifies detached root composition and pop-out session initialization |
 | Ownership | `frontend/src/test/sessionOwnership.test.ts` | `claimSession posts a claim message`, `releaseSession posts a release message`, `openPopout opens a new window`, `claim from another window marks session as popped out` | Verifies BroadcastChannel ownership and `/?popout=` URL creation |
@@ -555,9 +558,9 @@ Fallback component path:  Engine Ready | ACP UI
    - Why it happens: `ChatHeader` uses `workspace.path === activeSession.cwd` with no path normalization.
    - How to avoid it: keep `ChatSession.cwd` and `WorkspaceCwd.path` in the same path format.
 
-5. Header action handlers use `useUIStore.getState()` for two buttons.
-   - What goes wrong: tests that mock only hook return values miss file explorer and system settings behavior.
-   - Why it happens: the file explorer and system settings click handlers call the store singleton.
+5. Header action handlers use `useUIStore.getState()` for main-shell buttons.
+   - What goes wrong: tests that mock only hook return values miss file explorer, help docs, and system settings behavior.
+   - Why it happens: the file explorer, help docs, and system settings click handlers call the store singleton.
    - How to avoid it: assert store state changes or rendered modal effects in tests.
 
 6. Provider display text has a fixed fallback chain.
@@ -587,6 +590,7 @@ Fallback component path:  Engine Ready | ACP UI
   - `renders provider title and session name correctly`
   - `handles "System Settings" button click`
   - `handles "File Explorer" button click`
+  - `handles "Help" button click`
   - `renders app header fallback if no active session`
   - `hides sidebar menu and action buttons in pop-out mode`
 
@@ -607,7 +611,7 @@ Fallback component path:  Engine Ready | ACP UI
   - `setProviderReady updates isEngineReady if it is the active provider`
 - `frontend/src/test/useUIStore.test.ts`
   - `setSidebarOpen updates state`
-  - `setNotesOpen and setFileExplorerOpen update state`
+  - `setNotesOpen, setFileExplorerOpen, and setHelpDocsOpen update state`
 - `frontend/src/test/useSessionLifecycleStoreSync.test.ts`
   - `syncs activeSessionId to URL when isUrlSyncReady is true`
   - `does NOT sync to URL if isUrlSyncReady is false`

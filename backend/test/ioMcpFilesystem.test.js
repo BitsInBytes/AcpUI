@@ -87,6 +87,7 @@ describe('IO MCP filesystem helpers', () => {
         type: 'ux_grep_search_result',
         pattern: 'needle',
         dirPath: testDir,
+        resultMode: 'matches',
         matchCount: expect.any(Number),
         matches: expect.arrayContaining([
           expect.objectContaining({
@@ -96,6 +97,112 @@ describe('IO MCP filesystem helpers', () => {
           })
         ])
       }));
+    });
+
+    it('supports advanced grep options and result modes', async () => {
+      await createTestFile('grep/case.txt', 'Needle\nneedle\nword\nwording\n');
+      await createTestFile('grep/include.ts', 'token\n');
+      await createTestFile('grep/include.js', 'token\n');
+
+      const sensitive = await grepSearch('needle', testDir, {
+        fixedStrings: true,
+        caseMode: 'sensitive'
+      });
+      expect(sensitive.matchCount).toBeGreaterThanOrEqual(1);
+      expect(sensitive.matches.some(match => match.line === 'Needle')).toBe(false);
+
+      const insensitiveViaLegacy = await grepSearch('needle', testDir, {
+        fixedStrings: true,
+        caseSensitive: false
+      });
+      expect(insensitiveViaLegacy.matches.some(match => match.line === 'Needle')).toBe(true);
+
+      const wordMatches = await grepSearch('word', testDir, {
+        fixedStrings: true,
+        wordMatch: true
+      });
+      expect(wordMatches.matches.some(match => match.line === 'word')).toBe(true);
+      expect(wordMatches.matches.some(match => match.line === 'wording')).toBe(false);
+
+      const contextFromLegacy = await grepSearch('needle', testDir, {
+        fixedStrings: true,
+        context: 1
+      });
+      expect(contextFromLegacy.context.length).toBeGreaterThan(0);
+
+      const filesMode = await grepSearch('token', testDir, {
+        fixedStrings: true,
+        includeGlobs: ['**/*.{ts,js}'],
+        excludeGlobs: ['**/*.js'],
+        fileTypes: ['ts'],
+        resultMode: 'files'
+      });
+      expect(filesMode.resultMode).toBe('files');
+      expect(filesMode.matchCount).toBe(1);
+      expect(filesMode.files).toHaveLength(1);
+      expect(filesMode.files[0]).toContain('include.ts');
+      expect(filesMode.matches).toHaveLength(0);
+
+      const countMode = await grepSearch('needle', testDir, {
+        fixedStrings: true,
+        resultMode: 'count',
+        caseMode: 'insensitive'
+      });
+      expect(countMode.resultMode).toBe('count');
+      expect(countMode.matchCount).toBeGreaterThanOrEqual(2);
+      expect(countMode.matches).toHaveLength(0);
+
+      const limited = await grepSearch('needle', testDir, {
+        fixedStrings: true,
+        caseMode: 'insensitive',
+        maxMatches: 1
+      });
+      expect(limited.matches.filter(match => match.filePath.endsWith('case.txt'))).toHaveLength(1);
+    });
+
+    it('supports hidden and no-ignore grep controls', async () => {
+      const grepDir = path.join(testDir, 'grep-controls');
+      await createTestFile('grep-controls/.hidden.txt', 'hidden-token\n');
+      await createTestFile('grep-controls/ignored.txt', 'ignored-token\n');
+      await fs.writeFile(path.join(grepDir, '.ignore'), 'ignored.txt\n', 'utf8');
+
+      const hiddenDefault = await grepSearch('hidden-token', grepDir, { fixedStrings: true });
+      expect(hiddenDefault.matchCount).toBe(0);
+
+      const hiddenEnabled = await grepSearch('hidden-token', grepDir, { fixedStrings: true, hidden: true });
+      expect(hiddenEnabled.matches).toEqual(expect.arrayContaining([
+        expect.objectContaining({ filePath: expect.stringContaining('.hidden.txt') })
+      ]));
+
+      const ignoredDefault = await grepSearch('ignored-token', grepDir, { fixedStrings: true });
+      expect(ignoredDefault.matchCount).toBe(0);
+
+      const noIgnoreEnabled = await grepSearch('ignored-token', grepDir, { fixedStrings: true, noIgnore: true });
+      expect(noIgnoreEnabled.matches).toEqual(expect.arrayContaining([
+        expect.objectContaining({ filePath: expect.stringContaining('ignored.txt') })
+      ]));
+    });
+
+    it('rejects incompatible or unsafe advanced grep options', async () => {
+      await expect(grepSearch('needle', testDir, {
+        fixedStrings: true,
+        regexEngine: 'pcre2'
+      })).rejects.toThrow(/regex_engine/);
+
+      useMcpConfig({
+        tools: { io: true },
+        io: {
+          autoAllowWorkspaceCwd: false,
+          allowedRoots: [testDir],
+          maxReadBytes: 1024,
+          maxWriteBytes: 1024,
+          maxReplaceBytes: 1024,
+          maxOutputBytes: 1024
+        }
+      });
+
+      await expect(grepSearch('needle', testDir, { followSymlinks: true }))
+        .rejects.toThrow(/follow_symlinks/);
     });
 
     it('blocks file access outside configured allowed roots', async () => {
@@ -139,6 +246,14 @@ describe('IO MCP filesystem helpers', () => {
         await fs.writeFile(outsideFile, 'allowed', 'utf8');
 
         await expect(readFile(outsideFile)).resolves.toBe('allowed');
+
+        const grepResult = await grepSearch('allowed', outsideDir, {
+          fixedStrings: true,
+          followSymlinks: true
+        });
+        expect(grepResult.matches).toEqual(expect.arrayContaining([
+          expect.objectContaining({ filePath: outsideFile })
+        ]));
       } finally {
         await fs.rm(outsideDir, { recursive: true, force: true });
       }

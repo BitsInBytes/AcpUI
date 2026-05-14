@@ -74,9 +74,6 @@ function isTerminalSubAgentStatus(status?: string | null) {
 }
 
 const PinnedSubAgentPanel: React.FC<{ invocationId: string }> = ({ invocationId }) => {
-  const [isCollapsed, setIsCollapsed] = useState(false);
-  const manuallyToggledRef = useRef(false);
-  const autoCollapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const invocations = useSubAgentStore(state => state.invocations);
   const allAgents = useSubAgentStore(state => state.agents);
   const isInvocationActive = useSubAgentStore(state => state.isInvocationActive(invocationId));
@@ -94,6 +91,30 @@ const PinnedSubAgentPanel: React.FC<{ invocationId: string }> = ({ invocationId 
   const isTerminal = agents.length > 0
     && !isInvocationActive
     && (isTerminalSubAgentStatus(invocation?.status) || terminalCount === agents.length);
+  const [hasObservedActiveAgents, setHasObservedActiveAgents] = useState(() => agents.length > 0 && !isTerminal);
+  const [manuallyToggled, setManuallyToggled] = useState(false);
+  const autoCollapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shouldStartCollapsed = isTerminal && !hasObservedActiveAgents;
+  const [isCollapsed, setIsCollapsed] = useState(shouldStartCollapsed);
+  const shouldCollapseImmediately = isTerminal && !hasObservedActiveAgents && !manuallyToggled;
+  const effectiveCollapsed = isCollapsed || shouldCollapseImmediately;
+
+  useEffect(() => {
+    const unsubscribe = useSubAgentStore.subscribe(state => {
+      const scopedInvocation = state.invocations.find(inv => inv.invocationId === invocationId);
+      if (scopedInvocation && isTerminalSubAgentStatus(scopedInvocation.status)) return;
+
+      const hasActiveAgent = state.agents.some(agent =>
+        agent.invocationId === invocationId && !isTerminalSubAgentStatus(agent.status)
+      );
+      if (!hasActiveAgent && !scopedInvocation) return;
+
+      setHasObservedActiveAgents(true);
+      if (!manuallyToggled) setIsCollapsed(false);
+    });
+
+    return unsubscribe;
+  }, [invocationId, manuallyToggled]);
 
   useEffect(() => {
     if (autoCollapseTimerRef.current) {
@@ -101,14 +122,12 @@ const PinnedSubAgentPanel: React.FC<{ invocationId: string }> = ({ invocationId 
       autoCollapseTimerRef.current = null;
     }
 
-    if (!isTerminal) return;
+    if (!isTerminal || manuallyToggled || !hasObservedActiveAgents || isCollapsed) return;
 
-    if (!manuallyToggledRef.current && !isCollapsed) {
-      autoCollapseTimerRef.current = setTimeout(() => {
-        setIsCollapsed(true);
-        autoCollapseTimerRef.current = null;
-      }, PINNED_SUB_AGENT_AUTO_COLLAPSE_MS);
-    }
+    autoCollapseTimerRef.current = setTimeout(() => {
+      setIsCollapsed(true);
+      autoCollapseTimerRef.current = null;
+    }, PINNED_SUB_AGENT_AUTO_COLLAPSE_MS);
 
     return () => {
       if (autoCollapseTimerRef.current) {
@@ -116,15 +135,15 @@ const PinnedSubAgentPanel: React.FC<{ invocationId: string }> = ({ invocationId 
         autoCollapseTimerRef.current = null;
       }
     };
-  }, [isTerminal, isCollapsed]);
+  }, [hasObservedActiveAgents, isCollapsed, isTerminal, manuallyToggled]);
 
   const toggleCollapsed = () => {
-    manuallyToggledRef.current = true;
+    setManuallyToggled(true);
     if (autoCollapseTimerRef.current) {
       clearTimeout(autoCollapseTimerRef.current);
       autoCollapseTimerRef.current = null;
     }
-    setIsCollapsed(value => !value);
+    setIsCollapsed(!effectiveCollapsed);
   };
 
   if (agents.length === 0) return null;
@@ -133,7 +152,7 @@ const PinnedSubAgentPanel: React.FC<{ invocationId: string }> = ({ invocationId 
   const countText = agents.length > 0 ? `${terminalCount}/${agents.length}` : '';
 
   return (
-    <div className={`sub-agent-pinned-panel ${isCollapsed ? 'collapsed' : 'expanded'}`}>
+    <div className={`sub-agent-pinned-panel ${effectiveCollapsed ? 'collapsed' : 'expanded'}`}>
       <div className="sub-agent-pinned-header">
         <div className="sub-agent-pinned-heading">
           <span className="sub-agent-pinned-title">Subagents</span>
@@ -142,16 +161,16 @@ const PinnedSubAgentPanel: React.FC<{ invocationId: string }> = ({ invocationId 
         <button
           className="sub-agent-pinned-toggle"
           type="button"
-          aria-label={isCollapsed ? 'Show sub-agents' : 'Hide sub-agents'}
-          aria-expanded={!isCollapsed}
+          aria-label={effectiveCollapsed ? 'Show sub-agents' : 'Hide sub-agents'}
+          aria-expanded={!effectiveCollapsed}
           onClick={toggleCollapsed}
-          title={isCollapsed ? 'Show sub-agents' : 'Hide sub-agents'}
+          title={effectiveCollapsed ? 'Show sub-agents' : 'Hide sub-agents'}
         >
-          {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+          {effectiveCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
         </button>
       </div>
       <AnimatePresence initial={false}>
-        {!isCollapsed && (
+        {!effectiveCollapsed && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: 'auto', opacity: 1 }}

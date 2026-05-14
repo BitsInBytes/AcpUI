@@ -30,6 +30,53 @@ describe('providerToolNormalization', () => {
     }));
   });
 
+  it('preserves advanced grep search input keys from nested provider payloads', () => {
+    const input = inputFromToolUpdate({
+      rawInput: {
+        invocation: {
+          tool: 'ux_grep_search',
+          arguments: {
+            pattern: 'TODO',
+            case_mode: 'smart',
+            include_globs: ['src/**/*.ts'],
+            exclude_globs: ['dist/**'],
+            file_types: ['ts'],
+            before_context: 1,
+            after_context: 2,
+            max_matches: 3,
+            result_mode: 'files',
+            word_match: true,
+            multiline: true,
+            regex_engine: 'auto',
+            hidden: true,
+            no_ignore: true,
+            follow_symlinks: false,
+            fixed_strings: true
+          }
+        }
+      }
+    }, { deep: true });
+
+    expect(input).toEqual(expect.objectContaining({
+      pattern: 'TODO',
+      case_mode: 'smart',
+      include_globs: ['src/**/*.ts'],
+      exclude_globs: ['dist/**'],
+      file_types: ['ts'],
+      before_context: 1,
+      after_context: 2,
+      max_matches: 3,
+      result_mode: 'files',
+      word_match: true,
+      multiline: true,
+      regex_engine: 'auto',
+      hidden: true,
+      no_ignore: true,
+      follow_symlinks: false,
+      fixed_strings: true
+    }));
+  });
+
   it('builds input from Gemini-style args and JSON description fields', () => {
     const input = inputFromToolUpdate({
       args: { url: 'https://example.test/docs' },

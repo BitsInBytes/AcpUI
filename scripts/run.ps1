@@ -1,9 +1,15 @@
 ﻿# ACP UI start/restart script (Native)
-# Builds frontend first — if build fails, aborts to protect the running instance.
+# Production builds the frontend first; dev mode runs backend watch mode plus Vite HMR.
 # Usage: .\run.ps1        (production: backend serves built frontend)
-#        .\run.ps1 dev    (dev mode: backend + vite dev server with HMR)
+#        .\run.ps1 dev    (dev mode: backend hot reload + Vite HMR)
 
 param([string]$Mode = "prod")
+
+$Mode = $Mode.ToLowerInvariant()
+if ($Mode -notin @("prod", "dev")) {
+    Write-Host "Mode must be 'prod' or 'dev'."
+    exit 1
+}
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Split-Path -Parent $ScriptDir
@@ -50,6 +56,15 @@ function Reset-LogFile($path) {
     }
 }
 
+function Resolve-StartProcessCommand($name) {
+    $candidates = if ($env:OS -eq "Windows_NT") { @("$name.cmd", "$name.exe", $name) } else { @($name) }
+    foreach ($candidate in $candidates) {
+        $command = Get-Command $candidate -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($command) { return $command.Source }
+    }
+    throw "Required command '$name' was not found on PATH."
+}
+
 function Kill-Existing {
     Log "--- Killing existing processes ---"
     $killed = 0
@@ -86,19 +101,6 @@ function Build-Frontend {
     Log "=== FRONTEND BUILD START ==="
     Set-Location "$RootDir\frontend"
 
-    # Clear caches
-    if (Test-Path "node_modules\.vite") {
-        Log "  Clearing Vite cache (node_modules\.vite)..."
-        Remove-Item "node_modules\.vite" -Recurse -Force
-    }
-    if (Test-Path "dist") {
-        $oldFiles = Get-ChildItem "dist\assets\index-*.js" -ErrorAction SilentlyContinue
-        Log "  Clearing dist/ (old bundle: $($oldFiles.Name))..."
-        Remove-Item "dist" -Recurse -Force
-    } else {
-        Log "  No dist/ folder found (first build)"
-    }
-
     # TypeScript check
     Log "  Running TypeScript check (npx tsc -b)..."
     & npx tsc -b
@@ -128,7 +130,10 @@ function Start-App {
     Log "=== STARTING APP (mode: $Mode) ==="
 
     Set-Location "$RootDir\backend"
-    Log "  Starting backend (node server.js)..."
+    $NpmCommand = Resolve-StartProcessCommand "npm"
+    $BackendNpmScript = if ($Mode -eq "dev") { "dev" } else { "start" }
+    $BackendModeLabel = if ($Mode -eq "dev") { "backend watch mode" } else { "production backend" }
+    Log "  Starting $BackendModeLabel (npm run $BackendNpmScript)..."
     $BackendStdoutLog = if ($LogBEUsesAppLogger) { "$LogBE.stdout" } else { $LogBE }
     $BackendStderrLog = if ($LogBEUsesAppLogger) { "$LogBE.stderr" } else { "$LogBE.err" }
     if ($LogBEUsesAppLogger) {
@@ -136,7 +141,7 @@ function Start-App {
     }
     Reset-LogFile $BackendStdoutLog
     Reset-LogFile $BackendStderrLog
-    $be = Start-Process -FilePath "node" -ArgumentList "server.js" `
+    $be = Start-Process -FilePath $NpmCommand -ArgumentList "run", $BackendNpmScript `
         -RedirectStandardOutput $BackendStdoutLog -RedirectStandardError $BackendStderrLog `
         -NoNewWindow -PassThru
     $be.Id | Out-File $PidFileBE -Encoding ascii
@@ -148,14 +153,16 @@ function Start-App {
 
     if ($Mode -eq "dev") {
         Set-Location "$RootDir\frontend"
-        Log "  Starting Vite dev server..."
-        $fe = Start-Process -FilePath "npx" -ArgumentList "vite", "--host" `
+        Log "  Starting Vite dev server (npm run dev, port $FrontendPort)..."
+        Reset-LogFile $LogFE
+        Reset-LogFile "$LogFE.err"
+        $fe = Start-Process -FilePath $NpmCommand -ArgumentList "run", "dev", "--", "--port", $FrontendPort `
             -RedirectStandardOutput $LogFE -RedirectStandardError "$LogFE.err" `
             -NoNewWindow -PassThru
         $fe.Id | Out-File $PidFileFE -Encoding ascii
         Log "  Frontend dev server started — PID $($fe.Id)"
         Write-Host ""
-        Write-Host "  Backend:  https://localhost:$BackendPort"
+        Write-Host "  Backend:  https://localhost:$BackendPort  (dev + watch)"
         Write-Host "  Frontend: https://localhost:$FrontendPort  (dev + HMR)"
     } else {
         Write-Host ""
@@ -169,5 +176,9 @@ function Start-App {
     Get-Content $LogBE -Wait
 }
 
-Build-Frontend
+if ($Mode -eq "dev") {
+    Log "=== DEV MODE: SKIPPING PRODUCTION FRONTEND BUILD ==="
+} else {
+    Build-Frontend
+}
 Start-App
