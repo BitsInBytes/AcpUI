@@ -199,19 +199,32 @@ export function commandFromRawInput(rawValue) {
   return maybeString(value);
 }
 
-export function resolvePatternToolName(value, config) {
+function toolNameNormalizationCandidates(candidate, options = {}) {
+  const normalized = typeof candidate === 'string' ? candidate.trim() : '';
+  if (!normalized) return [];
+
+  const candidates = [normalized];
+  const patterns = Array.isArray(options.stripSuffixPatterns) ? options.stripSuffixPatterns : [];
+
+  for (const pattern of patterns) {
+    if (!(pattern instanceof RegExp)) continue;
+    const stripped = normalized.replace(pattern, '');
+    if (stripped && stripped !== normalized && !candidates.includes(stripped)) {
+      candidates.push(stripped);
+    }
+  }
+
+  return candidates;
+}
+
+export function resolvePatternToolName(value, config, options = {}) {
   const candidate = stripToolTitlePrefix(value);
   if (!candidate) return '';
 
-  const directMatch = matchToolIdPattern(candidate, config);
-  if (directMatch?.toolName) return directMatch.toolName.trim().toLowerCase();
-  if (isAcpUxToolName(candidate)) return candidate.toLowerCase();
-
-  const withoutGeminiSuffix = candidate.replace(/-\d+-\d+$/, '');
-  if (withoutGeminiSuffix !== candidate) {
-    const suffixMatch = matchToolIdPattern(withoutGeminiSuffix, config);
-    if (suffixMatch?.toolName) return suffixMatch.toolName.trim().toLowerCase();
-    if (isAcpUxToolName(withoutGeminiSuffix)) return withoutGeminiSuffix.toLowerCase();
+  for (const normalizedCandidate of toolNameNormalizationCandidates(candidate, options)) {
+    const directMatch = matchToolIdPattern(normalizedCandidate, config);
+    if (directMatch?.toolName) return directMatch.toolName.trim().toLowerCase();
+    if (isAcpUxToolName(normalizedCandidate)) return normalizedCandidate.toLowerCase();
   }
 
   return '';
@@ -254,11 +267,11 @@ export function collectToolNameCandidates(value, output = [], seen = new Set()) 
   return output;
 }
 
-export function resolveToolNameFromCandidates(candidates, config) {
+export function resolveToolNameFromCandidates(candidates, config, options = {}) {
   for (const candidate of Array.isArray(candidates) ? candidates : [candidates]) {
     const nestedCandidates = typeof candidate === 'string' ? [candidate] : collectToolNameCandidates(candidate);
     for (const nestedCandidate of nestedCandidates) {
-      const toolName = resolvePatternToolName(nestedCandidate, config);
+      const toolName = resolvePatternToolName(nestedCandidate, config, options);
       if (toolName) return toolName;
     }
   }

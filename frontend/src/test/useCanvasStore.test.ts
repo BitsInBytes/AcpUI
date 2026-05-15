@@ -85,10 +85,10 @@ describe('useCanvasStore', () => {
     expect(useCanvasStore.getState().canvasArtifacts[0].title).toBe('A1-v2');
   });
 
-  it('handleOpenFileInCanvas fetches from socket', () => {
+  it('handleOpenFileInCanvas fetches from socket with session-scoped payload', () => {
     const mockSocket = {
       emit: vi.fn((event, _params, cb) => {
-        if (event === 'canvas_read_file') cb({ artifact: { id: 'f1', title: 'File' } });
+        if (event === 'canvas_read_file') cb({ artifact: { id: 'f1', sessionId: 's1', title: 'File', content: 'x', language: 'text', version: 1 } });
       })
     } as any;
 
@@ -96,9 +96,19 @@ describe('useCanvasStore', () => {
       useCanvasStore.getState().handleOpenFileInCanvas(mockSocket, 's1', 'test.txt');
     });
 
+    expect(mockSocket.emit).toHaveBeenCalledWith('canvas_read_file', { filePath: 'test.txt', sessionId: 's1' }, expect.any(Function));
     expect(useCanvasStore.getState().canvasArtifacts[0].id).toBe('f1');
   });
 
+  it('handleOpenFileInCanvas skips read when active session is missing', () => {
+    const mockSocket = { emit: vi.fn() } as any;
+
+    act(() => {
+      useCanvasStore.getState().handleOpenFileInCanvas(mockSocket, null, 'test.txt');
+    });
+
+    expect(mockSocket.emit).not.toHaveBeenCalled();
+  });
 
   it('handleOpenFileInCanvas stores read errors in canvasError without alert', () => {
     const mockSocket = {
@@ -116,22 +126,24 @@ describe('useCanvasStore', () => {
     expect(alertMock).not.toHaveBeenCalled();
     alertMock.mockRestore();
   });
-  it('handleFileEdited updates watched artifacts', () => {
+  it('handleFileEdited updates watched artifacts with session-scoped reads', () => {
     const mockSocket = {
       emit: vi.fn((event, _params, cb) => {
-        if (event === 'canvas_read_file') cb({ artifact: { id: 'a1', content: 'new content' } });
+        if (event === 'canvas_read_file') cb({ artifact: { id: 'a1', sessionId: 's1', content: 'new content', title: 'main.ts', language: 'ts', version: 1 } });
       })
     } as any;
 
     act(() => {
       useCanvasStore.setState({ 
-          canvasArtifacts: [{ id: 'a1', filePath: '/src/main.ts', content: 'old' } as any],
-          activeCanvasArtifact: { id: 'a1' } as any
+        canvasArtifacts: [{ id: 'a1', sessionId: 's1', filePath: '/src/main.ts', title: 'main.ts', content: 'old', language: 'ts', version: 1 } as any],
+        activeCanvasArtifact: { id: 'a1' } as any
       });
       useCanvasStore.getState().handleFileEdited(mockSocket, 'main.ts');
     });
 
+    expect(mockSocket.emit).toHaveBeenCalledWith('canvas_read_file', { filePath: '/src/main.ts', sessionId: 's1' }, expect.any(Function));
     expect(useCanvasStore.getState().canvasArtifacts[0].content).toBe('new content');
+    expect(useCanvasStore.getState().canvasArtifacts[0].sessionId).toBe('s1');
   });
 
   it('handleCloseArtifact emits canvas_delete and updates state', () => {

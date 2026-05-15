@@ -4,7 +4,7 @@ import Editor, { loader } from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import './CanvasPane.css';
-import type { CanvasArtifact } from '../../types';
+import type { CanvasArtifact, CanvasReadFileRequest, CanvasReadFileResponse } from '../../types';
 import { useSocket } from '../../hooks/useSocket';
 import { useCanvasStore } from '../../store/useCanvasStore';
 import { useSessionLifecycleStore } from '../../store/useSessionLifecycleStore';
@@ -157,7 +157,8 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
   const handleOpenGitFile = (filePath: string) => {
     if (!socket || !activeSessionId) return;
     const fullPath = buildFullPath(cwd, filePath);
-    socket.emit('canvas_read_file', { filePath: fullPath }, (res: { artifact?: CanvasArtifact; error?: string }) => {
+    const request: CanvasReadFileRequest = { filePath: fullPath, sessionId: activeSessionId };
+    socket.emit('canvas_read_file', request, (res: CanvasReadFileResponse) => {
       if (res.artifact) {
         const artifactId = res.artifact.id;
         gitOpenRef.current = true;

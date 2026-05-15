@@ -147,8 +147,12 @@ export function getMcpConfig(env = process.env) {
   return cachedConfig;
 }
 
-export function resetMcpConfigForTests() {
+export function invalidateMcpConfigCache() {
   cachedConfig = null;
+}
+
+export function resetMcpConfigForTests() {
+  invalidateMcpConfigCache();
 }
 
 export function isInvokeShellMcpEnabled(env = process.env) {

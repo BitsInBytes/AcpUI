@@ -1,7 +1,7 @@
 # Feature Doc - Chat Input and Prompt Area
 
 ## Overview
-The Chat Input and Prompt Area is the prompt composition surface for an active chat session. It coordinates draft text, attachments, slash commands, voice entry controls, prompt submission/cancel actions, model quick-select, reasoning-effort options, context usage display, and footer actions for terminal, canvas, auto-scroll, notes, and fork merge.
+The Chat Input and Prompt Area is the prompt composition surface for an active chat session. It coordinates draft text, attachments, slash commands, voice entry controls, prompt submission/cancel actions, model quick-select, reasoning-effort options, context usage display, and footer actions for terminal, canvas, auto-scroll, Scratch Pad entry control, and fork merge. Notes ownership is documented in `[Feature Doc] - Notes.md`.
 
 This feature matters because it is the frontend boundary that creates `prompt` socket payloads and the backend path that converts those payloads into ACP `session/prompt` parts. Small mismatches between the UI attachment shape, socket payload, provider model state, or context metadata path can break prompt submission while the rest of the session UI still renders.
 
@@ -260,7 +260,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 | Submit state | `frontend/src/store/useChatStore.ts` | `handleSubmit`, `handleCancel` | Optimistic messages, prompt/cancel socket emission, custom command prompt substitution |
 | Session lifecycle | `frontend/src/store/useSessionLifecycleStore.ts` | `handleActiveSessionModelChange`, `handleSessionModelChange`, `handleSetSessionOption`, `fetchStats`, `maybeHydrateContextUsage` | Model mutation, session options, stats and context hydration |
 | System state | `frontend/src/store/useSystemStore.ts` | `SlashCommand`, `setSlashCommands`, `setCustomCommands`, `setContextUsage`, `getContextUsage`, `hasContextUsage`, `setCompacting`, `getCompacting`, `getBranding` | Provider branding, command lists, provider-scoped context usage and compaction state |
-| UI state | `frontend/src/store/useUIStore.ts` | `isModelDropdownOpen`, `setModelDropdownOpen`, `toggleAutoScroll`, `setSettingsOpen`, `setNotesOpen` | Dropdown, auto-scroll, settings, and notes modal state |
+| UI state | `frontend/src/store/useUIStore.ts` | `isModelDropdownOpen`, `setModelDropdownOpen`, `toggleAutoScroll`, `setSettingsOpen`, `setNotesOpen` | Dropdown, auto-scroll, settings, and Scratch Pad trigger state (notes ownership in `[Feature Doc] - Notes.md`) |
 | Canvas state | `frontend/src/store/useCanvasStore.ts` | `terminals`, `isCanvasOpen`, `openTerminal`, `setIsCanvasOpen` | Terminal and canvas footer pill behavior |
 | Model utilities | `frontend/src/utils/modelOptions.ts` | `getDefaultModelSelection`, `getModelIdForSelection`, `getModelLabel`, `getFooterModelChoices`, `getFullModelChoices`, `isModelChoiceActive` | Frontend model labels and option lists |
 | Extension routing | `frontend/src/utils/extensionRouter.ts` | `routeExtension`, result types `commands`, `metadata`, `config_options`, `compaction_started`, `compaction_completed` | Pure parser for provider extension payloads |

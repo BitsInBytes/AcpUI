@@ -39,6 +39,11 @@ export interface CanvasLoadResponse {
   artifacts?: CanvasArtifact[];
 }
 
+export interface CanvasReadFileRequest {
+  filePath: string;
+  sessionId: string;
+}
+
 export interface CanvasReadFileResponse {
   artifact?: CanvasArtifact;
   error?: string;

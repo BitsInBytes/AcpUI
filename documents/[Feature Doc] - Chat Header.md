@@ -301,7 +301,7 @@ Sub-agent status is a display suffix derived from `ChatSession.isSubAgent`. Work
 )}
 ```
 
-The header opens existing surfaces. `App` owns `SystemSettingsModal`, `NotesModal`, `FileExplorer`, and `HelpDocsModal`; the header does not manage modal internals.
+The header opens existing surfaces. `App` owns `SystemSettingsModal`, `FileExplorer`, `HelpDocsModal`, and other app-root modals (including `NotesModal`); the header does not manage modal internals. Notes ownership is documented in `[Feature Doc] - Notes.md`.
 
 ## Architecture Diagram
 
@@ -531,7 +531,7 @@ Fallback component path:  Engine Ready | ACP UI
 | Header component | `frontend/src/test/ChatHeader.test.tsx` | `renders provider title and session name correctly`, `handles "System Settings" button click`, `handles "File Explorer" button click`, `handles "Help" button click`, `renders app header fallback if no active session`, `hides sidebar menu and action buttons in pop-out mode` | Verifies title fallback chain, UI actions, fallback title, and pop-out suppression |
 | Socket hook | `frontend/src/test/useSocket.test.ts` | `handles "ready" event with providerId`, `handles "ready" event without providerId`, `handles "branding" event`, `handles "workspace_cwds" event`, `handles "providers" event`, `handles "disconnect" event` | Verifies socket events that populate header-facing system state |
 | System store | `frontend/src/test/useSystemStore.test.ts`, `frontend/src/test/useSystemStoreExtended.test.ts` | `setProviders calculates active provider and branding`, `setProviderBranding updates branding if provider is active`, `setProviderReady updates isEngineReady state`, `setProviderReady updates isEngineReady if it is the active provider` | Verifies provider branding and readiness state used by the header |
-| UI store | `frontend/src/test/useUIStore.test.ts` | `setSidebarOpen updates state`, `setNotesOpen, setFileExplorerOpen, and setHelpDocsOpen update state` | Verifies store actions used by header controls |
+| UI store | `frontend/src/test/useUIStore.test.ts` | `setSidebarOpen updates state`, `setNotesOpen, setFileExplorerOpen, and setHelpDocsOpen update state` | Verifies shared modal/sidebar visibility actions; Chat Header uses the sidebar/file-explorer/help/settings subset |
 | Main root | `frontend/src/test/App.test.tsx` | `renders Sidebar and ChatInput`, `switches between sessions and emits watch events`, `toggles sidebar when clicking bubble` | Verifies main root composition and active-session shell behavior around the header |
 | Pop-out root | `frontend/src/test/PopOutApp.test.tsx` | `renders ChatHeader and ChatInput when ready`, `does NOT render Sidebar`, `hydrates session and emits watch_session when ready`, `claims session ownership on mount` | Verifies detached root composition and pop-out session initialization |
 | Ownership | `frontend/src/test/sessionOwnership.test.ts` | `claimSession posts a claim message`, `releaseSession posts a release message`, `openPopout opens a new window`, `claim from another window marks session as popped out` | Verifies BroadcastChannel ownership and `/?popout=` URL creation |
@@ -611,7 +611,7 @@ Fallback component path:  Engine Ready | ACP UI
   - `setProviderReady updates isEngineReady if it is the active provider`
 - `frontend/src/test/useUIStore.test.ts`
   - `setSidebarOpen updates state`
-  - `setNotesOpen, setFileExplorerOpen, and setHelpDocsOpen update state`
+  - `setNotesOpen, setFileExplorerOpen, and setHelpDocsOpen update state` (shared UI store action coverage; header uses the non-notes subset)
 - `frontend/src/test/useSessionLifecycleStoreSync.test.ts`
   - `syncs activeSessionId to URL when isUrlSyncReady is true`
   - `does NOT sync to URL if isUrlSyncReady is false`

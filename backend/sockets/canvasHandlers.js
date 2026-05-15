@@ -50,10 +50,14 @@ export default function registerCanvasHandlers(io, socket) {
     }
   });
 
-  socket.on('canvas_read_file', async ({ filePath }, callback) => {
+  socket.on('canvas_read_file', async ({ filePath, sessionId }, callback) => {
     try {
+      if (!sessionId) {
+        throw new Error('sessionId is required for canvas_read_file');
+      }
+
       const allowedPath = resolveAllowedPath(filePath, 'file_path');
-      writeLog(`[FS] Reading file for canvas: ${allowedPath}`);
+      writeLog(`[FS] Reading file for canvas: ${allowedPath} (session ${sessionId})`);
       const content = fs.readFileSync(allowedPath, 'utf8');
       const language = path.extname(allowedPath).slice(1) || 'text';
       const title = path.basename(allowedPath);
@@ -61,6 +65,7 @@ export default function registerCanvasHandlers(io, socket) {
       callback?.({
         artifact: {
           id: `canvas-fs-${Date.now()}`,
+          sessionId,
           title,
           content,
           language,

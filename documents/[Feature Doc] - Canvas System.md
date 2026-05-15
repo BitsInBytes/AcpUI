@@ -90,14 +90,15 @@ if (status === 'completed' && filePath) {
 4. `handleOpenFileInCanvas` reads file content before creating an artifact.
    - File: `frontend/src/store/useCanvasStore.ts` (Store action: `handleOpenFileInCanvas`)
    - File: `backend/sockets/canvasHandlers.js` (Socket event: `canvas_read_file`)
-   - The frontend emits `canvas_read_file` with `{ filePath }`. The backend resolves the path through the shared IO MCP allowed-root validator, reads UTF-8 content from the allowed path, derives `language` from the extension, and returns an artifact without `sessionId`. The store then passes the artifact through `handleOpenInCanvas`, which stamps the active UI session id.
+   - The frontend emits `canvas_read_file` with `{ filePath, sessionId }`. The backend requires `sessionId`, resolves the path through the shared IO MCP allowed-root validator, reads UTF-8 content from the allowed path, derives `language` from the extension, and returns an artifact containing the same UI `sessionId`.
 
 ```js
 // FILE: backend/sockets/canvasHandlers.js (Socket event: canvas_read_file)
+if (!sessionId) throw new Error('sessionId is required for canvas_read_file');
 const allowedPath = resolveAllowedPath(filePath, 'file_path');
 const content = fs.readFileSync(allowedPath, 'utf8');
 const language = path.extname(allowedPath).slice(1) || 'text';
-callback({ artifact: { id: `canvas-fs-${Date.now()}`, title, content, language, filePath: allowedPath, version: 1 } });
+callback({ artifact: { id: `canvas-fs-${Date.now()}`, sessionId, title, content, language, filePath: allowedPath, version: 1 } });
 ```
 
 5. `handleOpenInCanvas` deduplicates and persists artifacts.
@@ -230,7 +231,7 @@ export interface CanvasArtifact {
 Rules that must hold:
 
 1. `sessionId` is the UI session id stored in `ChatSession.id` and `sessions.ui_id`; it is not the ACP session id.
-2. Artifacts returned from `canvas_read_file` do not include `sessionId`; `handleOpenInCanvas` must stamp the active UI session id before `canvas_save`.
+2. `canvas_read_file` requests must include the UI `sessionId`, and returned artifacts must include that same `sessionId`.
 3. `handleOpenInCanvas` deduplicates by exact `filePath` match before `id` match, and updates keep the existing artifact id.
 4. `handleFileEdited` updates only already-watched artifacts and preserves the watched artifact id.
 5. `canvas_load` and `getCanvasArtifactsForSession` query by UI session id.
@@ -379,8 +380,8 @@ ORDER BY created_at DESC
 3. Watched-file refresh does not emit `canvas_save`.
    - `handleFileEdited` updates the in-memory artifact and `lastUpdated`. Reopening through `handleOpenFileInCanvas` or calling `handleOpenInCanvas` persists through `canvas_save`.
 
-4. File artifacts read from disk need store stamping.
-   - `canvas_read_file` returns an artifact without `sessionId`. Persistence depends on `handleOpenInCanvas` receiving a non-null active UI session id.
+4. File reads are session-scoped.
+   - `canvas_read_file` requires `sessionId` and echoes it in the returned artifact; frontend callers must send the active or watched UI session id.
 
 5. Canvas reads and writes are root-gated.
    - `canvas_read_file` and `canvas_apply_to_file` resolve `filePath` through `resolveAllowedPath(filePath, 'file_path')` before touching disk, so paths outside configured allowed roots are rejected.

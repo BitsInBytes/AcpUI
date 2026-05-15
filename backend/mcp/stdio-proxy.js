@@ -59,6 +59,22 @@ async function backendFetch(path, options = {}) {
   }
 }
 
+export function mapBackendToolsToMcpListTools(tools = []) {
+  return tools.map(t => {
+    const tool = {
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    };
+    if (t.title) tool.title = t.title;
+    if (t.annotations) tool.annotations = t.annotations;
+    if (t.execution) tool.execution = t.execution;
+    if (t.outputSchema) tool.outputSchema = t.outputSchema;
+    if (t._meta) tool._meta = t._meta;
+    return tool;
+  });
+}
+
 export async function runProxy() {
   const providerId = process.env.ACP_SESSION_PROVIDER_ID || '';
   const proxyId = process.env.ACP_UI_MCP_PROXY_ID || '';
@@ -79,19 +95,7 @@ export async function runProxy() {
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: tools.map(t => {
-      const tool = {
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema,
-      };
-      if (t.title) tool.title = t.title;
-      if (t.annotations) tool.annotations = t.annotations;
-      if (t.execution) tool.execution = t.execution;
-      if (t.outputSchema) tool.outputSchema = t.outputSchema;
-      if (t._meta) tool._meta = t._meta;
-      return tool;
-    })
+    tools: mapBackendToolsToMcpListTools(tools)
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {

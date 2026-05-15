@@ -38,6 +38,7 @@ const CONTEXT_WINDOWS = {
   'gemini-3-flash-preview': 1_048_576,
 };
 const DEFAULT_CONTEXT_WINDOW = 1_048_576;
+const TOOL_NAME_STRIP_SUFFIX_PATTERNS = [/-\d+-\d+$/];
 
 function _emitCachedContext(sessionId) {
   if (!sessionId || _sessionsWithInitialEmit.has(sessionId)) return false;
@@ -533,7 +534,11 @@ export function normalizeTool(event, update) {
       update?.toolCall
     ])
   ];
-  const candidateToolName = resolveToolNameFromCandidates(toolNameCandidates, config);
+  const candidateToolName = resolveToolNameFromCandidates(
+    toolNameCandidates,
+    config,
+    { stripSuffixPatterns: TOOL_NAME_STRIP_SUFFIX_PATTERNS }
+  );
   const titleToolName = isAcpUiMcpTitle ? resolveToolNameFromMcpTitle(title) : '';
 
   let toolName = candidateToolName || titleToolName || event.toolName || '';
@@ -941,20 +946,45 @@ export function cloneSession(oldAcpId, newAcpId, pruneAtTurn) {
   }
 }
 
+function clearSessionRuntimeState(acpId) {
+  if (!acpId) return;
+
+  let tokenStateChanged = false;
+  if (_accumulatedTokensBySession.delete(acpId)) {
+    tokenStateChanged = true;
+  }
+
+  _sessionContextInfo.delete(acpId);
+  _sessionQuotaInfo.delete(acpId);
+  _sessionsWithInitialEmit.delete(acpId);
+
+  if (_inFlightSessions.delete(acpId)) {
+    if (_activePromptCount > 0) _activePromptCount--;
+    if (_activePromptCount === 0) _stopQuotaPolling();
+  }
+
+  if (_lastSessionId === acpId) {
+    _lastSessionId = null;
+  }
+
+  for (const key of [...toolArgCache.keys()]) {
+    if (typeof key === 'string' && key.startsWith(acpId + '::')) {
+      toolArgCache.delete(key);
+    }
+  }
+
+  if (tokenStateChanged) {
+    _saveTokenState();
+  }
+}
+
 export function deleteSessionFiles(acpId) {
   const paths = getSessionPaths(acpId);
   if (paths.jsonl && fs.existsSync(paths.jsonl)) fs.unlinkSync(paths.jsonl);
   if (paths.json && fs.existsSync(paths.json)) fs.unlinkSync(paths.json);
-
-  // Also clear token accumulation and emit tracking for this session
-  if (_accumulatedTokensBySession.has(acpId)) {
-    _accumulatedTokensBySession.delete(acpId);
-    _saveTokenState();
-  }
-  if (_sessionsWithInitialEmit.has(acpId)) {
-    _sessionsWithInitialEmit.delete(acpId);
-  }
   if (paths.tasksDir && fs.existsSync(paths.tasksDir)) fs.rmSync(paths.tasksDir, { recursive: true, force: true });
+
+  clearSessionRuntimeState(acpId);
 }
 
 export function archiveSessionFiles(acpId, archiveDir) {
@@ -971,7 +1001,7 @@ export function archiveSessionFiles(acpId, archiveDir) {
     fs.cpSync(paths.tasksDir, path.join(archiveDir, 'tasks'), { recursive: true });
     fs.rmSync(paths.tasksDir, { recursive: true, force: true });
   }
-  
+
   const sessionDir = paths.jsonl ? path.dirname(paths.jsonl) : '';
   if (sessionDir) {
     fs.writeFileSync(
@@ -979,8 +1009,9 @@ export function archiveSessionFiles(acpId, archiveDir) {
       JSON.stringify({ sessionDir }, null, 2)
     );
   }
-}
 
+  clearSessionRuntimeState(acpId);
+}
 /**
  * Extract a plain text string from a Gemini PartListUnion content value.
  *

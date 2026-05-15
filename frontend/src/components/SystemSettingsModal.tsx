@@ -132,7 +132,7 @@ const SystemSettingsModal: React.FC = () => {
                   <FileText size={16} />
                   <h3>Environment Variables</h3>
                 </div>
-                <p className="section-desc">Edit .env configuration. Changes take effect on next backend restart unless noted.</p>
+                <p className="section-desc">Edit .env configuration. Most keys require backend restart; workspace and commands path keys trigger a live list refresh.</p>
                 {envLoading ? (
                   <div className="stats-loading">Loading...</div>
                 ) : (
@@ -180,7 +180,7 @@ const SystemSettingsModal: React.FC = () => {
                   <FolderCog size={16} />
                   <h3>Workspace Configuration</h3>
                 </div>
-                <p className="section-desc">Edit workspaces.json. Pinned workspaces appear as sidebar buttons. Changes take effect on restart.</p>
+                <p className="section-desc">Edit workspaces.json. Pinned workspaces appear as sidebar buttons. Save refreshes the in-memory workspace list immediately.</p>
                 <div style={{ height: 500, border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6 }}>
                   <Editor
                     value={wsConfig}
@@ -191,7 +191,7 @@ const SystemSettingsModal: React.FC = () => {
                   />
                 </div>
                 {wsError && <p className="ws-error">{wsError}</p>}
-                {wsSaved && <p className="ws-saved">✓ Saved</p>}
+                {wsSaved && <p className="ws-saved">✓ Saved and workspace list refreshed</p>}
                 <button
                   className="done-button"
                   style={{ marginTop: '0.5rem' }}
@@ -200,7 +200,10 @@ const SystemSettingsModal: React.FC = () => {
                       JSON.parse(wsConfig);
                       socket?.emit('save_workspaces_config', { content: wsConfig }, (res: { error?: string }) => {
                         if (res?.error) setWsError(res.error);
-                        else setWsSaved(true);
+                        else {
+                          setWsError(null);
+                          setWsSaved(true);
+                        }
                       });
                     } catch { setWsError('Invalid JSON'); }
                   }}
@@ -216,7 +219,7 @@ const SystemSettingsModal: React.FC = () => {
                   <Terminal size={16} />
                   <h3>Custom Commands</h3>
                 </div>
-                <p className="section-desc">Edit commands.json. Custom slash commands with prompts. Changes take effect on restart.</p>
+                <p className="section-desc">Edit commands.json. Custom slash commands with prompts. Save refreshes command cache and slash command hydration immediately.</p>
                 <div style={{ height: 500, border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6 }}>
                   <Editor
                     value={cmdConfig}
@@ -227,7 +230,7 @@ const SystemSettingsModal: React.FC = () => {
                   />
                 </div>
                 {cmdError && <p className="ws-error">{cmdError}</p>}
-                {cmdSaved && <p className="ws-saved">✓ Saved</p>}
+                {cmdSaved && <p className="ws-saved">✓ Saved and commands refreshed</p>}
                 <button
                   className="done-button"
                   style={{ marginTop: '0.5rem' }}
@@ -236,7 +239,10 @@ const SystemSettingsModal: React.FC = () => {
                       JSON.parse(cmdConfig);
                       socket?.emit('save_commands_config', { content: cmdConfig }, (res: { error?: string }) => {
                         if (res?.error) setCmdError(res.error);
-                        else setCmdSaved(true);
+                        else {
+                          setCmdError(null);
+                          setCmdSaved(true);
+                        }
                       });
                     } catch { setCmdError('Invalid JSON'); }
                   }}
@@ -252,7 +258,7 @@ const SystemSettingsModal: React.FC = () => {
                   <Settings size={16} />
                   <h3>Provider Settings</h3>
                 </div>
-                <p className="section-desc">Edit user.json. Provider-specific secrets, paths, and overrides. Changes take effect on restart.</p>
+                <p className="section-desc">Edit user.json. Provider-specific secrets, paths, and overrides. Existing provider runtimes keep current values until backend restart.</p>
                 <div style={{ height: 500, border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6 }}>
                   <Editor
                     value={userConfig}
@@ -263,7 +269,7 @@ const SystemSettingsModal: React.FC = () => {
                   />
                 </div>
                 {userError && <p className="ws-error">{userError}</p>}
-                {userSaved && <p className="ws-saved">✓ Saved</p>}
+                {userSaved && <p className="ws-saved">✓ Saved (restart backend to apply)</p>}
                 <button
                   className="done-button"
                   style={{ marginTop: '0.5rem' }}
@@ -272,7 +278,10 @@ const SystemSettingsModal: React.FC = () => {
                       JSON.parse(userConfig);
                       socket?.emit('save_provider_config', { ...(providerId ? { providerId } : {}), content: userConfig }, (res: { error?: string }) => {
                         if (res?.error) setUserError(res.error);
-                        else setUserSaved(true);
+                        else {
+                          setUserError(null);
+                          setUserSaved(true);
+                        }
                       });
                     } catch { setUserError('Invalid JSON'); }
                   }}

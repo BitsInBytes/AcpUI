@@ -198,7 +198,7 @@ return (
 );
 ```
 
-The detached shell has no `Sidebar`, `SessionSettingsModal`, `SystemSettingsModal`, `NotesModal`, `FileExplorer`, or `HelpDocsModal` component roots. It still mounts `ConfigErrorModal`, registers chat socket listeners through `useChatManager`, scroll behavior through `useScroll`, canvas file handlers through `useCanvasStore`, and resize behavior through `computeResizeWidthNoSidebar`.
+The detached shell has no `Sidebar`, `SessionSettingsModal`, `SystemSettingsModal`, `NotesModal`, `FileExplorer`, or `HelpDocsModal` component roots. It still mounts `ConfigErrorModal`, registers chat socket listeners through `useChatManager`, scroll behavior through `useScroll`, canvas file handlers through `useCanvasStore`, and resize behavior through `computeResizeWidthNoSidebar`. Notes behavior/ownership details are documented in `[Feature Doc] - Notes.md`.
 
 ### 8. `ChatHeader` switches controls by pop-out mode
 
@@ -423,7 +423,7 @@ PopOutApp reads popout UI session ID
 - `ChatHeader` still renders `StatusIndicator`, provider title, session name, sub-agent suffix, and workspace label.
 - `ChatInput` does not read the `popout` query parameter. It uses `activeSessionId`, `activeSession`, provider branding, input store state, canvas store state, and system connectivity exactly as it does in the main shell.
 - `ChatInput` can open Terminal and Canvas because `PopOutApp` renders `CanvasPane` and wires canvas handlers.
-- `ChatInput` can set UI flags for Scratch Pad and chat config, but `PopOutApp` does not render `NotesModal` or `SessionSettingsModal`, so those modal roots are unavailable in the detached shell.
+- `ChatInput` can still set Scratch Pad and chat-config UI flags, but `PopOutApp` does not render `NotesModal` or `SessionSettingsModal`, so those modal roots are unavailable in the detached shell. Notes ownership and contracts: `[Feature Doc] - Notes.md`.
 
 ---
 
@@ -494,7 +494,7 @@ BroadcastChannel `announce` can mark a session as popped out even when the curre
 
 ### 5. Header controls and modal roots are different in the detached shell
 
-`ChatHeader` hides File Explorer, Help, and System Settings controls in pop-out mode. `ChatInput` still renders Scratch Pad and chat config triggers through normal input controls, but `PopOutApp` does not mount `NotesModal`, `SessionSettingsModal`, or `HelpDocsModal`.
+`ChatHeader` hides File Explorer, Help, and System Settings controls in pop-out mode. `ChatInput` still renders Scratch Pad and chat-config triggers through normal input controls, but `PopOutApp` does not mount `NotesModal`, `SessionSettingsModal`, or `HelpDocsModal`. Notes ownership and persistence contracts are documented in `[Feature Doc] - Notes.md`.
 
 ### 6. Canvas resize uses the no-sidebar helper
 

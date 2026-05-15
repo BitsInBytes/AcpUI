@@ -98,4 +98,18 @@ describe('workspaceConfig', () => {
     const expectedPath = path.default.resolve(projectRoot, '..', 'custom/config.json');
     expect(calledPath).toBe(expectedPath);
   });
+
+  it('reloads from disk after invalidateWorkspacesCache', async () => {
+    mockReadFileSync
+      .mockReturnValueOnce(JSON.stringify({ workspaces: [{ label: 'First', path: '/one' }] }))
+      .mockReturnValueOnce(JSON.stringify({ workspaces: [{ label: 'Second', path: '/two' }] }));
+
+    const { loadWorkspaces, invalidateWorkspacesCache } = await import('../services/workspaceConfig.js');
+
+    expect(loadWorkspaces()).toEqual([{ label: 'First', path: '/one', agent: '', pinned: false }]);
+    expect(loadWorkspaces()).toEqual([{ label: 'First', path: '/one', agent: '', pinned: false }]);
+
+    invalidateWorkspacesCache();
+    expect(loadWorkspaces()).toEqual([{ label: 'Second', path: '/two', agent: '', pinned: false }]);
+  });
 });

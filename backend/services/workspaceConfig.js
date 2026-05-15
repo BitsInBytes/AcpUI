@@ -29,3 +29,7 @@ export function loadWorkspaces() {
     return cached;
   }
 }
+
+export function invalidateWorkspacesCache() {
+  cached = null;
+}

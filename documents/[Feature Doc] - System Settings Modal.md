@@ -17,7 +17,7 @@ System Settings Modal is the global configuration surface for audio device selec
 ### Why This Matters
 - Invalid JSON in workspace, command, provider, registry, or MCP settings is reported during app load and blocks navigation until fixed.
 - Provider-scoped config writes must target the selected provider directory, not the active chat by accident.
-- Workspace and command loaders cache values, so file writes and runtime hydration are separate concerns.
+- Workspace and command loaders cache values, but save/env refresh paths invalidate cache and emit live hydration updates.
 - This is the primary Socket.IO callback pattern for editable global configuration.
 - Audio device selection is browser-local state, while voice enablement is backend-configured state.
 
@@ -63,17 +63,17 @@ socket.emit('get_provider_config', { providerId }, handleProviderConfig);
 6. **Environment reads and writes use `.env`**
    - File: `backend/sockets/systemSettingsHandlers.js` (Function: `registerSystemSettingsHandlers`, Socket events: `get_env`, `update_env`)
    - `get_env` reads `<repo>/.env`, skips blank/comment lines, splits each key at the first `=`, and returns `{ vars }`.
-   - `update_env` rewrites or appends `key=value`, updates `process.env[key]`, and returns `{ success: true }` or `{ error }`.
+   - `update_env` rewrites or appends `key=value`, updates `process.env[key]`, and returns `{ success: true, runtimeRefresh }` or `{ error }`. Keys affecting workspace/command/MCP config clear cache and refresh runtime hydration where supported.
 
 7. **Workspace config reads and writes use JSON text**
    - File: `backend/sockets/systemSettingsHandlers.js` (Socket events: `get_workspaces_config`, `save_workspaces_config`)
-   - The handler resolves `WORKSPACES_PATH` from `process.env.WORKSPACES_CONFIG || 'workspaces.json'`, reads raw text for the editor, validates JSON on save, and writes the file.
+   - The handler resolves `getWorkspacesPath()` from `process.env.WORKSPACES_CONFIG || 'workspaces.json'`, reads raw text for the editor, validates JSON on save, writes the file, invalidates workspace cache, and emits `workspace_cwds`.
    - File: `backend/services/workspaceConfig.js` (Function: `loadWorkspaces`)
    - Runtime workspace hydration filters entries to `{ label, path, agent, pinned }` and caches the result. When the JSON file cannot be read, `loadWorkspaces` falls back to four env vars: `DEFAULT_WORKSPACE_CWD`, `DEFAULT_WORKSPACE_AGENT`, `WORKSPACE_B_CWD`, and `WORKSPACE_B_AGENT`, producing two hardcoded entries labelled `Project-A` and `Project-B`.
 
 8. **Command config reads and writes use JSON text**
    - File: `backend/sockets/systemSettingsHandlers.js` (Socket events: `get_commands_config`, `save_commands_config`)
-   - The handler resolves `COMMANDS_PATH` from `process.env.COMMANDS_CONFIG || 'commands.json'`, reads raw text for the editor, validates JSON on save, and writes the file.
+   - The handler resolves `getCommandsPath()` from `process.env.COMMANDS_CONFIG || 'commands.json'`, reads raw text for the editor, validates JSON on save, writes the file, invalidates command cache, and emits `custom_commands`.
    - File: `backend/services/commandsConfig.js` (Function: `loadCommands`)
    - Runtime custom command hydration retains entries that have both `name` and `description`, preserves all fields on each entry (including `prompt`), and caches the result.
 
@@ -144,14 +144,14 @@ The modal and backend handlers must keep these callback contracts stable:
 
 ```text
 get_env(callback) -> { vars: Record<string, string> } | { error: string }
-update_env({ key, value }, callback?) -> { success: true } | { error: string }
+update_env({ key, value }, callback?) -> { success: true, runtimeRefresh?: { workspaceCwds: boolean, customCommands: boolean, mcpConfigCacheCleared: boolean, requiresBackendRestart: boolean } } | { error: string }
 get_workspaces_config(callback) -> { content: string, error?: string }
-save_workspaces_config({ content }, callback?) -> { success: true } | { error: string }
+save_workspaces_config({ content }, callback?) -> { success: true, runtimeRefresh?: { workspaceCwds: boolean, requiresBackendRestart: boolean } } | { error: string }
 get_commands_config(callback) -> { content: string, error?: string }
-save_commands_config({ content }, callback?) -> { success: true } | { error: string }
+save_commands_config({ content }, callback?) -> { success: true, runtimeRefresh?: { customCommands: boolean, requiresBackendRestart: boolean } } | { error: string }
 get_provider_config(callback) -> { content: string, error?: string }
 get_provider_config({ providerId }, callback) -> { content: string, error?: string }
-save_provider_config({ providerId?, content }, callback?) -> { success: true } | { error: string }
+save_provider_config({ providerId?, content }, callback?) -> { success: true, runtimeRefresh?: { requiresBackendRestart: boolean } } | { error: string }
 ```
 
 Startup diagnostics use this separate, non-callback socket event:
@@ -164,7 +164,7 @@ InvalidJsonConfig -> { id, label, path, message, blocksStartup? }
 The key hazards are:
 - JSON tabs require frontend validation and backend validation. Frontend validation provides immediate UX; backend validation protects the filesystem write path.
 - Provider saves must carry `providerId` when the UI has one. Missing provider scope falls back through `getProvider(null)` to the default provider context.
-- Save callbacks report file-write success only. Runtime consumers such as `loadWorkspaces`, `loadCommands`, and `getProvider` have separate cache/load behavior.
+- Save callbacks include file-write success and optional `runtimeRefresh` metadata. Workspace and command saves refresh cache and emit live hydration events; provider saves remain restart-bound.
 - The System Settings read/write path is Socket.IO-based. Backend HTTP routes such as `backend/routes/brandingApi.js` and `backend/routes/mcpApi.js` are not the persistence path for this modal.
 
 ## Configuration / Data Flow
@@ -174,8 +174,8 @@ The key hazards are:
 | Config | Source Anchor | Path Rule | Runtime Consumer |
 |---|---|---|---|
 | Environment variables | `backend/sockets/systemSettingsHandlers.js` (`ENV_PATH`) | `<repo>/.env` | `process.env` and modules that read it |
-| Workspace editor | `backend/sockets/systemSettingsHandlers.js` (`WORKSPACES_PATH`) | `process.env.WORKSPACES_CONFIG || 'workspaces.json'`, resolved from repo root | `backend/services/workspaceConfig.js` (`loadWorkspaces`) |
-| Command editor | `backend/sockets/systemSettingsHandlers.js` (`COMMANDS_PATH`) | `process.env.COMMANDS_CONFIG || 'commands.json'`, resolved from repo root | `backend/services/commandsConfig.js` (`loadCommands`) |
+| Workspace editor | `backend/sockets/systemSettingsHandlers.js` (`getWorkspacesPath`) | `process.env.WORKSPACES_CONFIG || 'workspaces.json'`, resolved from repo root | `backend/services/workspaceConfig.js` (`loadWorkspaces`, `invalidateWorkspacesCache`) |
+| Command editor | `backend/sockets/systemSettingsHandlers.js` (`getCommandsPath`) | `process.env.COMMANDS_CONFIG || 'commands.json'`, resolved from repo root | `backend/services/commandsConfig.js` (`loadCommands`, `invalidateCommandsCache`) |
 | Provider settings | `backend/sockets/systemSettingsHandlers.js` (`getProviderPaths`) | `providers/<provider.id>/user.json`; read fallback `user.json.example` | `backend/services/providerLoader.js` (`getProvider`) |
 | Provider registry | `backend/services/providerRegistry.js` (`getProviderRegistry`) | `process.env.ACP_PROVIDERS_CONFIG || 'configuration/providers.json'` | Provider list and provider resolution |
 | Startup JSON diagnostics | `backend/services/jsonConfigDiagnostics.js` (`collectInvalidJsonConfigErrors`) | Provider registry, enabled provider `provider.json`/`branding.json`/`user.json`, workspace config, command config, and MCP config paths | `config_errors` socket payload and provider startup blocking decisions |
@@ -206,7 +206,8 @@ get_*_config callback
   -> save_*_config socket event
   -> backend JSON.parse
   -> filesystem write
-  -> callback saved/error state
+  -> workspaces/commands: cache invalidation + io.emit hydration refresh
+  -> callback saved/error state with runtimeRefresh metadata
 ```
 
 ### Provider Config Merge Point
@@ -250,8 +251,8 @@ Refresh button
 | Socket Registration | `backend/sockets/index.js` | `registerSocketHandlers`, `registerSystemSettingsHandlers(io, socket)`, `config_errors`, `workspace_cwds`, `custom_commands`, `sidebar_settings` | Emits config diagnostics first, registers handlers after diagnostics pass, and blocks hydration for startup-critical invalid config |
 | JSON Diagnostics | `backend/services/jsonConfigDiagnostics.js` | `collectInvalidJsonConfigErrors`, `hasStartupBlockingJsonConfigError` | Checks startup/hydration config files and returns user-visible invalid-config issues, including missing required provider definitions |
 | Settings Handlers | `backend/sockets/systemSettingsHandlers.js` | `registerSystemSettingsHandlers`, `getProviderPaths`, `get_env`, `update_env`, `get_workspaces_config`, `save_workspaces_config`, `get_commands_config`, `save_commands_config`, `get_provider_config`, `save_provider_config` | Reads and writes env/workspace/command/provider config files |
-| Workspace Runtime Loader | `backend/services/workspaceConfig.js` | `loadWorkspaces` | Loads, normalizes, and caches workspace definitions; falls back to `DEFAULT_WORKSPACE_CWD/AGENT` and `WORKSPACE_B_CWD/AGENT` env vars when JSON file is missing |
-| Command Runtime Loader | `backend/services/commandsConfig.js` | `loadCommands` | Loads, filters, and caches custom commands |
+| Workspace Runtime Loader | `backend/services/workspaceConfig.js` | `loadWorkspaces`, `invalidateWorkspacesCache` | Loads, normalizes, and caches workspace definitions; save/env refresh paths clear cache before reloading and emitting `workspace_cwds` |
+| Command Runtime Loader | `backend/services/commandsConfig.js` | `loadCommands`, `invalidateCommandsCache` | Loads, filters, and caches custom commands; save/env refresh paths clear cache before reloading and emitting `custom_commands` |
 | Provider Loader | `backend/services/providerLoader.js` | `getProvider`, `resetProviderLoaderForTests` | Merges provider config with `user.json` overrides |
 | Provider Registry | `backend/services/providerRegistry.js` | `getProviderRegistry`, `resolveProviderId`, `getProviderEntry` | Resolves enabled provider ids and provider paths |
 | Route Layer Check | `backend/routes/brandingApi.js`, `backend/routes/mcpApi.js` | `/api/branding/icons`, `/api/branding/manifest.json`, `/api/mcp/tools`, `/api/mcp/execute` | Provider/config-related HTTP routes; not System Settings persistence |
@@ -272,17 +273,17 @@ Refresh button
 1. **Invalid or missing startup config is a blocking UI state**
    - `config_errors` feeds `ConfigErrorModal`, which has no dismiss action. Fixing the file requires a backend restart when the affected loader caches or startup state has already run, then a frontend reconnect/reload to receive an empty diagnostic list.
 
-2. **Save callbacks do not refresh runtime hydration events**
-   - `save_workspaces_config` and `save_commands_config` write files and return callback status. They do not emit `workspace_cwds` or `custom_commands` to connected clients.
+2. **Workspace and command saves do live refresh**
+   - `save_workspaces_config` and `save_commands_config` invalidate their module caches and emit `workspace_cwds` / `custom_commands` to connected clients immediately.
 
-3. **Workspace and command loaders cache values**
-   - `loadWorkspaces` and `loadCommands` keep module-level `cached` values. File writes and cache refresh are separate lifecycle events. Saving new workspace or command config via `save_workspaces_config` / `save_commands_config` updates the file but the in-memory cache retains old data until process restart. Additionally, if the workspace JSON file is absent on first load, `loadWorkspaces` falls back to the `DEFAULT_WORKSPACE_CWD/AGENT` and `WORKSPACE_B_CWD/AGENT` env vars and caches those results—subsequent saves to the file will not be picked up until restart.
+3. **Workspace and command loaders are still cached between refreshes**
+   - `loadWorkspaces` and `loadCommands` keep module-level caches. The refresh path explicitly clears cache before reloading, but out-of-band file edits will not appear until the next refresh trigger or restart.
 
-4. **Provider config is loaded through providerLoader cache**
-   - `getProvider` caches merged provider config. Saving `user.json` writes the file; active provider config objects keep their loaded values until the loader cache is reset or the process starts with fresh state.
+4. **Provider config remains restart-bound**
+   - `getProvider` caches merged provider config. Saving `user.json` writes the file and returns callback status, but active provider runtimes keep loaded values until backend restart.
 
-5. **Config path constants are evaluated at module import**
-   - `WORKSPACES_PATH` and `COMMANDS_PATH` are constants in `systemSettingsHandlers.js`. Editing `WORKSPACES_CONFIG` or `COMMANDS_CONFIG` through the Environment tab does not change those constants inside the loaded module.
+5. **Config paths now resolve per request**
+   - `getWorkspacesPath` and `getCommandsPath` are evaluated at handler call time. Editing `WORKSPACES_CONFIG` or `COMMANDS_CONFIG` in Environment updates the subsequent read/write path without restarting the module.
 
 6. **Provider tab follows sidebar-expanded provider first**
    - `expandedProviderId` wins over `activeProviderId` and `defaultProviderId`. A sidebar provider expansion changes which provider `user.json` the modal reads and writes.
@@ -290,8 +291,8 @@ Refresh button
 7. **The env parser is intentionally simple**
    - `get_env` ignores comments and blank lines, splits at the first `=`, and returns strings. It does not unquote values or parse shell syntax.
 
-8. **Env keys are used in a regular expression**
-   - `update_env` constructs a `RegExp` from the key. Keep editable keys in conventional env-var form: uppercase letters, digits, and underscores.
+8. **Env key updates use escaped regex matching**
+   - `update_env` escapes env keys before regex replacement, so conventional env keys and path-like keys both update safely.
 
 9. **Audio device selection is local browser state**
    - `selectedAudioDevice` is persisted in `localStorage`. Backend STT availability is driven by `voice_enabled` and `VOICE_STT_ENABLED`, not by this select box.
@@ -342,16 +343,19 @@ Refresh button
   - `get_provider_config falls back to example file when user.json missing`
   - `save_provider_config errors on invalid JSON`
   - `handles provider_config and error`
+  - emits `workspace_cwds` and `custom_commands` on successful saves
 - `backend/test/workspaceConfig.test.js`
   - `loads workspaces from JSON config file`
   - `falls back to env vars when config file does not exist`
   - `filters out entries without label or path`
   - `defaults pinned to false`
   - `resolves WORKSPACES_CONFIG relative to project root, not CWD`
+  - `reloads from disk after invalidateWorkspacesCache`
 - `backend/test/commandsConfig.test.js`
   - `loads commands from JSON config file`
   - `returns empty array when config file does not exist`
   - `filters out entries without name or description`
+  - `reloads from disk after invalidateCommandsCache`
 - `backend/test/jsonConfigDiagnostics.test.js`
   - `returns no errors when loaded JSON config files are valid`
   - `lists every malformed config file it can discover`
@@ -393,5 +397,5 @@ Refresh button
 - Provider settings are scoped by `expandedProviderId || activeProviderId || defaultProviderId` and target `providers/<provider.id>/user.json`.
 - Runtime stores hydrate through separate connection events handled in `useSocket`.
 - Malformed load-time JSON config flows through `jsonConfigDiagnostics`, `config_errors`, `useSystemStore.invalidJsonConfigs`, and the blocking `ConfigErrorModal`.
-- Workspace, command, and provider loaders cache values, so file persistence and active runtime state must be reasoned about separately.
+- Workspace and command saves trigger cache invalidation plus live hydration emits; provider runtime config remains cached until backend restart.
 - Audio device selection is managed by `useVoiceStore` and browser APIs, with selected device persistence in `localStorage`.

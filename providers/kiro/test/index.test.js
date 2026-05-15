@@ -265,8 +265,62 @@ describe('Kiro Provider', () => {
       expect(fs.copyFileSync).toHaveBeenCalledTimes(2);
       expect(fs.cpSync).toHaveBeenCalled();
     });
-  });
 
+    it('deleteSessionFiles clears Kiro runtime context cache state', async () => {
+      const emitProviderExtension = vi.fn();
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) {
+          return JSON.stringify({ [acpId]: 42 });
+        }
+        return '';
+      });
+      await kiro.prepareAcpEnvironment({ KEEP: '1' }, { emitProviderExtension, writeLog: vi.fn() });
+      expect(kiro.emitCachedContext(acpId)).toBe(true);
+
+      fs.existsSync.mockReturnValue(true);
+      const writesBeforeDelete = fs.writeFileSync.mock.calls.length;
+      kiro.deleteSessionFiles(acpId);
+      expect(fs.writeFileSync.mock.calls.length).toBeGreaterThan(writesBeforeDelete);
+
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) {
+          return JSON.stringify({ [acpId]: 30 });
+        }
+        return '';
+      });
+      await kiro.prepareAcpEnvironment({ KEEP: '1' }, { emitProviderExtension, writeLog: vi.fn() });
+      emitProviderExtension.mockClear();
+      expect(kiro.emitCachedContext(acpId)).toBe(true);
+    });
+
+    it('archiveSessionFiles clears Kiro runtime context cache state', async () => {
+      const archiveSessionId = 'sess-archive-123';
+      const emitProviderExtension = vi.fn();
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) {
+          return JSON.stringify({ [archiveSessionId]: 55 });
+        }
+        return '';
+      });
+      await kiro.prepareAcpEnvironment({ KEEP: '1' }, { emitProviderExtension, writeLog: vi.fn() });
+      expect(kiro.emitCachedContext(archiveSessionId)).toBe(true);
+
+      fs.existsSync.mockReturnValue(true);
+      const writesBeforeArchive = fs.writeFileSync.mock.calls.length;
+      kiro.archiveSessionFiles(archiveSessionId, '/archive/dir');
+      expect(fs.writeFileSync.mock.calls.length).toBeGreaterThan(writesBeforeArchive);
+
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_context.json')) {
+          return JSON.stringify({ [archiveSessionId]: 28 });
+        }
+        return '';
+      });
+      await kiro.prepareAcpEnvironment({ KEEP: '1' }, { emitProviderExtension, writeLog: vi.fn() });
+      emitProviderExtension.mockClear();
+      expect(kiro.emitCachedContext(archiveSessionId)).toBe(true);
+    });
+  });
   describe('normalizeTool', () => {
     it('normalizes kiro tool names from generic IDs via title', () => {
       const event = { id: 'call_bash_123', title: 'call_bash_123' };

@@ -9,11 +9,15 @@ function isExplicitFalse(value) {
   return value === false || String(value || '').trim().toLowerCase() === 'false';
 }
 
-export function subAgentCheckToolTitle(input = {}) {
+export function isSubAgentStatusWaitEnabled(input = {}) {
   const waitForCompletion = input.waitForCompletion ?? input.wait_for_completion;
-  return isExplicitFalse(waitForCompletion)
-    ? 'Check Subagents: Quick status check'
-    : 'Check Subagents: Waiting for agents to finish';
+  return !isExplicitFalse(waitForCompletion);
+}
+
+export function subAgentCheckToolTitle(input = {}) {
+  return isSubAgentStatusWaitEnabled(input)
+    ? 'Check Subagents: Waiting for agents to finish'
+    : 'Check Subagents: Quick status check';
 }
 
 export function basenameForToolPath(value) {

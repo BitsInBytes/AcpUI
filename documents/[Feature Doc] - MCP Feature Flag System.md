@@ -63,9 +63,9 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
 
 4. **Runtime callers use the cached config**
 
-   File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `resetMcpConfigForTests`)
+   File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `invalidateMcpConfigCache`, `resetMcpConfigForTests`)
 
-   `getMcpConfig` stores the first parsed result in `cachedConfig`. Tests that change `MCP_CONFIG` call `resetMcpConfigForTests` before reading a new temp config.
+   `getMcpConfig` stores the first parsed result in `cachedConfig`. `invalidateMcpConfigCache` clears the cache (used by System Settings env updates such as `MCP_CONFIG`). Tests that change `MCP_CONFIG` call `resetMcpConfigForTests` before reading a new temp config.
 
    ```js
    // FILE: backend/services/mcpConfig.js (Function: getMcpConfig)
@@ -110,20 +110,13 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
 8. **The route advertises only enabled tool definitions**
 
    File: `backend/routes/mcpApi.js` (Function: `createMcpApiRoutes`, Route: `GET /tools`, Mounted route: `GET /api/mcp/tools`)
+   File: `backend/mcp/mcpToolMetadata.js` (Functions: `getMcpToolEnablement`, `getAdvertisedMcpToolDefinitions`)
 
-   The route resolves provider context for advertisement with `resolveToolContext`, builds a provider-specific subagent model description from `modelOptionsFromProviderConfig`, and appends definitions only when the matching feature helper returns `true`.
+   The route resolves provider context for advertisement with `resolveToolContext`, builds a provider-specific subagent model description from `modelOptionsFromProviderConfig`, then delegates feature-flag selection to `getAdvertisedMcpToolDefinitions`.
 
    ```js
    // FILE: backend/routes/mcpApi.js (Route: GET /tools)
-   if (isInvokeShellMcpEnabled()) toolList.push(getInvokeShellMcpToolDefinition());
-   if (isSubagentsMcpEnabled()) toolList.push(getSubagentsMcpToolDefinition({ modelDescription }));
-   if (isCounselMcpEnabled()) toolList.push(getCounselMcpToolDefinition());
-   if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
-     toolList.push(getCheckSubagentsMcpToolDefinition());
-     toolList.push(getAbortSubagentsMcpToolDefinition());
-   }
-   if (isIoMcpEnabled()) toolList.push(...getIoMcpToolDefinitions());
-   if (isGoogleSearchMcpEnabled()) toolList.push(...getGoogleSearchMcpToolDefinitions());
+   const toolList = getAdvertisedMcpToolDefinitions({ modelDescription });
    ```
 
 9. **Tool definitions are owned by definition modules**
@@ -143,20 +136,22 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
 11. **Handler registration follows the same flags**
 
     File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`)
+    File: `backend/mcp/mcpToolMetadata.js` (Function: `getMcpToolEnablement`)
 
-    `createToolHandlers` installs only handlers whose config helpers are enabled. IO handlers and Google search handlers are added as grouped maps from `backend/mcp/ioMcpToolHandlers.js`.
+    `createToolHandlers` installs handlers from the same centralized enablement matrix used by route advertisement. IO handlers and Google search handlers are still added as grouped maps from `backend/mcp/ioMcpToolHandlers.js`.
 
     ```js
     // FILE: backend/mcp/mcpServer.js (Function: createToolHandlers)
-    if (isInvokeShellMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeShell] = runShellInvocation;
-    if (isSubagentsMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
-    if (isCounselMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
-    if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+    const toolEnablement = getMcpToolEnablement();
+    if (toolEnablement.invokeShell) tools[ACP_UX_TOOL_NAMES.invokeShell] = runShellInvocation;
+    if (toolEnablement.subagents) tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
+    if (toolEnablement.counsel) tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
+    if (toolEnablement.subagentStatus) {
       tools[ACP_UX_TOOL_NAMES.checkSubagents] = runCheckSubagentsInvocation;
       tools[ACP_UX_TOOL_NAMES.abortSubagents] = runAbortSubagentsInvocation;
     }
-    if (isIoMcpEnabled()) Object.assign(tools, createIoMcpToolHandlers());
-    if (isGoogleSearchMcpEnabled()) Object.assign(tools, createGoogleSearchMcpToolHandlers());
+    if (toolEnablement.io) Object.assign(tools, createIoMcpToolHandlers());
+    if (toolEnablement.googleSearch) Object.assign(tools, createGoogleSearchMcpToolHandlers());
     ```
 
 12. **Registered handlers are wrapped for tool state updates**
@@ -335,7 +330,7 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
 | Config example | `configuration/mcp.json.example` | `tools.invokeShell`, `tools.subagents`, `tools.counsel`, `tools.io`, `tools.googleSearch`, `subagents.*`, `io.*`, `webFetch.*`, `googleSearch.*` | Documents the JSON shape and sample values. |
-| Config loader | `backend/services/mcpConfig.js` | `DEFAULT_CONFIG_PATH`, `repoPath`, `boolSetting`, `numberSetting`, `stringArray`, `disabledConfig`, `normalizeMcpConfig`, `buildMcpConfig`, `getMcpConfig`, `resetMcpConfigForTests` | Loads, normalizes, caches, and resets MCP config. |
+| Config loader | `backend/services/mcpConfig.js` | `DEFAULT_CONFIG_PATH`, `repoPath`, `boolSetting`, `numberSetting`, `stringArray`, `disabledConfig`, `normalizeMcpConfig`, `buildMcpConfig`, `getMcpConfig`, `invalidateMcpConfigCache`, `resetMcpConfigForTests` | Loads, normalizes, caches, and resets MCP config. |
 | Feature helpers | `backend/services/mcpConfig.js` | `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`, `getSubagentsMcpConfig`, `getIoMcpConfig`, `getWebFetchMcpConfig`, `getGoogleSearchMcpConfig` | Exposes normalized flags and guardrail settings to routes and services. |
 | Main sessions | `backend/services/sessionManager.js` | `getMcpServers`, `loadSessionIntoMemory`, `autoLoadPinnedSessions` | Builds stdio proxy MCP server configs for main session loading paths. |
 | Socket sessions | `backend/sockets/sessionHandlers.js` | Socket event `create_session`, socket event `fork_session`, `getMcpServers`, `bindMcpProxy`, `getMcpProxyIdFromServers` | Injects MCP server configs into `session/new` and `session/load` requests. |
@@ -346,8 +341,9 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
 | Server mount | `backend/server.js` | `app.use('/api/mcp', ...)`, `mcpApiRouter`, `createMcpApiRoutes(io)` | Mounts the MCP API before the static route stack. |
-| Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `ListToolsRequestSchema`, `CallToolRequestSchema`, `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN` | Fetches tool definitions and forwards authenticated tool calls to the backend API. |
+| Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `mapBackendToolsToMcpListTools`, `ListToolsRequestSchema`, `CallToolRequestSchema`, `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN` | Fetches tool definitions and forwards authenticated tool calls to the backend API while preserving schema metadata parity. |
 | MCP API | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `resolveToolContext`, `resolveExecutionContext`, `createToolCallAbortSignal`, `GET /tools`, `POST /tool-call` | Advertises enabled tools and dispatches authenticated tool calls. |
+| Tool metadata matrix | `backend/mcp/mcpToolMetadata.js` | `getMcpToolEnablement`, `getAdvertisedMcpToolDefinitions` | Centralizes feature-gated MCP advertisement metadata shared by routes and handler registration logic. |
 | Core definitions | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition` | Defines core MCP tool schemas and metadata. |
 | IO definitions | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions` | Defines IO, web fetch, and Google search schemas and metadata. |
 | Handler registration | `backend/mcp/mcpServer.js` | `createToolHandlers`, `wrapToolHandlers`, `runShellInvocation`, `runSubagentInvocation`, `runCheckSubagentsInvocation`, `runAbortSubagentsInvocation`, `runCounselInvocation`, `getMaxShellResultLines` | Registers enabled backend handlers under canonical tool names. |
@@ -377,13 +373,13 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 
    `disabledConfig` sets every `tools.*` flag to `false`. Numeric guardrails still have defaults, but no route definitions or handlers should be considered enabled from a failed load.
 
-4. **Config is cached per backend process**
+4. **Config is cached until explicitly invalidated**
 
-   `getMcpConfig` caches the first load. Runtime config file edits require a backend lifecycle that rebuilds the cache. Tests use `resetMcpConfigForTests` to make each temp config visible.
+   `getMcpConfig` caches the first load. `invalidateMcpConfigCache` clears that cache (for example after `MCP_CONFIG` env updates), and tests use `resetMcpConfigForTests` to make each temp config visible.
 
-5. **Proxy tool definitions are captured during proxy startup**
+5. **Proxy tool definitions and handler maps are startup-scoped**
 
-   `stdio-proxy.js` fetches `/api/mcp/tools` in `runProxy` and its `ListTools` handler returns that captured list. New tool visibility is tied to the backend config cache and the proxy/session lifecycle.
+   `stdio-proxy.js` fetches `/api/mcp/tools` in `runProxy` and its `ListTools` handler returns that captured list. `createMcpApiRoutes` also builds the executable handler map during backend startup. Cache invalidation alone does not refresh already-running proxies or the existing handler map; use backend restart/new sessions for deterministic feature-flag changes.
 
 6. **Provider `mcpName` controls proxy injection**
 
@@ -397,9 +393,9 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 
    `getIoMcpToolDefinitions` includes `ux_web_fetch`, and `createIoMcpToolHandlers` registers the web fetch handler. There is no separate `tools.webFetch` flag.
 
-9. **Advertisement and handler registration are separate code paths**
+9. **Advertisement and handler registration still require parity checks**
 
-   `backend/routes/mcpApi.js` builds `GET /tools` responses. `backend/mcp/mcpServer.js` builds the handler map. New tools must update both paths with the same canonical name.
+   `backend/routes/mcpApi.js` builds `GET /tools` responses and `backend/mcp/mcpServer.js` builds the handler map, both through `backend/mcp/mcpToolMetadata.js` enablement. New tools still need matching schema and handler entries plus drift coverage in `backend/test/mcpToolMetadataDrift.test.js`.
 
 10. **Runtime context still matters after a flag is enabled**
 
@@ -413,7 +409,8 @@ File: `backend/test/mcpConfig.test.js`
 - `disables config-controlled tools when the config is missing`
 - `disables config-controlled tools when the config is malformed`
 - `reads enabled tools from configuration/mcp.json shape`
-- `normalizes IO, web fetch, and Google search settings`
+- `reloads config after invalidateMcpConfigCache`
+- `normalizes IO, web fetch, Google search, and sub-agent status settings`
 - `disables Google search when enabled without an MCP config API key`
 
 ### Route Advertisement and Tool Calls
@@ -434,6 +431,11 @@ File: `backend/test/mcpApi.test.js`
 - `POST /tool-call aborts the handler signal when the request fires the "aborted" event`
 - `POST /tool-call suppresses the error response when res.destroyed is true before the handler throws`
 - `POST /tool-call aborts the handler signal when the response closes before completion`
+
+File: `backend/test/mcpToolMetadataDrift.test.js`
+- `keeps advertised route tools in sync with registered handlers`
+- `keeps stdio proxy schema mapping aligned with advertised tool metadata`
+- `keeps frontend and backend AcpUI tool-name registries aligned`
 
 ### Handler Registration and Execution
 

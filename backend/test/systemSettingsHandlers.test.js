@@ -25,6 +25,7 @@ describe('systemSettingsHandlers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIo = new EventEmitter();
+    vi.spyOn(mockIo, 'emit');
     mockSocket = new EventEmitter();
     registerSystemSettingsHandlers(mockIo, mockSocket);
   });
@@ -45,7 +46,7 @@ describe('systemSettingsHandlers', () => {
     const callback = vi.fn();
     await mockSocket.emit('update_env', { key: 'KEY', value: 'NEW' }, callback);
     expect(mockFs.writeFileSync).toHaveBeenCalled();
-    expect(callback).toHaveBeenCalledWith({ success: true });
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
 
     mockFs.readFileSync.mockImplementation(() => { throw new Error('fail'); });
     await mockSocket.emit('update_env', { key: 'K', value: 'V' }, callback);
@@ -60,6 +61,7 @@ describe('systemSettingsHandlers', () => {
 
     await mockSocket.emit('save_workspaces_config', { content: '{"workspaces":[]}' }, callback);
     expect(mockFs.writeFileSync).toHaveBeenCalled();
+    expect(mockIo.emit).toHaveBeenCalledWith('workspace_cwds', { cwds: [] });
 
     mockFs.readFileSync.mockImplementation(() => { throw new Error('fail'); });
     await mockSocket.emit('get_workspaces_config', callback);
@@ -77,6 +79,7 @@ describe('systemSettingsHandlers', () => {
 
     await mockSocket.emit('save_commands_config', { content: '{"commands":[]}' }, callback);
     expect(mockFs.writeFileSync).toHaveBeenCalled();
+    expect(mockIo.emit).toHaveBeenCalledWith('custom_commands', { commands: [] });
 
     mockFs.readFileSync.mockImplementation(() => { throw new Error('fail'); });
     await mockSocket.emit('get_commands_config', callback);

@@ -1,6 +1,6 @@
 import { Socket } from 'socket.io-client';
 import { create } from 'zustand';
-import type { CanvasArtifact, CanvasReadFileResponse } from '../types';
+import type { CanvasArtifact, CanvasReadFileRequest, CanvasReadFileResponse } from '../types';
 
 interface CanvasState {
   isCanvasOpen: boolean;
@@ -106,8 +106,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 
   handleOpenFileInCanvas: (socket, activeSessionId, filePath) => {
-    if (!socket) return;
-    socket.emit('canvas_read_file', { filePath }, (res: CanvasReadFileResponse) => {
+    if (!socket || !activeSessionId) return;
+    const request: CanvasReadFileRequest = { filePath, sessionId: activeSessionId };
+    socket.emit('canvas_read_file', request, (res: CanvasReadFileResponse) => {
       if (res.artifact) {
         get().handleOpenInCanvas(socket, activeSessionId, res.artifact);
       } else if (res.error) {
@@ -125,12 +126,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       a.filePath && (normalize(a.filePath).endsWith(editedNormalized) || editedNormalized.endsWith(normalize(a.filePath)))
     );
     
-    if (watched && socket) {
-      socket.emit('canvas_read_file', { filePath: watched.filePath }, (res: CanvasReadFileResponse) => {
+    if (watched && socket && watched.filePath) {
+      const request: CanvasReadFileRequest = { filePath: watched.filePath, sessionId: watched.sessionId };
+      socket.emit('canvas_read_file', request, (res: CanvasReadFileResponse) => {
         if (res.artifact) {
           const updatedArtifact = { 
             ...res.artifact, 
-            id: watched.id, 
+            id: watched.id,
+            sessionId: watched.sessionId,
             lastUpdated: Date.now() 
           };
           

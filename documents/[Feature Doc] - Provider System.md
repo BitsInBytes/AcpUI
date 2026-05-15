@@ -215,7 +215,7 @@ Supporting workflows use provider hooks directly:
 
 - `parseJsonlSession` calls `getSessionPaths(acpSessionId)` and `parseSessionHistory(filePath, Diff)`.
 - `cleanupAcpSession` calls `deleteSessionFiles(acpSessionId)`.
-- Archive handlers call `archiveSessionFiles`, `restoreSessionFiles`, and `deleteSessionFiles`, and they resolve provider-scoped attachment roots and restored session provider identity from archive metadata.
+- Archive handlers call `archiveSessionFiles`, `restoreSessionFiles`, and `deleteSessionFiles`, and they resolve provider-scoped attachment roots and restored session provider identity from archive metadata. Providers are also responsible for clearing provider-local runtime maps/sets tied to that session during delete/archive so session memory does not leak across lifecycle transitions.
 - Attachment upload storage calls `getAttachmentsDir()`.
 - `runHooks` calls `getHooksForAgent(agentName, hookType)` unless `cliManagedHooks` includes the hook type.
 - Prompt execution calls `onPromptStarted(sessionId)` before `session/prompt` and `onPromptCompleted(sessionId)` in the prompt completion path.
@@ -308,7 +308,7 @@ Expected shape:
 
 Allowed `kind` values used by the contract are `acpui_mcp`, `mcp`, `provider_builtin`, and `unknown`. `backend/services/tools/toolInvocationResolver.js` compacts this into `invocation.identity`, merges cached state and MCP execution registry data, and marks AcpUI UX tools when the canonical name or MCP server matches the registered AcpUI tool set.
 
-`provider.json` key `toolIdPattern` is the configured source for MCP tool ID parsing. Generic helpers such as `matchToolIdPattern` only compile the pattern and extract `{mcpName}` and `{toolName}`; provider modules decide which raw fields to inspect.
+`provider.json` key `toolIdPattern` is the configured source for MCP tool ID parsing. Generic helpers such as `matchToolIdPattern` only compile the pattern and extract `{mcpName}` and `{toolName}`; provider modules decide which raw fields to inspect. Provider-specific cleanup of raw tool-name variants (for example provider-only suffix stripping) must remain provider-owned or provider-declarative, not hardcoded in shared normalization helpers.
 
 ### Contract: Session Model and Config State
 

@@ -29,6 +29,9 @@ describe('SystemSettingsModal', () => {
            if (event === 'get_workspaces_config') callback({ content: '[]' });
            if (event === 'get_commands_config') callback({ content: '[]' });
            if (event === 'get_provider_config') callback({ content: '{}' });
+           if (event === 'save_workspaces_config') callback({ success: true });
+           if (event === 'save_commands_config') callback({ success: true });
+           if (event === 'save_provider_config') callback({ success: true });
         }
       }),
       on: vi.fn(),
@@ -93,6 +96,7 @@ describe('SystemSettingsModal', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(mockSocket.emit).toHaveBeenCalledWith('save_workspaces_config', expect.objectContaining({ content: '{"updated": true}' }), expect.any(Function));
+    expect(screen.getByText('✓ Saved and workspace list refreshed')).toBeInTheDocument();
   });
 
   it('handles invalid JSON in workspace config', async () => {

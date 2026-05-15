@@ -679,8 +679,66 @@ describe('Claude Provider', () => {
       expect(fs.copyFileSync).toHaveBeenCalledTimes(2);
       expect(fs.unlinkSync).toHaveBeenCalledTimes(2);
     });
-  });
 
+    it('deleteSessionFiles clears Claude runtime context cache state', async () => {
+      const emitProviderExtension = vi.fn();
+      await claude.prepareAcpEnvironment({ CLAUDE_QUOTA_PROXY: 'false' }, { emitProviderExtension, writeLog: vi.fn() });
+
+      claude.intercept({
+        method: 'session/update',
+        params: {
+          sessionId: acpId,
+          update: { sessionUpdate: 'usage_update', used: 50, size: 100 }
+        }
+      });
+      expect(claude.emitCachedContext(acpId)).toBe(true);
+
+      fs.existsSync.mockReturnValue(true);
+      const writesBeforeDelete = fs.writeFileSync.mock.calls.length;
+      claude.deleteSessionFiles(acpId);
+      expect(fs.writeFileSync.mock.calls.length).toBeGreaterThan(writesBeforeDelete);
+
+      claude.intercept({
+        method: 'session/update',
+        params: {
+          sessionId: acpId,
+          update: { sessionUpdate: 'usage_update', used: 20, size: 100 }
+        }
+      });
+      emitProviderExtension.mockClear();
+      expect(claude.emitCachedContext(acpId)).toBe(true);
+    });
+
+    it('archiveSessionFiles clears Claude runtime context cache state', async () => {
+      const archiveSessionId = 'sess-archive-999';
+      const emitProviderExtension = vi.fn();
+      await claude.prepareAcpEnvironment({ CLAUDE_QUOTA_PROXY: 'false' }, { emitProviderExtension, writeLog: vi.fn() });
+
+      claude.intercept({
+        method: 'session/update',
+        params: {
+          sessionId: archiveSessionId,
+          update: { sessionUpdate: 'usage_update', used: 60, size: 100 }
+        }
+      });
+      expect(claude.emitCachedContext(archiveSessionId)).toBe(true);
+
+      fs.existsSync.mockReturnValue(true);
+      const writesBeforeArchive = fs.writeFileSync.mock.calls.length;
+      claude.archiveSessionFiles(archiveSessionId, '/archive/dir');
+      expect(fs.writeFileSync.mock.calls.length).toBeGreaterThan(writesBeforeArchive);
+
+      claude.intercept({
+        method: 'session/update',
+        params: {
+          sessionId: archiveSessionId,
+          update: { sessionUpdate: 'usage_update', used: 15, size: 100 }
+        }
+      });
+      emitProviderExtension.mockClear();
+      expect(claude.emitCachedContext(archiveSessionId)).toBe(true);
+    });
+  });
   describe('getHooksForAgent', () => {
     it('reads SessionStart hooks from settings.json', async () => {
       fs.readFileSync.mockReturnValue(JSON.stringify({

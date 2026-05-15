@@ -7,6 +7,7 @@ import {
   prettyToolTitle,
   resolveToolNameFromAcpUiMcpTitle,
   resolveToolNameFromCandidates,
+  resolvePatternToolName,
   toolTitleDetailFromInput
 } from '../services/tools/providerToolNormalization.js';
 
@@ -119,6 +120,13 @@ describe('providerToolNormalization', () => {
     expect(resolveToolNameFromAcpUiMcpTitle('Check Subagents')).toBe('ux_check_subagents');
     expect(resolveToolNameFromAcpUiMcpTitle('Check Subagents: Quick status check')).toBe('ux_check_subagents');
     expect(resolveToolNameFromAcpUiMcpTitle('Abort Subagents')).toBe('ux_abort_subagents');
+  });
+
+  it('supports provider-owned suffix stripping patterns for tool ids', () => {
+    expect(resolvePatternToolName('ux_read_file-1-2', config)).toBe('');
+    expect(resolvePatternToolName('ux_read_file-1-2', config, {
+      stripSuffixPatterns: [/-\d+-\d+$/]
+    })).toBe('ux_read_file');
   });
 
   it('formats shared provider titles and detail values', () => {

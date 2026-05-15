@@ -64,7 +64,7 @@ The provider list becomes `effectiveProviders` inside `Sidebar`, and workspace e
 File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`)
 File: `frontend/src/store/useSessionLifecycleStore.ts` (Action: `handleInitialLoad`)
 
-`useChatManager` calls `handleInitialLoad` when a socket is available. The store emits `load_sessions`, normalizes model fields, clears runtime startup flags, and builds the notes indicator map.
+`useChatManager` calls `handleInitialLoad` when a socket is available. The store emits `load_sessions`, normalizes model fields, clears runtime startup flags, and builds the notes indicator map used by sidebar row rendering. Notes ownership and socket/DB contracts are documented in `[Feature Doc] - Notes.md`.
 
 ```typescript
 // FILE: frontend/src/store/useSessionLifecycleStore.ts (Action: handleInitialLoad)
@@ -489,7 +489,7 @@ The `folders` table stores `id`, `name`, `parent_id`, `position`, `created_at`, 
 |---|---|---|---|
 | Sidebar shell | `frontend/src/components/Sidebar.tsx` | Component `Sidebar`; handlers `handleSelect`, `handleNew`, `handlePrimaryNew`, `handleShowArchives`, `handleRestore`, `handleRemoveSession`, `handleDropSession`, `handleDropFolder`, `handleRootDrop`, `renderChildren`, `onResizeStart` | Main provider stack, search, workspace, archive, folder, session, drag/drop, resize, and footer renderer. |
 | Folder tree | `frontend/src/components/FolderItem.tsx` | Component `FolderItem`; function `renderForkTree`; handlers `handleDrop`, `handleFolderDragStart`, `startEdit`, `saveEdit`; function `isDescendant` | Recursive folder renderer with rename/delete/subfolder controls and folder/session drop targets. |
-| Session row | `frontend/src/components/SessionItem.tsx` | Component `SessionItem`; handlers `handleStartEdit`, `handleSaveEdit`; functions `isSessionPoppedOut`, `openPopout`, `focusPopout` | Applies session classes, icons, notes indicator, sub-agent action restrictions, edit mode, and pop-out behavior. |
+| Session row | `frontend/src/components/SessionItem.tsx` | Component `SessionItem`; handlers `handleStartEdit`, `handleSaveEdit`; functions `isSessionPoppedOut`, `openPopout`, `focusPopout` | Applies session classes, icons, notes indicator rendering, sub-agent action restrictions, edit mode, and pop-out behavior. Notes ownership: `[Feature Doc] - Notes.md`. |
 | Styling | `frontend/src/components/Sidebar.css` | Classes `.sidebar`, `.sessions-list`, `.provider-stack`, `.provider-stack-header`, `.collapsed-running`, `.folder-row`, `.folder-row.drag-over`, `.session-item`, `.typing`, `.unread`, `.awaiting-permission`, `.awaiting-shell-input`, `.popped-out`, `.sidebar-resize-handle`; keyframes `breatheGlow`, `greenBreatheGlow` | Layout, responsive behavior, status animations, drag-over feedback, and row states. |
 | Archive modal | `frontend/src/components/ArchiveModal.tsx` | Component `ArchiveModal` | Lists, filters, restores, and deletes archive folder entries passed by `Sidebar`. |
 | Workspace picker | `frontend/src/components/WorkspacePickerModal.tsx` | Component `WorkspacePickerModal` | Lets the user choose a workspace cwd and optional agent when multiple workspaces exist. |
@@ -501,7 +501,7 @@ The `folders` table stores `id`, `name`, `parent_id`, `position`, `created_at`, 
 |---|---|---|---|
 | Socket bootstrap | `frontend/src/hooks/useSocket.ts` | Function `getOrCreateSocket`; hook `useSocket`; events `providers`, `branding`, `workspace_cwds`, `sidebar_settings` | Loads provider/workspace/branding/settings data used by the sidebar. |
 | Chat event routing | `frontend/src/hooks/useChatManager.ts` | Hook `useChatManager`; handlers for `session_renamed`, `token_done`, `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit`, `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`; local map `pendingSubAgents`; helper `syncShellInputStateForSession` | Routes stream, shell, and sub-agent events into stores that drive sidebar state. |
-| Sessions | `frontend/src/store/useSessionLifecycleStore.ts` | Store `useSessionLifecycleStore`; actions `handleInitialLoad`, `handleSessionSelect`, `handleNewChat`, `handleTogglePin`, `handleRenameSession`, `setSessions` | Holds session list, active session, notes map, selection behavior, pin sorting, and rename persistence. |
+| Sessions | `frontend/src/store/useSessionLifecycleStore.ts` | Store `useSessionLifecycleStore`; actions `handleInitialLoad`, `handleSessionSelect`, `handleNewChat`, `handleTogglePin`, `handleRenameSession`, `setSessions` | Holds session list, active session, notes indicator map, selection behavior, pin sorting, and rename persistence. Notes ownership: `[Feature Doc] - Notes.md`. |
 | Folders | `frontend/src/store/useFolderStore.ts` | Store `useFolderStore`; actions `loadFolders`, `createFolder`, `renameFolder`, `deleteFolder`, `moveFolder`, `moveSessionToFolder`, `toggleFolder`; constant `EXPANDED_KEY` | Holds folder tree and expanded state, emits folder socket events, and applies optimistic folder/session updates. |
 | UI | `frontend/src/store/useUIStore.ts` | Store `useUIStore`; actions `setSidebarOpen`, `setSidebarPinned`, `toggleSidebarPinned`, `setExpandedProviderId`, `setSettingsOpen` | Holds sidebar open/pinned state, expanded provider state, and session settings modal target. |
 | System | `frontend/src/store/useSystemStore.ts` | Store `useSystemStore`; actions `setProviders`, `setProviderBranding`, `setWorkspaceCwds`, `setDeletePermanent`, `setProviderStatus`, `getBranding` | Holds provider order, provider summaries, workspace list, delete mode, and provider status data. |
@@ -640,7 +640,7 @@ npx vitest run test/folderHandlers.test.js
 
 - `Sidebar` is the provider-scoped orchestrator for sidebar search, provider stacks, workspace controls, archive controls, folders, root sessions, fork nesting, sub-agent nesting, drag/drop, resizing, and footer actions.
 - `FolderItem` owns recursive folder rendering, folder actions, folder drop targets, and fork rendering inside expanded folders.
-- `SessionItem` owns row state classes, icon priority, edit mode, notes indicator, pop-out behavior, and action restrictions for sub-agents.
+- `SessionItem` owns row state classes, icon priority, edit mode, notes indicator rendering, pop-out behavior, and action restrictions for sub-agents. Notes ownership and persistence contracts live in `[Feature Doc] - Notes.md`.
 - `useSessionLifecycleStore`, `useFolderStore`, `useUIStore`, `useSystemStore`, `useCanvasStore`, and `useStreamStore` are all part of the rendering contract.
 - Provider matching uses `session.provider` and `folder.providerId`; tree matching uses `folderId`, `forkedFrom`, and `isSubAgent`.
 - Realtime status classes come from `isTyping`, `hasUnreadResponse`, `isAwaitingPermission`, `isAwaitingShellInput`, and pop-out ownership.

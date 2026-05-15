@@ -795,6 +795,74 @@ describe('Codex Provider', () => {
   });
 
   describe('session file operations', () => {
+    it('deleteSessionFiles clears Codex runtime context cache state', async () => {
+      const acpId = 'codex-cleanup-delete';
+      const emitProviderExtension = vi.fn();
+      fs.mkdirSync(mockConfig.paths.home, { recursive: true });
+      fs.writeFileSync(
+        path.join(mockConfig.paths.home, 'acp_session_context.json'),
+        JSON.stringify({ [acpId]: 42 }),
+        'utf8'
+      );
+
+      await codex.prepareAcpEnvironment({}, { emitProviderExtension });
+      expect(codex.emitCachedContext(acpId)).toBe(true);
+
+      const paths = codex.getSessionPaths(acpId);
+      fs.mkdirSync(path.dirname(paths.jsonl), { recursive: true });
+      fs.writeFileSync(paths.jsonl, '{}\n', 'utf8');
+      fs.writeFileSync(paths.json, '{}', 'utf8');
+      fs.mkdirSync(paths.tasksDir, { recursive: true });
+
+      codex.deleteSessionFiles(acpId);
+      const contextAfterDelete = JSON.parse(fs.readFileSync(path.join(mockConfig.paths.home, 'acp_session_context.json'), 'utf8'));
+      expect(contextAfterDelete[acpId]).toBeUndefined();
+
+      fs.writeFileSync(
+        path.join(mockConfig.paths.home, 'acp_session_context.json'),
+        JSON.stringify({ [acpId]: 25 }),
+        'utf8'
+      );
+      await codex.prepareAcpEnvironment({}, { emitProviderExtension });
+      emitProviderExtension.mockClear();
+      expect(codex.emitCachedContext(acpId)).toBe(true);
+    });
+
+    it('archiveSessionFiles clears Codex runtime context cache state', async () => {
+      const acpId = 'codex-cleanup-archive';
+      const archiveDir = path.join(mockConfig.paths.archive, 'archive-cleanup');
+      const emitProviderExtension = vi.fn();
+      fs.mkdirSync(mockConfig.paths.home, { recursive: true });
+      fs.writeFileSync(
+        path.join(mockConfig.paths.home, 'acp_session_context.json'),
+        JSON.stringify({ [acpId]: 55 }),
+        'utf8'
+      );
+
+      await codex.prepareAcpEnvironment({}, { emitProviderExtension });
+      expect(codex.emitCachedContext(acpId)).toBe(true);
+
+      const paths = codex.getSessionPaths(acpId);
+      fs.mkdirSync(path.dirname(paths.jsonl), { recursive: true });
+      fs.mkdirSync(archiveDir, { recursive: true });
+      fs.writeFileSync(paths.jsonl, '{}\n', 'utf8');
+      fs.writeFileSync(paths.json, '{}', 'utf8');
+      fs.mkdirSync(paths.tasksDir, { recursive: true });
+
+      codex.archiveSessionFiles(acpId, archiveDir);
+      const contextAfterArchive = JSON.parse(fs.readFileSync(path.join(mockConfig.paths.home, 'acp_session_context.json'), 'utf8'));
+      expect(contextAfterArchive[acpId]).toBeUndefined();
+
+      fs.writeFileSync(
+        path.join(mockConfig.paths.home, 'acp_session_context.json'),
+        JSON.stringify({ [acpId]: 30 }),
+        'utf8'
+      );
+      await codex.prepareAcpEnvironment({}, { emitProviderExtension });
+      emitProviderExtension.mockClear();
+      expect(codex.emitCachedContext(acpId)).toBe(true);
+    });
+
     it('clones and prunes Codex rollout files recursively', () => {
       const oldId = '11111111-1111-1111-1111-111111111111';
       const newId = '22222222-2222-2222-2222-222222222222';

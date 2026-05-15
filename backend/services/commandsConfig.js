@@ -28,3 +28,7 @@ export function loadCommands() {
     return cached;
   }
 }
+
+export function invalidateCommandsCache() {
+  cached = null;
+}

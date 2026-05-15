@@ -816,11 +816,24 @@ export function cloneSession(oldAcpId, newAcpId, pruneAtTurn) {
   // console.log('cloneSession completed', { sessionDir, newJsonl });
 }
 
+function clearSessionRuntimeState(acpId) {
+  if (!acpId) return;
+
+  const removedContext = _sessionContextCache.delete(acpId);
+  _sessionsWithInitialEmit.delete(acpId);
+
+  if (removedContext) {
+    _saveContextState();
+  }
+}
+
 export function deleteSessionFiles(acpId) {
   const paths = getSessionPaths(acpId);
   if (paths.jsonl && fs.existsSync(paths.jsonl)) fs.unlinkSync(paths.jsonl);
   if (paths.json && fs.existsSync(paths.json)) fs.unlinkSync(paths.json);
   if (paths.tasksDir && fs.existsSync(paths.tasksDir)) fs.rmSync(paths.tasksDir, { recursive: true, force: true });
+
+  clearSessionRuntimeState(acpId);
 }
 
 export function archiveSessionFiles(acpId, archiveDir) {
@@ -845,8 +858,9 @@ export function archiveSessionFiles(acpId, archiveDir) {
     path.join(archiveDir, 'restore_meta.json'),
     JSON.stringify({ sessionDir }, null, 2)
   );
-}
 
+  clearSessionRuntimeState(acpId);
+}
 /**
  * Parse Claude's JSONL session file and reconstruct UI messages.
  */

@@ -70,28 +70,31 @@ bindMcpProxy(getMcpProxyIdFromServers(newMcpServers), {
 File: `backend/services/sessionManager.js` (Function: `getMcpServers`)
 File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)
 
-Both builders read `provider.config.mcpName`, create a proxy binding, point ACP at `backend/mcp/stdio-proxy.js`, and inject environment values required by the proxy. `backend/services/sessionManager.js` is used by user session load/create paths; `backend/mcp/mcpServer.js` is used by sub-agent session creation through `subAgentInvocationManager`.
+Both builders now delegate to one shared helper in `backend/mcp/mcpServerConfig.js` to avoid schema/env drift. The helper resolves provider metadata, creates the proxy binding, and emits the canonical stdio proxy env block used by both session load/create paths and sub-agent session creation.
 
 ```javascript
-// FILE: backend/mcp/mcpServer.js (Function: getMcpServers)
-const provider = getProvider(providerId);
-const name = provider.config.mcpName;
-if (!name) return [];
-const mcpServerMeta = providerModule.getMcpServerMeta?.();
-const proxyId = createMcpProxyBinding({ providerId: provider.id, acpSessionId });
-return [{
-  name,
-  command: 'node',
-  args: [proxyPath],
-  env: [
-    { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
-    { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
-    { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
-    { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
-    { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' }
-  ],
-  ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
-}];
+// FILE: backend/mcp/mcpServerConfig.js (Function: buildMcpServersForProvider)
+export function buildMcpServersForProvider(providerId = null, { acpSessionId = null } = {}) {
+  const provider = getProvider(providerId);
+  const resolvedProviderId = provider.id;
+  const name = provider.config?.mcpName;
+  if (!name) return [];
+  const mcpServerMeta = providerModule.getMcpServerMeta?.();
+  const proxyId = createMcpProxyBinding({ providerId: resolvedProviderId, acpSessionId });
+  return [{
+    name,
+    command: 'node',
+    args: [proxyPath],
+    env: [
+      { name: 'ACP_SESSION_PROVIDER_ID', value: String(resolvedProviderId) },
+      { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
+      { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
+      { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
+      { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' }
+    ],
+    ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
+  }];
+}
 ```
 
 4. Proxy bindings preserve provider/session scope.
@@ -130,43 +133,31 @@ const { tools, serverName } = await backendFetch(`/api/mcp/tools${query}`);
 6. `GET /api/mcp/tools` returns enabled tool definitions.
 
 File: `backend/routes/mcpApi.js` (Route: `GET /tools`, Function: `resolveToolContext`)
+File: `backend/mcp/mcpToolMetadata.js` (Functions: `getMcpToolEnablement`, `getAdvertisedMcpToolDefinitions`)
 File: `backend/mcp/coreMcpToolDefinitions.js` (Functions: `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition`)
 File: `backend/mcp/ioMcpToolDefinitions.js` (Functions: `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions`)
 
-The route resolves provider context from the proxy id, uses provider model config to enrich the sub-agent model description, and returns `{ tools, serverName }`. Feature flags from `backend/services/mcpConfig.js` decide which definitions are advertised.
+The route resolves provider context from the proxy id, uses provider model config to enrich the sub-agent model description, then delegates tool selection to `getAdvertisedMcpToolDefinitions` so route advertisement and handler registration share the same feature-flag matrix.
 
 ```javascript
 // FILE: backend/routes/mcpApi.js (Route: GET /tools)
 const context = resolveToolContext(query.providerId || null, query.proxyId || null);
 const providerConfig = getProvider(context.providerId).config;
 const serverName = providerConfig.mcpName || 'acpui';
-const toolList = [];
-if (isInvokeShellMcpEnabled()) toolList.push(getInvokeShellMcpToolDefinition());
-if (isSubagentsMcpEnabled()) toolList.push(getSubagentsMcpToolDefinition({ modelDescription }));
-if (isCounselMcpEnabled()) toolList.push(getCounselMcpToolDefinition());
-if (isIoMcpEnabled()) toolList.push(...getIoMcpToolDefinitions());
-if (isGoogleSearchMcpEnabled()) toolList.push(...getGoogleSearchMcpToolDefinitions());
+const toolList = getAdvertisedMcpToolDefinitions({ modelDescription });
 res.json({ tools: toolList, serverName });
 ```
 
 7. The stdio proxy registers MCP SDK handlers.
 
-File: `backend/mcp/stdio-proxy.js` (Function: `buildServerInstructions`, Handlers: `ListToolsRequestSchema`, `CallToolRequestSchema`)
+File: `backend/mcp/stdio-proxy.js` (Functions: `buildServerInstructions`, `mapBackendToolsToMcpListTools`, Handlers: `ListToolsRequestSchema`, `CallToolRequestSchema`)
 
-The proxy creates an MCP `Server` with tool capabilities and server instructions generated from the fetched tools. `ListToolsRequestSchema` returns definitions while preserving optional `title`, `annotations`, `execution`, `outputSchema`, and `_meta` fields.
+The proxy creates an MCP `Server` with tool capabilities and server instructions generated from the fetched tools. `ListToolsRequestSchema` returns definitions via `mapBackendToolsToMcpListTools`, preserving optional `title`, `annotations`, `execution`, `outputSchema`, and `_meta` fields exactly as advertised by the backend route.
 
 ```javascript
 // FILE: backend/mcp/stdio-proxy.js (Handler: ListToolsRequestSchema)
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: tools.map(t => {
-    const tool = { name: t.name, description: t.description, inputSchema: t.inputSchema };
-    if (t.title) tool.title = t.title;
-    if (t.annotations) tool.annotations = t.annotations;
-    if (t.execution) tool.execution = t.execution;
-    if (t.outputSchema) tool.outputSchema = t.outputSchema;
-    if (t._meta) tool._meta = t._meta;
-    return tool;
-  })
+  tools: mapBackendToolsToMcpListTools(tools)
 }));
 ```
 
@@ -221,19 +212,20 @@ if (canWriteResponse(res, abortSignal)) res.json(result);
 File: `backend/mcp/mcpServer.js` (Function: `createToolHandlers`, Handler anchors: `runShellInvocation`, `runSubagentInvocation`, `runCheckSubagentsInvocation`, `runAbortSubagentsInvocation`, `runCounselInvocation`)
 File: `backend/mcp/ioMcpToolHandlers.js` (Functions: `createIoMcpToolHandlers`, `createGoogleSearchMcpToolHandlers`)
 
-Core tools are registered behind `tools.invokeShell`, `tools.subagents`, and `tools.counsel`. `ux_check_subagents` and `ux_abort_subagents` are registered whenever sub-agents or counsel are enabled. Optional IO and Google search handlers are registered behind `tools.io` and `tools.googleSearch`. Shell execution delegates to `shellRunManager.startPreparedRun` and forwards route abort signals so cancelled MCP calls stop active shell runs; sub-agent start calls delegate to `subAgentInvocationManager.runInvocation`; status calls delegate to `subAgentInvocationManager.getInvocationStatus` with `waitForCompletion` deciding whether the configured wait timeout is used; status tool titles include either `Check Subagents: Waiting for agents to finish` or `Check Subagents: Quick status check`; abort calls delegate to `subAgentInvocationManager.cancelInvocation` and then return an immediate status payload; counsel builds configured role prompts and delegates through the sub-agent invocation path.
+Core tools are registered behind `tools.invokeShell`, `tools.subagents`, and `tools.counsel`. `ux_check_subagents` and `ux_abort_subagents` are registered whenever sub-agents or counsel are enabled. Optional IO and Google search handlers are registered behind `tools.io` and `tools.googleSearch`. Handler registration now consumes `getMcpToolEnablement()` from `backend/mcp/mcpToolMetadata.js`, which uses the same gating matrix as route advertisement. Shell execution delegates to `shellRunManager.startPreparedRun` and forwards route abort signals so cancelled MCP calls stop active shell runs; sub-agent start calls delegate to `subAgentInvocationManager.runInvocation`; status calls delegate to `subAgentInvocationManager.getInvocationStatus` with wait behavior normalized through `isSubAgentStatusWaitEnabled` (supports both `waitForCompletion` and `wait_for_completion`); status tool titles include either `Check Subagents: Waiting for agents to finish` or `Check Subagents: Quick status check`; abort calls delegate to `subAgentInvocationManager.cancelInvocation` and then return an immediate status payload; counsel builds configured role prompts and delegates through the sub-agent invocation path.
 
 ```javascript
 // FILE: backend/mcp/mcpServer.js (Function: createToolHandlers)
-if (isInvokeShellMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeShell] = runShellInvocation;
-if (isSubagentsMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
-if (isCounselMcpEnabled()) tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
-if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+const toolEnablement = getMcpToolEnablement();
+if (toolEnablement.invokeShell) tools[ACP_UX_TOOL_NAMES.invokeShell] = runShellInvocation;
+if (toolEnablement.subagents) tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
+if (toolEnablement.counsel) tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
+if (toolEnablement.subagentStatus) {
   tools[ACP_UX_TOOL_NAMES.checkSubagents] = runCheckSubagentsInvocation;
   tools[ACP_UX_TOOL_NAMES.abortSubagents] = runAbortSubagentsInvocation;
 }
-if (isIoMcpEnabled()) Object.assign(tools, createIoMcpToolHandlers());
-if (isGoogleSearchMcpEnabled()) Object.assign(tools, createGoogleSearchMcpToolHandlers());
+if (toolEnablement.io) Object.assign(tools, createIoMcpToolHandlers());
+if (toolEnablement.googleSearch) Object.assign(tools, createGoogleSearchMcpToolHandlers());
 return wrapToolHandlers(tools, io);
 ```
 
@@ -458,8 +450,9 @@ Tool state projection written by `mcpExecutionRegistry`:
 | Socket sessions | `backend/sockets/sessionHandlers.js` | Socket event `create_session`, `bindMcpProxy`, `getMcpProxyIdFromServers` | Adds MCP server entries to ACP `session/new` and `session/load` requests. |
 | Session hot load | `backend/services/sessionManager.js` | `getMcpServers`, `loadSessionIntoMemory` | Builds user-session MCP server entries and hot-loads pinned sessions. |
 | MCP server helpers | `backend/mcp/mcpServer.js` | `getMcpServers`, `createToolHandlers`, `wrapToolHandlers`, `getMaxShellResultLines` | Builds sub-agent MCP server entries and executable handler maps. |
+| MCP server config builder | `backend/mcp/mcpServerConfig.js` | `buildMcpServersForProvider` | Shared stdio proxy launch-config builder used by both session and sub-agent MCP server paths. |
 | Proxy registry | `backend/mcp/mcpProxyRegistry.js` | `createMcpProxyBinding`, `bindMcpProxy`, `resolveMcpProxy`, `expireMcpProxyBindings`, `getMcpProxyIdFromServers`, `clearMcpProxyRegistry` | Stores proxy-to-provider/session bindings. |
-| Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `buildServerInstructions`, `ListToolsRequestSchema`, `CallToolRequestSchema` | Speaks MCP over stdio and forwards definitions/calls over HTTPS. |
+| Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `buildServerInstructions`, `mapBackendToolsToMcpListTools`, `ListToolsRequestSchema`, `CallToolRequestSchema` | Speaks MCP over stdio and forwards definitions/calls over HTTPS while preserving advertised schema metadata. |
 | MCP routes | `backend/routes/mcpApi.js` | `createMcpApiRoutes`, `GET /tools`, `POST /tool-call`, `resolveToolContext`, `createToolCallAbortSignal`, `canWriteResponse` | Serves tool definitions and dispatches tool calls to handlers. |
 
 ### Tool Definitions, Handlers, and State
@@ -467,7 +460,8 @@ Tool state projection written by `mcpExecutionRegistry`:
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Tool names | `backend/services/tools/acpUxTools.js` | `ACP_UX_TOOL_NAMES`, `ACP_UX_CORE_TOOL_NAMES`, `ACP_UX_IO_TOOL_CONFIG`, `isAcpUxToolName`, `acpUxIoToolConfig` | Defines canonical MCP tool names and UI categories. |
-| Tool title helpers | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `subAgentCheckToolTitle`, `basenameForToolPath` | Builds handler-visible titles for IO/search tools and wait-vs-quick sub-agent status checks. |
+| Tool metadata matrix | `backend/mcp/mcpToolMetadata.js` | `getMcpToolEnablement`, `getAdvertisedMcpToolDefinitions`, `getAdvertisedMcpToolNames` | Centralizes feature-gated route advertisement metadata used by handler/route drift checks. |
+| Tool title helpers | `backend/services/tools/acpUiToolTitles.js` | `acpUiToolTitle`, `subAgentCheckToolTitle`, `isSubAgentStatusWaitEnabled`, `basenameForToolPath` | Builds handler-visible titles for IO/search tools and shared wait-vs-quick sub-agent status behavior. |
 | Core schemas | `backend/mcp/coreMcpToolDefinitions.js` | `getInvokeShellMcpToolDefinition`, `getSubagentsMcpToolDefinition`, `getCounselMcpToolDefinition`, `getCheckSubagentsMcpToolDefinition`, `getAbortSubagentsMcpToolDefinition` | Provides JSON Schema and annotations for core MCP tools. |
 | IO schemas | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions` | Provides JSON Schema and annotations for optional IO/search tools. |
 | IO handlers | `backend/mcp/ioMcpToolHandlers.js` | `createIoMcpToolHandlers`, `createGoogleSearchMcpToolHandlers` | Implements optional file, search, and fetch tool behavior. |
@@ -486,6 +480,7 @@ Tool state projection written by `mcpExecutionRegistry`:
 | API routes | `backend/test/mcpApi.test.js` | `MCP API Routes`, `GET /tools returns tool list with JSON Schema`, `GET /tools hides disabled core tools`, `POST /tool-call passes resolved proxy context to handlers`, `POST /tool-call aborts the handler signal when the request fires the "aborted" event`, `POST /tool-call aborts the handler signal when the response closes before completion` | Verifies `/api/mcp/*` definitions, dispatch, context, errors, and abort wiring. |
 | Server helpers | `backend/test/mcpServer.test.js` | `mcpServer`, `getMcpServers returns server config`, `getMcpServers attaches _meta when getMcpServerMeta returns a value`, `core MCP feature flags`, `optional IO MCP tools`, `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagents`, `ux_abort_subagents`, `ux_invoke_counsel` | Verifies server config, feature-gated handlers, wrapper projection, shell behavior, and sub-agent behavior. |
 | Stdio proxy | `backend/test/stdio-proxy.test.js` | `stdio-proxy`, `runs the proxy lifecycle`, `handles fetch errors with retry`, `handles ListTools and CallTool requests`, `throws error after max retries in backendFetch`, `does not retry when fetch throws an AbortError` | Verifies proxy startup, list/call forwarding, metadata passthrough, retry, and abort behavior. |
+| Drift parity | `backend/test/mcpToolMetadataDrift.test.js` | `mcp tool metadata drift checks`, `keeps advertised route tools in sync with registered handlers`, `keeps stdio proxy schema mapping aligned with advertised tool metadata`, `keeps frontend and backend AcpUI tool-name registries aligned` | Detects route/handler/proxy/frontend metadata drift for canonical AcpUI MCP tools. |
 | Proxy registry | `backend/test/mcpProxyRegistry.test.js` | `mcpProxyRegistry`, `creates and resolves a pending proxy binding`, `creates pre-bound proxy bindings for known sessions`, `binds pending proxy bindings after session creation`, `rejects provider mismatches when binding`, `expires only unbound proxy bindings`, `extracts proxy id from MCP server env` | Verifies proxy binding lifecycle and extraction from `mcpServers`. |
 | Session manager | `backend/test/sessionManager.test.js` | `sessionManager`, `getMcpServers`, `should perform full hot-load lifecycle` | Verifies session-manager MCP entries and hot-load proxy binding. |
 | Sub-agent manager | `backend/test/subAgentInvocationManager.test.js` | `SubAgentInvocationManager`, `starts asynchronously and returns completed results through the status call`, `joins an active invocation when the idempotency key repeats`, `reports the active invocation instead of starting another batch for the same parent chat`, `aborts and cancels sub-agents when the tool call abort signal fires` | Verifies async sub-agent session creation, status polling, active-invocation enforcement, idempotency, and cancellation. |
@@ -498,11 +493,11 @@ Tool state projection written by `mcpExecutionRegistry`:
 
 1. Keep definitions and handlers synchronized.
 - Problem: a tool can be advertised by `GET /api/mcp/tools` but missing from `createToolHandlers`, or registered as a handler but absent from the advertised schemas.
-- Detection: compare `ACP_UX_TOOL_NAMES`, definition modules, `createToolHandlers`, and `mcpApi.test.js`/`mcpServer.test.js` expectations.
+- Detection: compare `ACP_UX_TOOL_NAMES`, definition modules, `createToolHandlers`, and `mcpToolMetadataDrift.test.js` route/handler parity assertions.
 
-2. Keep both MCP server builders equivalent.
+2. Keep both MCP server builders on the shared helper.
 - Problem: user sessions use `backend/services/sessionManager.js`; sub-agent sessions use `backend/mcp/mcpServer.js`.
-- Detection: check both `getMcpServers` functions for the same env variables, proxy binding behavior, and `_meta` behavior.
+- Detection: both wrappers should delegate to `buildMcpServersForProvider` so env fields, proxy binding behavior, and optional `_meta` remain identical.
 
 3. Bind new-session proxies after ACP returns the session id.
 - Problem: a `session/new` MCP server entry has a proxy id before the ACP session id exists.
@@ -543,7 +538,7 @@ Tool state projection written by `mcpExecutionRegistry`:
 Run these when changing MCP server creation, stdio proxy behavior, `/api/mcp/*`, handler wrapping, or execution metadata:
 
 ```powershell
-cd backend; npx vitest run test/mcpApi.test.js test/mcpServer.test.js test/stdio-proxy.test.js test/mcpProxyRegistry.test.js test/sessionManager.test.js test/subAgentInvocationManager.test.js test/toolInvocationResolver.test.js test/acpUiToolTitles.test.js test/mcpConfig.test.js test/server.test.js
+cd backend; npx vitest run test/mcpApi.test.js test/mcpServer.test.js test/stdio-proxy.test.js test/mcpToolMetadataDrift.test.js test/mcpProxyRegistry.test.js test/sessionManager.test.js test/subAgentInvocationManager.test.js test/toolInvocationResolver.test.js test/acpUiToolTitles.test.js test/mcpConfig.test.js test/server.test.js
 ```
 
 ### High-Value Test Names
@@ -572,6 +567,10 @@ cd backend; npx vitest run test/mcpApi.test.js test/mcpServer.test.js test/stdio
   - `handles fetch errors with retry`
   - `handles ListTools and CallTool requests`
   - `does not retry when fetch throws an AbortError`
+- `backend/test/mcpToolMetadataDrift.test.js`
+  - `keeps advertised route tools in sync with registered handlers`
+  - `keeps stdio proxy schema mapping aligned with advertised tool metadata`
+  - `keeps frontend and backend AcpUI tool-name registries aligned`
 - `backend/test/mcpProxyRegistry.test.js`
   - `creates and resolves a pending proxy binding`
   - `creates pre-bound proxy bindings for known sessions`

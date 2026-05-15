@@ -640,8 +640,93 @@ describe('Gemini Provider', () => {
       expect(paths.jsonl).toContain('proj-1');
       expect(paths.jsonl).toContain('a1b2c3d4');
     });
-  });
 
+    it('deleteSessionFiles clears Gemini runtime token and emit state', async () => {
+      const acpId = 'gemini-cleanup-delete';
+      const emitProviderExtension = vi.fn();
+
+      fs.existsSync.mockReturnValue(true);
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_tokens.json')) {
+          return JSON.stringify({
+            [acpId]: { inputTokens: 524288, outputTokens: 0, model: 'gemini-3-flash-preview' }
+          });
+        }
+        return '';
+      });
+
+      await gemini.prepareAcpEnvironment({}, { emitProviderExtension, writeLog: vi.fn() });
+      expect(gemini.emitCachedContext(acpId)).toBe(true);
+
+      const writesBeforeDelete = fs.writeFileSync.mock.calls.length;
+      gemini.deleteSessionFiles(acpId);
+      expect(fs.writeFileSync.mock.calls.length).toBeGreaterThan(writesBeforeDelete);
+
+      gemini.intercept({
+        result: {
+          stopReason: 'end_turn',
+          _meta: {
+            quota: {
+              token_count: { input_tokens: 1024, output_tokens: 32 },
+              model_usage: [{ model: 'gemini-3-flash-preview' }]
+            }
+          }
+        }
+      }, {
+        responseRequest: {
+          method: 'session/prompt',
+          sessionId: acpId,
+          params: { sessionId: acpId }
+        }
+      });
+
+      emitProviderExtension.mockClear();
+      expect(gemini.emitCachedContext(acpId)).toBe(true);
+    });
+
+    it('archiveSessionFiles clears Gemini runtime token and emit state', async () => {
+      const acpId = 'gemini-cleanup-archive';
+      const emitProviderExtension = vi.fn();
+
+      fs.existsSync.mockReturnValue(true);
+      fs.readFileSync.mockImplementation(filePath => {
+        if (String(filePath).endsWith('acp_session_tokens.json')) {
+          return JSON.stringify({
+            [acpId]: { inputTokens: 262144, outputTokens: 0, model: 'gemini-3-flash-preview' }
+          });
+        }
+        return '';
+      });
+
+      await gemini.prepareAcpEnvironment({}, { emitProviderExtension, writeLog: vi.fn() });
+      expect(gemini.emitCachedContext(acpId)).toBe(true);
+
+      const writesBeforeArchive = fs.writeFileSync.mock.calls.length;
+      gemini.archiveSessionFiles(acpId, '/archive/dir');
+      expect(fs.writeFileSync.mock.calls.length).toBeGreaterThan(writesBeforeArchive);
+
+      gemini.intercept({
+        result: {
+          stopReason: 'end_turn',
+          _meta: {
+            quota: {
+              token_count: { input_tokens: 2048, output_tokens: 64 },
+              model_usage: [{ model: 'gemini-3-flash-preview' }]
+            }
+          }
+        }
+      }, {
+        responseRequest: {
+          method: 'session/prompt',
+          sessionId: acpId,
+          params: { sessionId: acpId }
+        }
+      });
+
+      emitProviderExtension.mockClear();
+      expect(gemini.emitCachedContext(acpId)).toBe(true);
+    });
+  });
   describe('Quota Fetching', () => {
     let emitSpy;
     let writeSpy;

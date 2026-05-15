@@ -63,4 +63,18 @@ describe('commandsConfig', () => {
 
     expect(result).toEqual([{ name: 'good', description: 'Valid command' }]);
   });
+
+  it('reloads from disk after invalidateCommandsCache', async () => {
+    mockReadFileSync
+      .mockReturnValueOnce(JSON.stringify({ commands: [{ name: 'first', description: 'one' }] }))
+      .mockReturnValueOnce(JSON.stringify({ commands: [{ name: 'second', description: 'two' }] }));
+
+    const { loadCommands, invalidateCommandsCache } = await import('../services/commandsConfig.js');
+
+    expect(loadCommands()).toEqual([{ name: 'first', description: 'one' }]);
+    expect(loadCommands()).toEqual([{ name: 'first', description: 'one' }]);
+
+    invalidateCommandsCache();
+    expect(loadCommands()).toEqual([{ name: 'second', description: 'two' }]);
+  });
 });

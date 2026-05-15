@@ -8,6 +8,7 @@ import {
   getMcpConfig,
   getSubagentsMcpConfig,
   getWebFetchMcpConfig,
+  invalidateMcpConfigCache,
   isCounselMcpEnabled,
   isGoogleSearchMcpEnabled,
   isInvokeShellMcpEnabled,
@@ -78,6 +79,22 @@ describe('MCP config', () => {
     expect(isCounselMcpEnabled()).toBe(true);
     expect(isIoMcpEnabled()).toBe(true);
     expect(isGoogleSearchMcpEnabled()).toBe(false);
+  });
+
+  it('reloads config after invalidateMcpConfigCache', () => {
+    const configPath = writeTempConfig({
+      tools: { invokeShell: false }
+    });
+
+    expect(isInvokeShellMcpEnabled()).toBe(false);
+
+    fs.writeFileSync(configPath, JSON.stringify({ tools: { invokeShell: true } }), 'utf8');
+
+    // Cache remains stale until explicit invalidation.
+    expect(isInvokeShellMcpEnabled()).toBe(false);
+
+    invalidateMcpConfigCache();
+    expect(isInvokeShellMcpEnabled()).toBe(true);
   });
 
   it('normalizes IO, web fetch, Google search, and sub-agent status settings', () => {

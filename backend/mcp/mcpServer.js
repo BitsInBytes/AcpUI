@@ -12,30 +12,22 @@
  *   getMcpServers()           -- stdio MCP server config for session/new mcpServers array
  *   createToolHandlers(io)    -- returns { toolName: handler(args) } map
  */
-import { getProvider, getProviderModuleSync } from '../services/providerLoader.js';
 import { writeLog } from '../services/logger.js';
-import { fileURLToPath } from 'url';
-import path from 'path';
 import { createHash } from 'crypto';
 import { subAgentInvocationManager } from './subAgentInvocationManager.js';
 import { loadCounselConfig } from '../services/counselConfig.js';
-import { createMcpProxyBinding, getMcpProxyAuthToken } from './mcpProxyRegistry.js';
 import { shellRunManager } from '../services/shellRunManager.js';
 import {
   mcpExecutionRegistry,
   publicMcpToolInput,
   toolCallIdFromMcpContext
 } from '../services/tools/mcpExecutionRegistry.js';
-import {
-  isCounselMcpEnabled,
-  isGoogleSearchMcpEnabled,
-  isInvokeShellMcpEnabled,
-  isIoMcpEnabled,
-  isSubagentsMcpEnabled,
-  getSubagentsMcpConfig
-} from '../services/mcpConfig.js';
+import { getSubagentsMcpConfig } from '../services/mcpConfig.js';
 import { ACP_UX_TOOL_NAMES } from '../services/tools/acpUxTools.js';
+import { isSubAgentStatusWaitEnabled } from '../services/tools/acpUiToolTitles.js';
 import { createGoogleSearchMcpToolHandlers, createIoMcpToolHandlers } from './ioMcpToolHandlers.js';
+import { buildMcpServersForProvider } from './mcpServerConfig.js';
+import { getMcpToolEnablement } from './mcpToolMetadata.js';
 
 const DEFAULT_MAX_SHELL_RESULT_LINES = 1000;
 
@@ -109,27 +101,7 @@ function wrapToolHandlers(tools, io) {
  * The ACP spawns this as a child process and communicates via stdin/stdout.
  */
 export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
-  const provider = getProvider(providerId);
-  const name = provider.config.mcpName;
-  if (!name) return [];
-  const providerModule = getProviderModuleSync(provider.id);
-  const mcpServerMeta = providerModule.getMcpServerMeta?.();
-  const proxyPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'stdio-proxy.js');
-  const proxyId = createMcpProxyBinding({ providerId: provider.id, acpSessionId });
-  const proxyAuthToken = getMcpProxyAuthToken(proxyId);
-  return [{
-    name,
-    command: 'node',
-    args: [proxyPath],
-    env: [
-      { name: 'ACP_SESSION_PROVIDER_ID', value: String(provider.id) },
-      { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
-      { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
-      { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
-      { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' },
-    ],
-    ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
-  }];
+  return buildMcpServersForProvider(providerId, { acpSessionId });
 }
 
 /**
@@ -138,6 +110,7 @@ export function getMcpServers(providerId = null, { acpSessionId = null } = {}) {
  */
 export function createToolHandlers(io) {
   const tools = {};
+  const toolEnablement = getMcpToolEnablement();
 
   const runShellInvocation = async ({ description, command, cwd, providerId, acpSessionId, mcpRequestId, requestMeta, abortSignal }) => {
     const workingDir = cwd || process.env.DEFAULT_WORKSPACE_CWD || process.cwd();
@@ -169,7 +142,7 @@ export function createToolHandlers(io) {
     return { content: [{ type: 'text', text: 'Error: Shell execution context unavailable' }] };
   };
 
-  if (isInvokeShellMcpEnabled()) {
+  if (toolEnablement.invokeShell) {
     tools[ACP_UX_TOOL_NAMES.invokeShell] = runShellInvocation;
   }
 
@@ -205,17 +178,18 @@ export function createToolHandlers(io) {
     });
   };
 
-  if (isSubagentsMcpEnabled()) {
+  if (toolEnablement.subagents) {
     tools[ACP_UX_TOOL_NAMES.invokeSubagents] = runSubagentInvocation;
   }
 
-  const runCheckSubagentsInvocation = async ({ invocationId, providerId, waitForCompletion = true, abortSignal }) => {
+  const runCheckSubagentsInvocation = async ({ invocationId, providerId, waitForCompletion, wait_for_completion, abortSignal }) => {
     const { statusWaitTimeoutMs, statusPollIntervalMs } = getSubagentsMcpConfig();
+    const shouldWait = isSubAgentStatusWaitEnabled({ waitForCompletion, wait_for_completion });
     subAgentInvocationManager.setIo(io);
     return subAgentInvocationManager.getInvocationStatus({
       providerId,
       invocationId,
-      waitTimeoutMs: waitForCompletion === false ? 0 : statusWaitTimeoutMs,
+      waitTimeoutMs: shouldWait ? statusWaitTimeoutMs : 0,
       pollIntervalMs: statusPollIntervalMs,
       abortSignal
     });
@@ -289,20 +263,20 @@ export function createToolHandlers(io) {
     });
   };
 
-  if (isCounselMcpEnabled()) {
+  if (toolEnablement.counsel) {
     tools[ACP_UX_TOOL_NAMES.invokeCounsel] = runCounselInvocation;
   }
 
-  if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
+  if (toolEnablement.subagentStatus) {
     tools[ACP_UX_TOOL_NAMES.checkSubagents] = runCheckSubagentsInvocation;
     tools[ACP_UX_TOOL_NAMES.abortSubagents] = runAbortSubagentsInvocation;
   }
 
-  if (isIoMcpEnabled()) {
+  if (toolEnablement.io) {
     Object.assign(tools, createIoMcpToolHandlers());
   }
 
-  if (isGoogleSearchMcpEnabled()) {
+  if (toolEnablement.googleSearch) {
     Object.assign(tools, createGoogleSearchMcpToolHandlers());
   }
 

@@ -50,13 +50,14 @@ describe('canvasHandlers', () => {
     expect(callback).toHaveBeenCalledWith({ success: true });
   });
 
-  it('canvas_load returns artifacts', async () => {
+  it('canvas_load returns artifacts for the requested UI session', async () => {
     const artifacts = [{ id: 'a1' }, { id: 'a2' }];
     db.getCanvasArtifactsForSession.mockResolvedValue(artifacts);
     const callback = vi.fn();
 
     await mockSocket.listeners('canvas_load')[0]({ sessionId: 's1' }, callback);
 
+    expect(db.getCanvasArtifactsForSession).toHaveBeenCalledWith('s1');
     expect(callback).toHaveBeenCalledWith({ artifacts });
   });
 
@@ -70,16 +71,17 @@ describe('canvasHandlers', () => {
     expect(callback).toHaveBeenCalledWith({ success: true });
   });
 
-  it('canvas_read_file returns file content after allowed-root validation', async () => {
+  it('canvas_read_file returns file content with scoped sessionId after allowed-root validation', async () => {
     resolveAllowedPath.mockReturnValue('/workspace/test.js');
     fs.readFileSync.mockReturnValue('file content');
     const callback = vi.fn();
 
-    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/test.js' }, callback);
+    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/test.js', sessionId: 'ui-s1' }, callback);
 
     expect(resolveAllowedPath).toHaveBeenCalledWith('/workspace/test.js', 'file_path');
     expect(callback).toHaveBeenCalledWith({
       artifact: expect.objectContaining({
+        sessionId: 'ui-s1',
         content: 'file content',
         language: 'js',
         title: 'test.js',
@@ -104,7 +106,7 @@ describe('canvasHandlers', () => {
     fs.readFileSync.mockReturnValue('raw content');
     const callback = vi.fn();
 
-    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/Makefile' }, callback);
+    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/Makefile', sessionId: 'ui-s1' }, callback);
 
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({
       artifact: expect.objectContaining({ language: 'text', title: 'Makefile' })
@@ -117,11 +119,22 @@ describe('canvasHandlers', () => {
     });
     const callback = vi.fn();
 
-    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/etc/passwd' }, callback);
+    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/etc/passwd', sessionId: 'ui-s1' }, callback);
 
     expect(callback).toHaveBeenCalledWith({
       error: expect.stringContaining('outside the configured MCP IO allowed roots')
     });
+  });
+
+  it('canvas_read_file rejects requests without a sessionId', async () => {
+    const callback = vi.fn();
+
+    await mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/test.js' }, callback);
+
+    expect(callback).toHaveBeenCalledWith({
+      error: 'sessionId is required for canvas_read_file'
+    });
+    expect(resolveAllowedPath).not.toHaveBeenCalled();
   });
 
   it('canvas_save calls callback with error when DB fails', async () => {
@@ -162,7 +175,7 @@ describe('canvasHandlers', () => {
     await expect(mockSocket.listeners('canvas_load')[0]({ sessionId: 's1' })).resolves.not.toThrow();
     await expect(mockSocket.listeners('canvas_delete')[0]({ artifactId: 'a1' })).resolves.not.toThrow();
     await expect(mockSocket.listeners('canvas_apply_to_file')[0]({ filePath: '/workspace/f.js', content: 'x' })).resolves.not.toThrow();
-    await expect(mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/f.js' })).resolves.not.toThrow();
+    await expect(mockSocket.listeners('canvas_read_file')[0]({ filePath: '/workspace/f.js', sessionId: 's1' })).resolves.not.toThrow();
   });
 
   it('error branches do not throw when called without a callback', async () => {
@@ -177,6 +190,6 @@ describe('canvasHandlers', () => {
     await expect(mockSocket.listeners('canvas_load')[0]({ sessionId: 's1' })).resolves.not.toThrow();
     await expect(mockSocket.listeners('canvas_delete')[0]({ artifactId: 'a1' })).resolves.not.toThrow();
     await expect(mockSocket.listeners('canvas_apply_to_file')[0]({ filePath: '', content: '' })).resolves.not.toThrow();
-    await expect(mockSocket.listeners('canvas_read_file')[0]({ filePath: '' })).resolves.not.toThrow();
+    await expect(mockSocket.listeners('canvas_read_file')[0]({ filePath: '', sessionId: 's1' })).resolves.not.toThrow();
   });
 });

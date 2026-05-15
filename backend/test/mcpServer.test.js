@@ -787,6 +787,14 @@ describe('mcpServer', () => {
           waitTimeoutMs: 0,
           pollIntervalMs: 1000
         }));
+
+        await handlers.ux_check_subagents({ providerId: 'provider-a', invocationId: 'inv-1', wait_for_completion: false });
+        expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({
+          providerId: 'provider-a',
+          invocationId: 'inv-1',
+          waitTimeoutMs: 0,
+          pollIntervalMs: 1000
+        }));
       } finally {
         spy.mockRestore();
       }

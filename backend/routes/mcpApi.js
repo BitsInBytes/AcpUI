@@ -4,21 +4,7 @@ import { getProvider } from '../services/providerLoader.js';
 import { writeLog } from '../services/logger.js';
 import { modelOptionsFromProviderConfig } from '../services/modelOptions.js';
 import { resolveMcpProxy } from '../mcp/mcpProxyRegistry.js';
-import {
-  isCounselMcpEnabled,
-  isGoogleSearchMcpEnabled,
-  isInvokeShellMcpEnabled,
-  isIoMcpEnabled,
-  isSubagentsMcpEnabled
-} from '../services/mcpConfig.js';
-import {
-  getAbortSubagentsMcpToolDefinition,
-  getCheckSubagentsMcpToolDefinition,
-  getCounselMcpToolDefinition,
-  getInvokeShellMcpToolDefinition,
-  getSubagentsMcpToolDefinition
-} from '../mcp/coreMcpToolDefinitions.js';
-import { getGoogleSearchMcpToolDefinitions, getIoMcpToolDefinitions } from '../mcp/ioMcpToolDefinitions.js';
+import { getAdvertisedMcpToolDefinitions } from '../mcp/mcpToolMetadata.js';
 
 const MCP_PROXY_AUTH_HEADER = 'x-acpui-mcp-proxy-auth';
 
@@ -122,26 +108,7 @@ export default function createMcpApiRoutes(io) {
     const modelDescription = quickModels.length > 0
       ? `Optional model to use for these agents. Pass the model id. Available: ${quickModels.map(model => `${model.name} (id: ${model.id})`).join(', ')}`
       : 'Optional model id to use for these agents.';
-    const toolList = [];
-    if (isInvokeShellMcpEnabled()) {
-      toolList.push(getInvokeShellMcpToolDefinition());
-    }
-    if (isSubagentsMcpEnabled()) {
-      toolList.push(getSubagentsMcpToolDefinition({ modelDescription }));
-    }
-    if (isCounselMcpEnabled()) {
-      toolList.push(getCounselMcpToolDefinition());
-    }
-    if (isSubagentsMcpEnabled() || isCounselMcpEnabled()) {
-      toolList.push(getCheckSubagentsMcpToolDefinition());
-      toolList.push(getAbortSubagentsMcpToolDefinition());
-    }
-    if (isIoMcpEnabled()) {
-      toolList.push(...getIoMcpToolDefinitions());
-    }
-    if (isGoogleSearchMcpEnabled()) {
-      toolList.push(...getGoogleSearchMcpToolDefinitions());
-    }
+    const toolList = getAdvertisedMcpToolDefinitions({ modelDescription });
     res.json({ tools: toolList, serverName });
   });
 

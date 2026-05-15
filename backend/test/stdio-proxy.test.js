@@ -68,6 +68,8 @@ describe('stdio-proxy', () => {
           description: 'test tool',
           inputSchema: {},
           annotations: { readOnlyHint: false },
+          execution: { supportsAbort: true },
+          outputSchema: { type: 'object' },
           _meta: { custom: true }
         }],
         serverName: 'test'
@@ -83,6 +85,8 @@ describe('stdio-proxy', () => {
         title: 'Tool One',
         description: 'test tool',
         annotations: { readOnlyHint: false },
+        execution: { supportsAbort: true },
+        outputSchema: { type: 'object' },
         _meta: { custom: true }
       }));
     }
