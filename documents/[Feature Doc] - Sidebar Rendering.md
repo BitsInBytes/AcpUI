@@ -283,7 +283,7 @@ useSessionLifecycleStore.setState(state => ({
 File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`, Socket events: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`)
 File: `frontend/src/store/useSubAgentStore.ts` (Actions: `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `clearInvocationsForParent`, `addAgent`, `setStatus`, `completeAgent`)
 
-`sub_agents_starting` starts invocation-level state, clears stale parent-linked agent and invocation rows, and removes old sub-agent sidebar sessions only after the backend accepts a new invocation. `sub_agent_started` and `sub_agent_snapshot` register pending sub-agents, while `sub_agent_status` and `sub_agent_invocation_status` keep panel and auto-collapse state synchronized. The sidebar `ChatSession` is created when the first token or sub-agent system event arrives.
+`sub_agents_starting` starts invocation-level state, clears stale parent-linked agent and invocation rows, and removes old sub-agent sidebar sessions only after the backend accepts a new invocation. `sub_agent_started` and `sub_agent_snapshot` register pending sub-agents, including provider-derived fallback model display metadata when a socket payload has no model, while `sub_agent_status` and `sub_agent_invocation_status` keep panel and auto-collapse state synchronized. The sidebar `ChatSession` is created when the first token or sub-agent system event arrives.
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Handler: wrappedOnStreamToken)
@@ -298,6 +298,9 @@ if (pendingSubAgents.has(data.sessionId)) {
     messages: [],
     isTyping: true,
     isWarmingUp: false,
+    model: pending.model,
+    currentModelId: pending.model || null,
+    modelOptions: pending.modelOptions,
     isSubAgent: true,
     parentAcpSessionId: pending.parentSessionId,
     forkedFrom: pending.parentUiId,

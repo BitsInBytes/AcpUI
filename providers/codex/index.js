@@ -1062,23 +1062,71 @@ function readDirRecursive(root, predicate) {
   return null;
 }
 
+function comparablePath(value) {
+  if (!value) return '';
+  const resolved = path.resolve(value).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function isSameOrChildPath(parent, child) {
+  const parentPath = comparablePath(parent);
+  const childPath = comparablePath(child);
+  if (!parentPath || !childPath) return false;
+  return childPath === parentPath || childPath.startsWith(`${parentPath}${path.sep}`);
+}
+
+function uniquePaths(paths) {
+  const seen = new Set();
+  const result = [];
+  for (const candidate of paths) {
+    const key = comparablePath(candidate);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(candidate);
+  }
+  return result;
+}
+
+function sessionSearchRoots() {
+  const { home, sessions } = configPaths();
+  const defaultSessions = home ? path.join(home, 'sessions') : '';
+  const roots = [sessions];
+
+  const shouldSearchDefaultRoot = defaultSessions &&
+    isSameOrChildPath(defaultSessions, sessions) &&
+    comparablePath(defaultSessions) !== comparablePath(sessions);
+
+  if (shouldSearchDefaultRoot) {
+    roots.push(defaultSessions);
+  }
+
+  return uniquePaths(roots);
+}
+
 function findSessionFile(acpId) {
-  const { sessions } = configPaths();
-  if (!acpId || !sessions) return null;
+  if (!acpId) return null;
+  const roots = sessionSearchRoots();
 
-  const byName = readDirRecursive(sessions, (_filePath, name) =>
-    name.endsWith('.jsonl') && name.includes(acpId)
-  );
-  if (byName) return byName;
+  for (const root of roots) {
+    const byName = readDirRecursive(root, (_filePath, name) =>
+      name.endsWith('.jsonl') && name.includes(acpId)
+    );
+    if (byName) return byName;
+  }
 
-  return readDirRecursive(sessions, (filePath, name) => {
-    if (!name.endsWith('.jsonl')) return false;
-    try {
-      return fs.readFileSync(filePath, 'utf8').includes(acpId);
-    } catch {
-      return false;
-    }
-  });
+  for (const root of roots) {
+    const byContent = readDirRecursive(root, (filePath, name) => {
+      if (!name.endsWith('.jsonl')) return false;
+      try {
+        return fs.readFileSync(filePath, 'utf8').includes(acpId);
+      } catch {
+        return false;
+      }
+    });
+    if (byContent) return byContent;
+  }
+
+  return null;
 }
 
 export function getSessionPaths(acpId) {

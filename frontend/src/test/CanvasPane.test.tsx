@@ -4,9 +4,10 @@ import CanvasPane from '../components/CanvasPane/CanvasPane';
 import type { CanvasArtifact } from '../types';
 
 const mockSocketEmit = vi.fn();
+const mockSocket = { emit: mockSocketEmit };
 vi.mock('../hooks/useSocket', () => ({
   useSocket: () => ({
-    socket: { emit: mockSocketEmit }
+    socket: mockSocket
   })
 }));
 
@@ -19,6 +20,12 @@ vi.mock('@monaco-editor/react', () => ({
       onChange={(e) => onChange(e.target.value)}
       data-language={language}
     />
+  ),
+  DiffEditor: ({ original, modified, language }: any) => (
+    <div data-testid="monaco-diff-mock" data-language={language}>
+      <textarea aria-label="original-diff" readOnly value={original} />
+      <textarea aria-label="modified-diff" readOnly value={modified} />
+    </div>
   )
 }));
 
@@ -477,5 +484,72 @@ describe('CanvasPane - multiple terminals and tab interactions', () => {
     render(<CanvasPane artifacts={[artifact]} activeArtifact={artifact} onClose={vi.fn()} onCloseArtifact={vi.fn()} onSelectArtifact={vi.fn()} />);
     expect(screen.getByTestId('monaco-mock')).toBeInTheDocument();
     expect(screen.getByDisplayValue('const x = 1;')).toBeInTheDocument();
+  });
+
+  it('renders git diff and toggles back to code view', async () => {
+    act(() => {
+      useSessionLifecycleStore.setState({ activeSessionId: 'sess-1', sessions: [{ id: 'sess-1', cwd: '/repo' }] } as any);
+    });
+    mockSocketEmit.mockImplementation((event: string, _data: any, cb: any) => {
+      if (event === 'git_status') {
+        cb({ branch: 'main', files: [{ path: 'src/app.ts', status: 'modified', staged: false }] });
+      }
+      if (event === 'git_show_head') {
+        cb({ content: 'const x = 0;' });
+      }
+    });
+
+    const artifact: CanvasArtifact = {
+      id: 'diff-1', sessionId: 'sess-1', title: 'app.ts', content: 'const x = 1;', language: 'typescript', version: 1, filePath: '/repo/src/app.ts'
+    };
+    render(<CanvasPane artifacts={[artifact]} activeArtifact={artifact} onClose={vi.fn()} onCloseArtifact={vi.fn()} onSelectArtifact={vi.fn()} />);
+
+    fireEvent.click(await screen.findByTitle('Show Git Diff'));
+
+    expect(await screen.findByTestId('monaco-diff-mock')).toHaveAttribute('data-language', 'typescript');
+    expect(screen.getByLabelText('original-diff')).toHaveValue('const x = 0;');
+    expect(screen.getByLabelText('modified-diff')).toHaveValue('const x = 1;');
+
+    fireEvent.click(screen.getByTitle('Switch to Editor'));
+    expect(screen.getByTestId('monaco-mock')).toBeInTheDocument();
+  });
+
+  it('ignores delayed git diff response after active artifact changes', async () => {
+    let gitHeadCallback: ((res?: { content?: string }) => void) | undefined;
+    act(() => {
+      useSessionLifecycleStore.setState({ activeSessionId: 'sess-1', sessions: [{ id: 'sess-1', cwd: '/repo' }] } as any);
+    });
+    mockSocketEmit.mockImplementation((event: string, _data: any, cb: any) => {
+      if (event === 'git_status') {
+        cb({
+          branch: 'main',
+          files: [
+            { path: 'src/app.ts', status: 'modified', staged: false },
+            { path: 'src/other.ts', status: 'modified', staged: false },
+          ],
+        });
+      }
+      if (event === 'git_show_head') {
+        gitHeadCallback = cb;
+      }
+    });
+
+    const first: CanvasArtifact = {
+      id: 'diff-1', sessionId: 'sess-1', title: 'app.ts', content: 'const x = 1;', language: 'typescript', version: 1, filePath: '/repo/src/app.ts'
+    };
+    const second: CanvasArtifact = {
+      id: 'diff-2', sessionId: 'sess-1', title: 'other.ts', content: 'const y = 1;', language: 'typescript', version: 1, filePath: '/repo/src/other.ts'
+    };
+
+    const { rerender } = render(<CanvasPane artifacts={[first, second]} activeArtifact={first} onClose={vi.fn()} onCloseArtifact={vi.fn()} onSelectArtifact={vi.fn()} />);
+    fireEvent.click(await screen.findByTitle('Show Git Diff'));
+    rerender(<CanvasPane artifacts={[first, second]} activeArtifact={second} onClose={vi.fn()} onCloseArtifact={vi.fn()} onSelectArtifact={vi.fn()} />);
+
+    act(() => {
+      gitHeadCallback?.({ content: 'stale head' });
+    });
+
+    expect(screen.queryByTestId('monaco-diff-mock')).not.toBeInTheDocument();
+    expect(screen.getByDisplayValue('const y = 1;')).toBeInTheDocument();
   });
 });

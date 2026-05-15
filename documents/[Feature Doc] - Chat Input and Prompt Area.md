@@ -91,7 +91,7 @@ This feature matters because it is the frontend boundary that creates `prompt` s
 
     File: `backend/sockets/promptHandlers.js` (Socket event: `prompt`, ACP request: `session/prompt`)
 
-    The handler appends the text prompt or array prompt parts after attachment parts, prepends `meta.spawnContext` on the first prompt when present, resets response buffers, calls `providerModule.onPromptStarted(sessionId)`, sends ACP `session/prompt`, emits `stats_push` when ACP usage is present, and emits `token_done` plus `autoSaveTurn` when the stream controller has no pending stats capture. Errors emit formatted `token` and `token_done` events with `error: true`.
+    The handler appends the text prompt or array prompt parts after attachment parts, prepends `meta.spawnContext` on the first prompt when present, resets response buffers, calls `providerModule.onPromptStarted(sessionId)`, sends ACP `session/prompt`, uses response `usage.totalTokens` only as a stats fallback when no context-window total is known, and emits `token_done` plus `autoSaveTurn` when the stream controller has no pending stats capture. Errors emit formatted `token` and `token_done` events with `error: true`.
 
 13. Footer model and session option controls update session state.
 
@@ -285,7 +285,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 | Socket event | `set_session_option` | `useSessionLifecycleStore.handleSetSessionOption` | Session handlers | Session config option update request |
 | Socket event | `custom_commands` | Backend socket setup | `useSocket` | Local slash command and prompt substitution data |
 | Socket event | `provider_extension` | Provider runtime stream | `useSocket` and `routeExtension` | Commands, context metadata, provider status, config options, compaction status |
-| Socket event | `stats_push` | `registerPromptHandlers` | Stream/system handlers | Token usage push after ACP usage response |
+| Socket event | `stats_push` | `acpUpdateHandler`, `registerPromptHandlers` | Stream/system handlers | Context-window stats from `usage_update`, or prompt-response fallback when no context-window total is known |
 | ACP request | `session/set_model` | `registerPromptHandlers` | Provider ACP daemon | Enforces backend model before prompt |
 | ACP request | `session/prompt` | `registerPromptHandlers` | Provider ACP daemon | Sends prompt parts to ACP |
 
@@ -404,6 +404,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
   - `multer filename callback sanitizes original filename`
 - `backend/test/promptHandlers.test.js`
   - `should handle incoming prompt and send to ACP`
+  - `does not overwrite context-window stats with prompt response usage`
   - `should handle attachments (images and resource links)`
   - `should handle base64 image attachments without disk path`
   - `should decode non-image base64 files as text content`

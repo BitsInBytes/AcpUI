@@ -8,6 +8,7 @@ import { useVoiceStore } from '../store/useVoiceStore';
 import { useSubAgentStore } from '../store/useSubAgentStore';
 import { useShellRunStore, type ShellRunSnapshot } from '../store/useShellRunStore';
 import { ACP_UX_TOOL_NAMES, isAcpUxShellToolEvent, isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
+import { getQuickModelChoices } from '../utils/modelOptions';
 import { isSessionPoppedOut } from '../lib/sessionOwnership';
 
 /**
@@ -222,8 +223,68 @@ export function useChatManager(
       return !isSessionPoppedOut(owner.id);
     };
 
+    type PendingSubAgentInput = {
+      providerId: string;
+      acpSessionId: string;
+      uiId: string;
+      index: number;
+      name: string;
+      prompt: string;
+      agent: string;
+      model?: string;
+    };
+
+    type PendingSubAgent = PendingSubAgentInput & {
+      parentSessionId: string;
+      parentUiId: string;
+      model: string;
+      modelOptions: ChatSession['modelOptions'];
+    };
+
+    const getProviderModelsForSubAgent = (providerId: string) => {
+      const state = useSystemStore.getState();
+      return state.providersById[providerId]?.branding?.models || state.getBranding(providerId).models;
+    };
+
+    const getFallbackSubAgentModel = (providerId: string) => {
+      const models = getProviderModelsForSubAgent(providerId);
+      return models?.subAgent || models?.default || getQuickModelChoices(models)[0]?.id || '';
+    };
+
+    const getSubAgentModelOptions = (providerId: string): ChatSession['modelOptions'] => (
+      getQuickModelChoices(getProviderModelsForSubAgent(providerId)).map(choice => ({
+        id: choice.id,
+        name: choice.name,
+        ...(choice.description ? { description: choice.description } : {})
+      }))
+    );
+
+    const buildPendingSubAgent = (data: PendingSubAgentInput, parentSessionId: string, parentUiId: string): PendingSubAgent => ({
+      ...data,
+      parentSessionId,
+      parentUiId,
+      model: data.model || getFallbackSubAgentModel(data.providerId),
+      modelOptions: getSubAgentModelOptions(data.providerId)
+    });
+
+    const buildLazySubAgentSession = (pending: PendingSubAgent): ChatSession => ({
+      id: pending.uiId,
+      acpSessionId: pending.acpSessionId,
+      name: pending.name,
+      provider: pending.providerId,
+      messages: [],
+      isTyping: true,
+      isWarmingUp: false,
+      model: pending.model,
+      currentModelId: pending.model || null,
+      modelOptions: pending.modelOptions,
+      isSubAgent: true,
+      parentAcpSessionId: pending.parentSessionId,
+      forkedFrom: pending.parentUiId,
+    });
+
     // Pending sub-agents — session created lazily on first token
-    const pendingSubAgents = new Map<string, { providerId: string; acpSessionId: string; uiId: string; index: number; name: string; prompt: string; agent: string; parentSessionId: string; parentUiId: string; model: string }>();
+    const pendingSubAgents = new Map<string, PendingSubAgent>();
 
     // Intercept tokens to lazily create sub-agent sessions
     const origOnStreamToken = onStreamToken;
@@ -232,19 +293,7 @@ export function useChatManager(
       if (pendingSubAgents.has(data.sessionId)) {
         const pending = pendingSubAgents.get(data.sessionId)!;
         pendingSubAgents.delete(data.sessionId);
-        const subSession = {
-          id: pending.uiId,
-          acpSessionId: pending.acpSessionId,
-          name: pending.name,
-          provider: pending.providerId,
-          messages: [],
-          isTyping: true,
-          isWarmingUp: false,
-          model: pending.model as 'fast' | 'balanced' | 'flagship',
-          isSubAgent: true,
-          parentAcpSessionId: pending.parentSessionId,
-          forkedFrom: pending.parentUiId,
-        };
+        const subSession = buildLazySubAgentSession(pending);
         useSessionLifecycleStore.setState(state => ({ sessions: [...state.sessions, subSession] }));
       }
       
@@ -419,7 +468,7 @@ export function useChatManager(
       const parentSession = useSessionLifecycleStore.getState().sessions.find(s => s.id === parentUiId);
       const parentSessionId = data.parentAcpSessionId || parentSession?.acpSessionId || 'unknown';
       useSubAgentStore.getState().addAgent({ ...data, parentSessionId });
-      pendingSubAgents.set(data.acpSessionId, { ...data, parentSessionId, parentUiId, model: data.model || 'balanced' });
+      pendingSubAgents.set(data.acpSessionId, buildPendingSubAgent(data, parentSessionId, parentUiId));
 
       // Stamp the invocationId onto the in-progress sub-agent start ToolStep
       // on the first agent (index 0).  We defer to here rather than sub_agents_starting
@@ -476,9 +525,7 @@ export function useChatManager(
 
       const sidebarExists = useSessionLifecycleStore.getState().sessions.some(s => s.id === data.uiId);
       if (!sidebarExists) {
-        pendingSubAgents.set(data.acpSessionId, {
-          ...data, parentSessionId, parentUiId, model: data.model || 'balanced'
-        });
+        pendingSubAgents.set(data.acpSessionId, buildPendingSubAgent(data, parentSessionId, parentUiId));
       }
     });
 
@@ -519,14 +566,9 @@ export function useChatManager(
       if (pendingSubAgents.has(data.sessionId)) {
         const pending = pendingSubAgents.get(data.sessionId)!;
         pendingSubAgents.delete(data.sessionId);
-        useSessionLifecycleStore.setState(state => ({ sessions: [...state.sessions, {
-          id: pending.uiId, acpSessionId: pending.acpSessionId,
-          name: pending.name,
-          provider: pending.providerId,
-          messages: [], isTyping: true, isWarmingUp: false, model: pending.model as 'fast' | 'balanced' | 'flagship',
-          isSubAgent: true, parentAcpSessionId: pending.parentSessionId,
-          forkedFrom: pending.parentUiId,
-        }] }));
+        useSessionLifecycleStore.setState(state => ({
+          sessions: [...state.sessions, buildLazySubAgentSession(pending)]
+        }));
       }
       const agents = useSubAgentStore.getState().agents;
       if (!agents.some(a => a.acpSessionId === data.sessionId)) return;

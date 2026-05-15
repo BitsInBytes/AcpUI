@@ -13,7 +13,7 @@ This area is easy to break because canvas state is keyed by UI session id while 
 - Stores session-scoped `CanvasArtifact` entries in `useCanvasStore` and persists them with the `canvas_save` socket event.
 - Loads saved artifacts for the active UI session with `canvas_load` and `getCanvasArtifactsForSession`.
 - Reads current file contents through `canvas_read_file`, writes editor content through `canvas_apply_to_file`, and opens files in VS Code through `open_in_editor`.
-- Renders artifact content in Monaco code view, ReactMarkdown preview, or a Monaco `SafeDiffEditor` diff view.
+- Renders artifact content in Monaco code view, ReactMarkdown preview, or a React Monaco `SafeDiffEditor` diff view.
 - Opens files from assistant code blocks, local Markdown file links, tool timeline file paths, completed tool events, and git status rows.
 - Shows workspace git status, detects whether the active artifact has changes, and loads HEAD content with `git_show_head` for side-by-side diffs.
 - Hosts session-scoped terminal tabs in the same pane and keeps the pane open while terminals exist.
@@ -158,7 +158,7 @@ const watched = state.canvasArtifacts.find(a =>
 9. CanvasPane renders code, markdown preview, or diff.
    - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Component: `CanvasPane`, Function: `getMonacoLanguage`, Component: `SafeDiffEditor`)
    - Markdown artifacts default to preview mode. Non-markdown artifacts default to Monaco code mode. The component keeps the current `viewMode` when the same artifact id receives updated content, and resets view mode only when the active artifact id changes outside a git-open flow.
-   - Diff mode renders `SafeDiffEditor` only when `gitOriginal !== null`, which prevents Monaco diff models from mounting before HEAD content returns.
+   - Diff mode renders `SafeDiffEditor` only when `gitOriginal !== null`, which prevents Monaco diff models from mounting before HEAD content returns. The diff wrapper uses React Monaco `DiffEditor` model paths derived from the artifact id, clears diff state when no artifact is active, and ignores stale git callbacks after unmount or active-artifact changes.
 
 10. Editor apply writes content to disk.
     - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Handler: `handleApplyToFile`)
@@ -169,8 +169,8 @@ const watched = state.canvasArtifacts.find(a =>
     - File: `frontend/src/components/CanvasPane/CanvasPane.tsx` (Handlers: `refreshGitStatus`, `handleOpenGitFile`)
     - File: `frontend/src/utils/canvasHelpers.ts` (Functions: `isFileChanged`, `buildFullPath`)
     - File: `backend/sockets/gitHandlers.js` (Socket events: `git_status`, `git_show_head`, `git_diff`, `git_stage`, `git_unstage`)
-    - `CanvasPane` resolves `cwd` from the active session `cwd` or the first configured workspace path. It emits `git_status`, renders changed files, and uses `buildFullPath` before opening a git row. Opening a git row reads current disk content with `canvas_read_file`, stores it in the canvas, switches to diff mode, and fills the original side with `git_show_head`.
-    - The toolbar Diff button appears when the active artifact has `filePath` and `isFileChanged` matches it against the git status list. This button also uses `git_show_head`. Backend `git_diff`, `git_stage`, and `git_unstage` are implemented socket events, but `CanvasPane` does not render stage controls and uses `git_show_head` for the Monaco side-by-side diff.
+    - `CanvasPane` resolves `cwd` from the active session `cwd` or the first configured workspace path. It emits `git_status`, renders changed files, and uses `buildFullPath` before opening a git row. Backend `git_status` strips Git porcelain quote wrapping from paths before the UI receives them, so files such as `documents/[Feature Doc] - *.md` open with their real repository-relative path. Opening a git row reads current disk content with `canvas_read_file`, stores it in the canvas, switches to diff mode, and fills the original side with `git_show_head` when the opened artifact still matches the active canvas artifact.
+    - The toolbar Diff button appears when the active artifact has `filePath` and `isFileChanged` matches it against the git status list. This button also uses `git_show_head` and applies the same active-artifact guard before switching to diff mode. Backend `git_diff`, `git_stage`, and `git_unstage` are implemented socket events, but `CanvasPane` does not render stage controls and uses `git_show_head` for the Monaco side-by-side diff.
 
 12. Terminal tabs share the canvas pane.
     - File: `frontend/src/store/useCanvasStore.ts` (Store actions: `openTerminal`, `closeTerminal`, `setActiveTerminalId`)
@@ -298,6 +298,7 @@ CanvasPane.refreshGitStatus emits git_status with cwd
   -> canvas_read_file loads current disk content
   -> handleOpenInCanvas stores current content as an artifact
   -> CanvasPane emits git_show_head for original content
+  -> CanvasPane confirms the active artifact still matches the request
   -> SafeDiffEditor renders original HEAD content against current editor content
 ```
 
@@ -355,7 +356,7 @@ ORDER BY created_at DESC
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Frontend Store | `frontend/src/test/useCanvasStore.test.ts` | suite `useCanvasStore` | Store setters, terminal actions, artifact dedup, file read open, watched-file refresh, close/delete, reset |
-| Frontend Pane | `frontend/src/test/CanvasPane.test.tsx` | suites `CanvasPane Component`, `CanvasPane - additional coverage`, `CanvasPane - Terminal Tab`, `CanvasPane - prevArtifactIdRef behavior`, `CanvasPane - multiple terminals and tab interactions` | Rendering modes, apply/open editor actions, tab behavior, language mapping, terminal tabs, same-artifact view-mode preservation |
+| Frontend Pane | `frontend/src/test/CanvasPane.test.tsx` | suites `CanvasPane Component`, `CanvasPane - additional coverage`, `CanvasPane - Terminal Tab`, `CanvasPane - prevArtifactIdRef behavior`, `CanvasPane - multiple terminals and tab interactions` | Rendering modes, apply/open editor actions, tab behavior, language mapping, terminal tabs, same-artifact view-mode preservation, diff rendering, and stale diff callback guards |
 | Frontend Helpers | `frontend/src/test/canvasHelpers.test.ts` | suites `isFileChanged`, `buildFullPath` | Path normalization and git file-change matching |
 | Frontend Tool Timeline | `frontend/src/test/ToolStep.test.tsx` | suite `ToolStep`, suite `ToolStep - getFilePathFromEvent extraction` | Canvas hoist button rules and file path extraction |
 | Frontend Chat | `frontend/src/test/ChatMessage.test.tsx` | tests `renders Open in Canvas button on code blocks and calls callback`, `opens local markdown file links in canvas`, `does not render Open in Canvas button for truncated paths with ellipses`, `renders Open in Canvas button for valid full paths`, `code block shows Canvas button when canvas is open`, `code block does NOT show Canvas button when canvas is closed` | Code-block, local-link, and tool-hoist visibility through assistant rendering |
@@ -386,22 +387,25 @@ ORDER BY created_at DESC
 5. Canvas reads and writes are root-gated.
    - `canvas_read_file` and `canvas_apply_to_file` resolve `filePath` through `resolveAllowedPath(filePath, 'file_path')` before touching disk, so paths outside configured allowed roots are rejected.
 
-6. Diff mode has a loading sentinel.
-   - `SafeDiffEditor` mounts only when `viewMode === 'diff'` and `gitOriginal !== null`. `git_show_head` returns an empty string for new files; empty string means render a blank original side, while `null` means HEAD content has not arrived.
+6. Diff mode has a loading sentinel and stale-callback guard.
+   - `SafeDiffEditor` mounts only when `viewMode === 'diff'` and `gitOriginal !== null`. `git_show_head` returns an empty string for new files; empty string means render a blank original side, while `null` means HEAD content has not arrived. `git_show_head` callbacks must verify the pane is still mounted and the active artifact still matches the request before setting `gitOriginal` or `viewMode`.
 
 7. Git cwd fallback can change the repo source.
    - `CanvasPane` uses active session `cwd` first and then `workspaceCwds[0].path`. Missing session `cwd` can make the git panel show the first configured workspace.
 
-8. Code-block canvas actions require an open canvas.
+8. Git porcelain paths must be decoded before the UI joins them.
+   - `git_status` must remove paired quote wrapping from porcelain paths before returning them. If quote characters remain in `GitFile.path`, `buildFullPath` treats them as real filename characters and `canvas_read_file` fails with `ENOENT`.
+
+9. Code-block canvas actions require an open canvas.
    - `CodeBlock` hides its Canvas button when `isCanvasOpen` is false. ToolStep hoist buttons and local Markdown file links are independent of that code-block condition because they open files through `handleOpenFileInCanvas`.
 
-9. Local Markdown file links must remove editor line suffixes.
+10. Local Markdown file links must remove editor line suffixes.
    - `parseLocalFileLinkHref` strips trailing `:line` and `:line:column` before `canvas_read_file` so a rendered file link opens the file path, not a non-existent path with editor coordinates.
 
-10. Pop-out canvas does not issue `canvas_load` during bootstrap.
+11. Pop-out canvas does not issue `canvas_load` during bootstrap.
    - `PopOutApp` wires stream callbacks and renders `CanvasPane`, but the persisted artifact load path is in `App`.
 
-11. Terminal tabs keep the pane open.
+12. Terminal tabs keep the pane open.
     - `closeTerminal`, `resetCanvas`, and `handleCloseArtifact` all preserve `isCanvasOpen` when terminals remain for the active session.
 
 ---
@@ -425,6 +429,7 @@ ORDER BY created_at DESC
   - `git_status returns branch and files`
   - `git_status returns empty files array when working tree is clean`
   - `git_status maps deleted and renamed statuses`
+  - `git_status unquotes porcelain paths with spaces and brackets`
   - `git_diff returns staged diff`
   - `git_diff returns unstaged diff`
   - `git_diff shows full content for untracked files`
@@ -477,6 +482,8 @@ ORDER BY created_at DESC
   - `clicking a terminal tab calls setActiveTerminalId`
   - `close button on terminal tab calls closeTerminal`
   - `diff button not shown when no filePath on artifact`
+  - `renders git diff and toggles back to code view`
+  - `ignores delayed git diff response after active artifact changes`
 
 - `frontend/src/test/canvasHelpers.test.ts`
   - `returns true when file path matches`
@@ -538,7 +545,7 @@ ORDER BY created_at DESC
 3. Trace socket events: `canvas_load`, `canvas_save`, `canvas_delete`, `canvas_read_file`, `canvas_apply_to_file`, `git_status`, `git_show_head`, and `open_in_editor`.
 4. Check `canvas_artifacts` rows for the active `session_id` when persisted artifacts are missing or sorted unexpectedly.
 5. If a watched file does not refresh, verify that the stream event is completed, includes `filePath`, and that `handleFileEdited` can suffix-match an already-open artifact.
-6. If a diff is blank, distinguish `gitOriginal === null` from `gitOriginal === ''`, then check the `git_show_head` callback and the artifact id guard in `handleOpenGitFile`.
+6. If a diff is blank, distinguish `gitOriginal === null` from `gitOriginal === ''`, then check the `git_show_head` callback and the active-artifact guards in `handleOpenGitFile` and the toolbar Diff action.
 7. If git status points at the wrong repository, inspect active session `cwd` and `workspaceCwds[0].path`.
 8. If terminal tabs affect close behavior, inspect `terminals.filter(t => t.sessionId === activeSessionId)` and `activeTerminalId`.
 

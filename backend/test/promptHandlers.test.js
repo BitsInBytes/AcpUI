@@ -136,6 +136,28 @@ describe('Prompt Handlers', () => {
       sessionId,
       prompt: expect.arrayContaining([{ type: 'text', text: prompt }])
     }));
+    expect(mockAcpClient.sessionMetadata.get(sessionId).usedTokens).toBe(100);
+    expect(mockIo.emit).toHaveBeenCalledWith('stats_push', expect.objectContaining({ sessionId, providerId: 'provider-a', usedTokens: 100 }));
+    expect(mockIo.emit).toHaveBeenCalledWith('token_done', expect.objectContaining({ sessionId, providerId: 'provider-a' }));
+  });
+
+  it('does not overwrite context-window stats with prompt response usage', async () => {
+    const sessionId = 'sess-context-window';
+    mockAcpClient.sessionMetadata.set(sessionId, {
+      model: 'test-balanced',
+      promptCount: 0,
+      lastResponseBuffer: '',
+      lastThoughtBuffer: '',
+      usedTokens: 20000,
+      totalTokens: 200000
+    });
+    mockAcpClient.transport.sendRequest.mockResolvedValue({ success: true, usage: { totalTokens: 120000 } });
+
+    const handler = mockSocket.listeners('prompt')[0];
+    await handler({ uiId: 'ui-ctx', sessionId, prompt: 'continue', model: 'test-balanced' });
+
+    expect(mockAcpClient.sessionMetadata.get(sessionId).usedTokens).toBe(20000);
+    expect(mockIo.emit.mock.calls.filter(([event]) => event === 'stats_push')).toEqual([]);
     expect(mockIo.emit).toHaveBeenCalledWith('token_done', expect.objectContaining({ sessionId, providerId: 'provider-a' }));
   });
 

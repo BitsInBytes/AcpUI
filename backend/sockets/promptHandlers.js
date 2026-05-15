@@ -129,10 +129,16 @@ export default function registerPromptHandlers(io, socket) {
         });
 
         if (response && response.usage) {
-           if (meta) {
-              meta.usedTokens = response.usage.totalTokens || meta.usedTokens;
-           }
-           io.to('session:' + sessionId).emit('stats_push', { providerId: resolvedProviderId, sessionId, usedTokens: meta?.usedTokens, totalTokens: meta?.totalTokens });
+          const responseTotalTokens = Number(response.usage.totalTokens);
+          const hasContextWindowStats = meta
+            && Number.isFinite(Number(meta.totalTokens))
+            && Number(meta.totalTokens) > 0;
+
+          // response.usage is turn accounting; usage_update.used/size is context-window state.
+          if (meta && Number.isFinite(responseTotalTokens) && responseTotalTokens > 0 && !hasContextWindowStats) {
+            meta.usedTokens = responseTotalTokens;
+            io.to('session:' + sessionId).emit('stats_push', { providerId: resolvedProviderId, sessionId, usedTokens: meta.usedTokens, totalTokens: meta.totalTokens });
+          }
         }
 
         // If statsCaptures still has this session, a tool_result is pending — don't finalize yet.

@@ -762,6 +762,22 @@ describe('useChatManager hook', () => {
     const { useSubAgentStore } = await import('../store/useSubAgentStore');
     act(() => {
       useSubAgentStore.setState({ addAgent: vi.fn() as any });
+      useSystemStore.setState({
+        providersById: {
+          'provider-a': {
+            providerId: 'provider-a',
+            branding: {
+              ...useSystemStore.getState().branding,
+              providerId: 'provider-a',
+              models: {
+                default: 'test-default-model',
+                subAgent: 'test-subagent-model',
+                quickAccess: [{ id: 'test-subagent-model', displayName: 'Sub Agent Model' }]
+              }
+            }
+          } as any
+        }
+      });
       useSessionLifecycleStore.setState({
         sessions: [{ id: 'parent-ui', acpSessionId: 'parent-acp', messages: [] } as any]
       });
@@ -790,6 +806,9 @@ describe('useChatManager hook', () => {
     expect(created).toBeDefined();
     expect(created.provider).toBe('provider-a');
     expect(created.name).toBe('Token Agent');
+    expect(created.model).toBe('test-subagent-model');
+    expect(created.currentModelId).toBe('test-subagent-model');
+    expect(created.modelOptions).toEqual([{ id: 'test-subagent-model', name: 'Sub Agent Model' }]);
   });
 
   it('creates lazy sub-agent session with provider on first system_event', async () => {
@@ -818,6 +837,7 @@ describe('useChatManager hook', () => {
         name: 'Event Agent',
         prompt: 'p',
         agent: 'a',
+        model: 'explicit-subagent-model',
         invocationId: 'inv-event'
       });
       for (const h of systemHandlers) h({ sessionId: 'sub-acp-event', type: 'noop', id: 't1', title: 'Tool' });
@@ -827,6 +847,8 @@ describe('useChatManager hook', () => {
     expect(created).toBeDefined();
     expect(created.provider).toBe('provider-b');
     expect(created.name).toBe('Event Agent');
+    expect(created.model).toBe('explicit-subagent-model');
+    expect(created.currentModelId).toBe('explicit-subagent-model');
   });
 
   it('handles "session_renamed" event', () => {

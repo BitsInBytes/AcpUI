@@ -7,6 +7,17 @@ function git(cwd, args) {
   return execSync(`git ${args}`, { cwd, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).trimEnd();
 }
 
+function parseGitStatusPath(rawPath) {
+  const filePath = rawPath.trim();
+  if (!filePath.startsWith('"') || !filePath.endsWith('"')) return filePath;
+
+  try {
+    return JSON.parse(filePath);
+  } catch {
+    return filePath.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+}
+
 export default function registerGitHandlers(io, socket) {
   socket.on('git_status', ({ cwd }, callback) => {
     try {
@@ -15,7 +26,7 @@ export default function registerGitHandlers(io, socket) {
       const files = raw ? raw.split('\n').map(line => {
         const staged = line[0];
         const unstaged = line[1];
-        const filePath = line.substring(3).trim();
+        const filePath = parseGitStatusPath(line.substring(3));
         // Determine display status
         let status = 'modified';
         if (staged === '?' || unstaged === '?') status = 'untracked';

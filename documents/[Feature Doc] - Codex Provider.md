@@ -178,7 +178,7 @@ Architectural role: provider-specific backend adapter for Codex ACP, integrated 
 
     File: `providers/codex/index.js` (Functions: `getSessionPaths`, `cloneSession`, `deleteSessionFiles`, `archiveSessionFiles`, `restoreSessionFiles`)
 
-    `getSessionPaths()` searches `paths.sessions` recursively for a JSONL filename containing the session ID, then by file content, and falls back to `<sessionId>.jsonl` under the sessions directory. `cloneSession()` copies the rollout, companion JSON file, and task directory; it replaces the old session ID with the fork ID and prunes at whole turn boundaries when `pruneAtTurn` is provided. `archiveSessionFiles()` writes `restore_meta.json`, copies active files into the archive, and removes the active copies. `restoreSessionFiles()` restores files from archive metadata.
+    `getSessionPaths()` searches session roots recursively for a JSONL filename containing the session ID, then by file content. The configured `paths.sessions` root is searched first; when it is nested under `paths.home/sessions`, the canonical `paths.home/sessions` root is searched as a fallback before `<sessionId>.jsonl` under the configured sessions directory is returned. `cloneSession()` copies the rollout, companion JSON file, and task directory; it replaces the old session ID with the fork ID and prunes at whole turn boundaries when `pruneAtTurn` is provided. `archiveSessionFiles()` writes `restore_meta.json`, copies active files into the archive, and removes the active copies. `restoreSessionFiles()` restores files from archive metadata.
 
 12. **History parsing creates Unified Timeline messages**
 
@@ -253,7 +253,7 @@ Breaking this contract causes duplicated model controls, missing slash commands,
 | `quotaStatusIntervalMs` | Poll interval while prompts are in flight; `0` disables interval polling. |
 | `quotaStatusEndpoint`, `quotaOAuthRefreshEndpoint` | Override quota and OAuth refresh endpoints. |
 | `paths.home` | Location of `auth.json` and `acp_session_context.json`. |
-| `paths.sessions` | Recursive rollout JSONL search root. |
+| `paths.sessions` | Primary recursive rollout JSONL search root; nested roots under `paths.home/sessions` also allow fallback search of `paths.home/sessions`. |
 | `paths.agents`, `paths.attachments`, `paths.archive` | Codex agents, attachment, and archive directories. |
 | `models.default`, `models.quickAccess`, `models.titleGeneration`, `models.subAgent` | Provider model defaults and AcpUI quick-select options. |
 | `acpSupportsMcpTimeouts`, `acpMcpStartupTimeoutSec`, `acpMcpToolTimeoutSec` | Controls `_meta.codex_acp` timeout overrides. |
@@ -457,7 +457,7 @@ Important test groups and cases:
 - `setConfigOption`: `mode`, `model`, and generic option routing.
 - `tool helpers`: output extraction, file paths, diffs, AcpUI MCP title normalization, optional IO/Search title normalization, standard input locations, canonical invocation metadata, and built-in tool name normalization.
 - `getMcpServerMeta`: timeout metadata gating and numeric parsing.
-- `session file operations`: recursive clone/prune, modern turn pruning, rollout parsing, modern record parsing, and compacted history reset.
+- `session file operations`: nested session-root fallback, recursive clone/prune, modern turn pruning, rollout parsing, modern record parsing, and compacted history reset.
 
 ### Backend Tool and Contract Tests
 

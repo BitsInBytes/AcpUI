@@ -49,9 +49,9 @@ This architecture doc intentionally avoids duplicating feature-level rendering r
 ## Runtime Topology
 
 1. **Root selection**
-   File: `frontend/src/main.tsx` (Anchor: `isPopout`)
+   Files: `frontend/src/main.tsx` (Anchor: `isPopout`) and `frontend/src/utils/globalErrorHandler.ts` (Functions: `installGlobalErrorHandler`, `isOpaqueScriptError`)
 
-   The query string selects either `App` for the normal window or `PopOutApp` for the detached session window.
+   `main.tsx` installs the global runtime error handler, then the query string selects either `App` for the normal window or `PopOutApp` for the detached session window. The error handler preserves the visible app for opaque third-party `Script error.` events without an error object, while still rendering the runtime error view for actionable same-origin failures.
 
 2. **Normal-window shell**
    File: `frontend/src/App.tsx` (Component: `App`)
@@ -170,7 +170,7 @@ If this contract is broken, background streams can write into the wrong chat, sh
 
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
-| Root split | `frontend/src/main.tsx` | `isPopout` | Selects normal or pop-out app root |
+| Root split | `frontend/src/main.tsx`, `frontend/src/utils/globalErrorHandler.ts` | `isPopout`, `installGlobalErrorHandler`, `isOpaqueScriptError` | Installs global runtime error handling and selects normal or pop-out app root |
 | Normal root | `frontend/src/App.tsx` | `App`, `ConfigErrorModal`, `HelpDocsModal`, session switch effect | Main shell, session room switching, modal roots, canvas coordination |
 | Pop-out root | `frontend/src/PopOutApp.tsx` | `PopOutApp`, `claimSession`, `hydrateSession` | Detached single-session runtime |
 | Socket singleton | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `useSocket` | Bootstrap socket creation and global hydration listeners |
@@ -225,7 +225,7 @@ This doc lists only backbone tests. Feature docs list focused suites for their w
 
 | Area | Tests |
 |---|---|
-| Root and socket hydration | `frontend/src/test/App.test.tsx`, `frontend/src/test/PopOutApp.test.tsx`, `frontend/src/test/useSocket.test.ts` |
+| Root and socket hydration | `frontend/src/test/App.test.tsx`, `frontend/src/test/PopOutApp.test.tsx`, `frontend/src/test/useSocket.test.ts`, `frontend/src/test/globalErrorHandler.test.ts` |
 | Session lifecycle and stream state | `frontend/src/test/useSessionLifecycleStore.test.ts`, `frontend/src/test/useSessionLifecycleStoreExtended.test.ts`, `frontend/src/test/useStreamStore.test.ts`, `frontend/src/test/streamConcurrency.test.ts` |
 | Turn dispatcher, shell, and sub-agents | `frontend/src/test/useChatManager.test.ts`, `frontend/src/test/useShellRunStore.test.ts` |
 | System store and extensions | `frontend/src/test/useSystemStoreDeep.test.ts`, `frontend/src/test/extensionRouter.test.ts`, `frontend/src/test/acpUxTools.test.ts` |

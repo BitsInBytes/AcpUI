@@ -863,6 +863,20 @@ describe('Codex Provider', () => {
       expect(codex.emitCachedContext(acpId)).toBe(true);
     });
 
+    it('finds rollout files from the canonical sessions root when the configured path is nested', () => {
+      const acpId = '33333333-3333-3333-3333-333333333333';
+      mockConfig.paths.sessions = path.join(tempRoot, '.codex', 'sessions', 'cli');
+      const sessionDir = path.join(tempRoot, '.codex', 'sessions', '2026', '05', '15');
+      fs.mkdirSync(sessionDir, { recursive: true });
+      const rollout = path.join(sessionDir, `rollout-2026-05-15T01-02-03-${acpId}.jsonl`);
+      fs.writeFileSync(rollout, '{}\n', 'utf8');
+
+      const paths = codex.getSessionPaths(acpId);
+
+      expect(paths.jsonl).toBe(rollout);
+      expect(paths.tasksDir).toBe(path.join(sessionDir, acpId));
+    });
+
     it('clones and prunes Codex rollout files recursively', () => {
       const oldId = '11111111-1111-1111-1111-111111111111';
       const newId = '22222222-2222-2222-2222-222222222222';

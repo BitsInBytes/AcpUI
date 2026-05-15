@@ -63,6 +63,20 @@ describe('Git Handlers', () => {
     expect(files[2]).toMatchObject({ path: 'unstaged.js', status: 'deleted', staged: false });
   });
 
+  it('git_status unquotes porcelain paths with spaces and brackets', async () => {
+    const { execSync } = await import('child_process');
+    execSync.mockImplementationOnce(() => 'main\n');
+    execSync.mockImplementationOnce(() => ' M "documents/[Feature Doc] - Sidebar Rendering.md"\n');
+    const cb = vi.fn();
+    socket.listeners('git_status')[0]({ cwd: '/tmp/repo' }, cb);
+    const { files } = cb.mock.calls[0][0];
+    expect(files[0]).toEqual({
+      path: 'documents/[Feature Doc] - Sidebar Rendering.md',
+      status: 'modified',
+      staged: false,
+    });
+  });
+
   it('git_diff returns staged diff', () => {
     const cb = vi.fn();
     socket.listeners('git_diff')[0]({ cwd: '/tmp/repo', filePath: 'src/new.js', staged: true }, cb);

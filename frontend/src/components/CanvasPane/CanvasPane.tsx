@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { FileCode, TerminalSquare, X, HardDrive, Check, Eye, Code, ExternalLink, GitCompareArrows, GitBranch, FilePlus, FileEdit, FileX, FileQuestion, RefreshCw } from 'lucide-react';
-import Editor, { loader } from '@monaco-editor/react';
+import Editor, { DiffEditor } from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import './CanvasPane.css';
@@ -51,49 +51,30 @@ const getMonacoLanguage = (language: string, filePath?: string): string => {
 };
 
 function SafeDiffEditor({ language, original, modified, fileKey }: { language: string; original: string; modified: string; fileKey: string }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const editorRef = useRef<any>(null);
+  const modelKey = encodeURIComponent(fileKey);
 
-  useEffect(() => {
-    if (!containerRef.current) return;
-
-    let disposed = false;
-
-    loader.init().then((monaco) => {
-        if (disposed || !containerRef.current) return;
-
-        const diffEditor = monaco.editor.createDiffEditor(containerRef.current, {
-          readOnly: true,
-          minimap: { enabled: false },
-          fontSize: 14,
-          wordWrap: 'on',
-          automaticLayout: true,
-          scrollBeyondLastLine: false,
-          renderSideBySide: true,
-          padding: { top: 16, bottom: 16 },
-          theme: 'vs-dark',
-        });
-
-        const uid = `${fileKey}-${Date.now()}`;
-        const originalModel = monaco.editor.createModel(original, language, monaco.Uri.parse(`diff://original/${uid}`));
-        const modifiedModel = monaco.editor.createModel(modified, language, monaco.Uri.parse(`diff://modified/${uid}`));
-        diffEditor.setModel({ original: originalModel, modified: modifiedModel });
-        editorRef.current = { editor: diffEditor, original: originalModel, modified: modifiedModel };
-      });
-
-    return () => {
-      disposed = true;
-      try {
-        editorRef.current?.editor?.dispose();
-        editorRef.current?.original?.dispose();
-        editorRef.current?.modified?.dispose();
-      } catch { /* already disposed */ }
-      editorRef.current = null;
-    };
-  }, [language, original, modified, fileKey]);
-
-  return <div ref={containerRef} style={{ height: '100%', width: '100%' }} />;
+  return (
+    <DiffEditor
+      height="100%"
+      language={language}
+      original={original}
+      modified={modified}
+      originalModelPath={`diff://original/${modelKey}`}
+      modifiedModelPath={`diff://modified/${modelKey}`}
+      theme="vs-dark"
+      loading={null}
+      options={{
+        readOnly: true,
+        minimap: { enabled: false },
+        fontSize: 14,
+        wordWrap: 'on',
+        automaticLayout: true,
+        scrollBeyondLastLine: false,
+        renderSideBySide: true,
+        padding: { top: 16, bottom: 16 },
+      }}
+    />
+  );
 }
 
 export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact, onCloseArtifact, onClose }: CanvasPaneProps) {
@@ -118,31 +99,48 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
 
   const prevArtifactIdRef = useRef<string | null>(null);
   const gitOpenRef = useRef(false);
+  const activeArtifactRef = useRef<CanvasArtifact | null>(activeArtifact);
+  const isPaneMountedRef = useRef(true);
+  activeArtifactRef.current = activeArtifact;
 
   useEffect(() => {
-    if (activeArtifact) {
-      setContent(activeArtifact.content);
+    isPaneMountedRef.current = true;
+    return () => { isPaneMountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!activeArtifact) {
+      setContent('');
       setIsApplied(false);
-      
-      if (prevArtifactIdRef.current !== activeArtifact.id) {
-        if (!gitOpenRef.current) {
-          setGitOriginal(null);
-          if (isMarkdown) {
-            setViewMode('preview');
-          } else {
-            setViewMode('code');
-          }
-        }
-        gitOpenRef.current = false;
-      }
-      prevArtifactIdRef.current = activeArtifact.id;
+      setGitOriginal(null);
+      setViewMode('code');
+      prevArtifactIdRef.current = null;
+      gitOpenRef.current = false;
+      return;
     }
+
+    setContent(activeArtifact.content);
+    setIsApplied(false);
+
+    if (prevArtifactIdRef.current !== activeArtifact.id) {
+      if (!gitOpenRef.current) {
+        setGitOriginal(null);
+        if (isMarkdown) {
+          setViewMode('preview');
+        } else {
+          setViewMode('code');
+        }
+      }
+      gitOpenRef.current = false;
+    }
+    prevArtifactIdRef.current = activeArtifact.id;
   }, [activeArtifact, isMarkdown]);
 
   // Fetch git status for the workspace
   const refreshGitStatus = useCallback(() => {
     if (!socket || !cwd) return;
     socket.emit('git_status', { cwd }, (res: { branch?: string; files?: { path: string; status: string; staged: boolean }[] }) => {
+      if (!isPaneMountedRef.current) return;
       setGitBranch(res.branch || '');
       setGitFiles(res.files || []);
     });
@@ -154,25 +152,33 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
 
   const fileChanged = isFileChangedHelper(activeArtifact?.filePath, gitFiles);
 
+  const isActiveArtifactTarget = useCallback((artifactId: string, filePath?: string) => {
+    if (!isPaneMountedRef.current) return false;
+    const current = activeArtifactRef.current;
+    return Boolean(current && (current.id === artifactId || (filePath && current.filePath === filePath)));
+  }, []);
+
   const handleOpenGitFile = (filePath: string) => {
     if (!socket || !activeSessionId) return;
     const fullPath = buildFullPath(cwd, filePath);
     const request: CanvasReadFileRequest = { filePath: fullPath, sessionId: activeSessionId };
     socket.emit('canvas_read_file', request, (res: CanvasReadFileResponse) => {
+      if (!isPaneMountedRef.current) return;
       if (res.artifact) {
         const artifactId = res.artifact.id;
         gitOpenRef.current = true;
         useCanvasStore.getState().handleOpenInCanvas(socket, activeSessionId, res.artifact);
         setActiveTerminalId(null);
-        // Set content and null out gitOriginal immediately — the guard in the render
-        // (gitOriginal !== null) prevents SafeDiffEditor from mounting until data arrives
+        // Set content and null out gitOriginal immediately; the render guard waits
+        // for HEAD content before mounting the diff editor.
         setContent(res.artifact.content);
         setGitOriginal(null);
         setViewMode('diff');
-        socket.emit('git_show_head', { cwd, filePath: fullPath }, (headRes: { content: string }) => {
+        socket.emit('git_show_head', { cwd, filePath: fullPath }, (headRes?: { content?: string }) => {
+          if (!isPaneMountedRef.current) return;
           const current = useCanvasStore.getState().activeCanvasArtifact;
-          if (current?.id !== artifactId && current?.filePath !== fullPath) return;
-          setGitOriginal(headRes.content);
+          if (!current || (current.id !== artifactId && current.filePath !== fullPath)) return;
+          setGitOriginal(headRes?.content ?? '');
         });
       } else if (res.error) {
         setCanvasError('Failed to read file: ' + res.error);
@@ -191,6 +197,25 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
         }
       });
     }
+  };
+
+  const handleToggleDiff = () => {
+    if (!activeArtifact?.filePath) return;
+    if (viewMode === 'diff') {
+      setGitOriginal(null);
+      setViewMode('code');
+      return;
+    }
+    if (!socket || !cwd) return;
+
+    const artifactId = activeArtifact.id;
+    const filePath = activeArtifact.filePath;
+    setGitOriginal(null);
+    socket.emit('git_show_head', { cwd, filePath }, (res?: { content?: string }) => {
+      if (!isActiveArtifactTarget(artifactId, filePath)) return;
+      setGitOriginal(res?.content ?? '');
+      setViewMode('diff');
+    });
   };
 
   return (
@@ -296,14 +321,7 @@ export default function CanvasPane({ artifacts, activeArtifact, onSelectArtifact
                 )}
                 {activeArtifact.filePath && fileChanged && (
                   <button
-                    onClick={() => {
-                      if (viewMode === 'diff') { setViewMode('code'); return; }
-                      if (!socket || !cwd || !activeArtifact.filePath) return;
-                      socket.emit('git_show_head', { cwd, filePath: activeArtifact.filePath }, (res: { content: string }) => {
-                        setGitOriginal(res.content);
-                        setViewMode('diff');
-                      });
-                    }}
+                    onClick={handleToggleDiff}
                     className={`canvas-btn ${viewMode === 'diff' ? 'active' : ''}`}
                     title={viewMode === 'diff' ? "Switch to Editor" : "Show Git Diff"}
                   >

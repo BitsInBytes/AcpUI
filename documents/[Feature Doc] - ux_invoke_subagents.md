@@ -378,12 +378,12 @@ File: `frontend/src/store/useSessionLifecycleStore.ts` (State: `sessions`)
 
 `sub_agents_starting` creates invocation-level store state, removes existing sub-agent sidebar sessions for the same parent UI ID, and emits `delete_session` for each removed session. This event is only emitted after the backend accepts the new invocation, so an active-invocation rejection does not clear the old sidebar agents.
 
-`sub_agent_started` adds the agent to `useSubAgentStore`, records a pending sidebar session in `pendingSubAgents`, and stamps the batch `invocationId` onto the in-progress parent ToolStep when `index === 0`. `sub_agent_invocation_status` updates invocation-level status so the active ToolStep knows when it can collapse.
+`sub_agent_started` adds the agent to `useSubAgentStore`, records a pending sidebar session in `pendingSubAgents`, derives fallback model display metadata from provider branding when the socket payload has no model, and stamps the batch `invocationId` onto the in-progress parent ToolStep when `index === 0`. `sub_agent_invocation_status` updates invocation-level status so the active ToolStep knows when it can collapse.
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Socket event: sub_agent_started)
 useSubAgentStore.getState().addAgent({ ...data, parentSessionId });
-pendingSubAgents.set(data.acpSessionId, { ...data, parentSessionId, parentUiId, model: data.model || 'balanced' });
+pendingSubAgents.set(data.acpSessionId, buildPendingSubAgent(data, parentSessionId, parentUiId));
 
 if (data.index === 0) {
   useSessionLifecycleStore.setState(state => ({
@@ -416,6 +416,8 @@ const subSession = {
   isTyping: true,
   isWarmingUp: false,
   model: pending.model,
+  currentModelId: pending.model || null,
+  modelOptions: pending.modelOptions,
   isSubAgent: true,
   parentAcpSessionId: pending.parentSessionId,
   forkedFrom: pending.parentUiId,
