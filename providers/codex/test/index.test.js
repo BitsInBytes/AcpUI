@@ -429,6 +429,87 @@ describe('Codex Provider', () => {
       expect(result).toBeNull();
     });
 
+    it('swallows native no-output Codex web search updates but preserves real search tools', () => {
+      const start = {
+        method: 'session/update',
+        params: {
+          sessionId: 's1',
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'ws_empty',
+            title: 'Searching the Web',
+            kind: 'fetch'
+          }
+        }
+      };
+
+      const progress = {
+        method: 'session/update',
+        params: {
+          sessionId: 's1',
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'ws_empty',
+            status: 'in_progress',
+            title: 'Web search',
+            rawInput: { action: { type: 'other' } }
+          }
+        }
+      };
+
+      const completed = {
+        method: 'session/update',
+        params: {
+          sessionId: 's1',
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'ws_empty',
+            status: 'completed',
+            title: 'Web search',
+            rawOutput: { status: 'completed' }
+          }
+        }
+      };
+
+      const acpUiSearch = {
+        method: 'session/update',
+        params: {
+          sessionId: 's1',
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'mcp-search-1',
+            title: 'Tool: AcpUI/ux_google_web_search',
+            rawInput: {
+              invocation: {
+                server: 'AcpUI',
+                tool: 'ux_google_web_search',
+                arguments: { query: 'current docs' }
+              }
+            }
+          }
+        }
+      };
+
+      const nativeWithQuery = {
+        method: 'session/update',
+        params: {
+          sessionId: 's1',
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'ws_query',
+            title: 'Web search',
+            rawInput: { query: 'release notes' }
+          }
+        }
+      };
+
+      expect(codex.intercept(start)).toBeNull();
+      expect(codex.intercept(progress)).toBeNull();
+      expect(codex.intercept(completed)).toBeNull();
+      expect(codex.intercept(acpUiSearch)).toBe(acpUiSearch);
+      expect(codex.intercept(nativeWithQuery)).toBe(nativeWithQuery);
+    });
+
     it('promotes error.data.message to error.message for user-facing display', () => {
       const result = codex.intercept({
         id: 4,
@@ -1047,6 +1128,39 @@ describe('Codex Provider', () => {
       ]));
       const toolStep = messages[1].timeline.find(step => step.type === 'tool' && step.event.id === 'call-shell-1');
       expect(toolStep.event.output).toContain('README.md');
+    });
+
+    it('ignores no-output native Codex web search records during replay', async () => {
+      const sessionDir = path.join(mockConfig.paths.sessions, '2026', '05', '01');
+      fs.mkdirSync(sessionDir, { recursive: true });
+      const rollout = path.join(sessionDir, 'rollout-web-search-empty.jsonl');
+      fs.writeFileSync(rollout, [
+        JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'hello' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'web_search_begin', call_id: 'ws_empty', action: { type: 'other' } } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'web_search_end', call_id: 'ws_empty', action: { type: 'other' } } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'done', phase: 'final_answer' } })
+      ].join('\n'));
+
+      const messages = await codex.parseSessionHistory(rollout, Diff);
+      expect(messages).toHaveLength(2);
+      expect(messages[1].timeline?.some(step => step.type === 'tool')).toBe(false);
+    });
+
+    it('keeps visible native Codex web search records during replay', async () => {
+      const sessionDir = path.join(mockConfig.paths.sessions, '2026', '05', '01');
+      fs.mkdirSync(sessionDir, { recursive: true });
+      const rollout = path.join(sessionDir, 'rollout-web-search-visible.jsonl');
+      fs.writeFileSync(rollout, [
+        JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'hello' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'web_search_begin', call_id: 'ws_query', query: 'release notes' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'web_search_end', call_id: 'ws_query', query: 'release notes', output: 'found links' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'done', phase: 'final_answer' } })
+      ].join('\n'));
+
+      const messages = await codex.parseSessionHistory(rollout, Diff);
+      const toolStep = messages[1].timeline.find(step => step.type === 'tool' && step.event.id === 'ws_query');
+      expect(toolStep.event.status).toBe('completed');
+      expect(toolStep.event.output).toContain('found links');
     });
 
     it('resets prior history on compacted records and keeps replacement user messages', async () => {

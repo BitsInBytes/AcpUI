@@ -73,6 +73,7 @@ Start with these when beginning any backend or frontend work. They provide the f
 
 ### Generic Feature Docs (All Providers)
 - **[Feature Doc] - Provider System.md** — The pluggable adapter architecture. Load this when understanding how providers work, implementing a new provider, or debugging provider-related issues. **Start here for provider work.**
+- **[Feature Doc] - AcpUI Session Debugging Guide.md** — Operational runbook for debugging a supplied AcpUI UI session id, ACP session id, sub-agent id, or invocation id. Covers locating the active SQLite DB, mapping UI/ACP/sub-agent ids, finding provider JSONL/session files, correlating backend logs and JSON-RPC request ids, and separating provider, backend, tool-labeling, rehydration, and frontend failures. Load this when asked to investigate a specific session, chat, sub-agent, or ACP failure.
 - **[Feature Doc] - ux_invoke_shell.md** — Custom UI MCP tool for executing shell commands. Load this when implementing shell execution, streaming output, or debugging shell-related features.
 - **[Feature Doc] - ux_invoke_subagents.md** — Custom UI MCP tool for spawning parallel agents. Load this for agent orchestration, parallel execution, or subagent communication features.
 - **[Feature Doc] - MCP Server.md** — How AcpUI's MCP server works. Load this when adding new MCP tools or debugging MCP protocol issues.

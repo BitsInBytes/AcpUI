@@ -29,6 +29,7 @@ let _inFlightSessions = new Set(); // Track sessions with active prompts
 let _sessionContextCache = new Map(); // sessionId -> contextUsagePercentage
 let _contextStateFile = null; // Path to persist context state
 let _sessionsWithInitialEmit = new Set(); // Track which sessions we've already emitted initial context for
+let _hiddenNativeWebSearchToolIds = new Set();
 
 function _emitCachedContext(sessionId, config) {
   if (!sessionId || _sessionsWithInitialEmit.has(sessionId)) return false;
@@ -226,6 +227,69 @@ function normalizeCommands(commands) {
     }));
 }
 
+function directToolId(update = {}) {
+  const id = update.toolCallId || update.tool_call_id || update.call_id || update.callId || update.id;
+  return typeof id === 'string' ? id : '';
+}
+
+function isTerminalToolStatus(status) {
+  return ['completed', 'failed', 'cancelled', 'canceled'].includes(String(status || '').toLowerCase());
+}
+
+function hasVisibleNativeWebSearchPayload(update = {}) {
+  const rawInput = parseMaybeJson(update.rawInput);
+  const query = isObject(rawInput) && typeof rawInput.query === 'string' ? rawInput.query.trim() : '';
+  if (query) return true;
+
+  if (Array.isArray(update.content) && extractText(update.content).trim()) return true;
+  if (typeof update.rawOutput === 'string' && update.rawOutput.trim()) return true;
+  if (isObject(update.rawOutput) && extractText(update.rawOutput).trim()) return true;
+  return false;
+}
+
+function hiddenNativeWebSearchKey(sessionId, toolCallId) {
+  return `${sessionId || ''}:${toolCallId}`;
+}
+
+function isNativeCodexWebSearchUpdate(update = {}, sessionId = '') {
+  const toolCallId = directToolId(update);
+  if (!toolCallId.startsWith('ws_')) return false;
+
+  const rawInput = parseMaybeJson(update.rawInput);
+  const invocation = mcpInvocationFromRaw(update.rawInput);
+  if (invocation.tool || invocation.server) return false;
+
+  const title = String(update.title || '').toLowerCase();
+  const kind = String(update.kind || update.toolKind || '').toLowerCase();
+  const actionType = isObject(rawInput) && isObject(rawInput.action) ? rawInput.action.type : '';
+  const hiddenKey = hiddenNativeWebSearchKey(sessionId, toolCallId);
+
+  return title.includes('web search') ||
+    title.includes('searching the web') ||
+    kind === 'web_search' ||
+    (kind === 'fetch' && title.includes('search')) ||
+    actionType === 'other' ||
+    _hiddenNativeWebSearchToolIds.has(hiddenKey);
+}
+
+function shouldHideNativeCodexWebSearchUpdate(update = {}, sessionId = '') {
+  if (!['tool_call', 'tool_call_update'].includes(update.sessionUpdate)) return false;
+  const toolCallId = directToolId(update);
+  if (!toolCallId) return false;
+  const hiddenKey = hiddenNativeWebSearchKey(sessionId, toolCallId);
+  if (hasVisibleNativeWebSearchPayload(update)) {
+    _hiddenNativeWebSearchToolIds.delete(hiddenKey);
+    return false;
+  }
+  if (!isNativeCodexWebSearchUpdate(update, sessionId)) return false;
+
+  _hiddenNativeWebSearchToolIds.add(hiddenKey);
+  if (isTerminalToolStatus(update.status)) {
+    _hiddenNativeWebSearchToolIds.delete(hiddenKey);
+  }
+  return true;
+}
+
 export function intercept(payload) {
   try {
     const { config } = getProvider();
@@ -251,6 +315,13 @@ export function intercept(payload) {
     }
 
   } catch {}
+
+  if (
+    payload?.method === 'session/update' &&
+    shouldHideNativeCodexWebSearchUpdate(payload.params?.update, payload.params?.sessionId)
+  ) {
+    return null;
+  }
 
   if (
     payload?.method === 'session/update' &&
@@ -703,6 +774,7 @@ export function stopQuotaFetching() {
   _stopQuotaPolling();
   _activePromptCount = 0;
   _inFlightSessions.clear();
+  _hiddenNativeWebSearchToolIds.clear();
 }
 
 export function onPromptStarted(sessionId) {
@@ -1406,6 +1478,33 @@ function updateTool(state, id, fields) {
   });
 }
 
+function removeTool(state, id) {
+  if (!id) return;
+  state.tools.delete(id);
+  if (state.currentAssistant?.timeline) {
+    state.currentAssistant.timeline = state.currentAssistant.timeline.filter(step =>
+      !(step.type === 'tool' && step.event?.id === id)
+    );
+  }
+}
+
+function hasVisibleWebSearchEventPayload(payload = {}) {
+  if (typeof payload.query === 'string' && payload.query.trim()) return true;
+  if (typeof payload.output === 'string' && payload.output.trim()) return true;
+  if (typeof payload.stdout === 'string' && payload.stdout.trim()) return true;
+  if (typeof payload.stderr === 'string' && payload.stderr.trim()) return true;
+  if (typeof payload.aggregated_output === 'string' && payload.aggregated_output.trim()) return true;
+  if (typeof payload.aggregatedOutput === 'string' && payload.aggregatedOutput.trim()) return true;
+  if (Array.isArray(payload.content) && extractText(payload.content).trim()) return true;
+  if (isObject(payload.result) && extractText(payload.result).trim()) return true;
+  return false;
+}
+
+function isNoOutputNativeWebSearchPayload(payload = {}) {
+  const id = directToolId(payload);
+  return id.startsWith('ws_') && !hasVisibleWebSearchEventPayload(payload);
+}
+
 function payloadId(payload) {
   return payload?.call_id || payload?.callId || payload?.id || payload?.tool_call_id || payload?.toolCallId || `${Date.now()}`;
 }
@@ -1550,9 +1649,15 @@ function handleEventMsg(record, state, Diff) {
   } else if (type === 'mcp_tool_call_end') {
     updateTool(state, payloadId(payload), { status: payload.error ? 'failed' : 'completed', output: resultText(payload), endTime: Date.now() });
   } else if (type === 'web_search_begin') {
-    addTool(state, toolEventFromPayload(payload, 'Web search'));
+    if (!isNoOutputNativeWebSearchPayload(payload)) {
+      addTool(state, toolEventFromPayload(payload, 'Web search'));
+    }
   } else if (type === 'web_search_end') {
-    updateTool(state, payloadId(payload), { status: payload.error ? 'failed' : 'completed', output: resultText(payload), endTime: Date.now() });
+    if (isNoOutputNativeWebSearchPayload(payload)) {
+      removeTool(state, payloadId(payload));
+    } else {
+      updateTool(state, payloadId(payload), { title: 'Web search', status: payload.error ? 'failed' : 'completed', output: resultText(payload), endTime: Date.now() });
+    }
   } else if (type === 'patch_apply_begin') {
     addTool(state, toolEventFromPayload(payload, 'Edit file'));
   } else if (type === 'patch_apply_end' || type === 'patch_apply_updated') {

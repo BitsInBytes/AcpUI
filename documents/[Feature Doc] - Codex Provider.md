@@ -15,6 +15,7 @@ This doc matters because Codex exposes models, config options, tools, quota, and
 - Filters Codex's `model` config option while keeping `reasoning_effort` as a provider setting.
 - Converts Codex command updates into `_codex/commands/available` slash-command extensions.
 - Normalizes Codex built-in tools, core AcpUI MCP tools, optional IO MCP tools, and optional Google search MCP tools.
+- Suppresses native Codex `ws_` web-search artifacts when they carry no query, output, or content.
 - Manages Codex rollout JSONL files for fork, archive, restore, delete, and rehydration.
 - Fetches quota status from saved ChatGPT OAuth credentials and emits `_codex/provider/status`.
 - Persists context usage in `acp_session_context.json` and replays it through `_codex/metadata`.
@@ -26,6 +27,7 @@ This doc matters because Codex exposes models, config options, tools, quota, and
 - Codex rollout files are recursive and schema-rich, so cloning and parsing are provider-owned.
 - Codex MCP tool IDs use `AcpUI/<toolName>`, while backend Tool System V2 expects canonical names such as `ux_invoke_shell` and `ux_read_file`.
 - Optional IO/Search MCP tool categories come from shared AcpUI tool registry handlers, while the provider extracts identity and input from Codex payloads.
+- Codex can emit native `ws_` web-search updates with no visible query or output; the provider filters those artifacts before they become timeline tools.
 - Quota status depends on `paths.home/auth.json`, not on ACP session state.
 - Context usage needs a provider cache because a loaded or hot-resumed session can render before fresh `usage_update` events arrive.
 
@@ -224,8 +226,9 @@ flowchart TB
 7. `extractToolInvocation()` must return stable identity fields so `toolInvocationResolver` can mark AcpUI MCP tools, merge sticky metadata, and dispatch tool handlers.
 8. `parseSessionHistory()` must treat rollout JSONL as mixed `event_msg`, `response_item`, and `compacted` records while preserving turn boundaries.
 9. `getMcpServerMeta()` must return `undefined` unless `acpSupportsMcpTimeouts` is exactly `true` and at least one positive timeout exists.
+10. Native `ws_` web-search updates with no visible query/output/content must be swallowed live and replayed as no-ops; AcpUI MCP search calls must still pass through.
 
-Breaking this contract causes duplicated model controls, missing slash commands, generic tool titles, missing shell/sub-agent panels, lost context usage, broken quota status, or malformed replayed timelines.
+Breaking this contract causes duplicated model controls, missing slash commands, generic tool titles, missing shell/sub-agent panels, blank native web-search rows, lost context usage, broken quota status, or malformed replayed timelines.
 
 ## Configuration / Provider-Specific Behavior
 
@@ -295,6 +298,7 @@ Codex session/update config_option_update
 
 ```text
 Codex tool_call / tool_call_update
+  -> providers/codex/index.js intercept (drops empty native ws_ web-search artifacts)
   -> backend/services/acpUpdateHandler.js handleUpdate
   -> providers/codex/index.js normalizeTool + extractToolInvocation
   -> backend/services/tools/toolInvocationResolver.js resolveToolInvocation
@@ -322,6 +326,8 @@ Canonical provider extraction shape:
 ```
 
 `toolInvocationResolver` upgrades AcpUI MCP identities to `kind: "acpui_mcp"`, sets `isAcpUxTool`, and merges handler-derived `titleSource`, category, file path, and public input from `mcpExecutionRegistry` when available.
+
+Native Codex web-search calls use `ws_` IDs and are provider built-ins. `intercept()` drops native `ws_` updates with no query, output, or content so blank `Web search` rows do not appear live; `parseSessionHistory()` applies the same rule for `web_search_begin` and `web_search_end` records during replay. AcpUI MCP search calls such as `ux_google_web_search` still pass through because they have `AcpUI/<toolName>` or `rawInput.invocation` identity.
 
 ### Quota and Context Flow
 
@@ -420,23 +426,28 @@ Codex rollout JSONL
    - Provider extraction recognizes names like `ux_read_file` and `ux_google_web_search`.
    - Categories and title details for optional tools come from `ACP_UX_IO_TOOL_CONFIG` and `ioToolHandler`.
 
-6. **Quota refresh depends on JWT-shaped access tokens**
+6. **Native empty web-search artifacts are filtered**
+   - Codex can emit native `ws_` `Web search` updates with no query/output/content.
+   - `intercept()` swallows those live updates, and `parseSessionHistory()` removes matching `web_search_begin` / `web_search_end` replay records.
+   - Do not apply this filter to AcpUI MCP searches; `ux_google_web_search` calls must remain visible.
+
+7. **Quota refresh depends on JWT-shaped access tokens**
    - `refreshCodexOAuthToken()` derives `client_id` from the access-token JWT payload.
    - Opaque tokens or missing `client_id` fields make refresh fail with a clear error.
 
-7. **Quota polling is prompt-scoped**
+8. **Quota polling is prompt-scoped**
    - `onPromptStarted()` and `onPromptCompleted()` maintain active prompt count.
    - Streaming chunks alone do not start polling.
 
-8. **Rollout cloning is turn-boundary aware**
+9. **Rollout cloning is turn-boundary aware**
    - `cloneSession()` prunes at the next whole turn boundary based on `turn_context`, `event_msg`, and `response_item` turn metadata.
    - Avoid direct file slicing that can leave orphaned turn records.
 
-9. **History parsing handles multiple record families**
-   - `parseSessionHistory()` handles `event_msg`, `response_item`, and `compacted` records.
-   - Missing one record family drops thoughts, tools, user prompts, or compacted replacement history.
+10. **History parsing handles multiple record families**
+    - `parseSessionHistory()` handles `event_msg`, `response_item`, and `compacted` records.
+    - Missing one record family drops thoughts, tools, user prompts, or compacted replacement history.
 
-10. **MCP timeout metadata is opt-in**
+11. **MCP timeout metadata is opt-in**
     - `getMcpServerMeta()` returns data only when `acpSupportsMcpTimeouts` is exactly `true`.
     - Invalid timeout values are omitted, and an empty timeout object returns `undefined`.
 
@@ -452,12 +463,12 @@ Important test groups and cases:
 - `prepareAcpEnvironment`: `injects configured API keys into the child environment`, `emits persisted context for a loaded session on request`.
 - `quota status`: `fetches quota with Codex OAuth headers from auth.json`, `derives client ID from access_token JWT payload and refreshes on 401`, `fails when access_token JWT has no client_id field`, `builds provider status with 5h, weekly, and credit details`, `emits provider status when quota fetching is enabled`.
 - `prompt lifecycle hooks`: `exports onPromptStarted and onPromptCompleted`, `onPromptCompleted is a no-op for unknown sessions`.
-- `intercept`: command normalization, config-option filtering, model-only update handling, error promotion, and polling guard behavior.
+- `intercept`: command normalization, config-option filtering, model-only update handling, native empty web-search suppression, error promotion, and polling guard behavior.
 - `normalizeModelState`: slash-qualified model IDs, non-effort slash IDs, and config-option model catalogs.
 - `setConfigOption`: `mode`, `model`, and generic option routing.
 - `tool helpers`: output extraction, file paths, diffs, AcpUI MCP title normalization, optional IO/Search title normalization, standard input locations, canonical invocation metadata, and built-in tool name normalization.
 - `getMcpServerMeta`: timeout metadata gating and numeric parsing.
-- `session file operations`: nested session-root fallback, recursive clone/prune, modern turn pruning, rollout parsing, modern record parsing, and compacted history reset.
+- `session file operations`: nested session-root fallback, recursive clone/prune, modern turn pruning, rollout parsing, native empty web-search replay suppression, modern record parsing, and compacted history reset.
 
 ### Backend Tool and Contract Tests
 
