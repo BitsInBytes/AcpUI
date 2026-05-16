@@ -58,6 +58,75 @@ describe('sessionStreamPersistence', () => {
     }));
   });
 
+  it('targets meta.activeAssistantMessageId when stream chunks arrive before the placeholder is persisted', async () => {
+    const session = makeSession([
+      { id: 'u1', role: 'user', content: 'first' },
+      { id: 'a-prev', role: 'assistant', content: 'previous', isStreaming: false, timeline: [{ type: 'text', content: 'previous' }] }
+    ]);
+    const client = makeClient({ activeAssistantMessageId: 'a-new', turnStartTime: 1700000000000 });
+    db.getSessionByAcpId.mockResolvedValue(session);
+
+    await persistStreamEvent(client, 'acp-1', { type: 'token', text: 'new turn' }, { force: true });
+
+    const saved = db.saveSession.mock.calls.at(-1)[0];
+    expect(saved.messages[1]).toEqual(expect.objectContaining({
+      id: 'a-prev',
+      content: 'previous',
+      isStreaming: false
+    }));
+    expect(saved.messages[2]).toEqual(expect.objectContaining({
+      id: 'a-new',
+      role: 'assistant',
+      content: 'new turn',
+      isStreaming: true,
+      turnStartTime: 1700000000000,
+      timeline: [{ type: 'text', content: 'new turn' }]
+    }));
+  });
+
+  it('creates a new assistant when no explicit active id exists and latest assistant is completed', async () => {
+    const session = makeSession([
+      { id: 'u1', role: 'user', content: 'hello' },
+      { id: 'a-prev', role: 'assistant', content: 'already done', isStreaming: false, timeline: [{ type: 'text', content: 'already done' }] }
+    ]);
+    db.getSessionByAcpId.mockResolvedValue(session);
+
+    await persistStreamEvent(makeClient(), 'acp-1', { type: 'token', text: 'fresh response' }, { force: true });
+
+    const saved = db.saveSession.mock.calls.at(-1)[0];
+    expect(saved.messages[1]).toEqual(expect.objectContaining({
+      id: 'a-prev',
+      content: 'already done',
+      isStreaming: false
+    }));
+    expect(saved.messages[2]).toEqual(expect.objectContaining({
+      role: 'assistant',
+      content: 'fresh response',
+      isStreaming: true,
+      timeline: [{ type: 'text', content: 'fresh response' }]
+    }));
+  });
+
+  it('reuses the latest streaming assistant when no explicit active id exists', async () => {
+    const session = makeSession([
+      { id: 'u1', role: 'user', content: 'first' },
+      { id: 'a-prev', role: 'assistant', content: 'done', isStreaming: false, timeline: [{ type: 'text', content: 'done' }] },
+      { id: 'a-live', role: 'assistant', content: 'partial ', isStreaming: true, timeline: [{ type: 'text', content: 'partial ' }] }
+    ]);
+    db.getSessionByAcpId.mockResolvedValue(session);
+
+    await persistStreamEvent(makeClient(), 'acp-1', { type: 'token', text: 'tail' }, { force: true });
+
+    const saved = db.saveSession.mock.calls.at(-1)[0];
+    expect(saved.messages).toHaveLength(3);
+    expect(saved.messages[2]).toEqual(expect.objectContaining({
+      id: 'a-live',
+      content: 'partial tail',
+      isStreaming: true,
+      timeline: [{ type: 'text', content: 'partial tail' }]
+    }));
+  });
+
   it('merges tool updates by id and preserves sticky fields', async () => {
     const session = makeSession([
       { id: 'a1', role: 'assistant', content: '', isStreaming: true, timeline: [] }
@@ -108,6 +177,28 @@ describe('sessionStreamPersistence', () => {
     }));
   });
 
+  it('finalizes the explicit active assistant from metadata', async () => {
+    const session = makeSession([
+      { id: 'a-old', role: 'assistant', content: 'old stream', isStreaming: true, timeline: [{ type: 'text', content: 'old stream' }] },
+      { id: 'a-target', role: 'assistant', content: 'target stream', isStreaming: true, timeline: [{ type: 'text', content: 'target stream' }] }
+    ]);
+    const client = makeClient({ activeAssistantMessageId: 'a-target' });
+    db.getSessionByAcpId.mockResolvedValue(session);
+
+    await finalizeStreamPersistence(client, 'acp-1');
+
+    const saved = db.saveSession.mock.calls.at(-1)[0];
+    expect(saved.messages[1]).toEqual(expect.objectContaining({
+      id: 'a-target',
+      isStreaming: false,
+      turnEndTime: expect.any(Number)
+    }));
+    expect(saved.messages[0]).toEqual(expect.objectContaining({
+      id: 'a-old',
+      isStreaming: true
+    }));
+  });
+
   it('persists thought and permission steps and returns a cloned resume snapshot', async () => {
     const session = makeSession([
       {
@@ -147,6 +238,20 @@ describe('sessionStreamPersistence', () => {
 
     snapshot.message.timeline[0].event.status = 'mutated';
     expect(saved.messages[0].timeline[0].event.status).toBe('in_progress');
+  });
+
+  it('prefers meta.activeAssistantMessageId for stream resume snapshots', async () => {
+    const session = makeSession([
+      { id: 'a-explicit', role: 'assistant', content: 'older stream', isStreaming: true, timeline: [{ type: 'text', content: 'older stream' }] },
+      { id: 'a-latest', role: 'assistant', content: 'newer stream', isStreaming: true, timeline: [{ type: 'text', content: 'newer stream' }] }
+    ]);
+    const client = makeClient({ activeAssistantMessageId: 'a-explicit' });
+    db.getSessionByAcpId.mockResolvedValue(session);
+
+    const snapshot = await getStreamResumeSnapshot(client, 'acp-1');
+
+    expect(snapshot?.message?.id).toBe('a-explicit');
+    expect(snapshot?.message?.content).toBe('older stream');
   });
 
   it('creates an active assistant message when stream progress arrives before a placeholder exists', async () => {

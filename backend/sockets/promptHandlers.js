@@ -8,7 +8,17 @@ import { resolveModelSelection } from '../services/modelOptions.js';
 import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
 
 export default function registerPromptHandlers(io, socket) {
-  socket.on('prompt', async ({ providerId, uiId, sessionId, prompt, model, attachments = [] }) => {
+  socket.on('prompt', async ({
+    providerId,
+    uiId,
+    sessionId,
+    prompt,
+    model,
+    attachments = [],
+    assistantMessageId = null,
+    userMessageId = null,
+    turnStartTime = null
+  }) => {
     let runtime;
     try {
       runtime = providerRuntimeManager.getRuntime(providerId);
@@ -113,11 +123,17 @@ export default function registerPromptHandlers(io, socket) {
       }
 
       if (meta) {
+        const parsedTurnStartTime = Number(turnStartTime);
+        const resolvedTurnStartTime = Number.isFinite(parsedTurnStartTime)
+          ? parsedTurnStartTime
+          : Date.now();
         meta.lastResponseBuffer = '';
         meta.lastThoughtBuffer = '';
         meta.activePrompt = true;
         meta.activeUiId = uiId || meta.activeUiId || null;
-        meta.turnStartTime = Date.now();
+        meta.activeAssistantMessageId = assistantMessageId || null;
+        meta.activeUserMessageId = userMessageId || null;
+        meta.turnStartTime = resolvedTurnStartTime;
       }
 
       // Notify provider that a real prompt is starting. This is the authoritative
@@ -176,6 +192,9 @@ export default function registerPromptHandlers(io, socket) {
         if (meta) {
           meta.activePrompt = false;
           meta.activeUiId = null;
+          meta.activeAssistantMessageId = null;
+          meta.activeUserMessageId = null;
+          meta.turnStartTime = null;
         }
         acpClient.providerModule.onPromptCompleted(sessionId);
       }

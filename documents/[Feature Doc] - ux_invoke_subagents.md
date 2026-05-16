@@ -108,7 +108,7 @@ export const subAgentToolHandler = {
 };
 ```
 
-`toolCallState.upsert` stores sticky metadata for the parent tool event, including canonical identity. When the invocation ID is allocated, `SubAgentInvocationManager.executeStartInvocation` emits and force-persists a parent `tool_update` containing `invocationId` and canonical sub-agent tool identity, so reconnect history can link the parent ToolStep to the bottom-pinned panel even if the browser missed live `sub_agent_started`. If the provider did not expose a parent tool-call ID, the manager writes a synthetic `subagents-<invocationId>` marker with terminal tool status; the sub-agent store still drives live/terminal panel state.
+`toolCallState.upsert` stores sticky metadata for the parent tool event, including canonical identity. When the invocation ID is allocated, `SubAgentInvocationManager.executeStartInvocation` emits and force-persists a parent `tool_update` containing `invocationId` and canonical sub-agent tool identity, so reconnect history can link the parent ToolStep to the bottom-pinned panel even if the browser missed live `sub_agent_started`. If the provider did not expose a parent tool-call ID, the manager writes a synthetic `subagents-<invocationId>` marker with terminal tool status and opts stream persistence into using the latest parent assistant without marking that assistant as actively streaming when no active prompt ID is available; the sub-agent store still drives live/terminal panel state.
 
 ### 3. The Stdio Proxy Forwards MCP Context
 
@@ -941,6 +941,7 @@ model/current_model_id/model_options_json = resolved model state
   - `prunes completed invocation and idempotency entries after TTL while preserving active idempotency promises`
   - `prunes oldest completed invocation and idempotency entries when max-size limits are exceeded`
   - `reports the active invocation instead of starting another batch for the same parent chat`
+  - `persists a parent invocation marker without a parent tool call id`
   - `cleans active idempotency state when invocation setup rejects`
   - `uses explicit parent ACP session before stale client parent tracking`
   - `cancelAllForParent calls abortFn and sends session/cancel to sub-agents`

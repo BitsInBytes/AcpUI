@@ -157,7 +157,7 @@ flowchart TB
 ## Timeline Rendering Contract
 
 - `Message.timeline` is the authoritative assistant render model.
-- `useStreamStore.activeMsgIdByAcp[acpSessionId]` identifies the assistant message receiving streamed updates; hydration and `stream_resume_snapshot` can seed this mapping from a backend-marked streaming assistant.
+- `useStreamStore.activeMsgIdByAcp[acpSessionId]` identifies the assistant message receiving streamed updates; hydration and `stream_resume_snapshot` can seed this mapping from a backend-marked streaming assistant, but stale snapshots must not remap it away from a newer local streaming assistant.
 - `thought`, `token`, `system_event`, and `permission_request` events must become `TimelineStep` entries instead of separate component-local render state.
 - Tool updates merge by `SystemEvent.id`; shell output patches by `shellRunId`; sub-agent panels filter by `invocationId`.
 - Provider-scoped data flows through `useSystemStore.providersById`, `useSystemStore.branding`, and `useSystemStore.getBranding(providerId)`.

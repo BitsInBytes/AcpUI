@@ -10,6 +10,7 @@ import { useShellRunStore, type ShellRunSnapshot } from '../store/useShellRunSto
 import { ACP_UX_TOOL_NAMES, isAcpUxShellToolEvent, isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
 import { getQuickModelChoices } from '../utils/modelOptions';
 import { isSessionPoppedOut } from '../lib/sessionOwnership';
+import { createMessageId } from '../utils/messageIds';
 
 /**
  * Central socket event dispatcher. Wires socket.io events to the appropriate stores.
@@ -231,37 +232,115 @@ export function useChatManager(
         .join('');
     };
 
+    const readTurnStartTime = (message?: Message) => {
+      const turnStartTime = message?.turnStartTime;
+      return typeof turnStartTime === 'number' && Number.isFinite(turnStartTime)
+        ? turnStartTime
+        : null;
+    };
+
+    const isIncomingStreamingMessageNewer = (incoming: Message, current: Message) => {
+      const incomingTurn = readTurnStartTime(incoming);
+      const currentTurn = readTurnStartTime(current);
+      if (incomingTurn !== null && currentTurn !== null) return incomingTurn > currentTurn;
+      if (incomingTurn !== null && currentTurn === null) return true;
+      return false;
+    };
+
+    const findNewestStreamingAssistant = (messages: Message[]) => {
+      let selected: Message | undefined;
+      let selectedIndex = -1;
+
+      for (let i = 0; i < messages.length; i++) {
+        const message = messages[i];
+        if (message.role !== 'assistant' || !message.isStreaming) continue;
+
+        if (!selected) {
+          selected = message;
+          selectedIndex = i;
+          continue;
+        }
+
+        const selectedTurn = readTurnStartTime(selected);
+        const messageTurn = readTurnStartTime(message);
+
+        let shouldReplace = false;
+        if (selectedTurn !== null && messageTurn !== null) {
+          shouldReplace = messageTurn > selectedTurn || (messageTurn === selectedTurn && i > selectedIndex);
+        } else if (selectedTurn === null && messageTurn !== null) {
+          shouldReplace = true;
+        } else if (selectedTurn === null && messageTurn === null) {
+          shouldReplace = i > selectedIndex;
+        }
+
+        if (shouldReplace) {
+          selected = message;
+          selectedIndex = i;
+        }
+      }
+
+      return selected;
+    };
+
     const applyStreamResumeSnapshot = (data: { providerId?: string | null; sessionId: string; uiId?: string; message: Message }) => {
       if (!data?.sessionId || !data.message?.id || !shouldProcessSessionStream(data.sessionId)) return;
       const incomingContent = contentFromResumeMessage(data.message);
-      let selectedMessage = data.message;
+      let selectedMessage: Message | undefined;
 
       useSessionLifecycleStore.setState(state => ({
         sessions: state.sessions.map(session => {
           if (session.acpSessionId !== data.sessionId && session.id !== data.uiId) return session;
-          const existingIndex = session.messages.findIndex(message => message.id === data.message.id);
+
           const messages = [...session.messages];
+          const currentNewestStreaming = findNewestStreamingAssistant(messages);
+          const existingIndex = messages.findIndex(message => message.id === data.message.id);
+          const incomingTargetsCurrentStream = currentNewestStreaming?.id === data.message.id;
+          const incomingCanAdvanceStream = !currentNewestStreaming
+            || incomingTargetsCurrentStream
+            || isIncomingStreamingMessageNewer(data.message, currentNewestStreaming);
+          let mergedIncoming: Message | undefined;
+
           if (existingIndex !== -1) {
             const existing = messages[existingIndex];
-            const existingContent = contentFromResumeMessage(existing);
-            selectedMessage = existingContent.length > incomingContent.length ? existing : { ...existing, ...data.message };
-            messages[existingIndex] = selectedMessage;
-          } else {
-            const latestAssistantIndex = [...messages].reverse().findIndex(message => message.role === 'assistant' && message.isStreaming);
-            if (latestAssistantIndex === -1) messages.push(data.message);
-            else messages[messages.length - 1 - latestAssistantIndex] = data.message;
-            selectedMessage = data.message;
+            if (incomingCanAdvanceStream) {
+              const existingContent = contentFromResumeMessage(existing);
+              mergedIncoming = existingContent.length > incomingContent.length ? existing : { ...existing, ...data.message };
+              messages[existingIndex] = mergedIncoming;
+            } else {
+              mergedIncoming = existing;
+            }
+          } else if (incomingCanAdvanceStream) {
+            mergedIncoming = data.message;
+            messages.push(mergedIncoming);
           }
-          return { ...session, messages, isTyping: Boolean(selectedMessage.isStreaming) || session.isTyping };
+
+          const newestStreaming = findNewestStreamingAssistant(messages);
+          const mappedActiveId = useStreamStore.getState().activeMsgIdByAcp[data.sessionId];
+          const mappedActive = mappedActiveId
+            ? messages.find(message => message.id === mappedActiveId)
+            : undefined;
+          selectedMessage = newestStreaming || mergedIncoming || mappedActive || data.message;
+
+          return {
+            ...session,
+            messages,
+            isTyping: Boolean(findNewestStreamingAssistant(messages)) || session.isTyping
+          };
         })
       }));
 
+      if (!selectedMessage?.id) return;
+      const selectedMessageId = selectedMessage.id;
       const selectedContent = contentFromResumeMessage(selectedMessage);
-      useStreamStore.setState(state => ({
-        activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [data.sessionId]: selectedMessage.id },
-        displayedContentByMsg: { ...state.displayedContentByMsg, [selectedMessage.id]: selectedContent },
-        settledLengthByMsg: { ...state.settledLengthByMsg, [selectedMessage.id]: selectedContent.length }
-      }));
+      useStreamStore.setState(state => {
+        const existingDisplayed = state.displayedContentByMsg[selectedMessageId] || '';
+        const mergedDisplayed = existingDisplayed.length > selectedContent.length ? existingDisplayed : selectedContent;
+        return {
+          activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [data.sessionId]: selectedMessageId },
+          displayedContentByMsg: { ...state.displayedContentByMsg, [selectedMessageId]: mergedDisplayed },
+          settledLengthByMsg: { ...state.settledLengthByMsg, [selectedMessageId]: mergedDisplayed.length }
+        };
+      });
     };
 
     const subAgentToolTitle = (toolName: string) => (
@@ -561,7 +640,7 @@ export function useChatManager(
     socket.on('merge_message', (data: { sessionId: string; text: string }) => {
       useSessionLifecycleStore.setState(state => ({ sessions: state.sessions.map(s => {
           if (s.acpSessionId !== data.sessionId) return s;
-          return { ...s, messages: [...s.messages, { id: `merge-${Date.now()}`, role: 'user' as const, content: data.text }] };
+          return { ...s, messages: [...s.messages, { id: createMessageId('merge'), role: 'user' as const, content: data.text }] };
         }) }));
     });
 

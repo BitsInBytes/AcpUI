@@ -183,6 +183,92 @@ describe('useChatManager hook', () => {
     expect(useStreamStore.getState().settledLengthByMsg.a1).toBe('old fresh'.length);
   });
 
+  it('does not remap activeMsgIdByAcp to an older assistant on stale stream resume snapshot', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          provider: 'provider-a',
+          messages: [
+            { id: 'a-old', role: 'assistant', content: 'old local content', timeline: [{ type: 'text', content: 'old local content' }], isStreaming: false, turnStartTime: 10 },
+            { id: 'a-new', role: 'assistant', content: 'new local content', timeline: [{ type: 'text', content: 'new local content' }], isStreaming: true, turnStartTime: 20 }
+          ],
+          isTyping: true
+        } as any]
+      });
+      useStreamStore.setState({
+        activeMsgIdByAcp: { 'acp-1': 'a-new' },
+        displayedContentByMsg: { 'a-new': 'new local content' },
+        settledLengthByMsg: { 'a-new': 'new local content'.length }
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'stream_resume_snapshot')[1];
+
+    act(() => {
+      handler({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        uiId: 's1',
+        message: { id: 'a-old', role: 'assistant', content: 'old snapshot content', timeline: [{ type: 'text', content: 'old snapshot content' }], isStreaming: true, turnStartTime: 10 }
+      });
+    });
+
+    expect(useStreamStore.getState().activeMsgIdByAcp['acp-1']).toBe('a-new');
+    const session = useSessionLifecycleStore.getState().sessions[0];
+    const oldMessage = session.messages.find((message: any) => message.id === 'a-old');
+    expect(oldMessage?.content).toBe('old local content');
+    expect(oldMessage?.isStreaming).toBe(false);
+  });
+
+  it('keeps routing live tokens to the current assistant after a stale stream resume snapshot', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          provider: 'provider-a',
+          messages: [
+            { id: 'a-old', role: 'assistant', content: 'old local content', timeline: [{ type: 'text', content: 'old local content' }], isStreaming: false, turnStartTime: 10 },
+            { id: 'a-new', role: 'assistant', content: 'new local content', timeline: [{ type: 'text', content: 'new local content' }], isStreaming: true, turnStartTime: 20 }
+          ],
+          isTyping: true
+        } as any]
+      });
+      useStreamStore.setState({
+        activeMsgIdByAcp: { 'acp-1': 'a-new' },
+        displayedContentByMsg: { 'a-new': 'new local content' },
+        settledLengthByMsg: { 'a-new': 'new local content'.length }
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const resumeHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'stream_resume_snapshot')[1];
+    const tokenHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'token')[1];
+
+    act(() => {
+      resumeHandler({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        uiId: 's1',
+        message: { id: 'a-old', role: 'assistant', content: 'old snapshot content', timeline: [{ type: 'text', content: 'old snapshot content' }], isStreaming: true, turnStartTime: 10 }
+      });
+      tokenHandler({ sessionId: 'acp-1', text: ' + live token' });
+    });
+
+    flushStreamBuffer();
+
+    const session = useSessionLifecycleStore.getState().sessions[0];
+    const oldMessage = session.messages.find((message: any) => message.id === 'a-old');
+    const newMessage = session.messages.find((message: any) => message.id === 'a-new');
+    expect(useStreamStore.getState().activeMsgIdByAcp['acp-1']).toBe('a-new');
+    expect(newMessage?.content).toContain(' + live');
+    expect(oldMessage?.content).toBe('old local content');
+    expect(oldMessage?.isStreaming).toBe(false);
+  });
+
   it('stamps parent sub-agent tool steps from reconnect snapshots even when agent already exists', () => {
     act(() => {
       useSessionLifecycleStore.setState({

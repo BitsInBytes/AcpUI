@@ -49,7 +49,13 @@ describe('useChatStore (Orchestrator)', () => {
       });
 
       expect(useSessionLifecycleStore.getState().sessions[0].messages).toHaveLength(2);
-      expect(mockSocket.emit).toHaveBeenCalledWith('prompt', expect.objectContaining({ prompt: 'Hello', sessionId: acpId }));
+      expect(mockSocket.emit).toHaveBeenCalledWith('prompt', expect.objectContaining({
+        prompt: 'Hello',
+        sessionId: acpId,
+        assistantMessageId: expect.any(String),
+        userMessageId: expect.any(String),
+        turnStartTime: expect.any(Number)
+      }));
       expect(useInputStore.getState().inputs[uiId]).toBe(''); // cleared
     });
 

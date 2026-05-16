@@ -15,7 +15,7 @@ const SESSION_A = { id: 'ui-a', acpSessionId: 'acp-a', messages: [], model: 'bal
 const SESSION_B = { id: 'ui-b', acpSessionId: 'acp-b', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, provider: 'p1' };
 const SESSION_C = { id: 'ui-c', acpSessionId: 'acp-c', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, provider: 'p1' };
 
-// Static message IDs used by tests that check content — avoids Date.now() collisions under fake timers.
+// Static message IDs keep assertions deterministic under fake timers.
 const MSG_A = 'static-msg-a';
 const MSG_B = 'static-msg-b';
 const MSG_C = 'static-msg-c';
@@ -42,8 +42,7 @@ function resetStores() {
 
 /**
  * Pre-seeds each session with a static assistant message and activeMsgIdByAcp entry.
- * Avoids Date.now() collisions that occur when fake timers freeze time and multiple
- * ensureAssistantMessage calls run in the same tick, producing identical message IDs.
+ * This keeps message selection deterministic for per-session routing assertions.
  */
 function seedMessages() {
   const makeMsg = (id: string) => ({ id, role: 'assistant' as const, content: '', timeline: [], isStreaming: true });
@@ -150,7 +149,7 @@ describe('Multi-session stream isolation', () => {
   it('activeMsgIdByAcp maps each ACP session to the correct message placeholder', () => {
     act(() => {
       useStreamStore.getState().ensureAssistantMessage('acp-a');
-      vi.advanceTimersByTime(1); // ensure distinct Date.now() for each ID
+      vi.advanceTimersByTime(1);
       useStreamStore.getState().ensureAssistantMessage('acp-b');
     });
 

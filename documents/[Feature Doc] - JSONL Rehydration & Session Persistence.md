@@ -181,20 +181,23 @@ Architectural role: backend Socket.IO handlers, SQLite persistence, provider per
    File: `backend/sockets/promptHandlers.js` (Socket event: `prompt`)
    File: `backend/database.js` (Function: `saveSession`)
 
-   `handleSubmit` appends a user message and an assistant placeholder locally, emits `save_snapshot`, then emits `prompt`. The backend `save_snapshot` handler persists the frontend session object through `db.saveSession` after resolving the provider ID. The `prompt` handler sends ACP `session/prompt` and streams updates back through `handleUpdate`.
+   `handleSubmit` creates collision-resistant user and assistant message IDs, captures one `turnStartTime`, appends both messages locally, emits `save_snapshot`, then emits `prompt` with those IDs. The backend `save_snapshot` handler persists the frontend session object through `db.saveSession` after resolving the provider ID. The `prompt` handler stores the active turn metadata on `sessionMetadata`, sends ACP `session/prompt`, and streams updates back through `handleUpdate`.
 
    ```ts
    // FILE: frontend/src/store/useChatStore.ts (Store action: handleSubmit)
+   const turnStartTime = Date.now();
+   const userMsgId = createMessageId('user');
+   const assistantMsgId = createMessageId('assistant');
    lifecycle.setSessions(sessions.map(s => s.id === activeSessionId ? {
      ...s,
      isTyping: true,
      messages: [...s.messages,
        { id: userMsgId, role: 'user', content: promptText, attachments: [...attachments] },
-       { id: assistantMsgId, role: 'assistant', content: '', isStreaming: true, timeline: [{ type: 'thought', content: '_Thinking..._' }], turnStartTime: Date.now() }
+       { id: assistantMsgId, role: 'assistant', content: '', isStreaming: true, timeline: [{ type: 'thought', content: '_Thinking..._' }], turnStartTime }
      ]
    } : s));
    if (updatedSession) socket.emit('save_snapshot', updatedSession);
-   socket.emit('prompt', { providerId: activeSession.provider, uiId: activeSession.id, sessionId: acpId, prompt: promptText, attachments });
+   socket.emit('prompt', { providerId: activeSession.provider, uiId: activeSession.id, sessionId: acpId, prompt: promptText, attachments, assistantMessageId: assistantMsgId, userMessageId: userMsgId, turnStartTime });
    ```
 
 10. **Live stream persistence and completion finalize messages and stats**
@@ -205,9 +208,9 @@ Architectural role: backend Socket.IO handlers, SQLite persistence, provider per
     File: `frontend/src/hooks/useChatManager.ts` (Socket event: `token_done`)
     File: `frontend/src/store/useStreamStore.ts` (Store action: `onStreamDone`)
 
-    During streaming, `handleUpdate` calls `persistStreamEvent` for message chunks, thought chunks, tool updates, and permission requests after drain and stats-capture filtering. The reducer updates the persisted active assistant message while keeping `isStreaming: true` during progress saves.
+    During streaming, `handleUpdate` calls `persistStreamEvent` for message chunks, thought chunks, tool updates, and permission requests after drain and stats-capture filtering. The reducer uses `sessionMetadata.activeAssistantMessageId` when present, creates that assistant if the snapshot has not landed yet, and otherwise reuses only the latest streaming assistant before creating a fresh one. Normal live progress does not append to the latest completed assistant; sub-agent parent marker persistence has an explicit opt-in for restoring the parent ToolStep without marking that assistant as actively streaming when no active prompt ID is available.
 
-    `promptHandlers` calls `finalizeStreamPersistence` after successful prompts and failure paths that emit an error to the UI. Finalization removes synthetic thinking placeholders, marks the active assistant non-streaming, records `turnEndTime`, and marks unresolved in-progress tools as failed. The frontend still receives `token_done`, drains its local queue in `onStreamDone`, emits the final `save_snapshot`, and refreshes stats; stale snapshots are merged so they cannot overwrite richer backend-persisted progress for the same assistant message.
+    `promptHandlers` calls `finalizeStreamPersistence` after successful prompts and failure paths that emit an error to the UI. Finalization targets the same active assistant metadata when present, removes synthetic thinking placeholders, marks the active assistant non-streaming, records `turnEndTime`, and marks unresolved in-progress tools as failed. The frontend still receives `token_done`, drains its local queue in `onStreamDone`, emits the final `save_snapshot`, and refreshes stats; stale snapshots are merged so they cannot overwrite richer backend-persisted progress for the same assistant message.
 
 11. **Forced JSONL rehydration replaces DB messages explicitly**
 
@@ -296,7 +299,7 @@ The forced rehydrate path assigns `session.messages = jsonlMessages` and saves t
 
 ### Contract 5: `save_snapshot` and backend stream persistence merge by active assistant identity
 
-The frontend appends user and assistant messages locally and emits `save_snapshot` before prompt start and after stream completion. The backend also persists normalized live stream events into the active assistant message. `save_snapshot` merges against the existing DB row and preserves richer persisted content only when the latest assistant message ID matches, so a new blank prompt placeholder cannot inherit an older assistant answer.
+The frontend appends user and assistant messages locally and emits `save_snapshot` before prompt start and after stream completion. It also sends `assistantMessageId`, `userMessageId`, and `turnStartTime` in the `prompt` payload so backend live persistence can target the same turn even when stream chunks arrive before the snapshot write finishes. `save_snapshot` merges against the existing DB row and preserves richer persisted content only when the latest assistant message ID matches, so a new blank prompt placeholder cannot inherit an older assistant answer.
 
 ### Contract 6: Drain suppresses replayed message updates only
 
@@ -381,18 +384,20 @@ User selects a UI session
   -> socket event create_session with existingAcpId
   -> hot metadata return or cold session/load with drain
   -> socket event watch_session
-  -> backend emits stream_resume_snapshot for any flushed streaming assistant
-  -> useChatManager merges the snapshot and seeds activeMsgIdByAcp
+  -> backend emits stream_resume_snapshot for the current persisted streaming assistant
+  -> useChatManager merges non-stale snapshots and seeds activeMsgIdByAcp
 ```
 
 ### Active Prompt Persistence Pipeline
 
 ```text
 useChatStore.handleSubmit
+  -> create userMsgId, assistantMsgId, and turnStartTime
   -> append user message and assistant placeholder locally
   -> save_snapshot
   -> sessionHandlers.mergeSnapshotWithPersisted
-  -> prompt
+  -> prompt with assistantMessageId, userMessageId, and turnStartTime
+  -> promptHandlers stores active turn metadata on sessionMetadata
   -> ACP session/prompt
   -> handleUpdate persists normalized stream events with sessionStreamPersistence
   -> handleUpdate emits token/thought/system_event/permission_request
@@ -409,6 +414,8 @@ useChatStore.handleSubmit
 handleUpdate message/tool/permission event
   -> skip drained session/load replay and statsCaptures output
   -> persistStreamEvent loads DB session by provider + ACP session id
+  -> target sessionMetadata.activeAssistantMessageId when present
+  -> otherwise reuse latest streaming assistant or create a new assistant
   -> update active assistant content/timeline and runtime metadata
   -> flush progress to SQLite, keeping isStreaming true
 
@@ -460,12 +467,12 @@ Table: `sessions`
 
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
-| Socket gateway | `backend/sockets/index.js` | `watch_session`, `emitStreamResumeSnapshot`, socket event `stream_resume_snapshot` | Joins session rooms and sends the latest persisted streaming assistant snapshot before live chunks resume. |
+| Socket gateway | `backend/sockets/index.js` | `watch_session`, `emitStreamResumeSnapshot`, socket event `stream_resume_snapshot` | Joins session rooms and sends the current persisted streaming assistant snapshot before live chunks resume. |
 | Socket handlers | `backend/sockets/sessionHandlers.js` | `registerSessionHandlers`, `load_sessions`, `annotateLiveSessionState`, `get_session_history`, `flushActiveStream`, `rehydrate_session`, `save_snapshot`, `create_session`, `captureModelState`, `loadingSessions` | Main socket API for DB load, active runtime annotation, JSONL sync, forced rehydrate, snapshot writes, and ACP resume. |
-| Prompt handlers | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, `prompt`, `cancel_prompt`, `respond_permission`, provider hooks `onPromptStarted`, `onPromptCompleted` | Sends prompts to ACP, emits `token_done`, and triggers backend turn finalization. |
+| Prompt handlers | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, `prompt`, `cancel_prompt`, `respond_permission`, provider hooks `onPromptStarted`, `onPromptCompleted` | Sends prompts to ACP, records active turn message IDs on `sessionMetadata`, emits `token_done`, and triggers backend turn finalization. |
 | JSONL parser | `backend/services/jsonlParser.js` | `parseJsonlSession` | Delegates session file lookup and parsing to provider modules. |
 | Session manager | `backend/services/sessionManager.js` | `getMcpServers`, `loadSessionIntoMemory`, `autoLoadPinnedSessions`, `reapplySavedConfigOptions`, `setSessionModel`, `updateSessionModelMetadata` | Pinned hot-load, MCP injection, drain lifecycle, metadata reapply, and model state helpers. |
-| Stream persistence | `backend/services/sessionStreamPersistence.js` | `persistStreamEvent`, `flushStreamPersistence`, `getStreamResumeSnapshot`, `finalizeStreamPersistence`, `mergeSnapshotWithPersisted`, `shouldUseJsonlMessages` | Durable active-turn reducer for backend stream progress, reconnect snapshots, safe snapshot merge, finalization, and guarded JSONL repair. |
+| Stream persistence | `backend/services/sessionStreamPersistence.js` | `persistStreamEvent`, `flushStreamPersistence`, `getStreamResumeSnapshot`, `finalizeStreamPersistence`, `mergeSnapshotWithPersisted`, `shouldUseJsonlMessages` | Durable active-turn reducer for backend stream progress, explicit active assistant targeting, reconnect snapshots, safe snapshot merge, finalization, and guarded JSONL repair. |
 | Stream controller | `backend/services/streamController.js` | `StreamController`, `beginDraining`, `onChunk`, `waitForDrainToFinish`, `reset` | Tracks drain state and resolves after replay silence. |
 | Update router | `backend/services/acpUpdateHandler.js` | `handleUpdate`, `config_option_update`, `usage_update`, message drain check, `persistStreamEvent` calls | Normalizes provider updates, routes live stream events, persists stream/config/stat metadata, and suppresses drained replay chunks. |
 | Database | `backend/database.js` | `initDb`, `saveSession`, `getAllSessions`, `getPinnedSessions`, `getSession`, `getSessionByAcpId`, `saveConfigOptions`, `saveModelState` | SQLite schema, serialization, provider-scoped lookup, and metadata persistence. |
@@ -474,10 +481,11 @@ Table: `sessions`
 
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
-| Socket dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `applyStreamResumeSnapshot`, socket events `stream_resume_snapshot`, `token`, `thought`, `system_event`, `token_done`, `stats_push` | Wires backend stream events and reconnect snapshots to stores and calls initial session load. |
+| Socket dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `applyStreamResumeSnapshot`, socket events `stream_resume_snapshot`, `token`, `thought`, `system_event`, `token_done`, `stats_push` | Wires backend stream events and reconnect snapshots to stores, rejects stale resume snapshot retargeting, and calls initial session load. |
 | Session lifecycle store | `frontend/src/store/useSessionLifecycleStore.ts` | `handleInitialLoad`, `handleSessionSelect`, `hydrateSession`, `fetchStats`, `maybeHydrateContextUsage`, `handleSaveSession` | Loads metadata, preserves active runtime typing markers, hydrates history, resumes ACP sessions, and restores persisted stats. |
-| Chat orchestrator | `frontend/src/store/useChatStore.ts` | `handleSubmit`, `handleCancel`, `handleRespondPermission` | Creates local messages, emits `save_snapshot`, and starts prompts. |
-| Stream store | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamToken`, `onStreamThought`, `onStreamEvent`, `onStreamDone`, `processBuffer` | Converts socket stream events into AcpUI messages and final snapshot writes. |
+| Chat orchestrator | `frontend/src/store/useChatStore.ts` | `handleSubmit`, `handleCancel`, `handleRespondPermission` | Creates local messages with stable turn IDs, emits `save_snapshot`, and starts prompts. |
+| Stream store | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamToken`, `onStreamThought`, `onStreamEvent`, `onStreamDone`, `processBuffer` | Converts socket stream events into AcpUI messages, reuses the newest streaming assistant, and writes final snapshots. |
+| Message IDs | `frontend/src/utils/messageIds.ts` | `createMessageId`, `MessageIdPrefix` | Creates collision-resistant local message IDs used by prompt placeholders, stream targeting, and merge messages. |
 | Settings modal | `frontend/src/components/SessionSettingsModal.tsx` | `SessionSettingsModal`, `handleRehydrate`, tab `rehydrate` | User-triggered JSONL rebuild and UI message refresh. |
 | Socket singleton | `frontend/src/hooks/useSocket.ts` | `getOrCreateSocket`, `provider_extension`, `session_model_options` | Keeps socket identity stable and routes provider metadata. |
 
@@ -507,7 +515,7 @@ Table: `sessions`
 
 3. **`save_snapshot` must merge with backend stream progress**
 
-   Tokens and timeline steps are assembled in the frontend stream store and reduced in backend stream persistence. `save_snapshot` preserves richer DB content only for the same latest assistant message ID; new blank placeholders must remain blank until their own stream data arrives. Terminal MCP output is also persisted as tool output so completed shell cards can reload after the browser closes.
+   Tokens and timeline steps are assembled in the frontend stream store and reduced in backend stream persistence. `prompt` carries `assistantMessageId`, `userMessageId`, and `turnStartTime` so backend progress writes target the intended turn even before `save_snapshot` is visible in SQLite. `save_snapshot` preserves richer DB content only for the same latest assistant message ID; new blank placeholders must remain blank until their own stream data arrives. Terminal MCP output is also persisted as tool output so completed shell cards can reload after the browser closes.
 
 4. **Drain only suppresses message-like updates**
 
@@ -547,12 +555,12 @@ Table: `sessions`
 | `backend/test/sessionHandlers.test.js` | `handles load_sessions with cleanup`, `handles get_session_history`, `handles rehydrate_session`, `handles rehydrate_session when no acpSessionId`, `handles rehydrate_session when JSONL not found`, `handles get_session_history with JSONL having more messages than DB`, `repairs same-length low-quality assistant history from JSONL`, `protects richer DB stream progress from a stale save_snapshot`, `handles create_session with existingAcpId (resume)`, `handles create_session skipping load for hot sessions`, `handles create_session performing load for cold sessions with dbSession` | Socket persistence API, lazy sync, forced rehydrate, stale snapshot protection, cold/hot ACP resume. |
 | `backend/test/sessionManager.test.js` | `should return empty if no mcpName`, `should return server config if mcpName exists`, `should attach _meta when getMcpServerMeta returns a value`, `should load pinned sessions sequentially`, `should perform full hot-load lifecycle`, `does not force-complete a streaming assistant during progress saves` | MCP injection, pinned hot-load, drain setup, metadata capture, and progress-save behavior. |
 | `backend/test/acpUpdateHandler.test.js` | `persists message chunks as stream progress`, `handles config_option_update and emits provider_extension`, `handles usage_update and emits stats_push`, `buffers text in statsCaptures if present` | Backend stream progress persistence and metadata event persistence. |
-| `backend/test/sessionStreamPersistence.test.js` | `persists token progress into the active assistant message`, `merges tool updates by id and preserves sticky fields`, `finalizes the active assistant only on terminal prompt lifecycle`, `protects richer persisted assistant content from stale snapshots`, `does not copy a previous assistant answer into a new blank prompt placeholder`, `allows same-length JSONL repair for a low-quality latest assistant while preserving ids` | Durable stream reducer, sticky tool merge, safe snapshot merge, finalization, and guarded JSONL repair. |
+| `backend/test/sessionStreamPersistence.test.js` | `persists token progress into the active assistant message`, `targets meta.activeAssistantMessageId when stream chunks arrive before the placeholder is persisted`, `creates a new assistant when no explicit active id exists and latest assistant is completed`, `prefers meta.activeAssistantMessageId for stream resume snapshots`, `merges tool updates by id and preserves sticky fields`, `finalizes the active assistant only on terminal prompt lifecycle`, `protects richer persisted assistant content from stale snapshots`, `does not copy a previous assistant answer into a new blank prompt placeholder`, `allows same-length JSONL repair for a low-quality latest assistant while preserving ids` | Durable stream reducer, active assistant targeting, sticky tool merge, safe snapshot merge, finalization, and guarded JSONL repair. |
 | `backend/test/drain.test.js` | `should drop chunks and reset timer while draining`, `should allow metadata to pass through during drain while swallowing messages`, `should process chunks normally when not draining` | Drain behavior during `session/load`. |
 | `backend/test/streamController.test.js` | `should stay in draining state as long as chunks arrive`, `should support multiple concurrent draining sessions with independent timers`, `should resolve pending waitForDrain promises on reset` | Drain timer and reset semantics. |
 | `backend/test/persistence.test.js` | `saves and retrieves sessions`, `retrieves pinned sessions`, `saves config options without provider`, `saveModelState handles null provider path`, `retrieves session by acpId`, `handles saveModelState with modelOptions and 3-arg signature`, `handles saveConfigOptions with 4-arg signature` | SQLite session serialization and metadata helpers. |
 | `backend/test/providerContract.test.js` | `every provider explicitly exports every contract function` | Provider persistence hook availability. |
-| `backend/test/promptHandlers.test.js` | `should handle incoming prompt and send to ACP`, `should handle prompt errors and emit error token`, `calls onPromptStarted before sendRequest and onPromptCompleted after success`, `calls onPromptCompleted even when sendRequest rejects (error path)` | Prompt lifecycle and backend finalization triggers. |
+| `backend/test/promptHandlers.test.js` | `should handle incoming prompt and send to ACP`, `stores and clears active turn metadata from prompt payload fields`, `should handle prompt errors and emit error token`, `calls onPromptStarted before sendRequest and onPromptCompleted after success`, `calls onPromptCompleted even when sendRequest rejects (error path)` | Prompt lifecycle, active turn metadata, and backend finalization triggers. |
 
 ### Frontend Tests
 
@@ -560,8 +568,9 @@ Table: `sessions`
 |---|---|---|
 | `frontend/src/test/useSessionLifecycleStore.test.ts` | `handleInitialLoad loads sessions and syncs URL`, `hydrateSession cleans timeline and resumes on backend`, `hydrateSession preserves a persisted active assistant marker`, `hydrateSession restores awaiting permission state from unresolved permission steps`, `hydrateSession hydrates context usage from existing session stats before history load`, `fetchStats does not overwrite existing positive context usage with zero percent` | Metadata load, history hydration, active stream preservation, permission restore, ACP resume request, context fallback. |
 | `frontend/src/test/useSessionLifecycleStoreDeep.test.ts` | `handleSessionSelect rehydrates loaded sessions when cached context is missing`, `handleSessionSelect hydrates if session is empty`, `handleInitialLoad handles empty session list` | Selection-time hydration rules. |
-| `frontend/src/test/useChatStore.test.ts` | `creates messages and emits prompt`, `updates permission step and emits to socket` | Prompt snapshot setup and permission snapshot writes. |
-| `frontend/src/test/useStreamStore.test.ts` | `ensureAssistantMessage reuses a hydrated streaming assistant`, `onStreamToken appends to a hydrated streaming assistant without duplicating`, `onStreamDone finalizes a hydrated streaming assistant without an active map`, `onStreamDone marks message as finished and saves snapshot`, `processBuffer drains queue into session messages with adaptive speed` | Hydrated stream reattachment, stream completion persistence, and queue rendering. |
+| `frontend/src/test/useChatStore.test.ts` | `creates messages and emits prompt`, `updates permission step and emits to socket` | Prompt snapshot setup, prompt turn metadata payload, and permission snapshot writes. |
+| `frontend/src/test/useStreamStore.test.ts` | `ensureAssistantMessage reuses a hydrated streaming assistant`, `ensureAssistantMessage remaps stale active message ids to the newest streaming assistant`, `onStreamToken appends to a hydrated streaming assistant without duplicating`, `onStreamDone finalizes a hydrated streaming assistant without an active map`, `onStreamDone marks message as finished and saves snapshot`, `processBuffer drains queue into session messages with adaptive speed` | Hydrated stream reattachment, active assistant remapping, stream completion persistence, and queue rendering. |
+| `frontend/src/test/useChatManager.test.ts` | `applies stream resume snapshots and seeds active stream state`, `does not remap activeMsgIdByAcp to an older assistant on stale stream resume snapshot`, `keeps routing live tokens to the current assistant after a stale stream resume snapshot` | Reconnect snapshot merge, stale snapshot rejection, and live-token routing after chat switching. |
 | `frontend/src/test/SessionSettingsModal.test.tsx` | `rehydrate button calls socket emit` | Forced rehydrate UI entry point. |
 | `frontend/src/test/SessionSettingsModalExtended.test.tsx` | `handles rehydrate request` | Modal success state and message refresh behavior. |
 
@@ -578,7 +587,7 @@ npx vitest run test/sessionStreamPersistence.test.js test/jsonlParser.test.js te
 
 ```bash
 cd frontend
-npx vitest run src/test/useSessionLifecycleStore.test.ts src/test/useSessionLifecycleStoreDeep.test.ts src/test/useChatStore.test.ts src/test/useStreamStore.test.ts src/test/streamConcurrency.test.ts src/test/SessionSettingsModal.test.tsx src/test/SessionSettingsModalExtended.test.tsx
+npx vitest run src/test/useSessionLifecycleStore.test.ts src/test/useSessionLifecycleStoreDeep.test.ts src/test/useChatStore.test.ts src/test/useStreamStore.test.ts src/test/useChatManager.test.ts src/test/streamConcurrency.test.ts src/test/SessionSettingsModal.test.tsx src/test/SessionSettingsModalExtended.test.tsx
 ```
 
 ## How to Use This Guide
@@ -608,7 +617,7 @@ npx vitest run src/test/useSessionLifecycleStore.test.ts src/test/useSessionLife
 - `get_session_history` syncs JSONL when JSONL has more messages or repairs a same-length low-quality latest assistant without overwriting richer DB state.
 - `rehydrate_session` explicitly replaces the DB message array from provider JSONL.
 - `create_session` with `existingAcpId` resumes ACP state and uses drain to suppress replayed message chunks.
-- `watch_session` emits `stream_resume_snapshot` for the latest persisted streaming assistant so reconnecting UIs seed the active stream before new chunks arrive.
-- `save_snapshot` merges frontend-rendered state with backend-persisted stream progress by latest assistant message ID.
-- `sessionStreamPersistence` owns backend progress saves, terminal tool-output persistence, reconnect snapshots, and terminal assistant finalization from prompt lifecycle paths.
+- `watch_session` emits `stream_resume_snapshot` for the current persisted streaming assistant so reconnecting UIs seed the active stream before new chunks arrive.
+- `save_snapshot` merges frontend-rendered state with backend-persisted stream progress by latest assistant message ID, while `prompt` active-turn IDs keep backend live writes on the intended assistant.
+- `sessionStreamPersistence` owns backend progress saves, active assistant targeting, terminal tool-output persistence, reconnect snapshots, and terminal assistant finalization from prompt lifecycle paths.
 - Provider modules own JSONL paths, parsing, file lifecycle, session params, cached context, and prompt lifecycle hooks.

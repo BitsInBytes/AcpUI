@@ -5,6 +5,7 @@ import { useShellRunStore } from './useShellRunStore';
 import type { Socket } from 'socket.io-client';
 import { useSubAgentStore } from './useSubAgentStore';
 import { isAcpUxShellToolEvent, isAcpUxShellToolName, isAcpUxSubAgentStartToolEvent } from '../utils/acpUxTools';
+import { createMessageId } from '../utils/messageIds';
 import type { StreamTokenData, StreamEventData, StreamDoneData, Message, TimelineStep, SystemEvent } from '../types';
 
 function isShellDescriptionTitle(title?: string) {
@@ -69,12 +70,46 @@ function contentFromMessage(message: Message): string {
     .join('');
 }
 
+function readTurnStartTime(message?: Message): number | null {
+  const turnStartTime = message?.turnStartTime;
+  return typeof turnStartTime === 'number' && Number.isFinite(turnStartTime)
+    ? turnStartTime
+    : null;
+}
+
 function findHydratedActiveAssistant(messages: Message[]): Message | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
+  let selected: Message | undefined;
+  let selectedIndex = -1;
+
+  for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
-    if (message.role === 'assistant' && message.isStreaming) return message;
+    if (message.role !== 'assistant' || !message.isStreaming) continue;
+
+    if (!selected) {
+      selected = message;
+      selectedIndex = i;
+      continue;
+    }
+
+    const selectedTurn = readTurnStartTime(selected);
+    const messageTurn = readTurnStartTime(message);
+
+    let shouldReplace = false;
+    if (selectedTurn !== null && messageTurn !== null) {
+      shouldReplace = messageTurn > selectedTurn || (messageTurn === selectedTurn && i > selectedIndex);
+    } else if (selectedTurn === null && messageTurn !== null) {
+      shouldReplace = true;
+    } else if (selectedTurn === null && messageTurn === null) {
+      shouldReplace = i > selectedIndex;
+    }
+
+    if (shouldReplace) {
+      selected = message;
+      selectedIndex = i;
+    }
   }
-  return undefined;
+
+  return selected;
 }
 
 /**
@@ -124,29 +159,29 @@ export const useStreamStore = create<StreamState>((set, get) => ({
 
     const activeMsgId = activeMsgIdByAcp[acpSessionId];
     const mappedMessage = activeMsgId ? session.messages.find(m => m.id === activeMsgId) : undefined;
-    if (mappedMessage && activeMsgId) {
-      if (get().displayedContentByMsg[activeMsgId] === undefined) {
-        const existingContent = contentFromMessage(mappedMessage);
-        set(state => ({
-          displayedContentByMsg: { ...state.displayedContentByMsg, [activeMsgId]: existingContent },
-          settledLengthByMsg: { ...state.settledLengthByMsg, [activeMsgId]: existingContent.length }
-        }));
-      }
-      return;
-    }
-
     const hydratedMessage = findHydratedActiveAssistant(session.messages);
-    if (hydratedMessage) {
-      const existingContent = contentFromMessage(hydratedMessage);
-      set(state => ({
-        activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [acpSessionId]: hydratedMessage.id },
-        displayedContentByMsg: { ...state.displayedContentByMsg, [hydratedMessage.id]: existingContent },
-        settledLengthByMsg: { ...state.settledLengthByMsg, [hydratedMessage.id]: existingContent.length }
-      }));
+
+    const selectedMessage = hydratedMessage || (mappedMessage?.isStreaming ? mappedMessage : undefined);
+    if (selectedMessage) {
+      const selectedContent = contentFromMessage(selectedMessage);
+      set(state => {
+        const nextDisplayed = state.displayedContentByMsg[selectedMessage.id] === undefined
+          ? { ...state.displayedContentByMsg, [selectedMessage.id]: selectedContent }
+          : state.displayedContentByMsg;
+        const nextSettled = state.settledLengthByMsg[selectedMessage.id] === undefined
+          ? { ...state.settledLengthByMsg, [selectedMessage.id]: selectedContent.length }
+          : state.settledLengthByMsg;
+        return {
+          activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [acpSessionId]: selectedMessage.id },
+          displayedContentByMsg: nextDisplayed,
+          settledLengthByMsg: nextSettled
+        };
+      });
       return;
     }
 
-    const newMsgId = `assistant-${Date.now()}`;
+    const turnStartTime = Date.now();
+    const newMsgId = createMessageId('assistant');
     set(state => ({
       activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [acpSessionId]: newMsgId }
     }));
@@ -158,7 +193,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
           content: '',
           timeline: [],
           isStreaming: true,
-          turnStartTime: Date.now()
+          turnStartTime
         }]
       } : s) }));
   },

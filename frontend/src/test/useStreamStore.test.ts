@@ -66,6 +66,29 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(streamState.settledLengthByMsg['a-existing']).toBe('Persisted text'.length);
   });
 
+  it('ensureAssistantMessage remaps stale active message ids to the newest streaming assistant', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'a1',
+          provider: 'p1',
+          messages: [
+            { id: 'a-old', role: 'assistant', content: 'older', isStreaming: true, turnStartTime: 10, timeline: [{ type: 'text', content: 'older' }] },
+            { id: 'a-new', role: 'assistant', content: 'newer', isStreaming: true, turnStartTime: 20, timeline: [{ type: 'text', content: 'newer' }] }
+          ]
+        } as any]
+      });
+      useStreamStore.setState({ activeMsgIdByAcp: { a1: 'a-old' } });
+      useStreamStore.getState().ensureAssistantMessage('a1');
+    });
+
+    const streamState = useStreamStore.getState();
+    expect(streamState.activeMsgIdByAcp['a1']).toBe('a-new');
+    expect(streamState.displayedContentByMsg['a-new']).toBe('newer');
+    expect(streamState.settledLengthByMsg['a-new']).toBe('newer'.length);
+  });
+
   it('onStreamToken appends to a hydrated streaming assistant without duplicating', () => {
     act(() => {
       useSessionLifecycleStore.setState({
@@ -151,7 +174,7 @@ describe('useStreamStore (Pure Logic)', () => {
       useSessionLifecycleStore.setState(state => ({
           sessions: state.sessions.map(s => ({
               ...s,
-              messages: [{ id: msgId, role: 'assistant', timeline: [{ type: 'thought', content: 'thinking', isCollapsed: false }] }] as any
+              messages: [{ id: msgId, role: 'assistant', isStreaming: true, timeline: [{ type: 'thought', content: 'thinking', isCollapsed: false }] }] as any
           }))
       }));
 
@@ -214,6 +237,7 @@ describe('useStreamStore (Pure Logic)', () => {
           messages: [{
             id: msgId,
             role: 'assistant',
+            isStreaming: true,
             timeline: [
               {
                 type: 'tool',
@@ -266,6 +290,7 @@ describe('useStreamStore (Pure Logic)', () => {
           messages: [{
             id: msgId,
             role: 'assistant',
+            isStreaming: true,
             timeline: [{
               type: 'tool',
               isCollapsed: false,
@@ -759,7 +784,7 @@ describe('useStreamStore (Pure Logic)', () => {
       useSessionLifecycleStore.setState(state => ({
           sessions: state.sessions.map(s => ({
               ...s,
-              messages: [{ id: msgId, role: 'assistant', timeline: [{ type: 'thought', content: '_Thinking..._', isCollapsed: false }] }] as any
+              messages: [{ id: msgId, role: 'assistant', isStreaming: true, timeline: [{ type: 'thought', content: '_Thinking..._', isCollapsed: false }] }] as any
           }))
       }));
 

@@ -304,7 +304,10 @@ export class SubAgentInvocationManager {
         toolCategory: 'sub_agent',
         isFileOperation: false
       };
-      await persistStreamEvent(acpClient, parentAcpSessionId, parentToolEvent, { force: true });
+      await persistStreamEvent(acpClient, parentAcpSessionId, parentToolEvent, {
+        force: true,
+        allowCompletedAssistantFallback: true
+      });
       this.io.to?.(`session:${parentAcpSessionId}`)?.emit?.('system_event', parentToolEvent);
     }
 

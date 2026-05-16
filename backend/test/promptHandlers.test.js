@@ -143,6 +143,41 @@ describe('Prompt Handlers', () => {
     expect(mockIo.emit).toHaveBeenCalledWith('token_done', expect.objectContaining({ sessionId, providerId: 'provider-a' }));
   });
 
+  it('stores and clears active turn metadata from prompt payload fields', async () => {
+    const sessionId = 'sess-turn-meta';
+    const uiId = 'ui-turn-meta';
+    mockAcpClient.sessionMetadata.set(sessionId, {
+      model: 'test-balanced',
+      promptCount: 0,
+      lastResponseBuffer: '',
+      lastThoughtBuffer: ''
+    });
+    mockAcpClient.transport.sendRequest.mockImplementationOnce(async () => {
+      const meta = mockAcpClient.sessionMetadata.get(sessionId);
+      expect(meta.activeAssistantMessageId).toBe('assistant-msg-1');
+      expect(meta.activeUserMessageId).toBe('user-msg-1');
+      expect(meta.turnStartTime).toBe(1700000000000);
+      return { success: true };
+    });
+
+    const handler = mockSocket.listeners('prompt')[0];
+    await handler({
+      providerId: 'provider-a',
+      uiId,
+      sessionId,
+      prompt: 'hello',
+      model: 'test-balanced',
+      assistantMessageId: 'assistant-msg-1',
+      userMessageId: 'user-msg-1',
+      turnStartTime: 1700000000000
+    });
+
+    const meta = mockAcpClient.sessionMetadata.get(sessionId);
+    expect(meta.activeAssistantMessageId).toBeNull();
+    expect(meta.activeUserMessageId).toBeNull();
+    expect(meta.turnStartTime).toBeNull();
+  });
+
   it('does not overwrite context-window stats with prompt response usage', async () => {
     const sessionId = 'sess-context-window';
     mockAcpClient.sessionMetadata.set(sessionId, {

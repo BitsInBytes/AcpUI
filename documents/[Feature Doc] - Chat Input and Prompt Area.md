@@ -74,7 +74,7 @@ This feature matters because it is the frontend boundary that creates `prompt` s
 
    File: `frontend/src/store/useChatStore.ts` (Action: `handleSubmit`)
 
-   The store trims the prompt, resolves attachments from `attachmentsMap[activeSessionId]` unless an override is provided, intercepts exact prompt-backed custom commands from `useSystemStore.customCommands`, marks the ACP stream active in `useStreamStore`, clears the input and attachments, appends a user message plus an assistant placeholder, emits `save_snapshot`, then emits `prompt`.
+   The store trims the prompt, resolves attachments from `attachmentsMap[activeSessionId]` unless an override is provided, intercepts exact prompt-backed custom commands from `useSystemStore.customCommands`, creates `userMsgId`, `assistantMsgId`, and `turnStartTime`, marks the ACP stream active in `useStreamStore`, clears the input and attachments, appends a user message plus an assistant placeholder, emits `save_snapshot`, then emits `prompt` with the active turn IDs.
 
 10. The backend resolves provider runtime and model state.
 
@@ -159,7 +159,10 @@ socket.emit('prompt', {
   sessionId: acpId,
   prompt: promptText,
   model: activeSession.model,
-  attachments
+  attachments,
+  assistantMessageId: assistantMsgId,
+  userMessageId: userMsgId,
+  turnStartTime
 });
 ```
 
@@ -170,6 +173,9 @@ The payload depends on these keys:
 - `prompt`: string text or prebuilt ACP prompt parts when an override supplies an array.
 - `model`: frontend selection that the backend resolves and applies through ACP `session/set_model`.
 - `attachments`: `Attachment[]` from `frontend/src/types.ts`.
+- `assistantMessageId`: frontend-created assistant placeholder ID that backend stream persistence must target for this turn.
+- `userMessageId`: frontend-created user message ID for the submitted prompt.
+- `turnStartTime`: timestamp shared by the assistant placeholder and backend active-turn metadata for ordering streaming assistants.
 
 Attachment shape:
 ```ts
@@ -215,7 +221,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 2. Textarea `onChange` calls `useInputStore.setInput(activeSession.id, value)`.
 3. `Enter` without Shift, the send button, or a no-argument slash command calls `useChatStore.handleSubmit(socket)`.
 4. `handleSubmit` clears the draft with `useInputStore.clearInput(activeSessionId)` after it builds the prompt payload.
-5. The optimistic user message stores `content: promptText` and a copy of the submitted attachments.
+5. The optimistic user message stores `content: promptText` and a copy of the submitted attachments; the assistant placeholder stores the matching `assistantMessageId`, `isStreaming: true`, and the shared `turnStartTime`.
 
 ### Attachment Upload and Prompt Conversion
 1. Browser files enter `useFileUpload.handleFileUpload` from the hidden file input or `window` paste listener.
@@ -258,7 +264,8 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Input state | `frontend/src/store/useInputStore.ts` | `inputs`, `attachmentsMap`, `setInput`, `setAttachments`, `clearInput`, `handleFileUpload` | Session-scoped drafts and attachments |
-| Submit state | `frontend/src/store/useChatStore.ts` | `handleSubmit`, `handleCancel` | Optimistic messages, prompt/cancel socket emission, custom command prompt substitution |
+| Submit state | `frontend/src/store/useChatStore.ts` | `handleSubmit`, `handleCancel` | Optimistic messages, active turn IDs, prompt/cancel socket emission, custom command prompt substitution |
+| Message IDs | `frontend/src/utils/messageIds.ts` | `createMessageId`, `MessageIdPrefix` | Collision-resistant local user, assistant, and merge message IDs |
 | Session lifecycle | `frontend/src/store/useSessionLifecycleStore.ts` | `handleActiveSessionModelChange`, `handleSessionModelChange`, `handleSetSessionOption`, `fetchStats`, `maybeHydrateContextUsage` | Model mutation, session options, stats and context hydration |
 | System state | `frontend/src/store/useSystemStore.ts` | `SlashCommand`, `setSlashCommands`, `setCustomCommands`, `setContextUsage`, `getContextUsage`, `hasContextUsage`, `setCompacting`, `getCompacting`, `getBranding` | Provider branding, command lists, provider-scoped context usage and compaction state |
 | UI state | `frontend/src/store/useUIStore.ts` | `isModelDropdownOpen`, `setModelDropdownOpen`, `toggleAutoScroll`, `setSettingsOpen`, `setNotesOpen` | Dropdown, auto-scroll, settings, and Scratch Pad trigger state (notes ownership in `[Feature Doc] - Notes.md`) |
@@ -273,14 +280,14 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 | Route mount | `backend/routes/index.js` | `router.use('/upload', uploadRoutes)` | Mounts upload route tree |
 | Upload route | `backend/routes/upload.js` | `router.post('/:uiId', upload.array('files'), handleUpload)` | Receives multipart attachment uploads |
 | Attachment service | `backend/services/attachmentVault.js` | `getAttachmentsRoot`, `upload`, `handleUpload`, multer `destination`, multer `filename` | Resolves attachment storage root, stores files, sanitizes filenames, returns metadata |
-| Prompt socket | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, socket events `prompt`, `cancel_prompt`, `respond_permission`, `set_mode`, ACP requests `session/set_model`, `session/prompt` | Prompt conversion, model enforcement, attachment transformation, cancel and permission forwarding |
+| Prompt socket | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, socket events `prompt`, `cancel_prompt`, `respond_permission`, `set_mode`, ACP requests `session/set_model`, `session/prompt` | Prompt conversion, active turn metadata, model enforcement, attachment transformation, cancel and permission forwarding |
 | Model service | `backend/services/modelOptions.js` | `normalizeModelOptions`, `modelOptionsFromProviderConfig`, `findModelConfigOption`, `extractModelState`, `mergeModelOptions`, `resolveModelSelection` | Backend model selection normalization and resolution |
 
 ### Routes, Events, and Protocol Fields
 | Type | Name | Producer | Consumer | Purpose |
 |---|---|---|---|---|
 | HTTP route | `POST /upload/:uiId` | `useFileUpload.handleFileUpload` | `backend/routes/upload.js` | Multipart upload endpoint for prompt attachments |
-| Socket event | `prompt` | `useChatStore.handleSubmit` | `registerPromptHandlers` | Prompt dispatch with model and attachments |
+| Socket event | `prompt` | `useChatStore.handleSubmit` | `registerPromptHandlers` | Prompt dispatch with model, attachments, and active turn message IDs |
 | Socket event | `cancel_prompt` | `useChatStore.handleCancel` | `registerPromptHandlers` | ACP cancel forwarding and sub-agent cancellation |
 | Socket event | `set_session_model` | `useSessionLifecycleStore.handleSessionModelChange` | Session handlers | Session model update request |
 | Socket event | `set_session_option` | `useSessionLifecycleStore.handleSetSessionOption` | Session handlers | Session config option update request |
@@ -310,6 +317,8 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 9. Context bar absence can be valid state. No fill renders until the provider-scoped context key (`providerId + acpSessionId`) exists from metadata or stats hydration.
 
 10. Input clear is eager. `handleSubmit` clears draft text and attachments before the backend prompt completes; submit failures emit error timeline events but do not restore the previous draft.
+
+11. Prompt turn IDs are part of stream routing. `assistantMessageId`, `userMessageId`, and `turnStartTime` must be emitted with `prompt` after the optimistic `save_snapshot`; backend stream persistence uses them to avoid appending new turn output to a previous assistant when persistence races with live chunks.
 
 ## Unit Tests
 ### Frontend
@@ -405,6 +414,7 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
   - `multer filename callback sanitizes original filename`
 - `backend/test/promptHandlers.test.js`
   - `should handle incoming prompt and send to ACP`
+  - `stores and clears active turn metadata from prompt payload fields`
   - `does not overwrite context-window stats with prompt response usage`
   - `should handle attachments (images and resource links)`
   - `should handle base64 image attachments without disk path`
@@ -441,9 +451,9 @@ If these keys are mixed, the visible prompt can submit against the wrong backend
 
 ## Summary
 - `ChatInput` coordinates prompt composition, attachments, slash commands, voice controls, footer actions, context display, and model/session option controls for the active session.
-- `useInputStore` owns UI-session-scoped drafts and attachments; `useChatStore.handleSubmit` owns prompt emission and optimistic message insertion.
+- `useInputStore` owns UI-session-scoped drafts and attachments; `useChatStore.handleSubmit` owns prompt emission, active turn IDs, and optimistic message insertion.
 - Attachment upload returns disk metadata first; ACP prompt conversion later transforms attachments into `image`, `text`, or `resource_link` parts.
 - Model quick-select is sourced from provider branding quick-access entries and enforced again in the backend prompt handler through ACP `session/set_model`.
 - Slash command data comes from provider extensions and prompt-backed custom commands; exact custom command names can substitute configured prompt text.
 - Context display is keyed by provider id + ACP session id and can be populated from provider metadata or stats hydration.
-- The critical contract is the `prompt` payload plus the `Attachment` shape and the separation between UI session id and ACP session id.
+- The critical contract is the `prompt` payload, active turn IDs, the `Attachment` shape, and the separation between UI session id and ACP session id.

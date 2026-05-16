@@ -402,6 +402,7 @@ describe('SubAgentInvocationManager', () => {
       canonicalName: 'ux_invoke_subagents',
       status: 'completed'
     }));
+    expect(savedParent?.messages?.[0]?.isStreaming).not.toBe(true);
   });
 
   it('cleans active idempotency state when invocation setup rejects', async () => {

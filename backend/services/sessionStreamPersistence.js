@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import * as db from '../database.js';
 import { writeLog } from './logger.js';
 
@@ -84,28 +85,87 @@ function latestStreamingAssistantIndex(messages = []) {
   return -1;
 }
 
-function ensureActiveAssistant(session) {
+function getExplicitActiveAssistantId(meta = null) {
+  const activeAssistantMessageId = meta?.activeAssistantMessageId;
+  if (typeof activeAssistantMessageId !== 'string') return null;
+  const trimmed = activeAssistantMessageId.trim();
+  return trimmed || null;
+}
+
+function findAssistantIndexById(messages = [], messageId = null) {
+  if (!messageId) return -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'assistant' && messages[i]?.id === messageId) return i;
+  }
+  return -1;
+}
+
+function resolveTurnStartTime(meta = null) {
+  const parsedTurnStartTime = Number(meta?.turnStartTime);
+  return Number.isFinite(parsedTurnStartTime) ? parsedTurnStartTime : Date.now();
+}
+
+function createStreamingAssistant({ id = null, turnStartTime = Date.now() } = {}) {
+  return {
+    id: id || `assistant-${randomUUID()}`,
+    role: 'assistant',
+    content: '',
+    timeline: [],
+    isStreaming: true,
+    turnStartTime
+  };
+}
+
+function ensureActiveAssistant(session, meta = null, { allowCompletedAssistantFallback = false } = {}) {
   if (!Array.isArray(session.messages)) session.messages = [];
-  let idx = latestStreamingAssistantIndex(session.messages);
-  if (idx === -1) idx = latestAssistantIndex(session.messages);
+
+  const explicitAssistantId = getExplicitActiveAssistantId(meta);
+  const turnStartTime = resolveTurnStartTime(meta);
+
+  let idx = explicitAssistantId
+    ? findAssistantIndexById(session.messages, explicitAssistantId)
+    : latestStreamingAssistantIndex(session.messages);
+  let usedCompletedAssistantFallback = false;
+
+  if (idx === -1 && !explicitAssistantId && allowCompletedAssistantFallback) {
+    idx = latestAssistantIndex(session.messages);
+    usedCompletedAssistantFallback = idx !== -1;
+  }
+
   if (idx === -1) {
-    session.messages.push({
-      id: `assistant-${Date.now()}`,
-      role: 'assistant',
-      content: '',
-      timeline: [],
-      isStreaming: true,
-      turnStartTime: Date.now()
-    });
+    session.messages.push(createStreamingAssistant({ id: explicitAssistantId, turnStartTime }));
     idx = session.messages.length - 1;
   }
 
   const msg = session.messages[idx];
   if (!Array.isArray(msg.timeline)) msg.timeline = [];
   if (typeof msg.content !== 'string') msg.content = msg.content ? String(msg.content) : '';
-  msg.isStreaming = true;
-  if (!msg.turnStartTime) msg.turnStartTime = Date.now();
+  if (!usedCompletedAssistantFallback) {
+    msg.isStreaming = true;
+    if (!msg.turnStartTime) msg.turnStartTime = turnStartTime;
+  }
   return msg;
+}
+
+function getActiveAssistantForSnapshot(session, meta = null) {
+  const messages = session?.messages || [];
+  const explicitAssistantId = getExplicitActiveAssistantId(meta);
+  if (explicitAssistantId) {
+    const explicitIdx = findAssistantIndexById(messages, explicitAssistantId);
+    if (explicitIdx !== -1) return messages[explicitIdx];
+  }
+  const streamingIdx = latestStreamingAssistantIndex(messages);
+  if (streamingIdx !== -1) return messages[streamingIdx];
+  return null;
+}
+
+function getAssistantForFinalization(session, meta = null) {
+  const messages = session?.messages || [];
+  const explicitAssistantId = getExplicitActiveAssistantId(meta);
+  if (explicitAssistantId) return ensureActiveAssistant(session, meta);
+  const streamingIdx = latestStreamingAssistantIndex(messages);
+  if (streamingIdx === -1) return null;
+  return messages[streamingIdx];
 }
 
 function usefulTextLength(value) {
@@ -145,9 +205,9 @@ function hasTerminalToolOutput(message) {
   ));
 }
 
-function appendText(session, text) {
+function appendText(session, text, meta = null) {
   if (!text) return;
-  const msg = ensureActiveAssistant(session);
+  const msg = ensureActiveAssistant(session, meta);
   const timeline = removeSyntheticThinking(msg.timeline);
   const last = timeline[timeline.length - 1];
   msg.content = `${msg.content || ''}${text}`;
@@ -160,9 +220,9 @@ function appendText(session, text) {
   msg.timeline = timeline;
 }
 
-function appendThought(session, text) {
+function appendThought(session, text, meta = null) {
   if (!text) return;
-  const msg = ensureActiveAssistant(session);
+  const msg = ensureActiveAssistant(session, meta);
   const timeline = removeSyntheticThinking(msg.timeline);
   const last = timeline[timeline.length - 1];
   if (last?.type === 'thought' && !last.isCollapsed) {
@@ -241,8 +301,10 @@ function matchingToolIndex(timeline, event) {
   ));
 }
 
-function applyToolEvent(session, event) {
-  const msg = ensureActiveAssistant(session);
+function applyToolEvent(session, event, meta = null, options = {}) {
+  const msg = ensureActiveAssistant(session, meta, {
+    allowCompletedAssistantFallback: options.allowCompletedAssistantFallback === true
+  });
   const timeline = removeSyntheticThinking(msg.timeline);
   const idx = matchingToolIndex(timeline, event);
 
@@ -271,8 +333,8 @@ function applyToolEvent(session, event) {
   msg.timeline = timeline;
 }
 
-function applyPermissionEvent(session, event) {
-  const msg = ensureActiveAssistant(session);
+function applyPermissionEvent(session, event, meta = null) {
+  const msg = ensureActiveAssistant(session, meta);
   const timeline = removeSyntheticThinking(msg.timeline);
   if (!timeline.some(step => step.type === 'permission' && step.request?.id === event.id)) {
     timeline.push({ type: 'permission', request: event, isCollapsed: false });
@@ -280,12 +342,12 @@ function applyPermissionEvent(session, event) {
   msg.timeline = timeline;
 }
 
-function applyStreamEvent(session, event) {
+function applyStreamEvent(session, event, meta = null, options = {}) {
   if (!event) return;
-  if (event.type === 'token') appendText(session, event.text || '');
-  else if (event.type === 'thought') appendThought(session, event.text || '');
-  else if (event.type === 'permission_request') applyPermissionEvent(session, event);
-  else if (event.type === 'tool_start' || event.type === 'tool_update' || event.type === 'tool_end') applyToolEvent(session, event);
+  if (event.type === 'token') appendText(session, event.text || '', meta);
+  else if (event.type === 'thought') appendThought(session, event.text || '', meta);
+  else if (event.type === 'permission_request') applyPermissionEvent(session, event, meta);
+  else if (event.type === 'tool_start' || event.type === 'tool_update' || event.type === 'tool_end') applyToolEvent(session, event, meta, options);
 }
 
 export function applyRuntimeMetadataToSession(session, acpSessionId, meta) {
@@ -335,8 +397,8 @@ async function mutatePersistedSession(acpClient, acpSessionId, mutator, { force 
     if (!entry.session) entry.session = await loadSession(database, providerId, acpSessionId);
     if (!entry.session) return null;
 
-    const didMutate = await mutator(entry.session);
     const meta = acpClient?.sessionMetadata?.get(acpSessionId);
+    const didMutate = await mutator(entry.session, meta);
     const metadataChanged = applyRuntimeMetadataToSession(entry.session, acpSessionId, meta);
     entry.dirty = entry.dirty || didMutate || metadataChanged;
 
@@ -357,8 +419,8 @@ async function mutatePersistedSession(acpClient, acpSessionId, mutator, { force 
 
 export function persistStreamEvent(acpClient, acpSessionId, event, options = {}) {
   if (!acpSessionId || !event) return Promise.resolve(null);
-  return mutatePersistedSession(acpClient, acpSessionId, (session) => {
-    applyStreamEvent(session, event);
+  return mutatePersistedSession(acpClient, acpSessionId, (session, meta) => {
+    applyStreamEvent(session, event, meta, options);
     return true;
   }, options);
 }
@@ -374,7 +436,8 @@ export async function getStreamResumeSnapshot(acpClient, acpSessionId) {
   const database = getPersistenceDb(acpClient);
   const session = await flushStreamPersistence(acpClient, acpSessionId)
     || await loadSession(database, providerId, acpSessionId);
-  const msg = session?.messages?.[latestStreamingAssistantIndex(session.messages || [])];
+  const meta = acpClient?.sessionMetadata?.get(acpSessionId) || null;
+  const msg = getActiveAssistantForSnapshot(session, meta);
   if (!msg) return null;
   return {
     providerId: session.provider || providerId,
@@ -389,11 +452,9 @@ export async function finalizeStreamPersistence(acpClient, acpSessionId, { error
     await persistStreamEvent(acpClient, acpSessionId, { type: 'token', text: errorText }, { force: true });
   }
 
-  const session = await mutatePersistedSession(acpClient, acpSessionId, (workingSession) => {
-    const idx = latestStreamingAssistantIndex(workingSession.messages);
-    const assistantIdx = idx === -1 ? latestAssistantIndex(workingSession.messages) : idx;
-    if (assistantIdx === -1) return false;
-    const msg = workingSession.messages[assistantIdx];
+  const session = await mutatePersistedSession(acpClient, acpSessionId, (workingSession, meta) => {
+    const msg = getAssistantForFinalization(workingSession, meta);
+    if (!msg) return false;
     msg.timeline = removeSyntheticThinking(msg.timeline || []);
     msg.isStreaming = false;
     msg.turnEndTime = Date.now();

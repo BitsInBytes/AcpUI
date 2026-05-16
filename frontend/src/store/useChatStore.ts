@@ -6,6 +6,7 @@ import { useInputStore } from './useInputStore';
 import { useSessionLifecycleStore } from './useSessionLifecycleStore';
 import { mergeProviderConfigOptions } from '../utils/configOptions';
 import { normalizeModelOptions } from '../utils/modelOptions';
+import { createMessageId } from '../utils/messageIds';
 import type { ChatSession, Attachment, ForkSessionResponse } from '../types';
 
 function mergeModelOptions(current?: ChatSession['modelOptions'], incoming?: ChatSession['modelOptions']) {
@@ -53,8 +54,9 @@ export const useChatStore = create<ChatState>((_set, get) => ({
       return;
     }
 
-    const userMsgId = `user-${Date.now()}`;
-    const assistantMsgId = `assistant-${Date.now()}`;
+    const turnStartTime = Date.now();
+    const userMsgId = createMessageId('user');
+    const assistantMsgId = createMessageId('assistant');
 
     // Update streaming store state
     useStreamStore.setState(state => ({
@@ -71,7 +73,7 @@ export const useChatStore = create<ChatState>((_set, get) => ({
       isTyping: true,
       messages: [...s.messages,
         { id: userMsgId, role: 'user', content: promptText, attachments: [...attachments] },
-        { id: assistantMsgId, role: 'assistant', content: '', isStreaming: true, timeline: [{ type: 'thought', content: '_Thinking..._' }], turnStartTime: Date.now() }
+        { id: assistantMsgId, role: 'assistant', content: '', isStreaming: true, timeline: [{ type: 'thought', content: '_Thinking..._' }], turnStartTime }
       ]
     } : s));
 
@@ -84,7 +86,10 @@ export const useChatStore = create<ChatState>((_set, get) => ({
       sessionId: acpId,
       prompt: promptText,
       model: activeSession.model,
-      attachments
+      attachments,
+      assistantMessageId: assistantMsgId,
+      userMessageId: userMsgId,
+      turnStartTime
     });
   },
 
