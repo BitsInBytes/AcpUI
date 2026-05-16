@@ -81,13 +81,13 @@ The backend persists pending permission requests into the active assistant timel
 socket.on('stream_resume_snapshot', applyStreamResumeSnapshot);
 socket.on('thought', onStreamThought);
 socket.on('token', wrappedOnStreamToken);
-socket.on('system_event', onStreamEvent);
+socket.on('system_event', systemEventHandler);
 socket.on('permission_request', (event: StreamEventData) => {
   onStreamEvent({ ...event, type: 'permission_request' });
 });
 ```
 
-`applyStreamResumeSnapshot` merges the backend's latest persisted streaming assistant into the matching session and seeds `activeMsgIdByAcp`, `displayedContentByMsg`, and `settledLengthByMsg` before live chunks resume. `permission_request` checks `useSubAgentStore` first. Sub-agent permissions are stored on the matching sub-agent entry; main-session permissions enter the message timeline through `onStreamEvent`.
+`applyStreamResumeSnapshot` merges the backend's latest persisted streaming assistant into the matching session and seeds `activeMsgIdByAcp`, `displayedContentByMsg`, and `settledLengthByMsg` before live chunks resume. `systemEventHandler` is the single `system_event` dispatcher and routes both timeline updates (`onStreamEvent`) and sub-agent panel tool-step updates. `permission_request` checks `useSubAgentStore` first. Sub-agent permissions are stored on the matching sub-agent entry; main-session permissions enter the message timeline through `onStreamEvent`.
 
 4. Assistant placeholder creation anchors each ACP stream
 - File: `frontend/src/store/useStreamStore.ts` (Store action: `ensureAssistantMessage`)
@@ -261,7 +261,7 @@ if (!matched && snapshot) ensureShellRunToolStep(snapshot, patch);
 Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message timeline receives status, display metadata, and `shellNeedsInput` patches by `shellRunId`, tool-call ID, or the active shell description title. `useChatManager.syncShellInputStateForSession` also mirrors active `ShellRunSnapshot.needsInput` values into `ChatSession.isAwaitingShellInput`, which drives the sidebar's green waiting state for interactive shell prompts. If no matching rendered step exists yet, shell lifecycle events queue a fallback `tool_start` through `useStreamStore.onStreamEvent` so it stays ordered behind pending thought chunks. Provider shell starts that arrive before `shellRunId` exists merge by provider tool id, preventing duplicate no-run-id shell cards from later becoming duplicate terminals for one run. Active shell tool steps stay expanded when later parallel shell starts arrive, so running sibling terminals do not spawn collapsed. Completed shell steps stay open briefly so the terminal-to-read-only transition can settle, then ChatMessage auto-collapses them unless the user manually toggled that step. Once a terminal shell step has auto-collapsed, later timeline updates preserve that local collapsed state instead of reopening the step from stale `isCollapsed: false` stream metadata.
 
 15. Sub-agent events coordinate panel rendering and child sessions
-- File: `frontend/src/hooks/useChatManager.ts` (Handlers: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`, `subAgentSystemHandler`)
+- File: `frontend/src/hooks/useChatManager.ts` (Handlers: `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`, `systemEventHandler`)
 - File: `frontend/src/store/useSubAgentStore.ts` (Actions: `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent`)
 - File: `frontend/src/components/SubAgentPanel.tsx` (Component: `SubAgentPanel`, Prop: `invocationId`, Handler: `handleStop`)
 
@@ -548,7 +548,7 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 ### Frontend Stores and Hooks
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Socket wiring | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `applyStreamResumeSnapshot`, `stampSubAgentInvocationOnParent`, `wrappedOnStreamToken`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, `syncShellInputStateForSession`, `subAgentSystemHandler`, socket events `stream_resume_snapshot`, `thought`, `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes reconnect snapshots and live socket events into stream, shell-run, sub-agent, notification, and session stores. |
+| Socket wiring | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `applyStreamResumeSnapshot`, `stampSubAgentInvocationOnParent`, `wrappedOnStreamToken`, `systemEventHandler`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, `syncShellInputStateForSession`, socket events `stream_resume_snapshot`, `thought`, `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes reconnect snapshots and live socket events into stream, shell-run, sub-agent, notification, and session stores. |
 | Stream engine | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`, `shellRunPatch`, `isShellDescriptionTitle`, `isShellToolData`, `isTerminalToolStatus`, `isSameShellDescriptionTitle` | Owns stream queues, hydrated assistant reattachment, adaptive typewriter mutation, event merge logic, and active assistant message mapping. |
 | Shell run state | `frontend/src/store/useShellRunStore.ts` | `ShellRunSnapshot`, `ShellRunSnapshot.needsInput`, `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`, `trimShellTranscript`, `pruneShellRuns` | Stores live shell transcripts and shell-run metadata by `runId`, including input-wait state. |
 | Permission response | `frontend/src/store/useChatStore.ts` | `handleRespondPermission`, socket event `respond_permission`, socket event `save_snapshot` | Updates permission timeline responses and emits ACP permission selections. |

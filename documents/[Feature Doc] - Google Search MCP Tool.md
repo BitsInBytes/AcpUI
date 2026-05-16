@@ -10,7 +10,7 @@ This feature sits across MCP tool advertisement, route-mounted tool execution, s
 
 - Advertises `ux_google_web_search` with a JSON Schema requiring `query`.
 - Registers the runtime handler only when effective MCP config enables Google search.
-- Reads API key, timeout, and output limit from `configuration/mcp.json` or the file referenced by `MCP_CONFIG`.
+- Reads API key, timeout, and output limit from `configuration/mcp.json` (or `MCP_CONFIG`), with env-first key lookup via `googleSearch.apiKeyEnv`.
 - Calls `@google/genai` with `models.generateContent`, model `gemini-2.5-flash`, and `tools: [{ googleSearch: {} }]`.
 - Formats response text with citation markers and a `Sources:` section when grounding metadata is present.
 - Returns MCP text content and records Tool System V2 title/category metadata for the UI timeline.
@@ -30,13 +30,14 @@ Feature role: backend MCP tool, backend service, route-mounted MCP API, Tool Sys
 1. **MCP config is loaded and normalized**
    - File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `normalizeMcpConfig`, `isGoogleSearchMcpEnabled`, `getGoogleSearchMcpConfig`)
    - `MCP_CONFIG` selects the JSON config file; the default path is `configuration/mcp.json`.
-   - `tools.googleSearch` accepts boolean form or object form with `enabled`, but effective enablement also requires a trimmed non-empty `googleSearch.apiKey`.
+   - `tools.googleSearch` accepts boolean form or object form with `enabled`; effective enablement requires a trimmed non-empty API key resolved from `googleSearch.apiKeyEnv` (preferred) or `googleSearch.apiKey`.
 
    ```javascript
    // FILE: backend/services/mcpConfig.js (Function: normalizeMcpConfig)
-   const googleSearchApiKey = typeof googleSearch.apiKey === 'string'
-     ? googleSearch.apiKey.trim()
-     : '';
+   const googleSearchApiKeyEnv = stringSetting(googleSearch.apiKeyEnv, 'MCP_GOOGLE_SEARCH_API_KEY');
+   const envGoogleSearchApiKey = stringSetting(env?.[googleSearchApiKeyEnv], '');
+   const configGoogleSearchApiKey = stringSetting(googleSearch.apiKey, '');
+   const googleSearchApiKey = envGoogleSearchApiKey || configGoogleSearchApiKey;
    const requestedGoogleSearch = boolSetting(tools.googleSearch);
 
    tools: {
@@ -207,7 +208,8 @@ Canonical example shape: `configuration/mcp.json.example`.
     "googleSearch": { "enabled": true }
   },
   "googleSearch": {
-    "apiKey": "<google-search-api-key>",
+    "apiKey": "",
+    "apiKeyEnv": "MCP_GOOGLE_SEARCH_API_KEY",
     "timeoutMs": 15000,
     "maxOutputBytes": 262144
   }
@@ -217,7 +219,8 @@ Canonical example shape: `configuration/mcp.json.example`.
 Relevant keys:
 
 - `tools.googleSearch` or `tools.googleSearch.enabled`: requests advertisement and handler registration.
-- `googleSearch.apiKey`: required for effective enablement and service execution.
+- `googleSearch.apiKeyEnv`: preferred environment-variable name used to resolve the API key.
+- `googleSearch.apiKey`: optional fallback when the configured env var is unset.
 - `googleSearch.timeoutMs`: passed to `withTimeout`; default is `15000` when absent or invalid.
 - `googleSearch.maxOutputBytes`: passed to `limitOutput`; default is `262144` when absent or invalid.
 
@@ -402,8 +405,8 @@ Service errors:
 
 ## Gotchas
 
-1. **Enablement requires two config values**
-   - `tools.googleSearch` can request the tool, but `isGoogleSearchMcpEnabled()` returns true only when `googleSearch.apiKey` is non-empty after trimming.
+1. **Enablement requires tool flag plus an API key source**
+   - `tools.googleSearch` can request the tool, but `isGoogleSearchMcpEnabled()` returns true only when an API key resolves from `googleSearch.apiKeyEnv` (preferred) or `googleSearch.apiKey`.
 
 2. **Config is cached in process**
    - `getMcpConfig()` caches the normalized config. Tests call `resetMcpConfigForTests()`. Runtime config edits need the backend path that refreshes process state, or a backend restart, before handler maps and tool definitions reflect them.
@@ -503,7 +506,7 @@ Service errors:
 ## Summary
 
 - `ux_google_web_search` is an optional backend MCP tool for grounded Google Search.
-- Effective enablement requires both requested `tools.googleSearch` and non-empty `googleSearch.apiKey`.
+- Effective enablement requires requested `tools.googleSearch` plus a resolved API key from `googleSearch.apiKeyEnv` (preferred) or `googleSearch.apiKey`.
 - The stdio proxy discovers the tool through `GET /api/mcp/tools` and executes it through `POST /api/mcp/tool-call`.
 - The MCP schema accepts only `query`; API key, timeout, and output limit are config-owned.
 - `googleWebSearch` calls `@google/genai`, formats grounding citations/sources, handles empty text, wraps SDK/timeout failures, and truncates by UTF-8 bytes.

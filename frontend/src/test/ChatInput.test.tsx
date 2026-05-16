@@ -29,6 +29,7 @@ vi.mock('../../hooks/useVoice', () => ({
 describe('ChatInput Unit Test', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    window.history.replaceState({}, '', '/');
     
     act(() => {
       useSystemStore.setState({
@@ -170,6 +171,27 @@ describe('ChatInput Unit Test', () => {
     });
     render(<ChatInput />);
     expect(screen.getByTitle('Stop generating')).toBeInTheDocument();
+  });
+
+  it('shows scratch pad and chat config controls in the main window', () => {
+    render(<ChatInput />);
+    expect(screen.getByTitle('Scratch Pad')).toBeInTheDocument();
+    expect(screen.getByTitle('Open chat config')).toBeInTheDocument();
+  });
+
+  it('hides scratch pad and chat config controls in pop-out mode', () => {
+    const originalLocation = window.location;
+    delete (window as any).location;
+    (window as any).location = { ...originalLocation, search: '?popout=s1' };
+
+    render(<ChatInput />);
+
+    expect(screen.queryByTitle('Scratch Pad')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Open chat config')).not.toBeInTheDocument();
+    expect(useUIStore.getState().isNotesOpen).toBe(false);
+    expect(useUIStore.getState().isSettingsOpen).toBe(false);
+
+    (window as any).location = originalLocation;
   });
 
   it('uses provider-specific input placeholder when session has a provider', () => {

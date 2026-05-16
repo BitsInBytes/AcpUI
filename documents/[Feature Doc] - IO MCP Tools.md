@@ -41,6 +41,7 @@ This is a backend MCP feature with frontend output rendering support. Source own
    io: {
      autoAllowWorkspaceCwd: boolSetting(io.autoAllowWorkspaceCwd),
      allowedRoots: stringArray(io.allowedRoots),
+     wildcardRootMode: wildcardRootModeSetting(io.wildcardRootMode),
      maxReadBytes: numberSetting(io.maxReadBytes, 1048576),
      maxWriteBytes: numberSetting(io.maxWriteBytes, 1048576),
      maxReplaceBytes: numberSetting(io.maxReplaceBytes, 1048576),
@@ -193,7 +194,8 @@ Primary source: `configuration/mcp.json` or the path in `MCP_CONFIG`.
 |---|---|---|
 | `tools.io` or `tools.io.enabled` | `isIoMcpEnabled` | Enables IO schema advertisement and handler registration |
 | `io.autoAllowWorkspaceCwd` | `configuredAllowedRoots` | Adds `DEFAULT_WORKSPACE_CWD` or `process.cwd()` to allowed roots |
-| `io.allowedRoots` | `resolveAllowedPath` | Allowed absolute paths, repo-relative paths, or `*` wildcard |
+| `io.allowedRoots` | `resolveAllowedPath` | Allowed absolute paths or repo-relative paths; `*` is broad local access |
+| `io.wildcardRootMode` | `normalizeMcpConfig` | `warn` allows wildcard roots with a startup warning; `reject` disables `tools.io` when `allowedRoots` includes `*` |
 | `io.maxReadBytes` | `readFile` | Maximum existing file size for `ux_read_file` |
 | `io.maxWriteBytes` | `writeFile` | Maximum UTF-8 byte size for `content` |
 | `io.maxReplaceBytes` | `replaceText` | Maximum source file size and replacement result size |
@@ -216,6 +218,7 @@ Example pattern with placeholder values:
   "io": {
     "autoAllowWorkspaceCwd": true,
     "allowedRoots": ["D:/Git/AcpUI"],
+    "wildcardRootMode": "warn",
     "maxReadBytes": 1048576,
     "maxWriteBytes": 1048576,
     "maxReplaceBytes": 1048576,
@@ -367,7 +370,7 @@ wrapToolHandlers begin
    - `ACP_UX_IO_TOOL_CONFIG` includes metadata for `ux_google_web_search`, but `getIoMcpToolDefinitions` returns the seven IO tools in this guide. Google search schema, handler, config, and service details belong in `documents/[Feature Doc] - Google Search MCP Tool.md`.
 
 4. **Allowed roots are mandatory unless wildcard is configured**
-   - `resolveAllowedPath` rejects paths outside `io.allowedRoots` plus the optional auto-allowed workspace cwd. It canonicalizes existing targets and existing parent directories before `path.relative` containment checks. `allowedRoots: ["*"]` permits any local path.
+   - `resolveAllowedPath` rejects paths outside `io.allowedRoots` plus the optional auto-allowed workspace cwd. It canonicalizes existing targets and existing parent directories before `path.relative` containment checks. `allowedRoots: ["*"]` permits any local path in `warn` mode, and disables `tools.io` in `reject` mode.
 
 5. **Repo-relative roots are rooted at the repository**
    - `configRootToAbsolute` resolves relative roots against the repository root. Do not reason about relative roots from the target file's directory.

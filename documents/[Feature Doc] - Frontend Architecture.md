@@ -51,7 +51,7 @@ This architecture doc intentionally avoids duplicating feature-level rendering r
 1. **Root selection**
    Files: `frontend/src/main.tsx` (Anchor: `isPopout`) and `frontend/src/utils/globalErrorHandler.ts` (Functions: `installGlobalErrorHandler`, `isOpaqueScriptError`)
 
-   `main.tsx` installs the global runtime error handler, then the query string selects either `App` for the normal window or `PopOutApp` for the detached session window. The error handler preserves the visible app for opaque third-party `Script error.` events without an error object, while still rendering the runtime error view for actionable same-origin failures.
+   `main.tsx` installs the global runtime error handler, then the query string selects either `App` for the normal window or `PopOutApp` for the detached session window. The error handler preserves the visible app for opaque third-party `Script error.` events without an error object, renders actionable same-origin failures, and gates detailed stack/message rendering to development mode while keeping production UI messaging sanitized.
 
 2. **Normal-window shell**
    File: `frontend/src/App.tsx` (Component: `App`)

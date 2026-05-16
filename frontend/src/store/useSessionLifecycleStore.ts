@@ -3,6 +3,7 @@ import { Socket } from 'socket.io-client';
 import { useSystemStore } from './useSystemStore';
 import { mergeProviderConfigOptions } from '../utils/configOptions';
 import { getDefaultModelSelection, getModelIdForSelection, normalizeModelOptions } from '../utils/modelOptions';
+import { createUiSessionId } from '../utils/uiSessionId';
 import type { ChatSession, Message, LoadSessionsResponse, CreateSessionResponse, SessionHistoryResponse, StatsResponse } from '../types';
 
 function mergeModelOptions(current?: ChatSession['modelOptions'], incoming?: ChatSession['modelOptions']) {
@@ -155,7 +156,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
 
   handleNewChat: (socket, id, cwd, agent) => {
     if (!socket) return;
-    const uiId = id || Date.now().toString();
+    const uiId = id || createUiSessionId();
     const { sessions } = get();
 
     if (sessions.find(s => s.id === uiId)) return;

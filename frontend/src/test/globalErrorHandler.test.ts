@@ -24,7 +24,7 @@ describe('globalErrorHandler', () => {
 
   it('suppresses opaque script errors without replacing the app root', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    installGlobalErrorHandler('test-root');
+    installGlobalErrorHandler('test-root', { showDetails: true });
 
     const handled = window.onerror?.('Script error.', 'https://cdn.example/app.js', 0, 0, undefined);
 
@@ -37,8 +37,9 @@ describe('globalErrorHandler', () => {
     });
   });
 
-  it('renders actionable runtime errors for non-opaque failures', () => {
-    installGlobalErrorHandler('test-root');
+  it('renders actionable runtime errors with detail in development mode', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    installGlobalErrorHandler('test-root', { showDetails: true });
     const error = new Error('boom');
 
     const handled = window.onerror?.('TypeError: boom', 'app.js', 10, 5, error);
@@ -47,5 +48,20 @@ describe('globalErrorHandler', () => {
     expect(root).toHaveTextContent('Runtime Error');
     expect(root).toHaveTextContent('TypeError: boom');
     expect(root).toHaveTextContent('Error: boom');
+  });
+
+  it('renders sanitized runtime errors without detail in production mode', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    installGlobalErrorHandler('test-root', { showDetails: false });
+    const error = new Error('boom');
+
+    const handled = window.onerror?.('TypeError: boom', 'app.js', 10, 5, error);
+
+    expect(handled).toBe(false);
+    expect(root).toHaveTextContent('Runtime Error');
+    expect(root).toHaveTextContent('Something went wrong. Please refresh the page. If the issue persists, contact your administrator.');
+    expect(root).not.toHaveTextContent('TypeError: boom');
+    expect(root).not.toHaveTextContent('Error: boom');
+    expect(root.querySelector('pre')).toBeNull();
   });
 });

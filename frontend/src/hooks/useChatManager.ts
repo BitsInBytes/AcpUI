@@ -515,6 +515,28 @@ export function useChatManager(
       origOnStreamToken(data);
     };
 
+    const systemEventHandler = (event: StreamEventData) => {
+      if (!shouldProcessSessionStream(event?.sessionId)) return;
+
+      if (pendingSubAgents.has(event.sessionId)) {
+        const pending = pendingSubAgents.get(event.sessionId)!;
+        pendingSubAgents.delete(event.sessionId);
+        useSessionLifecycleStore.setState(state => ({
+          sessions: [...state.sessions, buildLazySubAgentSession(pending)]
+        }));
+      }
+
+      onStreamEvent(event);
+
+      const agents = useSubAgentStore.getState().agents;
+      if (!agents.some(a => a.acpSessionId === event.sessionId)) return;
+      if (event.type === 'tool_start' && event.id && event.title) {
+        useSubAgentStore.getState().addToolStep(event.sessionId, event.id, event.title);
+      } else if (event.type === 'tool_end' && event.id) {
+        useSubAgentStore.getState().updateToolStep(event.sessionId, event.id, event.status || 'completed', event.output);
+      }
+    };
+
     socket.on('stats_push', (data: { providerId?: string; sessionId: string; usedTokens?: number; totalTokens?: number }) => {
       if (!data || !data.sessionId) return;
       const sessionProviderId = data.providerId || useSessionLifecycleStore.getState().sessions.find(s => s.acpSessionId === data.sessionId)?.provider || null;
@@ -548,10 +570,7 @@ export function useChatManager(
       onStreamThought(data);
     });
     socket.on('token', wrappedOnStreamToken);
-    socket.on('system_event', (event: StreamEventData) => {
-      if (!shouldProcessSessionStream(event?.sessionId)) return;
-      onStreamEvent(event);
-    });
+    socket.on('system_event', systemEventHandler);
     socket.on('stream_resume_snapshot', applyStreamResumeSnapshot);
     socket.on('permission_request', (event: StreamEventData) => {
       if (!shouldProcessSessionStream(event?.sessionId)) return;
@@ -767,27 +786,6 @@ export function useChatManager(
         }) }));
     });
 
-    // Route system_event for sub-agent tool steps to the sub-agent store
-    const subAgentSystemHandler = (data: { sessionId: string; type: string; id: string; title: string; status?: string; output?: string }) => {
-      if (!shouldProcessSessionStream(data?.sessionId)) return;
-      // Lazily create session if pending
-      if (pendingSubAgents.has(data.sessionId)) {
-        const pending = pendingSubAgents.get(data.sessionId)!;
-        pendingSubAgents.delete(data.sessionId);
-        useSessionLifecycleStore.setState(state => ({
-          sessions: [...state.sessions, buildLazySubAgentSession(pending)]
-        }));
-      }
-      const agents = useSubAgentStore.getState().agents;
-      if (!agents.some(a => a.acpSessionId === data.sessionId)) return;
-      if (data.type === 'tool_start') {
-        useSubAgentStore.getState().addToolStep(data.sessionId, data.id, data.title);
-      } else if (data.type === 'tool_end') {
-        useSubAgentStore.getState().updateToolStep(data.sessionId, data.id, data.status || 'completed', data.output);
-      }
-    };
-
-    socket.on('system_event', subAgentSystemHandler);
 
     return () => {
       socket.off('stats_push');
@@ -795,7 +793,7 @@ export function useChatManager(
       socket.off('merge_message');
       socket.off('thought');
       socket.off('token');
-      socket.off('system_event');
+      socket.off('system_event', systemEventHandler);
       socket.off('stream_resume_snapshot');
       socket.off('permission_request');
       socket.off('token_done');

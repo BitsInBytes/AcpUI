@@ -6,6 +6,8 @@ import { writeLog } from './logger.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const DEFAULT_CONFIG_PATH = 'configuration/mcp.json';
+const DEFAULT_GOOGLE_SEARCH_API_KEY_ENV = 'MCP_GOOGLE_SEARCH_API_KEY';
+const WILDCARD_ROOT_MODES = new Set(['warn', 'reject']);
 
 let cachedConfig = null;
 
@@ -30,6 +32,17 @@ function stringArray(value) {
     : [];
 }
 
+function stringSetting(value, fallback = '') {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  return trimmed || fallback;
+}
+
+function wildcardRootModeSetting(value) {
+  const normalized = stringSetting(value, 'warn').toLowerCase();
+  return WILDCARD_ROOT_MODES.has(normalized) ? normalized : 'warn';
+}
+
 function disabledConfig(source, reason) {
   return {
     source,
@@ -45,6 +58,7 @@ function disabledConfig(source, reason) {
     io: {
       autoAllowWorkspaceCwd: false,
       allowedRoots: [],
+      wildcardRootMode: 'warn',
       maxReadBytes: 1048576,
       maxWriteBytes: 1048576,
       maxReplaceBytes: 1048576,
@@ -61,6 +75,7 @@ function disabledConfig(source, reason) {
     },
     googleSearch: {
       apiKey: '',
+      apiKeyEnv: DEFAULT_GOOGLE_SEARCH_API_KEY_ENV,
       timeoutMs: 15000,
       maxOutputBytes: 262144
     },
@@ -71,16 +86,23 @@ function disabledConfig(source, reason) {
   };
 }
 
-function normalizeMcpConfig(raw, source) {
+function normalizeMcpConfig(raw, source, env = process.env) {
   const tools = raw?.tools || {};
   const io = raw?.io || {};
   const webFetch = raw?.webFetch || {};
   const googleSearch = raw?.googleSearch || {};
   const subagents = raw?.subagents || {};
 
-  const googleSearchApiKey = typeof googleSearch.apiKey === 'string'
-    ? googleSearch.apiKey.trim()
-    : '';
+  const requestedIo = boolSetting(tools.io);
+  const allowedRoots = stringArray(io.allowedRoots);
+  const wildcardRootMode = wildcardRootModeSetting(io.wildcardRootMode);
+  const hasWildcardRoot = allowedRoots.includes('*');
+  const ioEnabled = requestedIo && !(hasWildcardRoot && wildcardRootMode === 'reject');
+
+  const googleSearchApiKeyEnv = stringSetting(googleSearch.apiKeyEnv, DEFAULT_GOOGLE_SEARCH_API_KEY_ENV);
+  const envGoogleSearchApiKey = stringSetting(env?.[googleSearchApiKeyEnv], '');
+  const configGoogleSearchApiKey = stringSetting(googleSearch.apiKey, '');
+  const googleSearchApiKey = envGoogleSearchApiKey || configGoogleSearchApiKey;
   const requestedGoogleSearch = boolSetting(tools.googleSearch);
 
   return {
@@ -90,12 +112,13 @@ function normalizeMcpConfig(raw, source) {
       invokeShell: boolSetting(tools.invokeShell),
       subagents: boolSetting(tools.subagents),
       counsel: boolSetting(tools.counsel),
-      io: boolSetting(tools.io),
+      io: ioEnabled,
       googleSearch: requestedGoogleSearch && Boolean(googleSearchApiKey)
     },
     io: {
       autoAllowWorkspaceCwd: boolSetting(io.autoAllowWorkspaceCwd),
-      allowedRoots: stringArray(io.allowedRoots),
+      allowedRoots,
+      wildcardRootMode,
       maxReadBytes: numberSetting(io.maxReadBytes, 1048576),
       maxWriteBytes: numberSetting(io.maxWriteBytes, 1048576),
       maxReplaceBytes: numberSetting(io.maxReplaceBytes, 1048576),
@@ -114,6 +137,7 @@ function normalizeMcpConfig(raw, source) {
     },
     googleSearch: {
       apiKey: googleSearchApiKey,
+      apiKeyEnv: googleSearchApiKeyEnv,
       timeoutMs: numberSetting(googleSearch.timeoutMs, 15000),
       maxOutputBytes: numberSetting(googleSearch.maxOutputBytes, 262144)
     },
@@ -130,11 +154,27 @@ function buildMcpConfig(env = process.env) {
 
   try {
     const raw = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
-    const config = normalizeMcpConfig(raw, resolvedPath);
+    const config = normalizeMcpConfig(raw, resolvedPath, env);
     writeLog(`[MCP CONFIG] Loaded MCP config from ${resolvedPath}`);
-    if (boolSetting(raw?.tools?.googleSearch) && !config.googleSearch.apiKey) {
-      writeLog('[MCP CONFIG] Google search MCP disabled; googleSearch.apiKey is required when tools.googleSearch is enabled.');
+
+    if (boolSetting(raw?.tools?.io) && config.io.allowedRoots.includes('*')) {
+      if (config.io.wildcardRootMode === 'reject') {
+        writeLog('[MCP CONFIG] IO MCP disabled; io.allowedRoots includes "*" while io.wildcardRootMode="reject". Replace wildcard roots with explicit paths or set wildcardRootMode="warn" for local-only override.');
+      } else {
+        writeLog('[MCP CONFIG] Warning: io.allowedRoots includes "*" with tools.io enabled. This grants broad local filesystem access. Prefer explicit allowed roots or set io.wildcardRootMode="reject" to block wildcard usage.');
+      }
     }
+
+    if (boolSetting(raw?.tools?.googleSearch)) {
+      const envApiKey = stringSetting(env?.[config.googleSearch.apiKeyEnv], '');
+      const configApiKey = stringSetting(raw?.googleSearch?.apiKey, '');
+      if (!config.googleSearch.apiKey) {
+        writeLog(`[MCP CONFIG] Google search MCP disabled; set ${config.googleSearch.apiKeyEnv} (preferred) or googleSearch.apiKey when tools.googleSearch is enabled.`);
+      } else if (!envApiKey && configApiKey) {
+        writeLog(`[MCP CONFIG] Google search MCP key loaded from configuration file. Prefer ${config.googleSearch.apiKeyEnv} to keep secrets out of mcp.json.`);
+      }
+    }
+
     return config;
   } catch (err) {
     writeLog(`[MCP CONFIG] MCP tools disabled; failed to load ${resolvedPath}: ${err.message}`);

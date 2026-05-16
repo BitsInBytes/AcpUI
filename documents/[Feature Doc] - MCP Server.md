@@ -343,7 +343,7 @@ File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `getSubagentsM
 | `tools.counsel` | `configuration/mcp.json` | Advertises and registers `ux_invoke_counsel`; also enables `ux_check_subagents` and `ux_abort_subagents`. |
 | `subagents.statusWaitTimeoutMs` / `subagents.statusPollIntervalMs` | `configuration/mcp.json` | Controls how long `ux_check_subagents` waits by default and how often it polls before returning partial progress. |
 | `tools.io` | `configuration/mcp.json` | Advertises and registers IO tools. |
-| `tools.googleSearch` plus `googleSearch.apiKey` | `configuration/mcp.json` | Advertises and registers `ux_google_web_search` only when both are configured. |
+| `tools.googleSearch` plus resolved API key (`googleSearch.apiKeyEnv` preferred, fallback `googleSearch.apiKey`) | `configuration/mcp.json` | Advertises and registers `ux_google_web_search` only when both are configured. |
 | `io.*` | `configuration/mcp.json` | Controls file IO roots, auto-allow behavior, and byte limits used by IO handlers. |
 | `webFetch.*` | `configuration/mcp.json` | Controls protocol, host, CIDR, byte, timeout, and redirect limits for `ux_web_fetch`. |
 | `googleSearch.*` | `configuration/mcp.json` | Controls API key, timeout, and output size for Google search. |
@@ -352,7 +352,7 @@ File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `getSubagentsM
 | `DEFAULT_WORKSPACE_CWD` | Runtime environment | Supplies default working directory for shell and IO contexts when a call omits `cwd` or `dir_path`. |
 | `MAX_SHELL_RESULT_LINES` | Runtime environment | Caps shell result lines in `getMaxShellResultLines`. |
 
-Missing or malformed MCP config produces a disabled config through `disabledConfig`; all config-controlled tools are disabled in that state. Google search also requires a non-empty `googleSearch.apiKey`.
+Missing or malformed MCP config produces a disabled config through `disabledConfig`; all config-controlled tools are disabled in that state. Google search also requires an API key resolved from `googleSearch.apiKeyEnv` (preferred) or `googleSearch.apiKey`.
 
 ### Request and State Shapes
 

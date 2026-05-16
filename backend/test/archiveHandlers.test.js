@@ -150,6 +150,7 @@ describe('archiveHandlers', () => {
         acpSessionId: 'acp-1',
         provider: 'provider-b',
       }));
+      expect(db.saveSession.mock.calls[0][0].id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
       expect(callback).toHaveBeenCalledWith(expect.objectContaining({ success: true, providerId: 'provider-b' }));
     });
 

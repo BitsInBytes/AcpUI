@@ -7,7 +7,7 @@ import { installGlobalErrorHandler } from './utils/globalErrorHandler'
 
 const isPopout = new URLSearchParams(window.location.search).has('popout');
 
-installGlobalErrorHandler();
+installGlobalErrorHandler('root', { showDetails: import.meta.env.DEV });
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

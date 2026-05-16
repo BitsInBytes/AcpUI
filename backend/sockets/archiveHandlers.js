@@ -5,6 +5,7 @@ import * as db from '../database.js';
 import { getProvider, getProviderModule } from '../services/providerLoader.js';
 import { getAttachmentsRoot } from '../services/attachmentVault.js';
 import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
+import { createUiSessionId } from '../services/uiSessionId.js';
 
 function collectDescendants(allSessions, parentId) {
   const descendants = [];
@@ -152,7 +153,7 @@ export default function registerArchiveHandlers(io, socket) {
       const saved = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
       const restoredProvider = getProvider(saved.provider || archiveProvider.id);
       const restoredProviderId = restoredProvider.id;
-      const newUiId = Date.now().toString();
+      const newUiId = createUiSessionId();
       const providerModule = await getProviderModule(restoredProviderId);
 
       if (saved.acpSessionId) {

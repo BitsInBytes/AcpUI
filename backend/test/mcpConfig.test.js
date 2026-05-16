@@ -103,6 +103,7 @@ describe('MCP config', () => {
       io: {
         autoAllowWorkspaceCwd: true,
         allowedRoots: ['*', ' D:/Git/AcpUI '],
+        wildcardRootMode: 'warn',
         maxReadBytes: 42,
         maxWriteBytes: 43,
         maxReplaceBytes: 44,
@@ -131,6 +132,7 @@ describe('MCP config', () => {
     expect(getIoMcpConfig()).toEqual({
       autoAllowWorkspaceCwd: true,
       allowedRoots: ['*', 'D:/Git/AcpUI'],
+      wildcardRootMode: 'warn',
       maxReadBytes: 42,
       maxWriteBytes: 43,
       maxReplaceBytes: 44,
@@ -147,6 +149,7 @@ describe('MCP config', () => {
     });
     expect(getGoogleSearchMcpConfig()).toEqual({
       apiKey: 'configured-key',
+      apiKeyEnv: 'MCP_GOOGLE_SEARCH_API_KEY',
       timeoutMs: 48,
       maxOutputBytes: 49
     });
@@ -171,6 +174,39 @@ describe('MCP config', () => {
     });
   });
 
+  it('rejects wildcard roots when strict wildcard mode is enabled', () => {
+    writeTempConfig({
+      tools: { io: true },
+      io: {
+        allowedRoots: ['*'],
+        wildcardRootMode: 'reject'
+      }
+    });
+
+    expect(isIoMcpEnabled()).toBe(false);
+    expect(getIoMcpConfig()).toEqual(expect.objectContaining({
+      allowedRoots: ['*'],
+      wildcardRootMode: 'reject'
+    }));
+  });
+
+  it('uses Google search API key from environment when configured', () => {
+    vi.stubEnv('MCP_GOOGLE_SEARCH_API_KEY', 'env-key');
+    writeTempConfig({
+      tools: { googleSearch: true },
+      googleSearch: {
+        apiKey: 'configured-key',
+        apiKeyEnv: 'MCP_GOOGLE_SEARCH_API_KEY'
+      }
+    });
+
+    expect(isGoogleSearchMcpEnabled()).toBe(true);
+    expect(getGoogleSearchMcpConfig()).toEqual(expect.objectContaining({
+      apiKey: 'env-key',
+      apiKeyEnv: 'MCP_GOOGLE_SEARCH_API_KEY'
+    }));
+  });
+
   it('disables Google search when enabled without an MCP config API key', () => {
     writeTempConfig({
       tools: { googleSearch: true },
@@ -184,6 +220,7 @@ describe('MCP config', () => {
     expect(isGoogleSearchMcpEnabled()).toBe(false);
     expect(getGoogleSearchMcpConfig()).toEqual({
       apiKey: '',
+      apiKeyEnv: 'MCP_GOOGLE_SEARCH_API_KEY',
       timeoutMs: 48,
       maxOutputBytes: 49
     });

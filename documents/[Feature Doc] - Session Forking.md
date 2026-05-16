@@ -78,7 +78,7 @@ const providerId = session.provider || getProvider().id;
 const runtime = providerRuntimeManager.getRuntime(providerId);
 const providerModule = await getProviderModule(providerId);
 const newAcpId = crypto.randomUUID();
-const newUiId = `fork-${Date.now()}`;
+const newUiId = createUiSessionId('fork');
 
 providerModule.cloneSession(session.acpSessionId, newAcpId, Math.ceil((messageIndex + 1) / 2));
 ```
@@ -546,9 +546,9 @@ The frontend `merge_message` handler appends `{ role: 'user' }` to the parent se
 
 SQLite does not enforce `forked_from` relationships. Use `delete_session` for parent deletion so descendants, attachment directories, and ACP files are cleaned consistently.
 
-10. `fork-${Date.now()}` is the UI ID format
+10. createUiSessionId('fork') is the fork UI ID format
 
-Fork UI IDs use millisecond timestamps. The ACP ID is a UUID. Code that needs a globally unique transport identity must use `acpSessionId`, not the UI ID.
+Fork UI IDs are created with `createUiSessionId('fork')`, so they are UUID-backed and collision-safe. The ACP ID is also a UUID. Code that needs a globally unique transport identity must use `acpSessionId`, not the UI ID.
 
 ---
 

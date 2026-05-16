@@ -76,6 +76,19 @@ describe('useChatManager hook', () => {
     expect(mockSocket.on).toHaveBeenCalled();
   });
 
+  it('registers one system_event listener and removes only that handler on cleanup', () => {
+    const { unmount } = renderHook(() => useChatManager(vi.fn()));
+
+    const systemEventRegistrations = mockSocket.on.mock.calls.filter((c: any) => c[0] === 'system_event');
+    expect(systemEventRegistrations).toHaveLength(1);
+
+    const handler = systemEventRegistrations[0][1];
+    unmount();
+
+    expect(mockSocket.off).toHaveBeenCalledWith('system_event', handler);
+    expect(mockSocket.off.mock.calls.some((c: any[]) => c[0] === 'system_event' && c.length === 1)).toBe(false);
+  });
+
   it('handles "stats_push" event', () => {
     const setSessions = vi.fn();
     act(() => {
@@ -1185,7 +1198,7 @@ describe('useChatManager hook', () => {
 
     renderHook(() => useChatManager(vi.fn()));
     const startedHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_started')[1];
-    const systemHandlers = mockSocket.on.mock.calls.filter((c: any) => c[0] === 'system_event').map((c: any) => c[1]);
+    const systemHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'system_event')[1];
 
     act(() => {
       startedHandler({
@@ -1200,7 +1213,7 @@ describe('useChatManager hook', () => {
         model: 'explicit-subagent-model',
         invocationId: 'inv-event'
       });
-      for (const h of systemHandlers) h({ sessionId: 'sub-acp-event', type: 'noop', id: 't1', title: 'Tool' });
+      systemHandler({ sessionId: 'sub-acp-event', type: 'noop', id: 't1', title: 'Tool' });
     });
 
     const created = useSessionLifecycleStore.getState().sessions.find((s: any) => s.id === 'sub-ui-event') as any;
@@ -1407,16 +1420,15 @@ describe('useChatManager hook', () => {
     });
 
     renderHook(() => useChatManager(vi.fn()));
-    // system_event is registered twice (onStreamEvent + subAgentSystemHandler)
-    const handlers = mockSocket.on.mock.calls.filter((c: any) => c[0] === 'system_event').map((c: any) => c[1]);
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'system_event')[1];
 
     act(() => {
-      for (const h of handlers) h({ sessionId: 'sub-acp', type: 'tool_start', id: 't1', title: 'Tool' });
+      handler({ sessionId: 'sub-acp', type: 'tool_start', id: 't1', title: 'Tool' });
     });
     expect(addToolStep).toHaveBeenCalledWith('sub-acp', 't1', 'Tool');
 
     act(() => {
-      for (const h of handlers) h({ sessionId: 'sub-acp', type: 'tool_end', id: 't1', title: 'Tool', status: 'success', output: 'done' });
+      handler({ sessionId: 'sub-acp', type: 'tool_end', id: 't1', title: 'Tool', status: 'success', output: 'done' });
     });
     expect(updateToolStep).toHaveBeenCalledWith('sub-acp', 't1', 'success', 'done');
   });

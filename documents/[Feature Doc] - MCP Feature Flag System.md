@@ -18,7 +18,7 @@ This feature matters because MCP tool availability crosses several boundaries: c
 - ACP agents can only call tools returned by the stdio proxy's `ListTools` handler.
 - `POST /api/mcp/tool-call` can only execute names present in the backend handler map.
 - A missing, unreadable, or malformed MCP config disables all config-controlled tools.
-- Google search requires both `tools.googleSearch` and a non-empty `googleSearch.apiKey`.
+- Google search requires `tools.googleSearch` plus an API key resolved from `googleSearch.apiKeyEnv` (preferred) or `googleSearch.apiKey`.
 - IO, web fetch, and search guardrails are normalized once and reused by the tool services.
 
 ### Architectural Role
@@ -223,7 +223,8 @@ The default runtime file is `configuration/mcp.json`. The example file documents
   },
   "io": {
     "autoAllowWorkspaceCwd": true,
-    "allowedRoots": [],
+    "allowedRoots": ["D:/path/to/your/workspace"],
+    "wildcardRootMode": "warn",
     "maxReadBytes": 1048576,
     "maxWriteBytes": 1048576,
     "maxReplaceBytes": 1048576,
@@ -240,6 +241,7 @@ The default runtime file is `configuration/mcp.json`. The example file documents
   },
   "googleSearch": {
     "apiKey": "",
+    "apiKeyEnv": "MCP_GOOGLE_SEARCH_API_KEY",
     "timeoutMs": 15000,
     "maxOutputBytes": 262144
   }
@@ -253,7 +255,7 @@ Supported keys under `tools`:
 - `subagents` gates `ux_invoke_subagents` and enables `ux_check_subagents` plus `ux_abort_subagents`.
 - `counsel` gates `ux_invoke_counsel` and also enables `ux_check_subagents` plus `ux_abort_subagents`.
 - `io` gates `ux_read_file`, `ux_write_file`, `ux_replace`, `ux_list_directory`, `ux_glob`, `ux_grep_search`, and `ux_web_fetch`.
-- `googleSearch` gates `ux_google_web_search` only when `googleSearch.apiKey` is also non-empty.
+- `googleSearch` gates `ux_google_web_search` only when an API key resolves from `googleSearch.apiKeyEnv` (preferred) or `googleSearch.apiKey`.
 
 Each flag accepts either a boolean or an object with `enabled`:
 
@@ -287,6 +289,7 @@ File: `backend/services/mcpConfig.js` (Function: `normalizeMcpConfig`)
   io: {
     autoAllowWorkspaceCwd: Boolean,
     allowedRoots: String[],
+    wildcardRootMode: 'warn' | 'reject',
     maxReadBytes: Number,
     maxWriteBytes: Number,
     maxReplaceBytes: Number,
@@ -303,6 +306,7 @@ File: `backend/services/mcpConfig.js` (Function: `normalizeMcpConfig`)
   },
   googleSearch: {
     apiKey: String,
+    apiKeyEnv: String,
     timeoutMs: Number,
     maxOutputBytes: Number
   }
@@ -313,7 +317,7 @@ File: `backend/services/mcpConfig.js` (Function: `normalizeMcpConfig`)
 
 File: `backend/services/ioMcp/filesystem.js` (Functions: `configuredAllowedRoots`, `resolveAllowedPath`, `readFile`, `writeFile`, `replaceText`, `limitTextOutput`)
 
-The filesystem tools use `getIoMcpConfig()` for allowed roots and byte caps. `autoAllowWorkspaceCwd` adds `DEFAULT_WORKSPACE_CWD` or `process.cwd()` to the allowed roots. `allowedRoots: ["*"]` permits any resolved path.
+The filesystem tools use `getIoMcpConfig()` for allowed roots and byte caps. `autoAllowWorkspaceCwd` adds `DEFAULT_WORKSPACE_CWD` or `process.cwd()` to the allowed roots. `allowedRoots: ["*"]` permits broad local access in `warn` mode and disables `tools.io` in `reject` mode.
 
 File: `backend/services/ioMcp/webFetch.js` (Functions: `webFetch`, `assertUrlAllowed`, `fetchWithRedirects`, `readResponseText`)
 
@@ -387,7 +391,7 @@ File: `backend/services/ioMcp/googleWebSearch.js` (Function: `googleWebSearch`)
 
 7. **Google search has a double gate**
 
-   `isGoogleSearchMcpEnabled` is true only when `tools.googleSearch` is enabled and `googleSearch.apiKey` trims to a non-empty string. The API key is not part of the advertised input schema.
+   `isGoogleSearchMcpEnabled` is true only when `tools.googleSearch` is enabled and an API key resolves from `googleSearch.apiKeyEnv` (preferred) or `googleSearch.apiKey`. The API key is not part of the advertised input schema.
 
 8. **`tools.io` also gates web fetch**
 

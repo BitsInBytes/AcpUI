@@ -252,12 +252,12 @@ Files:
 - `backend/database.js` (Function: `saveSession`)
 - `providers/<provider>/index.js` (Function: `restoreSessionFiles`)
 
-The backend reads `session.json`, creates `newUiId` from `Date.now().toString()`, calls the provider restore hook, copies attachments to the new UI id, writes a new SQLite session row, removes the archive folder, and returns the new UI id.
+The backend reads `session.json`, creates `newUiId` via `createUiSessionId()`, calls the provider restore hook, copies attachments to the new UI id, writes a new SQLite session row, removes the archive folder, and returns the new UI id.
 
 ```javascript
 // FILE: backend/sockets/archiveHandlers.js (Socket event: restore_archive)
 const saved = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
-const newUiId = Date.now().toString();
+const newUiId = createUiSessionId();
 const providerModule = await getProviderModule(providerId);
 
 if (saved.acpSessionId) {
@@ -413,7 +413,7 @@ Restore consumes these fields directly. Fields outside this shape are ignored un
 
 ### Restore Identity Contract
 
-- Restore always creates a new UI id with `Date.now().toString()`.
+- Restore always creates a new UI id with `createUiSessionId()`.
 - Restore stores `saved.acpSessionId` as the session `acpSessionId`.
 - Restore calls `providerModule.restoreSessionFiles(saved.acpSessionId, archiveDir)` and ignores the return value.
 - Restore saves the session unpinned with `isPinned: false`.
@@ -544,7 +544,7 @@ Archive copies `getAttachmentsRoot()/uiId` to `archiveDir/attachments` and remov
 
 ### 1. Restore Creates a New UI Id but Reuses the Archived ACP Id
 
-The restore handler creates `newUiId` with `Date.now().toString()` and stores `saved.acpSessionId` in the restored row. `restoreSessionFiles` return values are ignored. Provider hooks should restore files for the saved ACP id unless the backend restore contract is changed together with tests.
+The restore handler creates `newUiId` with `createUiSessionId()` and stores `saved.acpSessionId` in the restored row. `restoreSessionFiles` return values are ignored. Provider hooks should restore files for the saved ACP id unless the backend restore contract is changed together with tests.
 
 ### 2. Restore Persists Provider Id
 

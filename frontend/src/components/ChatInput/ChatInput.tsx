@@ -33,6 +33,7 @@ const ChatInput: React.FC = () => {
   const { handleSubmit, handleCancel } = useChatStore();
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
+  const isPopout = new URLSearchParams(window.location.search).has('popout');
   const branding = useSystemStore(state => state.getBranding(activeSession?.provider));
   const activeProvider = activeSession?.provider || useSystemStore.getState().activeProviderId;
   const providerCommands = activeProvider ? slashCommandsByProviderId[activeProvider] : null;
@@ -214,14 +215,16 @@ const ChatInput: React.FC = () => {
           >
             <Paperclip size={20} />
           </button>
-          <button
-            type="button"
-            className={`input-action-btn ${useSessionLifecycleStore.getState().sessionNotes[activeSessionId || ''] ? 'has-notes' : ''}`}
-            onClick={() => useUIStore.getState().setNotesOpen(true)}
-            title="Scratch Pad"
-          >
-            <StickyNote size={20} />
-          </button>
+          {!isPopout && (
+            <button
+              type="button"
+              className={`input-action-btn ${useSessionLifecycleStore.getState().sessionNotes[activeSessionId || ''] ? 'has-notes' : ''}`}
+              onClick={() => useUIStore.getState().setNotesOpen(true)}
+              title="Scratch Pad"
+            >
+              <StickyNote size={20} />
+            </button>
+          )}
 
           <div className="textarea-container">
             <SlashDropdown
@@ -367,7 +370,7 @@ const ChatInput: React.FC = () => {
           modelDropdownRef={modelDropdownRef}
           getActiveModelQuotaPercent={() => null}
           disabled={!!isDisabled}
-          onOpenSettings={() => activeSession && setSettingsOpen(true, activeSession.id, 'config')}
+          onOpenSettings={isPopout ? undefined : () => activeSession && setSettingsOpen(true, activeSession.id, 'config')}
         />
       </div>
     </footer>

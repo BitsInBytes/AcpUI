@@ -421,7 +421,7 @@ if (data.index === 0) {
 
 ### 13. Streams Materialize Sidebar Sessions Lazily
 
-File: `frontend/src/hooks/useChatManager.ts` (Handlers: `wrappedOnStreamToken`, `subAgentSystemHandler`)
+File: `frontend/src/hooks/useChatManager.ts` (Handlers: `wrappedOnStreamToken`, `systemEventHandler`)
 File: `frontend/src/store/useStreamStore.ts` (Actions: `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`)
 
 A sub-agent `ChatSession` is not created on `sub_agent_started`. It is created when the first `token` or `system_event` arrives for a pending sub-agent ACP session.
@@ -445,7 +445,7 @@ const subSession = {
 };
 ```
 
-There are two `system_event` listeners in `useChatManager`: the general stream handler updates the full timeline, and `subAgentSystemHandler` updates `useSubAgentStore.toolSteps` for the orchestration panel.
+`useChatManager` uses one `system_event` listener (`systemEventHandler`) that dispatches timeline updates through `onStreamEvent` and routes sub-agent tool step updates into `useSubAgentStore.toolSteps`.
 
 ### 14. Permissions Route to the Panel
 
@@ -845,9 +845,9 @@ model/current_model_id/model_options_json = resolved model state
 
    `sub_agent_started` adds panel state and a pending entry. The sidebar `ChatSession` is created only on the first `token` or `system_event` from that sub-agent ACP session.
 
-5. Two `system_event` handlers run in the frontend.
+5. `system_event` handling is centralized in one frontend dispatcher.
 
-   `onStreamEvent` feeds the full timeline, and `subAgentSystemHandler` feeds `useSubAgentStore.toolSteps`. Debugging code should account for both handlers receiving the same socket event.
+   `systemEventHandler` feeds `onStreamEvent` for timeline updates and `useSubAgentStore.toolSteps` for panel tool progress. Debugging should follow that single dispatch path.
 
 6. Permission responses use provider runtime state.
 
@@ -1088,7 +1088,7 @@ model/current_model_id/model_options_json = resolved model state
 2. Parent ToolStep has a generic title or no panel: check `mcpExecutionRegistry.begin`, `resolveToolInvocation`, `subAgentToolHandler.onStart`, and `ToolStep` `canonicalName || toolName` handling.
 3. Panel renders empty: check that `sub_agent_started` / `sub_agent_snapshot` include `invocationId`, `useSubAgentStore.addAgent` stores it, `useChatManager` resolves the parent from either UI or ACP ID, and pending stamps replay after parent history hydrates.
 4. Sidebar entry is missing: check `pendingSubAgents`, then verify a `token` or `system_event` arrived for the sub-agent ACP session.
-5. Tool steps show in the sidebar but not the panel: check the second `system_event` handler in `useChatManager` and the `useSubAgentStore.addToolStep` / `updateToolStep` actions.
+5. Tool steps show in the sidebar but not the panel: check `useChatManager.systemEventHandler` dispatch and the `useSubAgentStore.addToolStep` / `updateToolStep` actions.
 6. Permission prompt appears in the main timeline: check whether the permission event `sessionId` matches a registered `SubAgentEntry.acpSessionId`.
 7. Sub-agent events reach the wrong browser: check parent room membership in `io.fetchSockets()` and the `session:${parentAcpSessionId}` room join branch.
 8. Nested sub-agent tools lack context: check `bindMcpProxy` after `session/new` and `resolveMcpProxy` in `POST /tool-call`.

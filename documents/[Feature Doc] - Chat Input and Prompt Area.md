@@ -11,6 +11,7 @@ This feature matters because it is the frontend boundary that creates `prompt` s
 - Merges provider slash commands with local custom commands and routes selected commands through the same submit path as typed prompts.
 - Emits `save_snapshot`, `prompt`, `cancel_prompt`, `set_session_model`, `set_session_option`, and `merge_fork` socket events through store and component handlers.
 - Displays footer state from provider branding, session model metadata, config options, context usage, compaction state, canvas state, terminal state, and auto-scroll state.
+- Hides Scratch Pad and chat-config triggers in pop-out mode because `PopOutApp` does not mount `NotesModal` or `SessionSettingsModal`.
 - Converts attachments into ACP prompt parts in `registerPromptHandlers` before sending `session/prompt` to the active provider runtime.
 
 ### Why This Matters

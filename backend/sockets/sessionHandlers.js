@@ -35,6 +35,7 @@ import {
 } from '../services/sessionManager.js';
 import { bindMcpProxy, getMcpProxyIdFromServers } from '../mcp/mcpProxyRegistry.js';
 import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
+import { createUiSessionId } from '../services/uiSessionId.js';
 
 async function saveModelState(sessionId, modelState) {
   if (typeof db.saveModelState === 'function') {
@@ -283,7 +284,7 @@ export default function registerSessionHandlers(io, socket) {
 
       const crypto = await import('crypto');
       const newAcpId = crypto.randomUUID();
-      const newUiId = `fork-${Date.now()}`;
+      const newUiId = createUiSessionId('fork');
       const oldAcpId = session.acpSessionId;
 
       providerModule.cloneSession(oldAcpId, newAcpId, Math.ceil((messageIndex + 1) / 2));

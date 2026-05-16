@@ -8,7 +8,8 @@
   },
   "io": {
     "autoAllowWorkspaceCwd": true,
-    "allowedRoots": [],
+    "allowedRoots": ["D:/path/to/your/workspace"],
+    "wildcardRootMode": "warn",
     "maxReadBytes": 1048576,
     "maxWriteBytes": 1048576,
     "maxReplaceBytes": 1048576,
@@ -25,6 +26,7 @@
   },
   "googleSearch": {
     "apiKey": "",
+    "apiKeyEnv": "MCP_GOOGLE_SEARCH_API_KEY",
     "timeoutMs": 15000,
     "maxOutputBytes": 262144
   },

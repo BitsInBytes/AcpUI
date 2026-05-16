@@ -240,6 +240,7 @@ describe('Session Handlers', () => {
     const handler = mockSocket.listeners('fork_session')[0];
     await handler({ uiId: 'ui-1', messageIndex: 0 }, callback);
     expect(mockProviderModule.cloneSession).toHaveBeenCalled();
+    expect(mockDb.saveSession).toHaveBeenCalledWith(expect.objectContaining({ id: 'fork-mock-uuid' }));
   });
 
   it('handles create_session', async () => {
