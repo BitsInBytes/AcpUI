@@ -140,6 +140,10 @@ certutil -addstore -user -f "Root" ".\backend\.ssl\cert.pem"
 
 Restart your browser fully after trusting the certificate.
 
+MCP proxy backend calls now keep TLS verification enabled by default. The backend passes `backend/.ssl/cert.pem` to MCP proxy children through `NODE_EXTRA_CA_CERTS` when the file exists, so the documented local cert flow remains the supported path.
+
+For local troubleshooting only, you can opt in to insecure MCP proxy TLS bypass by setting `ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS=1` before starting the backend. This disables certificate verification for MCP proxy backend calls and is intentionally disabled by default.
+
 ## 7. Configure Voice STT (Optional)
 
 The application supports real-time voice-to-text input using Whisper.
@@ -298,4 +302,5 @@ Frontend test setup mocks `HTMLCanvasElement.getContext`, `window.alert`, and `w
 - **Socket disconnects** — check `pingTimeout` in `backend/server.js`.
 - **Extensions not working** — verify `protocolPrefix` in `provider.json` matches ACP daemon output.
 - **MCP tools missing from agents** — verify `configuration/mcp.json`, the provider `mcpName`, backend restart, and new/reloaded ACP sessions.
+- **MCP proxy TLS/certificate errors** — run `cd backend; node generate-ssl.js`, trust `backend/.ssl/cert.pem`, then restart backend + agent session. Use `ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS=1` only as a local troubleshooting override.
 - **Voice input unavailable** — verify `VOICE_STT_ENABLED=true`, whisper files exist under `backend/whisper/`, and `STT_PORT` is not already in use.

@@ -90,7 +90,7 @@ export function buildMcpServersForProvider(providerId = null, { acpSessionId = n
       { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
       { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
       { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
-      { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' }
+      { name: 'NODE_EXTRA_CA_CERTS', value: 'absolute/path/to/backend/.ssl/cert.pem' }
     ],
     ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
   }];
@@ -348,7 +348,8 @@ File: `backend/services/mcpConfig.js` (Functions: `getMcpConfig`, `getSubagentsM
 | `webFetch.*` | `configuration/mcp.json` | Controls protocol, host, CIDR, byte, timeout, and redirect limits for `ux_web_fetch`. |
 | `googleSearch.*` | `configuration/mcp.json` | Controls API key, timeout, and output size for Google search. |
 | `BACKEND_PORT` | Runtime environment and proxy env | Tells the stdio proxy which backend port to call. |
-| `NODE_TLS_REJECT_UNAUTHORIZED` | MCP server env and proxy process env | Allows localhost backend calls with local SSL certificates. |
+| `NODE_EXTRA_CA_CERTS` | MCP server env and proxy process env | Adds the local backend cert (`backend/.ssl/cert.pem`) to trusted roots for MCP proxy HTTPS calls. |
+| `ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS` | Runtime environment (opt-in) | Local-only troubleshooting override that injects `NODE_TLS_REJECT_UNAUTHORIZED=0` for MCP proxy child processes. Disabled by default. |
 | `DEFAULT_WORKSPACE_CWD` | Runtime environment | Supplies default working directory for shell and IO contexts when a call omits `cwd` or `dir_path`. |
 | `MAX_SHELL_RESULT_LINES` | Runtime environment | Caps shell result lines in `getMaxShellResultLines`. |
 
@@ -368,7 +369,7 @@ MCP server entry passed to ACP:
     { "name": "ACP_UI_MCP_PROXY_ID", "value": "mcp-proxy-id" },
     { "name": "ACP_UI_MCP_PROXY_AUTH_TOKEN", "value": "mcp-proxy-auth-token" },
     { "name": "BACKEND_PORT", "value": "3005" },
-    { "name": "NODE_TLS_REJECT_UNAUTHORIZED", "value": "0" }
+    { "name": "NODE_EXTRA_CA_CERTS", "value": "D:/Git/AcpUI/backend/.ssl/cert.pem" }
   ],
   "_meta": { "provider_namespace": { "option": true } }
 }

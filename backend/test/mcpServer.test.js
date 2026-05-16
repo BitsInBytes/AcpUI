@@ -272,6 +272,24 @@ describe('mcpServer', () => {
     ]));
   });
 
+  it('getMcpServers keeps TLS verification enabled by default', () => {
+    vi.stubEnv('ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS', '0');
+    const servers = getMcpServers('provider-a');
+    const tlsRejectEntry = servers[0].env.find((entry) => entry?.name === 'NODE_TLS_REJECT_UNAUTHORIZED');
+    const insecureFlagEntry = servers[0].env.find((entry) => entry?.name === 'ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS');
+    expect(tlsRejectEntry).toBeUndefined();
+    expect(insecureFlagEntry).toBeUndefined();
+  });
+
+  it('getMcpServers allows explicit insecure TLS override for local debugging', () => {
+    vi.stubEnv('ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS', '1');
+    const servers = getMcpServers('provider-a');
+    expect(servers[0].env).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS', value: '1' }),
+      expect.objectContaining({ name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' })
+    ]));
+  });
+
   describe('core MCP feature flags', () => {
     it('registers core handlers when MCP config enables them', () => {
       useMcpConfig();

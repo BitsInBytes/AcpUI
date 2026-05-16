@@ -16,8 +16,13 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
-// Accept self-signed certs for localhost backend communication
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+const INSECURE_MCP_PROXY_TLS_ENV = 'ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS';
+
+function isTruthyEnvValue(value) {
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
 
 function getBackendUrl() {
   return `https://localhost:${process.env.BACKEND_PORT || '3005'}`;
@@ -43,6 +48,36 @@ function buildServerInstructions(tools = [], serverName = 'AcpUI') {
   ].join('\n');
 }
 
+function isTlsCertificateError(err) {
+  const code = err?.code || err?.cause?.code || '';
+  const message = String(err?.message || err?.cause?.message || '').toLowerCase();
+  const tlsCodes = new Set([
+    'DEPTH_ZERO_SELF_SIGNED_CERT',
+    'SELF_SIGNED_CERT_IN_CHAIN',
+    'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+    'CERT_HAS_EXPIRED',
+    'ERR_TLS_CERT_ALTNAME_INVALID'
+  ]);
+
+  if (code && tlsCodes.has(String(code).toUpperCase())) return true;
+
+  return (
+    message.includes('certificate') ||
+    message.includes('self-signed') ||
+    message.includes('unable to verify') ||
+    message.includes('tls')
+  );
+}
+
+function buildTlsFailureMessage(requestPath, err) {
+  const code = err?.code || err?.cause?.code || 'unknown';
+  return [
+    `[MCP PROXY] TLS certificate verification failed for ${getBackendUrl()}${requestPath} (${code}).`,
+    'Trust the local backend certificate from SETUP.md (generate/trust backend/.ssl/cert.pem).',
+    `For local troubleshooting only, set ${INSECURE_MCP_PROXY_TLS_ENV}=1 to opt into insecure TLS bypass.`
+  ].join(' ');
+}
+
 async function backendFetch(path, options = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -53,6 +88,9 @@ async function backendFetch(path, options = {}) {
       return await res.json();
     } catch (err) {
       if (options.signal?.aborted || err.name === 'AbortError') throw err;
+      if (isTlsCertificateError(err)) {
+        throw new Error(buildTlsFailureMessage(path, err), { cause: err });
+      }
       if (attempt < 2) await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
       else throw err;
     }
@@ -76,6 +114,10 @@ export function mapBackendToolsToMcpListTools(tools = []) {
 }
 
 export async function runProxy() {
+  if (isTruthyEnvValue(process.env[INSECURE_MCP_PROXY_TLS_ENV])) {
+    process.stderr.write(`[MCP PROXY] WARNING: ${INSECURE_MCP_PROXY_TLS_ENV}=1 disables TLS certificate verification.\n`);
+  }
+
   const providerId = process.env.ACP_SESSION_PROVIDER_ID || '';
   const proxyId = process.env.ACP_UI_MCP_PROXY_ID || '';
   const proxyAuthToken = process.env.ACP_UI_MCP_PROXY_AUTH_TOKEN || '';

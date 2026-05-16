@@ -28,6 +28,8 @@ describe('stdio-proxy', () => {
     process.env.ACP_SESSION_PROVIDER_ID = 'provider-a';
     process.env.ACP_UI_MCP_PROXY_ID = 'proxy-1';
     process.env.ACP_UI_MCP_PROXY_AUTH_TOKEN = 'proxy-auth-token';
+    delete process.env.ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS;
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   });
 
   it('runs the proxy lifecycle', async () => {
@@ -44,6 +46,16 @@ describe('stdio-proxy', () => {
     );
   });
 
+  it('does not force-disable TLS verification by default', async () => {
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';
+    global.fetch.mockResolvedValue({
+      json: () => Promise.resolve({ tools: [], serverName: 'test' })
+    });
+
+    await runProxy();
+    expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe('1');
+  });
+
   it('handles fetch errors with retry', async () => {
     global.fetch
       .mockRejectedValueOnce(new Error('fail'))
@@ -51,6 +63,22 @@ describe('stdio-proxy', () => {
     
     await runProxy();
     expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces actionable TLS trust errors without retrying', async () => {
+    const certErr = new Error('self-signed certificate');
+    certErr.code = 'DEPTH_ZERO_SELF_SIGNED_CERT';
+    global.fetch.mockRejectedValueOnce(certErr);
+
+    try {
+      await runProxy();
+      throw new Error('Expected runProxy to fail on TLS certificate error');
+    } catch (err) {
+      expect(String(err?.message || err)).toContain('TLS certificate verification failed');
+      expect(String(err?.message || err)).toContain('SETUP.md');
+    }
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 
   it('handles ListTools and CallTool requests', async () => {

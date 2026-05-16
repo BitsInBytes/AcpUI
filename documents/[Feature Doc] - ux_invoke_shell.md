@@ -53,7 +53,7 @@ return [{
     { name: 'ACP_UI_MCP_PROXY_ID', value: proxyId },
     { name: 'ACP_UI_MCP_PROXY_AUTH_TOKEN', value: String(proxyAuthToken || '') },
     { name: 'BACKEND_PORT', value: String(process.env.BACKEND_PORT || 3005) },
-    { name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' }
+    { name: 'NODE_EXTRA_CA_CERTS', value: 'absolute/path/to/backend/.ssl/cert.pem' }
   ],
   ...(mcpServerMeta ? { _meta: mcpServerMeta } : {})
 }];
@@ -477,7 +477,8 @@ File: `backend/services/shellRunManager.js` (Functions: `getMaxShellResultLines`
 - `ACP_SESSION_PROVIDER_ID`: provider context passed into the stdio proxy.
 - `ACP_UI_MCP_PROXY_ID`: proxy binding key used by `resolveMcpProxy`.
 - `ACP_UI_MCP_PROXY_AUTH_TOKEN`: per-proxy secret forwarded as `x-acpui-mcp-proxy-auth` for `/api/mcp/tool-call` authorization.
-- `NODE_TLS_REJECT_UNAUTHORIZED=0`: lets the local stdio proxy call the self-signed HTTPS backend.
+- `NODE_EXTRA_CA_CERTS`: points MCP proxy child processes at `backend/.ssl/cert.pem` so TLS verification stays enabled for local HTTPS backend calls.
+- `ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS=1`: local-only opt-in that injects `NODE_TLS_REJECT_UNAUTHORIZED=0` for MCP proxy troubleshooting.
 - `SHELL_V2_ENABLED`: exported and tested by `isShellV2Enabled`; it is not a runtime gate in the shell execution path.
 - PTY env override `GIT_PAGER=cat`: prevents Git commands from launching an interactive pager while preserving the shell tool's stdin path for commands that genuinely need input.
 

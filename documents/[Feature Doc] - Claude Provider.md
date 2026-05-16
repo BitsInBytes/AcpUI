@@ -70,7 +70,7 @@ Claude is a provider-specific backend adapter. The frontend stays provider-agnos
 
    - `create_session` obtains Claude `sessionParams` from `buildSessionParams(requestAgent)`.
    - `buildSessionParams` always returns `_meta.claudeCode.options.disallowedTools` with `Bash`, `PowerShell`, and `Agent`; it adds `_meta.claudeCode.options.agent` when an agent is supplied.
-   - `getMcpServers` builds the AcpUI stdio MCP proxy with env keys `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `BACKEND_PORT`, and `NODE_TLS_REJECT_UNAUTHORIZED`.
+   - `getMcpServers` builds the AcpUI stdio MCP proxy with env keys `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `BACKEND_PORT`, and `NODE_EXTRA_CA_CERTS`; it adds `NODE_TLS_REJECT_UNAUTHORIZED=0` only when `ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS=1` is explicitly set.
    - Claude `getMcpServerMeta` returns `undefined`, so Claude MCP server entries do not include `_meta`.
    - `setInitialAgent` is a no-op because Claude agent selection is applied through spawn-time `_meta` fields.
 

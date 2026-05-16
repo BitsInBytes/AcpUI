@@ -161,7 +161,7 @@ File: `backend/services/sessionManager.js` (Functions: `getMcpServers`, `loadSes
 
 The `create_session` handler resolves the runtime, checks `isHandshakeComplete`, loads provider config and module, calls `providerModule.buildSessionParams(requestAgent)`, and sends either `session/new` or `session/load` with `cwd`, `mcpServers`, and any returned provider params.
 
-`getMcpServers(providerId, { acpSessionId })` reads provider config key `mcpName`. If absent, no MCP server is advertised. If present, it creates a stdio proxy server entry with `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `BACKEND_PORT`, `NODE_TLS_REJECT_UNAUTHORIZED`, and optional `_meta` from `providerModule.getMcpServerMeta()`.
+`getMcpServers(providerId, { acpSessionId })` reads provider config key `mcpName`. If absent, no MCP server is advertised. If present, it creates a stdio proxy server entry with `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `BACKEND_PORT`, `NODE_EXTRA_CA_CERTS`, and optional `_meta` from `providerModule.getMcpServerMeta()`. The local-only troubleshooting override `ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS=1` is required before `NODE_TLS_REJECT_UNAUTHORIZED=0` is injected.
 
 Model and config state are captured through `extractModelState`, `providerModule.normalizeModelState`, `providerModule.normalizeConfigOptions`, and persisted with database helpers. `setInitialAgent(acpClient, sessionId, requestAgent)` is called after session creation and after non-hot `session/load` when an agent is requested.
 

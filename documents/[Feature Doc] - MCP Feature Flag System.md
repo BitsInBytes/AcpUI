@@ -84,7 +84,7 @@ This is a backend control plane for MCP tools. The frontend renders tool effects
    File: `backend/services/sessionManager.js` (Function: `getMcpServers`)
    File: `backend/mcp/mcpServer.js` (Function: `getMcpServers`)
 
-   Main session create/load/fork flows call `sessionManager.getMcpServers`. Sub-agent invocation code uses `mcpServer.getMcpServers`. Both functions return a `node backend/mcp/stdio-proxy.js` server config when the provider has `config.mcpName`, create an MCP proxy binding, and pass `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN`, `BACKEND_PORT`, and `NODE_TLS_REJECT_UNAUTHORIZED` in the server env.
+   Main session create/load/fork flows call `sessionManager.getMcpServers`. Sub-agent invocation code uses `mcpServer.getMcpServers`. Both functions return a `node backend/mcp/stdio-proxy.js` server config when the provider has `config.mcpName`, create an MCP proxy binding, and pass `ACP_SESSION_PROVIDER_ID`, `ACP_UI_MCP_PROXY_ID`, `ACP_UI_MCP_PROXY_AUTH_TOKEN`, `BACKEND_PORT`, and `NODE_EXTRA_CA_CERTS` in the server env. They only inject `NODE_TLS_REJECT_UNAUTHORIZED=0` when `ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS` is explicitly enabled.
 
    ```js
    // FILE: backend/services/sessionManager.js (Function: getMcpServers)

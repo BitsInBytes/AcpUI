@@ -14,6 +14,10 @@ describe('sessionManager', () => {
     clearMcpProxyRegistry();
   });
 
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   describe('getMcpServers', () => {
     it('should return empty if no mcpName', () => {
       getProvider.mockReturnValue({ config: {} });
@@ -29,7 +33,22 @@ describe('sessionManager', () => {
       expect(servers[0].env).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: 'ACP_UI_MCP_PROXY_ID', value: expect.stringMatching(/^mcp-proxy-/) })
       ]));
+      const tlsRejectEntry = servers[0].env.find((entry) => entry?.name === 'NODE_TLS_REJECT_UNAUTHORIZED');
+      const insecureFlagEntry = servers[0].env.find((entry) => entry?.name === 'ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS');
+      expect(tlsRejectEntry).toBeUndefined();
+      expect(insecureFlagEntry).toBeUndefined();
       expect(servers[0]._meta).toBeUndefined();
+    });
+
+    it('should include explicit insecure TLS override when enabled', () => {
+      getProvider.mockReturnValue({ config: { mcpName: 'test-mcp' } });
+      getProviderModuleSync.mockReturnValue({ getMcpServerMeta: () => undefined });
+      vi.stubEnv('ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS', '1');
+      const servers = sessionManager.getMcpServers('p1');
+      expect(servers[0].env).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'ACP_UI_ALLOW_INSECURE_MCP_PROXY_TLS', value: '1' }),
+        expect.objectContaining({ name: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0' })
+      ]));
     });
 
     it('should attach _meta when getMcpServerMeta returns a value', () => {
