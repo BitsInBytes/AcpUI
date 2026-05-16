@@ -12,11 +12,11 @@ function isShellDescriptionTitle(title?: string) {
 }
 
 function isShellToolData(event: Partial<StreamEventData & SystemEvent>) {
-  return isAcpUxShellToolEvent(event) || event.isShellCommand === true || event.toolCategory === 'shell';
+  return Boolean(event.shellRunId) || isAcpUxShellToolEvent(event) || event.isShellCommand === true || event.toolCategory === 'shell';
 }
 
 function isTerminalToolStatus(status?: string) {
-  return status === 'completed' || status === 'failed';
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
 }
 
 function isActiveShellToolStep(step?: TimelineStep) {
@@ -59,6 +59,22 @@ function isActiveSubAgentToolStep(step?: TimelineStep) {
 function collapseForNewTimelineStep(step: TimelineStep): TimelineStep {
   if (isActiveShellToolStep(step) || isActiveSubAgentToolStep(step)) return { ...step, isCollapsed: false };
   return { ...step, isCollapsed: true };
+}
+
+function contentFromMessage(message: Message): string {
+  if (typeof message.content === 'string' && message.content.length > 0) return message.content;
+  return (message.timeline || [])
+    .filter((step): step is Extract<TimelineStep, { type: 'text' }> => step.type === 'text')
+    .map(step => step.content || '')
+    .join('');
+}
+
+function findHydratedActiveAssistant(messages: Message[]): Message | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role === 'assistant' && message.isStreaming) return message;
+  }
+  return undefined;
 }
 
 /**
@@ -107,7 +123,28 @@ export const useStreamStore = create<StreamState>((set, get) => ({
     if (!session) return;
 
     const activeMsgId = activeMsgIdByAcp[acpSessionId];
-    if (activeMsgId && session.messages.some(m => m.id === activeMsgId)) return;
+    const mappedMessage = activeMsgId ? session.messages.find(m => m.id === activeMsgId) : undefined;
+    if (mappedMessage && activeMsgId) {
+      if (get().displayedContentByMsg[activeMsgId] === undefined) {
+        const existingContent = contentFromMessage(mappedMessage);
+        set(state => ({
+          displayedContentByMsg: { ...state.displayedContentByMsg, [activeMsgId]: existingContent },
+          settledLengthByMsg: { ...state.settledLengthByMsg, [activeMsgId]: existingContent.length }
+        }));
+      }
+      return;
+    }
+
+    const hydratedMessage = findHydratedActiveAssistant(session.messages);
+    if (hydratedMessage) {
+      const existingContent = contentFromMessage(hydratedMessage);
+      set(state => ({
+        activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [acpSessionId]: hydratedMessage.id },
+        displayedContentByMsg: { ...state.displayedContentByMsg, [hydratedMessage.id]: existingContent },
+        settledLengthByMsg: { ...state.settledLengthByMsg, [hydratedMessage.id]: existingContent.length }
+      }));
+      return;
+    }
 
     const newMsgId = `assistant-${Date.now()}`;
     set(state => ({
@@ -215,7 +252,20 @@ export const useStreamStore = create<StreamState>((set, get) => ({
 
       if (isQueueEmpty || isTimedOut) {
         clearInterval(check);
-        const activeMsgId = activeMsgIdByAcp[sessionId];
+        let activeMsgId = activeMsgIdByAcp[sessionId];
+        if (!activeMsgId) {
+          const hydratedSession = useSessionLifecycleStore.getState().sessions.find(s => s.acpSessionId === sessionId);
+          const hydratedMessage = hydratedSession ? findHydratedActiveAssistant(hydratedSession.messages) : undefined;
+          if (hydratedMessage) {
+            const existingContent = contentFromMessage(hydratedMessage);
+            activeMsgId = hydratedMessage.id;
+            set(state => ({
+              activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [sessionId]: hydratedMessage.id },
+              displayedContentByMsg: { ...state.displayedContentByMsg, [hydratedMessage.id]: existingContent },
+              settledLengthByMsg: { ...state.settledLengthByMsg, [hydratedMessage.id]: existingContent.length }
+            }));
+          }
+        }
         const isCompacting = useSessionLifecycleStore.getState().sessions
           .filter(s => s.acpSessionId === sessionId)
           .some(s => useSystemStore.getState().getCompacting(s.provider, sessionId));
@@ -307,7 +357,10 @@ export const useStreamStore = create<StreamState>((set, get) => ({
           updatedSession.messages = updatedSession.messages.map(msg => {
             if (msg.id === activeMsgId) {
               const t = [...(msg.timeline || [])];
-              if (type === 'permission_request') t.push({ type: 'permission', request: action.data, isCollapsed: false });
+              if (type === 'permission_request') {
+                const alreadyPresent = t.some(step => step.type === 'permission' && step.request.id === action.data.id);
+                if (!alreadyPresent) t.push({ type: 'permission', request: action.data, isCollapsed: false });
+              }
               else if (type === 'tool_start') {
                 const shellPatch = shellRunPatch(action.data.shellRunId) as Partial<StreamEventData & SystemEvent>;
                 const incomingTerminalStatus = isTerminalToolStatus(action.data.status);
@@ -376,6 +429,12 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                   if (existingStep.type === 'tool') {
                     const { title: incomingTitle } = action.data;
                     const mergedFilePath = filePath || existingStep.event.filePath;
+                    const incomingTerminalStatus = isTerminalToolStatus(status);
+                    const hasExistingShellOutput = Boolean((existingStep.event.shellRunId || action.data.shellRunId) && existingStep.event.output);
+                    const incomingOutputIsBlank = output === '' || output === null;
+                    const mergedOutput = hasExistingShellOutput && (!incomingTerminalStatus || incomingOutputIsBlank)
+                      ? existingStep.event.output
+                      : output ?? existingStep.event.output;
 
                     // Selection logic:
                     // 1. Prefer authoritative handler titles.
@@ -432,7 +491,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                       event: {
                         ...existingStep.event,
                         status: status || existingStep.event.status,
-                        output: (existingStep.event.shellRunId ? existingStep.event.output : output) || existingStep.event.output,
+                        output: mergedOutput,
                         filePath: mergedFilePath,
                         title: bestTitle,
                         titleSource: bestTitleSource || action.data.titleSource || existingStep.event.titleSource,
@@ -444,6 +503,13 @@ export const useStreamStore = create<StreamState>((set, get) => ({
                         toolCategory: action.data.toolCategory || existingStep.event.toolCategory,
                         isShellCommand: action.data.isShellCommand ?? existingStep.event.isShellCommand,
                         isFileOperation: action.data.isFileOperation ?? existingStep.event.isFileOperation,
+                        shellRunId: action.data.shellRunId || existingStep.event.shellRunId,
+                        shellState: action.data.shellState || (incomingTerminalStatus && isShellToolData(existingStep.event) ? 'exited' : existingStep.event.shellState),
+                        shellNeedsInput: action.data.shellNeedsInput ?? (incomingTerminalStatus && isShellToolData(existingStep.event) ? false : existingStep.event.shellNeedsInput),
+                        shellInteractive: action.data.shellInteractive ?? existingStep.event.shellInteractive,
+                        command: action.data.command || existingStep.event.command,
+                        cwd: action.data.cwd || existingStep.event.cwd,
+                        invocationId: action.data.invocationId || existingStep.event.invocationId,
                         endTime: status === 'completed' ? Date.now() : existingStep.event.endTime
                       },
                       isCollapsed: false

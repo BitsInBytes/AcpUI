@@ -6,6 +6,8 @@ import {
 } from './acpUxTools.js';
 import { toolCallState } from './toolCallState.js';
 import { getProvider } from '../providerLoader.js';
+import { writeLog } from '../logger.js';
+import { persistStreamEvent } from '../sessionStreamPersistence.js';
 
 const DEFAULT_MCP_SERVER_NAME = 'AcpUI';
 const RECENT_EXECUTION_TTL_MS = 60_000;
@@ -167,20 +169,51 @@ export function invocationFromMcpExecution(record) {
     }),
     category: descriptor.category || {},
     filePath: descriptor.filePath,
-    output: record.output,
+    output: record.output || record.error,
+    status: record.status,
     execution: record
   };
 }
 
-function emitMcpToolUpdate(io, record) {
-  const invocation = invocationFromMcpExecution(record);
-  if (!io || !record.providerId || !record.sessionId || !record.toolCallId || !invocation?.display?.title) return;
+function terminalStatus(record) {
+  if (record?.status === 'completed') return 'completed';
+  if (record?.status === 'failed') return 'failed';
+  return record?.status || undefined;
+}
 
-  io.to?.(`session:${record.sessionId}`)?.emit?.('system_event', compactObject({
+function cachedToolCallRecord(record) {
+  if (!record?.providerId || !record.sessionId || !record.toolCallId) return null;
+  return toolCallState.get(record.providerId, record.sessionId, record.toolCallId);
+}
+
+function invocationIdFromOutput(output) {
+  if (typeof output !== 'string') return null;
+  const jsonMatch = output.match(/"invocationId"\s*:\s*"([^"]+)"/);
+  if (jsonMatch?.[1]) return jsonMatch[1];
+  const labelMatch = output.match(/Invocation ID:\s*([^\s]+)/i);
+  return labelMatch?.[1] || null;
+}
+
+function isSubAgentStartTool(toolName) {
+  return toolName === ACP_UX_TOOL_NAMES.invokeSubagents || toolName === ACP_UX_TOOL_NAMES.invokeCounsel;
+}
+
+function mcpToolEventFromRecord(record, invocation) {
+  const status = terminalStatus(record);
+  const cached = cachedToolCallRecord(record);
+  const shellRunId = record.toolName === ACP_UX_TOOL_NAMES.invokeShell
+    ? cached?.toolSpecific?.shellRunId
+    : null;
+  const invocationId = isSubAgentStartTool(record.toolName)
+    ? cached?.toolSpecific?.invocationId || invocationIdFromOutput(invocation.output)
+    : cached?.toolSpecific?.invocationId;
+  return compactObject({
     providerId: record.providerId,
     sessionId: record.sessionId,
-    type: 'tool_update',
+    type: status === 'completed' || status === 'failed' ? 'tool_end' : 'tool_update',
     id: record.toolCallId,
+    status,
+    output: invocation.output,
     toolName: record.toolName,
     canonicalName: record.toolName,
     mcpServer: invocation.identity.mcpServer,
@@ -189,8 +222,27 @@ function emitMcpToolUpdate(io, record) {
     title: invocation.display.title,
     titleSource: invocation.display.titleSource,
     filePath: invocation.filePath,
+    shellRunId,
+    invocationId,
+    ...(record.toolName === ACP_UX_TOOL_NAMES.invokeShell && status === 'completed' ? { shellState: 'exited', shellNeedsInput: false } : {}),
+    ...(record.toolName === ACP_UX_TOOL_NAMES.invokeShell && status === 'failed' ? { shellState: 'exited', shellNeedsInput: false } : {}),
     ...invocation.category
-  }));
+  });
+}
+
+function persistMcpToolUpdate(record, invocation) {
+  if (!record?.providerId || !record.sessionId || !record.toolCallId) return;
+  const event = mcpToolEventFromRecord(record, invocation);
+  if (!event.type) return;
+  void persistStreamEvent({ providerId: record.providerId, sessionMetadata: new Map() }, record.sessionId, event, { force: true })
+    .catch(err => writeLog(`[MCP TOOL] Failed to persist ${record.toolName} update for ${record.sessionId}: ${err.message}`));
+}
+
+function emitMcpToolUpdate(io, record) {
+  const invocation = invocationFromMcpExecution(record);
+  if (!io || !record.providerId || !record.sessionId || !record.toolCallId || !invocation?.display?.title) return;
+
+  io.to?.(`session:${record.sessionId}`)?.emit?.('system_event', mcpToolEventFromRecord(record, invocation));
 }
 
 export class McpExecutionRegistry {
@@ -232,7 +284,7 @@ export class McpExecutionRegistry {
     }
   }
 
-  project(record, { emitUpdate = false } = {}) {
+  project(record, { emitUpdate = false, persistUpdate = false } = {}) {
     if (record.providerId && record.sessionId && record.toolCallId) {
       const invocation = invocationFromMcpExecution(record);
       toolCallState.upsert({
@@ -247,6 +299,7 @@ export class McpExecutionRegistry {
         output: invocation.output,
         raw: { mcpExecutionId: record.executionId }
       });
+      if (persistUpdate) persistMcpToolUpdate(record, invocation);
     }
     if (emitUpdate) emitMcpToolUpdate(record.io, record);
   }
@@ -313,7 +366,7 @@ export class McpExecutionRegistry {
     record.completedAt = nowMs();
     record.updatedAt = nowMs();
     this.records.set(record.executionId, record);
-    this.project(record);
+    this.project(record, { emitUpdate: true, persistUpdate: true });
     return record;
   }
 
@@ -325,7 +378,7 @@ export class McpExecutionRegistry {
     record.completedAt = nowMs();
     record.updatedAt = nowMs();
     this.records.set(record.executionId, record);
-    this.project(record);
+    this.project(record, { emitUpdate: true, persistUpdate: true });
     return record;
   }
 

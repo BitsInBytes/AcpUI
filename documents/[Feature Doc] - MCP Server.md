@@ -235,7 +235,7 @@ File: `backend/mcp/mcpServer.js` (Function: `wrapToolHandlers`)
 File: `backend/services/tools/mcpExecutionRegistry.js` (Functions: `begin`, `complete`, `fail`, `publicMcpToolInput`, `toolCallIdFromMcpContext`)
 File: `backend/services/tools/toolCallState.js` (Functions: `upsert`, `get`, `clear`)
 
-Each registered handler is wrapped. The wrapper removes internal fields from public input, starts an MCP execution record, completes or fails the record after the handler resolves, and returns the original handler result. `mcpExecutionRegistry.begin` emits an immediate `system_event` tool update when provider id, ACP session id, tool call id, and title are available.
+Each registered handler is wrapped. The wrapper removes internal fields from public input, starts an MCP execution record, completes or fails the record after the handler resolves, and returns the original handler result. `mcpExecutionRegistry.begin` emits an immediate `system_event` tool update when provider id, ACP session id, tool call id, and title are available; `complete` and `fail` emit and persist terminal `tool_end` updates with output/status so reloads can render completed MCP tool state even when the UI was closed.
 
 ```javascript
 // FILE: backend/mcp/mcpServer.js (Function: wrapToolHandlers)
@@ -321,7 +321,7 @@ The MCP server contract has four synchronized layers:
 
 4. Tool execution identity and output projection.
 - `wrapToolHandlers` must surround every registered handler.
-- `mcpExecutionRegistry.begin`, `complete`, and `fail` own the canonical MCP execution state.
+- `mcpExecutionRegistry.begin`, `complete`, and `fail` own the canonical MCP execution state and persist terminal tool updates through stream persistence.
 - `toolCallIdFromMcpContext` recognizes `requestMeta.toolCallId`, `requestMeta.tool_call_id`, `requestMeta.callId`, and MCP-shaped request ids.
 - Handlers return MCP content objects such as `{ content: [{ type: 'text', text: '...' }] }`.
 
@@ -466,7 +466,7 @@ Tool state projection written by `mcpExecutionRegistry`:
 | IO schemas | `backend/mcp/ioMcpToolDefinitions.js` | `getIoMcpToolDefinitions`, `getGoogleSearchMcpToolDefinitions` | Provides JSON Schema and annotations for optional IO/search tools. |
 | IO handlers | `backend/mcp/ioMcpToolHandlers.js` | `createIoMcpToolHandlers`, `createGoogleSearchMcpToolHandlers` | Implements optional file, search, and fetch tool behavior. |
 | MCP config | `backend/services/mcpConfig.js` | `getMcpConfig`, `resetMcpConfigForTests`, `isInvokeShellMcpEnabled`, `isSubagentsMcpEnabled`, `isCounselMcpEnabled`, `isIoMcpEnabled`, `isGoogleSearchMcpEnabled`, `getSubagentsMcpConfig`, `getIoMcpConfig`, `getWebFetchMcpConfig`, `getGoogleSearchMcpConfig` | Loads and normalizes feature flags and per-tool limits. |
-| Execution registry | `backend/services/tools/mcpExecutionRegistry.js` | `McpExecutionRegistry`, `mcpExecutionRegistry`, `begin`, `complete`, `fail`, `find`, `publicMcpToolInput`, `toolCallIdFromMcpContext`, `invocationFromMcpExecution` | Tracks MCP executions and projects canonical tool metadata. |
+| Execution registry | `backend/services/tools/mcpExecutionRegistry.js` | `McpExecutionRegistry`, `mcpExecutionRegistry`, `begin`, `complete`, `fail`, `find`, `publicMcpToolInput`, `toolCallIdFromMcpContext`, `invocationFromMcpExecution` | Tracks MCP executions, projects canonical tool metadata, and persists terminal output/status updates. |
 | Tool state cache | `backend/services/tools/toolCallState.js` | `upsert`, `get`, `clear` | Stores timeline-visible tool invocation metadata. |
 | Invocation resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider updates with cached MCP execution state. |
 | Shell runner | `backend/services/shellRunManager.js` | `startPreparedRun`, `setIo` | Owns terminal-backed shell execution for `ux_invoke_shell`. |
@@ -479,6 +479,7 @@ Tool state projection written by `mcpExecutionRegistry`:
 |---|---|---|---|
 | API routes | `backend/test/mcpApi.test.js` | `MCP API Routes`, `GET /tools returns tool list with JSON Schema`, `GET /tools hides disabled core tools`, `POST /tool-call passes resolved proxy context to handlers`, `POST /tool-call aborts the handler signal when the request fires the "aborted" event`, `POST /tool-call aborts the handler signal when the response closes before completion` | Verifies `/api/mcp/*` definitions, dispatch, context, errors, and abort wiring. |
 | Server helpers | `backend/test/mcpServer.test.js` | `mcpServer`, `getMcpServers returns server config`, `getMcpServers attaches _meta when getMcpServerMeta returns a value`, `core MCP feature flags`, `optional IO MCP tools`, `ux_invoke_shell`, `ux_invoke_subagents`, `ux_check_subagents`, `ux_abort_subagents`, `ux_invoke_counsel` | Verifies server config, feature-gated handlers, wrapper projection, shell behavior, and sub-agent behavior. |
+| Registry persistence | `backend/test/mcpExecutionRegistryPersistence.test.js` | `mcpExecutionRegistry persistence projection`, `persists terminal MCP tool updates with invocation metadata` | Verifies terminal MCP execution records emit and persist final tool updates with invocation metadata. |
 | Stdio proxy | `backend/test/stdio-proxy.test.js` | `stdio-proxy`, `runs the proxy lifecycle`, `handles fetch errors with retry`, `handles ListTools and CallTool requests`, `throws error after max retries in backendFetch`, `does not retry when fetch throws an AbortError` | Verifies proxy startup, list/call forwarding, metadata passthrough, retry, and abort behavior. |
 | Drift parity | `backend/test/mcpToolMetadataDrift.test.js` | `mcp tool metadata drift checks`, `keeps advertised route tools in sync with registered handlers`, `keeps stdio proxy schema mapping aligned with advertised tool metadata`, `keeps frontend and backend AcpUI tool-name registries aligned` | Detects route/handler/proxy/frontend metadata drift for canonical AcpUI MCP tools. |
 | Proxy registry | `backend/test/mcpProxyRegistry.test.js` | `mcpProxyRegistry`, `creates and resolves a pending proxy binding`, `creates pre-bound proxy bindings for known sessions`, `binds pending proxy bindings after session creation`, `rejects provider mismatches when binding`, `expires only unbound proxy bindings`, `extracts proxy id from MCP server env` | Verifies proxy binding lifecycle and extraction from `mcpServers`. |
@@ -517,7 +518,7 @@ Tool state projection written by `mcpExecutionRegistry`:
 
 7. Handler wrapping owns UI metadata.
 - Problem: bypassing `wrapToolHandlers` skips `mcpExecutionRegistry` and loses canonical names, titles, file paths, categories, and output projection.
-- Detection: tool updates should appear in `toolCallState` and Socket.IO `system_event` calls in `mcpServer.test.js`.
+- Detection: tool updates should appear in `toolCallState`, Socket.IO `system_event` calls in `mcpServer.test.js`, and persisted terminal updates in `mcpExecutionRegistryPersistence.test.js`.
 
 8. Internal handler args must not become public tool input.
 - Problem: provider/session/request fields can leak into displayed tool input if `publicMcpToolInput` is bypassed.
@@ -538,7 +539,7 @@ Tool state projection written by `mcpExecutionRegistry`:
 Run these when changing MCP server creation, stdio proxy behavior, `/api/mcp/*`, handler wrapping, or execution metadata:
 
 ```powershell
-cd backend; npx vitest run test/mcpApi.test.js test/mcpServer.test.js test/stdio-proxy.test.js test/mcpToolMetadataDrift.test.js test/mcpProxyRegistry.test.js test/sessionManager.test.js test/subAgentInvocationManager.test.js test/toolInvocationResolver.test.js test/acpUiToolTitles.test.js test/mcpConfig.test.js test/server.test.js
+cd backend; npx vitest run test/mcpApi.test.js test/mcpServer.test.js test/mcpExecutionRegistryPersistence.test.js test/stdio-proxy.test.js test/mcpToolMetadataDrift.test.js test/mcpProxyRegistry.test.js test/sessionManager.test.js test/subAgentInvocationManager.test.js test/toolInvocationResolver.test.js test/acpUiToolTitles.test.js test/mcpConfig.test.js test/server.test.js
 ```
 
 ### High-Value Test Names
@@ -562,6 +563,8 @@ cd backend; npx vitest run test/mcpApi.test.js test/mcpServer.test.js test/stdio
   - `deduplicates repeated MCP request ids for the same parent session`
   - `binds the MCP proxy id to the sub-agent ACP session after session/new`
   - `runs counsel through the sub-agent invocation pipeline when the subagents tool is hidden`
+- `backend/test/mcpExecutionRegistryPersistence.test.js`
+  - `persists terminal MCP tool updates with invocation metadata`
 - `backend/test/stdio-proxy.test.js`
   - `runs the proxy lifecycle`
   - `handles fetch errors with retry`
@@ -620,6 +623,6 @@ cd backend; npx vitest run test/mcpApi.test.js test/mcpServer.test.js test/stdio
 - `/api/mcp/tools` advertises schemas from definition modules according to `mcpConfig` feature flags.
 - `/api/mcp/tool-call` owns timeout disabling, context resolution, abort signal creation, handler dispatch, and response safety.
 - `createToolHandlers` registers core, IO, and search handlers behind the same feature flags used for advertisement.
-- `wrapToolHandlers` and `mcpExecutionRegistry` are the canonical bridge from MCP calls to timeline-visible AcpUI tool metadata.
+- `wrapToolHandlers` and `mcpExecutionRegistry` are the canonical bridge from MCP calls to timeline-visible and persisted AcpUI tool metadata.
 - `requestMeta`, `mcpRequestId`, `providerId`, `acpSessionId`, and `mcpProxyId` are the fields that keep execution records correlated with provider updates.
 - The main breakage risk is divergence between canonical tool names, advertised definitions, registered handlers, proxy context, and execution-state projection.

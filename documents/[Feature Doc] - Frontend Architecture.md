@@ -131,7 +131,7 @@ flowchart TB
 | Owner | Events | Responsibility |
 |---|---|---|
 | `useSocket` | `connect`, `disconnect`, `config_errors`, `providers`, `ready`, `voice_enabled`, `workspace_cwds`, `branding`, `sidebar_settings`, `custom_commands`, `session_model_options`, `provider_extension` | Bootstrap and provider-scoped global state hydration |
-| `useChatManager` | `stats_push`, `session_renamed`, `merge_message`, `thought`, `token`, `system_event`, `permission_request`, `token_done`, `hooks_status` | Turn-level session, stream, stats, timeline, and permission routing |
+| `useChatManager` | `stream_resume_snapshot`, `stats_push`, `session_renamed`, `merge_message`, `thought`, `token`, `system_event`, `permission_request`, `token_done`, `hooks_status` | Reconnect snapshot, turn-level session, stream, stats, timeline, and permission routing |
 | `useChatManager` | `shell_run_prepared`, `shell_run_snapshot`, `shell_run_started`, `shell_run_output`, `shell_run_exit` | Shell run store updates and timeline step patching by `shellRunId` |
 | `useChatManager` | `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed` | Invocation-scoped sub-agent store and lazy sub-agent session state |
 | App roots | `watch_session`, `unwatch_session`, `load_sessions`, `create_session`, `save_snapshot`, `canvas_load` | Session room ownership, hydration, persistence, and canvas coordination |
@@ -143,8 +143,8 @@ flowchart TB
 | Store | Anchors | Owns |
 |---|---|---|
 | `useSystemStore` | `setProviders`, `setProviderBranding`, `setInvalidJsonConfigs`, `setContextUsage`, `setProviderStatus`, `getBranding` | Socket instance, provider catalog, branding, config errors, commands, context, compaction, provider status |
-| `useSessionLifecycleStore` | `handleInitialLoad`, `handleNewChat`, `handleSessionSelect`, `hydrateSession`, `fetchStats`, `handleSaveSession` | Session list, active session, URL sync, hydration, stats, model/config state |
-| `useStreamStore` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `processBuffer`, `onStreamDone` | Per-ACP stream queues, adaptive typewriter, timeline mutation, stream completion |
+| `useSessionLifecycleStore` | `handleInitialLoad`, `handleNewChat`, `handleSessionSelect`, `hydrateSession`, `fetchStats`, `handleSaveSession` | Session list, active session, URL sync, history hydration, active-stream markers, permission restore, stats, model/config state |
+| `useStreamStore` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `processBuffer`, `onStreamDone` | Per-ACP stream queues, hydrated assistant reattachment, adaptive typewriter, timeline mutation, stream completion |
 | `useChatStore` | `handleSubmit`, `handleCancel`, `handleForkSession`, `handleRespondPermission` | Prompt submit/cancel/fork/permission command workflows |
 | `useInputStore` | `setInput`, `setAttachments`, `handleFileUpload`, `clearInput` | Per-session prompt text and attachments |
 | `useUIStore` | `setSidebarOpen`, `setSettingsOpen`, `setSystemSettingsOpen`, `setFileExplorerOpen`, `setHelpDocsOpen`, `incrementVisibleCount`, `toggleAutoScroll` | Sidebar, modal, documentation browser, pagination, and scroll preferences |
@@ -157,7 +157,7 @@ flowchart TB
 ## Timeline Rendering Contract
 
 - `Message.timeline` is the authoritative assistant render model.
-- `useStreamStore.activeMsgIdByAcp[acpSessionId]` identifies the assistant message receiving streamed updates.
+- `useStreamStore.activeMsgIdByAcp[acpSessionId]` identifies the assistant message receiving streamed updates; hydration and `stream_resume_snapshot` can seed this mapping from a backend-marked streaming assistant.
 - `thought`, `token`, `system_event`, and `permission_request` events must become `TimelineStep` entries instead of separate component-local render state.
 - Tool updates merge by `SystemEvent.id`; shell output patches by `shellRunId`; sub-agent panels filter by `invocationId`.
 - Provider-scoped data flows through `useSystemStore.providersById`, `useSystemStore.branding`, and `useSystemStore.getBranding(providerId)`.

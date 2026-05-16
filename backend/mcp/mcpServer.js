@@ -167,12 +167,19 @@ export function createToolHandlers(io) {
       toolName: idempotencyToolName,
       input: { requests, model }
     });
+    const parentToolCallId = toolCallIdFromMcpContext({
+      requestMeta,
+      mcpRequestId,
+      toolName: idempotencyToolName
+    });
     subAgentInvocationManager.setIo(io);
     return subAgentInvocationManager.runInvocation({
       requests,
       model,
       providerId,
       parentAcpSessionId: acpSessionId,
+      parentToolCallId,
+      parentToolName: idempotencyToolName,
       idempotencyKey,
       abortSignal
     });

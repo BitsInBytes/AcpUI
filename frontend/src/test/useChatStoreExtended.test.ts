@@ -97,6 +97,10 @@ describe('useChatStore Orchestration', () => {
       expect(state.activeSessionId).toBe('fork-1');
       expect(state.sessions[1].name).toBe('Original (fork)');
       expect(state.sessions[1].forkedFrom).toBe('s1');
+      expect(mockSocket.emit).toHaveBeenCalledWith('watch_session', {
+        providerId: 'p1',
+        sessionId: 'acp-fork'
+      });
 
       // Should automatically submit acknowledgment message
       act(() => { vi.advanceTimersByTime(600); });

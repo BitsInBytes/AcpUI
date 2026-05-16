@@ -40,11 +40,17 @@ vi.mock('../services/jsonConfigDiagnostics.js', () => ({
 }));
 vi.mock('../database.js', () => ({
   initDb: vi.fn(() => Promise.resolve()),
-  getProviderStatusExtensions: vi.fn(() => Promise.resolve([]))
+  getProviderStatusExtensions: vi.fn(() => Promise.resolve([])),
+  getSessionByAcpId: vi.fn(() => Promise.resolve(null)),
+  getSubAgentInvocationsForParent: vi.fn(() => Promise.resolve([])),
+  getSubAgentInvocationWithAgents: vi.fn(() => Promise.resolve(null))
 }));
 vi.mock('../services/providerStatusMemory.js', () => ({
   getLatestProviderStatusExtension: vi.fn(() => null),
   getLatestProviderStatusExtensions: vi.fn(() => [])
+}));
+vi.mock('../services/sessionStreamPersistence.js', () => ({
+  getStreamResumeSnapshot: vi.fn().mockResolvedValue(null)
 }));
 vi.mock('../services/providerLoader.js', () => ({ 
   getProvider: () => ({
@@ -69,7 +75,9 @@ import registerSocketHandlers from '../sockets/index.js';
 import { collectInvalidJsonConfigErrors } from '../services/jsonConfigDiagnostics.js';
 import { getDefaultProviderId } from '../services/providerRegistry.js';
 import { getLatestProviderStatusExtension, getLatestProviderStatusExtensions } from '../services/providerStatusMemory.js';
+import providerRuntimeManager from '../services/providerRuntimeManager.js';
 import { getProviderStatusExtensions } from '../database.js';
+import { getStreamResumeSnapshot } from '../services/sessionStreamPersistence.js';
 
 function connectSocket(mockIo) {
   const mockSocket = new EventEmitter();
@@ -95,6 +103,8 @@ describe('Socket Index Handler', () => {
     getLatestProviderStatusExtension.mockReturnValue(null);
     getLatestProviderStatusExtensions.mockReturnValue([]);
     getProviderStatusExtensions.mockResolvedValue([]);
+    getStreamResumeSnapshot.mockResolvedValue(null);
+    providerRuntimeManager.getRuntimes.mockReturnValue([{ providerId: 'test', client: { isHandshakeComplete: true, serverBootId: 'test-boot' } }]);
     mockIo = new EventEmitter();
     mockIo.engine = { clientsCount: 1 };
     registerSocketHandlers(mockIo);
@@ -246,6 +256,8 @@ describe('Socket Index - session rooms', () => {
     getLatestProviderStatusExtension.mockReturnValue(null);
     getLatestProviderStatusExtensions.mockReturnValue([]);
     getProviderStatusExtensions.mockResolvedValue([]);
+    getStreamResumeSnapshot.mockResolvedValue(null);
+    providerRuntimeManager.getRuntimes.mockReturnValue([{ providerId: 'test', client: { isHandshakeComplete: true, serverBootId: 'test-boot' } }]);
     mockIo = new EventEmitter();
     mockIo.engine = { clientsCount: 1 };
     registerSocketHandlers(mockIo);
@@ -262,6 +274,33 @@ describe('Socket Index - session rooms', () => {
     const s = connectSocket(mockIo);
     s.emit('watch_session', { providerId: 'provider-a', sessionId: 'sess-123' });
     expect(emitShellRunSnapshotsForSession).toHaveBeenCalledWith(s, { providerId: 'provider-a', sessionId: 'sess-123' });
+  });
+
+  it('watch_session emits a stream resume snapshot when active progress exists', async () => {
+    const snapshot = { providerId: 'provider-a', sessionId: 'sess-123', message: { id: 'a1', role: 'assistant', content: 'partial', isStreaming: true } };
+    providerRuntimeManager.getRuntimes.mockReturnValue([{ providerId: 'provider-a', client: { isHandshakeComplete: true, serverBootId: 'test-boot' } }]);
+    getStreamResumeSnapshot.mockResolvedValue(snapshot);
+    const s = connectSocket(mockIo);
+
+    s.emit('watch_session', { providerId: 'provider-a', sessionId: 'sess-123' });
+    await flushPromises();
+
+    expect(getStreamResumeSnapshot).toHaveBeenCalledWith(expect.any(Object), 'sess-123');
+    expect(s.emit).toHaveBeenCalledWith('stream_resume_snapshot', snapshot);
+  });
+
+  it('watch_session emits pending permission snapshots', () => {
+    const permissionPayload = { id: 'perm-1', providerId: 'provider-a', sessionId: 'sess-123', options: [] };
+    providerRuntimeManager.getRuntimes.mockReturnValue([{ providerId: 'provider-a', client: {
+      isHandshakeComplete: true,
+      serverBootId: 'test-boot',
+      permissions: { getPendingPermissionForSession: vi.fn().mockReturnValue(permissionPayload) }
+    } }]);
+
+    const s = connectSocket(mockIo);
+    s.emit('watch_session', { providerId: 'provider-a', sessionId: 'sess-123' });
+
+    expect(s.emit).toHaveBeenCalledWith('permission_request', permissionPayload);
   });
 
   it('unwatch_session leaves the session room', () => {

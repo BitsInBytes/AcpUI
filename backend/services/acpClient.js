@@ -347,11 +347,11 @@ export class AcpClient {
   }
 
   handleUpdate(sessionId, update) {
-    _handleUpdate(this, sessionId, update);
+    return _handleUpdate(this, sessionId, update);
   }
 
   handleRequestPermission(id, params) {
-    this.permissions.handleRequest(id, params, this.io, this.getProviderId());
+    this.permissions.handleRequest(id, params, this.io, this.getProviderId(), this);
   }
 
   setMode(sessionId, modeId) {

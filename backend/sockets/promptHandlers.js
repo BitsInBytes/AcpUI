@@ -2,13 +2,13 @@ import fs from 'fs';
 import sharp from 'sharp';
 import { writeLog } from '../services/logger.js';
 import { providerRuntimeManager } from '../services/providerRuntimeManager.js';
-import { autoSaveTurn } from '../services/sessionManager.js';
+import { finalizeStreamPersistence } from '../services/sessionStreamPersistence.js';
 import { resolveModelSelection } from '../services/modelOptions.js';
 
 import { subAgentInvocationManager } from '../mcp/subAgentInvocationManager.js';
 
 export default function registerPromptHandlers(io, socket) {
-  socket.on('prompt', async ({ providerId, uiId: _uiId, sessionId, prompt, model, attachments = [] }) => {
+  socket.on('prompt', async ({ providerId, uiId, sessionId, prompt, model, attachments = [] }) => {
     let runtime;
     try {
       runtime = providerRuntimeManager.getRuntime(providerId);
@@ -115,6 +115,9 @@ export default function registerPromptHandlers(io, socket) {
       if (meta) {
         meta.lastResponseBuffer = '';
         meta.lastThoughtBuffer = '';
+        meta.activePrompt = true;
+        meta.activeUiId = uiId || meta.activeUiId || null;
+        meta.turnStartTime = Date.now();
       }
 
       // Notify provider that a real prompt is starting. This is the authoritative
@@ -145,7 +148,7 @@ export default function registerPromptHandlers(io, socket) {
         // Otherwise the turn is complete: notify UI and persist to JSONL/DB.
         if (!acpClient.stream.statsCaptures.has(sessionId)) {
           io.to('session:' + sessionId).emit('token_done', { providerId: resolvedProviderId, sessionId });
-          autoSaveTurn(sessionId, acpClient);
+          await finalizeStreamPersistence(acpClient, sessionId);
           writeLog(`[HOOKS] Turn complete for ${sessionId}, agentName=${meta?.agentName}`);
         }
       } catch (_err) {
@@ -162,14 +165,18 @@ export default function registerPromptHandlers(io, socket) {
           });
           io.to('session:' + sessionId).emit('token_done', { providerId: resolvedProviderId, sessionId, error: true });
 
-          // ENSURE PERSISTENCE ON FAILURE:
-          // This prevents the 'Thinking...' bubble on refresh.
-          autoSaveTurn(sessionId, acpClient);
+          await finalizeStreamPersistence(acpClient, sessionId, {
+            errorText: `\n\n:::ERROR:::\n${errorMessage}\n:::END_ERROR:::\n\n**Recovery:** The request failed. You can try asking again, or check the server logs for more technical details.`
+          });
         }
       } finally {
         // Always notify the provider that this prompt is done — whether it resolved,
         // was cancelled (session/cancel causes sendRequest to resolve with stopReason:
         // "cancelled"), or threw an error. This keeps _activePromptCount accurate.
+        if (meta) {
+          meta.activePrompt = false;
+          meta.activeUiId = null;
+        }
         acpClient.providerModule.onPromptCompleted(sessionId);
       }
     } catch (_err) {
@@ -183,6 +190,9 @@ export default function registerPromptHandlers(io, socket) {
         text: `\n\n:::ERROR:::\n${_err.message || 'An unknown error occurred.'}\n:::END_ERROR:::\n\n**Recovery:** The request failed. You can try asking again, or check the server logs for more technical details.`
       });
       io.to('session:' + sessionId).emit('token_done', { providerId: resolvedProviderId, sessionId, error: true });
+      await finalizeStreamPersistence(acpClient, sessionId, {
+        errorText: `\n\n:::ERROR:::\n${_err.message || 'An unknown error occurred.'}\n:::END_ERROR:::\n\n**Recovery:** The request failed. You can try asking again, or check the server logs for more technical details.`
+      });
     }
 
   });

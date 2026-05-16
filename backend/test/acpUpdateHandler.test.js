@@ -31,6 +31,8 @@ const { mockProviderModule, mockShellRunManager } = vi.hoisted(() => ({
 vi.mock('../services/logger.js', () => ({ writeLog: vi.fn() }));
 vi.mock('../services/sessionManager.js', () => ({ autoSaveTurn: vi.fn() }));
 vi.mock('../database.js', () => ({
+  getSessionByAcpId: vi.fn().mockResolvedValue(null),
+  saveSession: vi.fn().mockResolvedValue(undefined),
   saveConfigOptions: vi.fn().mockResolvedValue({})
 }));
 vi.mock('../services/providerLoader.js', () => ({
@@ -483,12 +485,19 @@ describe('acpUpdateHandler', () => {
     expect(client.io.emit).not.toHaveBeenCalledWith('provider_extension', expect.any(Object));
   });
 
-  it('performs periodic autoSaveTurn', async () => {
-    const { autoSaveTurn } = await import('../services/sessionManager.js');
-    client._lastPeriodicSave.set(sid, Date.now() - 5000);
+  it('persists message chunks as stream progress', async () => {
+    const { getSessionByAcpId, saveSession } = await import('../database.js');
+    getSessionByAcpId.mockResolvedValueOnce({
+      id: 'ui-1',
+      acpSessionId: sid,
+      provider: 'test-provider',
+      messages: [{ id: 'a1', role: 'assistant', content: '', isStreaming: true, timeline: [] }]
+    });
     const update = { sessionUpdate: 'agent_message_chunk', content: { text: 'chunk' } };
     await handleUpdate(client, sid, update);
-    expect(autoSaveTurn).toHaveBeenCalledWith(sid, client);
+    expect(saveSession).toHaveBeenCalledWith(expect.objectContaining({
+      messages: [expect.objectContaining({ content: 'chunk', isStreaming: true })]
+    }));
   });
 
   it('handles tool_call_update with completed status and runHooks', async () => {

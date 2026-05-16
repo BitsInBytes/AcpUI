@@ -10,6 +10,7 @@ import { modelOptionsFromProviderConfig, resolveModelSelection } from '../servic
 import { getAttachmentsRoot } from '../services/attachmentVault.js';
 import { getMcpServers } from './mcpServer.js';
 import { ACP_UX_TOOL_NAMES } from '../services/tools/acpUxTools.js';
+import { finalizeStreamPersistence, persistStreamEvent } from '../services/sessionStreamPersistence.js';
 
 const ACTIVE_AGENT_STATUSES = new Set(['spawning', 'prompting', 'running', 'waiting_permission', 'cancelling']);
 const TERMINAL_AGENT_STATUSES = new Set(['completed', 'failed', 'cancelled']);
@@ -45,6 +46,36 @@ function invocationStatusFromAgents(agents = []) {
 
 function textResult(text) {
   return { content: [{ type: 'text', text }] };
+}
+
+function latestAssistantText(session) {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message?.role !== 'assistant') continue;
+    if (typeof message.content === 'string' && message.content.trim()) return message.content;
+    const timelineText = (message.timeline || [])
+      .filter(step => step?.type === 'text')
+      .map(step => step.content || '')
+      .join('');
+    if (timelineText.trim()) return timelineText;
+  }
+  return '';
+}
+
+function initialSubAgentMessages(req, now) {
+  const promptText = typeof req.prompt === 'string' ? req.prompt : JSON.stringify(req.prompt || '');
+  return [
+    { id: `user-${now}`, role: 'user', content: promptText },
+    {
+      id: `assistant-${now}`,
+      role: 'assistant',
+      content: '',
+      isStreaming: true,
+      timeline: [{ type: 'thought', content: '_Thinking..._' }],
+      turnStartTime: now
+    }
+  ];
 }
 
 export class SubAgentInvocationManager {
@@ -91,8 +122,19 @@ export class SubAgentInvocationManager {
     const result = [];
     for (const inv of this.invocations.values()) {
       if (inv.parentAcpSessionId !== parentAcpSessionId) continue;
-      for (const agent of inv.agents.values()) {
-        if (!isTerminalStatus(agent.status)) result.push(agent);
+      const agents = Array.from(inv.agents.values());
+      const totalCount = Number(inv.totalCount || agents.length || 0);
+      const completedCount = this.completedAgentCount(inv);
+      for (const agent of agents) {
+        if (!isTerminalStatus(agent.status)) {
+          result.push({
+            ...agent,
+            invocationStatus: inv.status,
+            totalCount,
+            completedCount,
+            statusToolName: inv.statusToolName || ACP_UX_TOOL_NAMES.checkSubagents
+          });
+        }
       }
     }
     return result;
@@ -142,7 +184,7 @@ export class SubAgentInvocationManager {
     return this.startInvocation(args);
   }
 
-  async startInvocation({ requests, model, providerId, parentAcpSessionId: explicitParentAcpSessionId = null, idempotencyKey = null, abortSignal = null }) {
+  async startInvocation({ requests, model, providerId, parentAcpSessionId: explicitParentAcpSessionId = null, parentToolCallId = null, parentToolName = ACP_UX_TOOL_NAMES.invokeSubagents, idempotencyKey = null, abortSignal = null }) {
     if (!this.io) return textResult('Error: Sub-agent system not available');
     const safeRequests = Array.isArray(requests) ? requests : [];
     this.pruneCompletedState();
@@ -173,6 +215,8 @@ export class SubAgentInvocationManager {
       resolvedProviderId,
       acpClient,
       parentAcpSessionId,
+      parentToolCallId,
+      parentToolName,
       abortSignal
     });
 
@@ -190,7 +234,7 @@ export class SubAgentInvocationManager {
     });
   }
 
-  async executeStartInvocation({ requests, model, provider, resolvedProviderId, acpClient, parentAcpSessionId, abortSignal }) {
+  async executeStartInvocation({ requests, model, provider, resolvedProviderId, acpClient, parentAcpSessionId, parentToolCallId, parentToolName, abortSignal }) {
     this.log(`[SUB-AGENT] Starting async invocation for ${requests.length} sub-agent(s)`);
 
     const models = provider.config.models || {};
@@ -221,6 +265,7 @@ export class SubAgentInvocationManager {
       agents: new Map(),
       waiters: new Set(),
       status: 'spawning',
+      totalCount: requests.length,
       startedAt: this.now(),
       completedAt: null,
       statusToolName: ACP_UX_TOOL_NAMES.checkSubagents,
@@ -240,6 +285,28 @@ export class SubAgentInvocationManager {
       createdAt: invocationRecord.startedAt,
       updatedAt: invocationRecord.startedAt
     });
+
+    if (parentAcpSessionId) {
+      const title = parentToolName === ACP_UX_TOOL_NAMES.invokeCounsel ? 'Invoke Counsel' : 'Invoke Subagents';
+      const parentToolEvent = {
+        providerId: resolvedProviderId,
+        sessionId: parentAcpSessionId,
+        type: 'tool_update',
+        id: parentToolCallId || `subagents-${invocationId}`,
+        status: parentToolCallId ? 'in_progress' : 'completed',
+        invocationId,
+        title,
+        titleSource: 'mcp_handler',
+        toolName: parentToolName,
+        canonicalName: parentToolName,
+        mcpToolName: parentToolName,
+        isAcpUxTool: true,
+        toolCategory: 'sub_agent',
+        isFileOperation: false
+      };
+      await persistStreamEvent(acpClient, parentAcpSessionId, parentToolEvent, { force: true });
+      this.io.to?.(`session:${parentAcpSessionId}`)?.emit?.('system_event', parentToolEvent);
+    }
 
     this.io.emit('sub_agents_starting', {
       invocationId,
@@ -341,7 +408,7 @@ export class SubAgentInvocationManager {
         acpSessionId: subAcpId,
         name: req.name || `Agent ${index + 1}: ${String(req.prompt || '').slice(0, 50)}`,
         model: resolvedModelKey || null,
-        messages: [],
+        messages: initialSubAgentMessages(req, this.now()),
         isPinned: false,
         isSubAgent: true,
         forkedFrom: parentUiId,
@@ -472,6 +539,7 @@ export class SubAgentInvocationManager {
 
   async startAgentPrompt({ invocationRecord, agentRecord, acpClient }) {
     if (invocationRecord.cancelled || isTerminalStatus(agentRecord.status)) return;
+    acpClient._sessionStreamPersistenceDb = this.db;
     await this.setAgentStatus(invocationRecord, agentRecord, 'prompting');
     try {
       await acpClient.transport.sendRequest('session/prompt', {
@@ -479,7 +547,8 @@ export class SubAgentInvocationManager {
         prompt: [{ type: 'text', text: agentRecord.prompt }]
       });
       const meta = acpClient.sessionMetadata.get(agentRecord.acpId);
-      const response = meta?.lastResponseBuffer?.trim() || '(no response)';
+      const finalizedSession = await finalizeStreamPersistence(acpClient, agentRecord.acpId);
+      const response = latestAssistantText(finalizedSession).trim() || meta?.lastResponseBuffer?.trim() || '(no response)';
       agentRecord.response = response;
       await this.setAgentStatus(invocationRecord, agentRecord, 'completed', { resultText: response });
       this.io.emit('sub_agent_completed', {
@@ -494,6 +563,7 @@ export class SubAgentInvocationManager {
       acpClient.sessionMetadata.delete(agentRecord.acpId);
     } catch (err) {
       if (invocationRecord.cancelled) {
+        await finalizeStreamPersistence(acpClient, agentRecord.acpId);
         await this.setAgentStatus(invocationRecord, agentRecord, 'cancelled', { errorText: 'Cancelled' });
         this.io.emit('sub_agent_completed', {
           providerId: invocationRecord.providerId,
@@ -505,6 +575,9 @@ export class SubAgentInvocationManager {
       } else {
         const message = err?.message || 'Unknown sub-agent error';
         this.log(`[SUB-AGENT ${agentRecord.index}] Error: ${message}`);
+        await finalizeStreamPersistence(acpClient, agentRecord.acpId, {
+          errorText: `\n\n:::ERROR:::\n${message}\n:::END_ERROR:::\n\n`
+        });
         await this.setAgentStatus(invocationRecord, agentRecord, 'failed', { errorText: message });
         this.io.emit('sub_agent_completed', {
           providerId: invocationRecord.providerId,

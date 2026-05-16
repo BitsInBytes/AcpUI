@@ -68,10 +68,11 @@ interface SubAgentState {
 const ACTIVE_STATUSES = new Set<SubAgentStatus>(['spawning', 'prompting', 'running', 'waiting_permission', 'cancelling']);
 const TERMINAL_STATUSES = new Set<SubAgentStatus>(['completed', 'failed', 'cancelled']);
 
-function invocationStatusFromAgents(agents: SubAgentEntry[], invocationId: string): SubAgentStatus {
-  const scoped = agents.filter(a => a.invocationId === invocationId);
-  if (scoped.length === 0) return 'running';
+function invocationStatusFromAgents(agents: SubAgentEntry[], invocation: SubAgentInvocationEntry): SubAgentStatus {
+  const scoped = agents.filter(a => a.invocationId === invocation.invocationId);
+  if (scoped.length === 0) return ACTIVE_STATUSES.has(invocation.status) ? invocation.status : 'running';
   if (scoped.some(a => ACTIVE_STATUSES.has(a.status))) return 'running';
+  if (scoped.length < invocation.totalCount && ACTIVE_STATUSES.has(invocation.status)) return invocation.status;
   if (scoped.some(a => a.status === 'failed')) return 'failed';
   if (scoped.some(a => a.status === 'cancelled')) return 'cancelled';
   return 'completed';
@@ -81,11 +82,18 @@ export const useSubAgentStore = create<SubAgentState>((set, get) => ({
   invocations: [],
   agents: [],
   startInvocation: (entry) => set(state => {
+    const existing = state.invocations.find(inv => inv.invocationId === entry.invocationId);
+    const incomingStatus = entry.status || existing?.status || 'spawning';
+    const status = existing && TERMINAL_STATUSES.has(existing.status) && !TERMINAL_STATUSES.has(incomingStatus)
+      ? existing.status
+      : incomingStatus;
     const next: SubAgentInvocationEntry = {
+      ...existing,
       ...entry,
-      status: entry.status || 'spawning',
-      startedAt: entry.startedAt || Date.now(),
-      completedAt: null
+      totalCount: Math.max(Number(existing?.totalCount || 0), Number(entry.totalCount || 0)),
+      status,
+      startedAt: entry.startedAt || existing?.startedAt || Date.now(),
+      completedAt: TERMINAL_STATUSES.has(status) ? (existing?.completedAt || Date.now()) : (existing?.completedAt || null)
     };
     return {
       invocations: [next, ...state.invocations.filter(inv => inv.invocationId !== next.invocationId)]
@@ -117,9 +125,11 @@ export const useSubAgentStore = create<SubAgentState>((set, get) => ({
     const agents = state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, status } : a);
     const changedAgent = agents.find(a => a.acpSessionId === acpSessionId);
     const invocations = changedAgent
-      ? state.invocations.map(inv => inv.invocationId === changedAgent.invocationId
-        ? { ...inv, status: invocationStatusFromAgents(agents, inv.invocationId), completedAt: TERMINAL_STATUSES.has(invocationStatusFromAgents(agents, inv.invocationId)) ? Date.now() : inv.completedAt }
-        : inv)
+      ? state.invocations.map(inv => {
+        if (inv.invocationId !== changedAgent.invocationId) return inv;
+        const nextStatus = invocationStatusFromAgents(agents, inv);
+        return { ...inv, status: nextStatus, completedAt: TERMINAL_STATUSES.has(nextStatus) ? Date.now() : inv.completedAt };
+      })
       : state.invocations;
     return { agents, invocations };
   }),
@@ -127,9 +137,11 @@ export const useSubAgentStore = create<SubAgentState>((set, get) => ({
     const agents = state.agents.map(a => a.acpSessionId === acpSessionId ? { ...a, status } : a);
     const changedAgent = agents.find(a => a.acpSessionId === acpSessionId);
     const invocations = changedAgent
-      ? state.invocations.map(inv => inv.invocationId === changedAgent.invocationId
-        ? { ...inv, status: invocationStatusFromAgents(agents, inv.invocationId), completedAt: TERMINAL_STATUSES.has(invocationStatusFromAgents(agents, inv.invocationId)) ? Date.now() : inv.completedAt }
-        : inv)
+      ? state.invocations.map(inv => {
+        if (inv.invocationId !== changedAgent.invocationId) return inv;
+        const nextStatus = invocationStatusFromAgents(agents, inv);
+        return { ...inv, status: nextStatus, completedAt: TERMINAL_STATUSES.has(nextStatus) ? Date.now() : inv.completedAt };
+      })
       : state.invocations;
     return { agents, invocations };
   }),

@@ -1,5 +1,5 @@
 import { writeLog } from './logger.js';
-import { autoSaveTurn } from './sessionManager.js';
+import { persistStreamEvent } from './sessionStreamPersistence.js';
 import { runHooks } from './hookRunner.js';
 import { getProvider, getProviderModule } from './providerLoader.js';
 import { toolRegistry, toolCallState, resolveToolInvocation, applyInvocationToEvent } from './tools/index.js';
@@ -98,16 +98,6 @@ export async function handleUpdate(acpClient, sessionId, update) {
     return; // Drop message chunks during drain
   }
 
-  if (['agent_message_chunk', 'agent_thought_chunk', 'tool_call', 'tool_call_update'].includes(update.sessionUpdate)) {
-    if (!acpClient._lastPeriodicSave) acpClient._lastPeriodicSave = new Map();
-    const now = Date.now();
-    const last = acpClient._lastPeriodicSave.get(sessionId) || 0;
-    if (now - last > 3000) {
-      acpClient._lastPeriodicSave.set(sessionId, now);
-      autoSaveTurn(sessionId, acpClient);
-    }
-  }
-
   const resolvePath = (p) => {
     if (!p || p.includes('...')) return undefined;
     try {
@@ -137,6 +127,7 @@ export async function handleUpdate(acpClient, sessionId, update) {
         // statsCaptures: buffer output silently — this session is internal (e.g., title gen)
         acpClient.stream.statsCaptures.get(sessionId).buffer += text;
       } else {
+        await persistStreamEvent(acpClient, sessionId, { type: 'token', text });
         acpClient.io.to('session:' + sessionId).emit('token', { providerId, sessionId, text });
 
         // Title generation fires on response chunks so failed/empty prompts are not titled.
@@ -162,6 +153,7 @@ export async function handleUpdate(acpClient, sessionId, update) {
         if (meta.lastResponseBuffer !== undefined) meta.lastResponseBuffer = '';
       }
       if (!acpClient.stream.statsCaptures.has(sessionId)) {
+        await persistStreamEvent(acpClient, sessionId, { type: 'thought', text });
         acpClient.io.to('session:' + sessionId).emit('thought', { providerId, sessionId, text });
       }
     }
@@ -216,6 +208,7 @@ export async function handleUpdate(acpClient, sessionId, update) {
       }
     });
 
+    await persistStreamEvent(acpClient, sessionId, eventToEmit);
     acpClient.io.to('session:' + sessionId).emit('system_event', eventToEmit);
   }
   else if (update.sessionUpdate === 'tool_call_update') {
@@ -300,6 +293,7 @@ export async function handleUpdate(acpClient, sessionId, update) {
       }
     });
 
+    await persistStreamEvent(acpClient, sessionId, endEvent);
     acpClient.io.to('session:' + sessionId).emit('system_event', endEvent);
   }
   else if (update.sessionUpdate === 'usage_update') {

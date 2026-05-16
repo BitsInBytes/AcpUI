@@ -115,7 +115,7 @@ function App() {
         return;
       }
       if (newSession?.acpSessionId && socket) {
-        socket.emit('watch_session', { sessionId: newSession.acpSessionId });
+        socket.emit('watch_session', { providerId: newSession.provider, sessionId: newSession.acpSessionId });
       }
       // Save current session's canvas open state
       const prevId = lastActiveSessionIdRef.current;

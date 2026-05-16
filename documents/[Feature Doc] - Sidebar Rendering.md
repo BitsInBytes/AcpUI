@@ -75,7 +75,7 @@ socket.emit('load_sessions', (res: LoadSessionsResponse) => {
   });
   set({
     sessions: res.sessions.map((s: ChatSession) => applyModelState(
-      { ...s, isTyping: false, isWarmingUp: false },
+      { ...s, isTyping: Boolean(s.isTyping), isWarmingUp: false },
       { currentModelId: s.currentModelId, modelOptions: s.modelOptions }
     )),
     sessionNotes: notesMap

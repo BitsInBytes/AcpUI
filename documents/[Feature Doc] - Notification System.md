@@ -393,7 +393,7 @@ Notification store hydration still flows through `sidebar_settings`; existing so
 | Area | File | Stable Anchors | Purpose |
 |---|---|---|---|
 | Socket hydration | `backend/sockets/index.js` | `registerSocketHandlers`, `sidebar_settings`, `workspace_cwds`, `branding`, `buildBrandingPayload`, `getProviderPayloads` | Sends notification defaults, workspace paths, and provider branding to connecting clients |
-| Prompt completion | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, `prompt`, `token_done`, `autoSaveTurn`, `statsCaptures` | Emits `token_done` for successful prompts and error completions |
+| Prompt completion | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, `prompt`, `token_done`, `finalizeStreamPersistence`, `statsCaptures` | Emits `token_done` for successful prompts and error completions |
 | Fork merge completion | `backend/sockets/sessionHandlers.js` | `registerSessionHandlers`, `merge_fork`, `merge_message`, `token_done` | Emits parent-session completion after merge prompt injection |
 | Environment editing | `backend/sockets/systemSettingsHandlers.js` | `registerSystemSettingsHandlers`, `get_env`, `update_env`, `ENV_PATH` | Reads/writes `.env` and updates `process.env` |
 | Example config | `.env.example` | `NOTIFICATION_SOUND`, `NOTIFICATION_DESKTOP`, `UI_NOTIFICATION_DELAY_MS` | Documents default notification-related keys |

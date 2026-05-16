@@ -131,6 +131,36 @@ describe('toolInvocationResolver', () => {
     expect(event.isAcpUxTool).toBe(true);
   });
 
+  it('fills missing status and output from recorded MCP execution state', () => {
+    const record = mcpExecutionRegistry.begin({
+      providerId: 'p',
+      sessionId: 's',
+      mcpRequestId: 'mcp_AcpUI_ux_check_subagents-99',
+      toolName: 'ux_check_subagents',
+      input: { invocationId: 'inv-1' }
+    });
+    mcpExecutionRegistry.complete(record, {
+      content: [{ type: 'text', text: 'Completed results:\n## Agent 1: A\nDone' }]
+    });
+
+    const invocation = resolveToolInvocation({
+      providerId: 'p',
+      sessionId: 's',
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'mcp_AcpUI_ux_check_subagents-99'
+      },
+      event: { id: 'mcp_AcpUI_ux_check_subagents-99', type: 'tool_update' },
+      providerModule: { extractToolInvocation: () => null },
+      acpUiMcpServerName: 'AcpUI'
+    });
+
+    const event = applyInvocationToEvent({ id: 'mcp_AcpUI_ux_check_subagents-99', type: 'tool_update' }, invocation);
+
+    expect(event.status).toBe('completed');
+    expect(event.output).toContain('Completed results:');
+  });
+
   it('records sub-agent check title from waitForCompletion input', () => {
     mcpExecutionRegistry.begin({
       providerId: 'p',

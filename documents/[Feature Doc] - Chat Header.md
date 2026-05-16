@@ -208,7 +208,7 @@ useEffect(() => {
 
       const session = mapped.find((s: ChatSession) => s.id === popoutSessionId);
       if (session?.acpSessionId) {
-        socket.emit('watch_session', { sessionId: session.acpSessionId });
+        socket.emit('watch_session', { providerId: session.provider, sessionId: session.acpSessionId });
         useSessionLifecycleStore.getState().hydrateSession(socket, popoutSessionId);
       }
       setReady(true);

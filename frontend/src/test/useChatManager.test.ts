@@ -5,6 +5,7 @@ import { useSystemStore } from '../store/useSystemStore';
 import { useSessionLifecycleStore } from '../store/useSessionLifecycleStore';
 import { useStreamStore } from '../store/useStreamStore';
 import { useShellRunStore } from '../store/useShellRunStore';
+import { useSubAgentStore } from '../store/useSubAgentStore';
 import { isSessionPoppedOut } from '../lib/sessionOwnership';
 
 vi.mock('../lib/sessionOwnership', () => ({
@@ -35,6 +36,7 @@ describe('useChatManager hook', () => {
         typewriterInterval: null
       });
       useShellRunStore.getState().reset();
+      useSubAgentStore.getState().clear();
     });
   });
 
@@ -133,6 +135,364 @@ describe('useChatManager hook', () => {
     
     handler({ sessionId: 'sub-1', id: 42, options: [], toolCall: { title: 'Tool' } });
     expect(setPermission).toHaveBeenCalledWith('sub-1', expect.objectContaining({ id: 42 }));
+  });
+
+  it('applies stream resume snapshots and seeds active stream state', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'acp-1',
+          provider: 'provider-a',
+          messages: [{ id: 'a1', role: 'assistant', content: 'old', timeline: [{ type: 'text', content: 'old' }], isStreaming: true }],
+          isTyping: false
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'stream_resume_snapshot')[1];
+
+    act(() => {
+      handler({
+        providerId: 'provider-a',
+        sessionId: 'acp-1',
+        uiId: 's1',
+        message: { id: 'a1', role: 'assistant', content: 'old fresh', timeline: [{ type: 'text', content: 'old fresh' }], isStreaming: true }
+      });
+    });
+
+    const session = useSessionLifecycleStore.getState().sessions[0];
+    expect(session.isTyping).toBe(true);
+    expect(session.messages[0].content).toBe('old fresh');
+    expect(useStreamStore.getState().activeMsgIdByAcp['acp-1']).toBe('a1');
+    expect(useStreamStore.getState().displayedContentByMsg.a1).toBe('old fresh');
+    expect(useStreamStore.getState().settledLengthByMsg.a1).toBe('old fresh'.length);
+  });
+
+  it('stamps parent sub-agent tool steps from reconnect snapshots even when agent already exists', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 'parent-ui',
+          acpSessionId: 'parent-acp',
+          provider: 'provider-a',
+          messages: [{
+            id: 'a1',
+            role: 'assistant',
+            content: '',
+            timeline: [{
+              type: 'tool',
+              event: {
+                id: 'tool-1',
+                title: 'Invoke Subagents',
+                status: 'in_progress',
+                toolName: 'ux_invoke_subagents',
+                canonicalName: 'ux_invoke_subagents'
+              }
+            }],
+            isStreaming: true
+          }]
+        } as any]
+      });
+      useSubAgentStore.setState({ agents: [{ acpSessionId: 'sub-acp-1', invocationId: 'inv-1' } as any] });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_snapshot')[1];
+
+    act(() => {
+      handler({
+        providerId: 'provider-a',
+        acpSessionId: 'sub-acp-1',
+        uiId: 'sub-ui-1',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: 'parent-ui',
+        invocationId: 'inv-1',
+        index: 0,
+        name: 'Agent 1',
+        prompt: 'Check node',
+        agent: 'default',
+        status: 'running'
+      });
+    });
+
+    const step = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline?.[0] as any;
+    expect(step.event.invocationId).toBe('inv-1');
+  });
+
+  it('creates a recovered parent sub-agent ToolStep from reconnect snapshots when history missed the start event', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 'parent-ui',
+          acpSessionId: 'parent-acp',
+          provider: 'provider-a',
+          messages: [{ id: 'a1', role: 'assistant', content: 'Working', timeline: [{ type: 'text', content: 'Working' }], isStreaming: true }]
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_snapshot')[1];
+
+    act(() => {
+      handler({
+        providerId: 'provider-a',
+        acpSessionId: 'sub-acp-1',
+        uiId: 'sub-ui-1',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: 'parent-ui',
+        invocationId: 'inv-1',
+        index: 0,
+        name: 'Agent 1',
+        prompt: 'Check node',
+        agent: 'default',
+        status: 'running',
+        invocationStatus: 'running',
+        totalCount: 1
+      });
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline.some(step => step.type === 'tool' && step.event.invocationId === 'inv-1')).toBe(true);
+    expect(useSubAgentStore.getState().agents.some(agent => agent.invocationId === 'inv-1')).toBe(true);
+  });
+
+  it('replays reconnect sub-agent stamps after parent history hydrates', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 'parent-ui',
+          acpSessionId: 'parent-acp',
+          provider: 'provider-a',
+          messages: []
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_snapshot')[1];
+
+    act(() => {
+      handler({
+        providerId: 'provider-a',
+        acpSessionId: 'sub-acp-1',
+        uiId: 'sub-ui-1',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: 'parent-ui',
+        invocationId: 'inv-1',
+        index: 0,
+        name: 'Agent 1',
+        prompt: 'Check node',
+        agent: 'default',
+        status: 'running',
+        invocationStatus: 'running',
+        totalCount: 1
+      });
+    });
+
+    expect(useSubAgentStore.getState().agents.some(agent => agent.invocationId === 'inv-1')).toBe(true);
+    expect(useSessionLifecycleStore.getState().sessions[0].messages).toHaveLength(0);
+
+    act(() => {
+      useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.map(session => session.id === 'parent-ui'
+          ? {
+              ...session,
+              messages: [{
+                id: 'a1',
+                role: 'assistant',
+                content: 'Working',
+                timeline: [{ type: 'text', content: 'Working' }],
+                isStreaming: true
+              }]
+            } as any
+          : session)
+      }));
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline.some(step => step.type === 'tool' && step.event.invocationId === 'inv-1')).toBe(true);
+  });
+
+  it('keeps reconnect sub-agent stamps after stream resume refreshes the parent message', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 'parent-ui',
+          acpSessionId: 'parent-acp',
+          provider: 'provider-a',
+          messages: [{ id: 'a1', role: 'assistant', content: 'Working', timeline: [{ type: 'text', content: 'Working' }], isStreaming: true }]
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const snapshotHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_snapshot')[1];
+    const resumeHandler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'stream_resume_snapshot')[1];
+
+    act(() => {
+      snapshotHandler({
+        providerId: 'provider-a',
+        acpSessionId: 'sub-acp-1',
+        uiId: 'sub-ui-1',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: 'parent-ui',
+        invocationId: 'inv-1',
+        index: 0,
+        name: 'Agent 1',
+        prompt: 'Check node',
+        agent: 'default',
+        status: 'running',
+        invocationStatus: 'running',
+        totalCount: 1
+      });
+      resumeHandler({
+        providerId: 'provider-a',
+        sessionId: 'parent-acp',
+        uiId: 'parent-ui',
+        message: { id: 'a1', role: 'assistant', content: 'Working longer', timeline: [{ type: 'text', content: 'Working longer' }], isStreaming: true }
+      });
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline.some(step => step.type === 'tool' && step.event.invocationId === 'inv-1')).toBe(true);
+  });
+
+  it('recovers a parent sub-agent ToolStep from terminal reconnect snapshots', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 'parent-ui',
+          acpSessionId: 'parent-acp',
+          provider: 'provider-a',
+          messages: [{ id: 'a1', role: 'assistant', content: 'Done', timeline: [{ type: 'text', content: 'Done' }], isStreaming: false }]
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_snapshot')[1];
+
+    act(() => {
+      handler({
+        providerId: 'provider-a',
+        acpSessionId: 'sub-acp-1',
+        uiId: 'sub-ui-1',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: 'parent-ui',
+        invocationId: 'inv-1',
+        index: 0,
+        name: 'Agent 1',
+        prompt: 'Check node',
+        agent: 'default',
+        status: 'completed',
+        invocationStatus: 'completed',
+        totalCount: 1
+      });
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline.some(step => step.type === 'tool' && step.event.invocationId === 'inv-1')).toBe(true);
+    expect(useSubAgentStore.getState().agents.some(agent => agent.invocationId === 'inv-1')).toBe(true);
+  });
+
+  it('resolves parent ui id from parent acp id for reconnect snapshots', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 'parent-ui',
+          acpSessionId: 'parent-acp',
+          provider: 'provider-a',
+          messages: [{ id: 'a1', role: 'assistant', content: 'Working', timeline: [{ type: 'text', content: 'Working' }], isStreaming: true }]
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_snapshot')[1];
+
+    act(() => {
+      handler({
+        providerId: 'provider-a',
+        acpSessionId: 'sub-acp-1',
+        uiId: 'sub-ui-1',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: null,
+        invocationId: 'inv-1',
+        index: 0,
+        name: 'Agent 1',
+        prompt: 'Check node',
+        agent: 'default',
+        status: 'running',
+        invocationStatus: 'running',
+        totalCount: 1
+      });
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline as any[];
+    expect(timeline.some(step => step.type === 'tool' && step.event.invocationId === 'inv-1')).toBe(true);
+    expect(useSubAgentStore.getState().invocations[0].parentUiId).toBe('parent-ui');
+  });
+
+  it('stamps only the best matching parent sub-agent tool step', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 'parent-ui',
+          acpSessionId: 'parent-acp',
+          provider: 'provider-a',
+          messages: [
+            {
+              id: 'old-assistant',
+              role: 'assistant',
+              content: '',
+              isStreaming: false,
+              timeline: [{
+                type: 'tool',
+                event: { id: 'old-tool', title: 'Invoke Subagents', status: 'completed', toolName: 'ux_invoke_subagents' }
+              }]
+            },
+            {
+              id: 'active-assistant',
+              role: 'assistant',
+              content: '',
+              isStreaming: true,
+              timeline: [{
+                type: 'tool',
+                event: { id: 'active-tool', title: 'Invoke Subagents', status: 'in_progress', toolName: 'ux_invoke_subagents' }
+              }]
+            }
+          ]
+        } as any]
+      });
+    });
+
+    renderHook(() => useChatManager(vi.fn()));
+    const handler = mockSocket.on.mock.calls.find((c: any) => c[0] === 'sub_agent_snapshot')[1];
+
+    act(() => {
+      handler({
+        providerId: 'provider-a',
+        acpSessionId: 'sub-acp-1',
+        uiId: 'sub-ui-1',
+        parentAcpSessionId: 'parent-acp',
+        parentUiId: 'parent-ui',
+        invocationId: 'inv-1',
+        index: 0,
+        name: 'Agent 1',
+        prompt: 'Check node',
+        agent: 'default',
+        status: 'running',
+        invocationStatus: 'running',
+        totalCount: 1
+      });
+    });
+
+    const [oldMessage, activeMessage] = useSessionLifecycleStore.getState().sessions[0].messages;
+    expect((oldMessage.timeline?.[0] as any).event.invocationId).toBeUndefined();
+    expect((activeMessage.timeline?.[0] as any).event.invocationId).toBe('inv-1');
   });
 
   it('handles Shell V2 socket events by explicit shellRunId', async () => {

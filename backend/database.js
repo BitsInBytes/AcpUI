@@ -517,15 +517,23 @@ export function getSubAgentInvocation(providerId, invocationId) {
   });
 }
 
-export function getSubAgentInvocationsForParent(providerId, parentUiId) {
-  if (!parentUiId) return Promise.resolve([]);
+export function getSubAgentInvocationsForParent(providerId, parentUiId, parentAcpSessionId = null) {
+  if (!parentUiId && !parentAcpSessionId) return Promise.resolve([]);
   const params = [];
   const providerClause = providerWhere(providerId, params);
-  params.push(parentUiId);
+  const parentClauses = [];
+  if (parentUiId) {
+    parentClauses.push('parent_ui_id = ?');
+    params.push(parentUiId);
+  }
+  if (parentAcpSessionId) {
+    parentClauses.push('parent_acp_session_id = ?');
+    params.push(parentAcpSessionId);
+  }
   return new Promise((resolve, reject) => {
     db.all(`
       SELECT * FROM subagent_invocations
-      WHERE ${providerClause} AND parent_ui_id = ?
+      WHERE ${providerClause} AND (${parentClauses.join(' OR ')})
       ORDER BY updated_at DESC
     `, params, (err, rows) => {
       if (err) reject(err);

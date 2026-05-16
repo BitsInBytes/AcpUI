@@ -10,6 +10,7 @@ import {
 import { mergeConfigOptions, normalizeConfigOptions } from './configOptions.js';
 import { bindMcpProxy, getMcpProxyIdFromServers } from '../mcp/mcpProxyRegistry.js';
 import { buildMcpServersForProvider } from '../mcp/mcpServerConfig.js';
+import { applyRuntimeMetadataToSession, flushStreamPersistence } from './sessionStreamPersistence.js';
 
 function emitCachedContext(providerModule, sessionId) {
   if (!sessionId) return;
@@ -271,70 +272,26 @@ export function findSessionFiles(_sessionId) {
 
 export async function autoSaveTurn(sessionId, acpClient = null) {
   try {
-    // Wait for any final tool call/token updates from the AI process to settle
     await new Promise(r => setTimeout(r, 5000));
 
-    // Don't force-complete if a permission request is pending
     if (acpClient?.permissions?.pendingPermissions?.has(sessionId)) {
-      writeLog(`[DB] Skipping auto-save for ${sessionId} — permission request pending`);
+      writeLog(`[DB] Skipping progress save for ${sessionId} — permission request pending`);
       return;
     }
 
-    const providerId = acpClient?.getProviderId?.() || acpClient?.providerId || null;
-    const session = providerId
-      ? await db.getSessionByAcpId(providerId, sessionId)
-      : await db.getSessionByAcpId(sessionId);
+    if (acpClient) {
+      await flushStreamPersistence(acpClient, sessionId);
+      return;
+    }
+
+    const session = await db.getSessionByAcpId(sessionId);
+    if (!session) return;
     const meta = acpClient?.sessionMetadata?.get(sessionId);
-    
-    if (session && session.messages && session.messages.length > 0) {
-      const lastMsg = session.messages[session.messages.length - 1];
-      let statsChanged = false;
-
-      // Update configOptions from memory if available
-      if (meta?.configOptions) {
-        session.configOptions = meta.configOptions;
-      }
-      if (meta?.currentModelId) {
-        session.currentModelId = meta.currentModelId;
-      }
-      if (meta?.modelOptions) {
-        session.modelOptions = meta.modelOptions;
-      }
-      if (meta) {
-        const prevUsed = Number(session.stats?.usedTokens || 0);
-        const prevTotal = Number(session.stats?.totalTokens || 0);
-        const nextUsed = Number(meta.usedTokens || 0);
-        const nextTotal = Number(meta.totalTokens || 0);
-        statsChanged = prevUsed !== nextUsed || prevTotal !== nextTotal;
-        session.stats = {
-          sessionId,
-          sessionPath: session.stats?.sessionPath || 'Relative',
-          model: meta.currentModelId || meta.model || session.model || session.stats?.model || 'Unknown',
-          toolCalls: Number(meta.toolCalls || session.stats?.toolCalls || 0),
-          successTools: Number(meta.successTools || session.stats?.successTools || 0),
-          durationMs: Number((Date.now() - Number(meta.startTime || Date.now())) || 0),
-          usedTokens: nextUsed,
-          totalTokens: nextTotal,
-          sessionSizeMb: Number(((nextUsed * 4) / (1024 * 1024)).toFixed(2))
-        };
-      }
-
-      // Only save if it's still in a streaming state in the DB
-      if (lastMsg.role === 'assistant' && lastMsg.isStreaming) {
-        writeLog(`[DB] Auto-completing turn for disconnected UI: ${sessionId}`);
-        lastMsg.isStreaming = false;
-        
-        // If the message is completely empty, it means the UI never sent ANY updates. 
-        // We don't want to save an empty bubble as 'finished' because that's non-recoverable.
-        if (lastMsg.content || (lastMsg.timeline && lastMsg.timeline.length > 0)) {
-          await db.saveSession(session);
-        }
-      } else if (statsChanged) {
-        await db.saveSession(session);
-      }
+    if (applyRuntimeMetadataToSession(session, sessionId, meta)) {
+      await db.saveSession(session);
     }
   } catch (e) {
-    writeLog(`[DB ERR] Auto-save failed: ${e.message}`);
+    writeLog(`[DB ERR] Progress save failed: ${e.message}`);
   }
 }
 

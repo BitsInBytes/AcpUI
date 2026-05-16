@@ -194,6 +194,27 @@ describe('ShellToolTerminal', () => {
     expect(container.querySelector('.shell-tool-terminal-readonly')?.innerHTML).toContain('color');
   });
 
+  it('renders terminal tool completion as read-only even if the stored run snapshot is stale', () => {
+    useShellRunStore.getState().upsertSnapshot({
+      providerId: 'provider-a',
+      sessionId: 'acp-1',
+      runId: 'shell-run-1',
+      status: 'running',
+      command: 'node --version',
+      transcript: '$ node --version\nv22.1.0\n',
+      needsInput: true
+    });
+
+    render(<ShellToolTerminal event={baseEvent({
+      status: 'completed',
+      output: 'v22.1.0'
+    })} />);
+
+    expect(terminals).toHaveLength(0);
+    expect(screen.getByText(/v22\.1\.0/)).toBeInTheDocument();
+    expect(screen.getByTitle('Stop command')).toBeDisabled();
+  });
+
   it('prefers colored stored transcript over plain final output after exit', () => {
     useShellRunStore.getState().upsertSnapshot({
       providerId: 'provider-a',

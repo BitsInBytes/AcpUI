@@ -156,7 +156,7 @@ This establishes whether the supplied id is a parent chat, fork, sub-agent, or o
 
 Files:
 - `backend/database.js` (Tables: `subagent_invocations`, `subagent_invocation_agents`)
-- `backend/mcp/subAgentInvocationManager.js` (Class: `SubAgentInvocationManager`, Method: `executeAgentPrompt`)
+- `backend/mcp/subAgentInvocationManager.js` (Class: `SubAgentInvocationManager`, Method: `startAgentPrompt`)
 - `backend/sockets/subAgentHandlers.js` (Socket event: `sub_agent_snapshot`)
 
 Schema anchors:
@@ -541,8 +541,8 @@ UI asks for history or forced rehydrate
 |---|---|---|---|
 | Session DB | `backend/database.js` | `initDb`, `sessions` table, `saveSession`, `getSession`, `getSessionByAcpId`, `getAllSessions` | Stores durable session metadata and cached messages. |
 | Sub-agent DB | `backend/database.js` | `subagent_invocations`, `subagent_invocation_agents`, `createSubAgentInvocation`, `updateSubAgentInvocationStatus`, `updateSubAgentInvocationAgentStatus`, `getSubAgentInvocationWithAgents` | Stores durable async sub-agent batch and per-agent status/results/errors. |
-| Sub-agent orchestration | `backend/mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager`, `executeAgentPrompt`, `getInvocationStatus`, `cancelInvocation` | Creates sub-sessions, sends prompts, records results/errors, returns status snapshots. |
-| Sub-agent sockets | `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession`, Socket event `sub_agent_snapshot` | Hydrates active sub-agent status for reconnecting clients. |
+| Sub-agent orchestration | `backend/mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager`, `startAgentPrompt`, `getInvocationStatus`, `cancelInvocation` | Creates sub-sessions, sends prompts, persists child transcripts, records results/errors, returns status snapshots. |
+| Sub-agent sockets | `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession`, `emitDbBackedSubAgentSnapshots`, Socket event `sub_agent_snapshot` | Hydrates in-memory and DB-backed sub-agent status for reconnecting clients and joins active child rooms. |
 
 ### Provider And JSONL
 

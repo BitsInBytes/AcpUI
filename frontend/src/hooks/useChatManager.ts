@@ -1,4 +1,4 @@
-import type { StreamEventData, StreamDoneData, ChatSession, SystemEvent } from '../types';
+import type { StreamEventData, StreamDoneData, ChatSession, SystemEvent, Message, TimelineStep } from '../types';
 import { useEffect } from 'react';
 import { useSystemStore } from '../store/useSystemStore';
 import { shouldNotify as shouldNotifyHelper } from '../utils/notificationHelper';
@@ -223,6 +223,200 @@ export function useChatManager(
       return !isSessionPoppedOut(owner.id);
     };
 
+    const contentFromResumeMessage = (message: Message) => {
+      if (message.content) return message.content;
+      return (message.timeline || [])
+        .filter((step): step is Extract<NonNullable<Message['timeline']>[number], { type: 'text' }> => step.type === 'text')
+        .map(step => step.content || '')
+        .join('');
+    };
+
+    const applyStreamResumeSnapshot = (data: { providerId?: string | null; sessionId: string; uiId?: string; message: Message }) => {
+      if (!data?.sessionId || !data.message?.id || !shouldProcessSessionStream(data.sessionId)) return;
+      const incomingContent = contentFromResumeMessage(data.message);
+      let selectedMessage = data.message;
+
+      useSessionLifecycleStore.setState(state => ({
+        sessions: state.sessions.map(session => {
+          if (session.acpSessionId !== data.sessionId && session.id !== data.uiId) return session;
+          const existingIndex = session.messages.findIndex(message => message.id === data.message.id);
+          const messages = [...session.messages];
+          if (existingIndex !== -1) {
+            const existing = messages[existingIndex];
+            const existingContent = contentFromResumeMessage(existing);
+            selectedMessage = existingContent.length > incomingContent.length ? existing : { ...existing, ...data.message };
+            messages[existingIndex] = selectedMessage;
+          } else {
+            const latestAssistantIndex = [...messages].reverse().findIndex(message => message.role === 'assistant' && message.isStreaming);
+            if (latestAssistantIndex === -1) messages.push(data.message);
+            else messages[messages.length - 1 - latestAssistantIndex] = data.message;
+            selectedMessage = data.message;
+          }
+          return { ...session, messages, isTyping: Boolean(selectedMessage.isStreaming) || session.isTyping };
+        })
+      }));
+
+      const selectedContent = contentFromResumeMessage(selectedMessage);
+      useStreamStore.setState(state => ({
+        activeMsgIdByAcp: { ...state.activeMsgIdByAcp, [data.sessionId]: selectedMessage.id },
+        displayedContentByMsg: { ...state.displayedContentByMsg, [selectedMessage.id]: selectedContent },
+        settledLengthByMsg: { ...state.settledLengthByMsg, [selectedMessage.id]: selectedContent.length }
+      }));
+    };
+
+    const subAgentToolTitle = (toolName: string) => (
+      toolName === ACP_UX_TOOL_NAMES.invokeCounsel ? 'Invoke Counsel' : 'Invoke Subagents'
+    );
+
+    const recoveredSubAgentToolStep = (invocationId: string, toolName: string): TimelineStep => ({
+      type: 'tool',
+      event: {
+        id: `subagents-${invocationId}`,
+        title: subAgentToolTitle(toolName),
+        status: 'completed',
+        toolName,
+        canonicalName: toolName,
+        mcpToolName: toolName,
+        isAcpUxTool: true,
+        toolCategory: 'sub_agent',
+        isFileOperation: false,
+        invocationId,
+        startTime: Date.now(),
+        endTime: Date.now()
+      } as SystemEvent,
+      isCollapsed: false
+    });
+
+    type PendingSubAgentStamp = { invocationId: string; toolName: string; allowRecovery: boolean };
+    const pendingParentSubAgentStamps = new Map<string, PendingSubAgentStamp[]>();
+    let isReplayingPendingSubAgentStamps = false;
+
+    const scoreSubAgentToolCandidate = (message: Message, event: SystemEvent, messageIndex: number, stepIndex: number) => {
+      const streamingScore = message.isStreaming ? 10_000 : 0;
+      const progressScore = event.status === 'in_progress' ? 1_000 : 0;
+      return streamingScore + progressScore + (messageIndex * 10) + stepIndex;
+    };
+
+    const applySubAgentInvocationToParent = (parentUiId: string, invocationId: string, toolName: string, allowRecovery: boolean) => {
+      let applied = false;
+      useSessionLifecycleStore.setState(state => {
+        let stateChanged = false;
+        const sessions = state.sessions.map(s => {
+          if (s.id !== parentUiId) return s;
+
+          let candidate: { messageIndex: number; stepIndex: number; score: number } | null = null;
+          for (let messageIndex = 0; messageIndex < s.messages.length; messageIndex += 1) {
+            const message = s.messages[messageIndex];
+            if (message.role !== 'assistant' || !message.timeline) continue;
+            for (let stepIndex = 0; stepIndex < message.timeline.length; stepIndex += 1) {
+              const entry = message.timeline[stepIndex];
+              if (entry.type !== 'tool' || !isAcpUxSubAgentStartToolEvent(entry.event)) continue;
+              if (entry.event.invocationId === invocationId) {
+                applied = true;
+                return s;
+              }
+              if (entry.event.invocationId) continue;
+              const score = scoreSubAgentToolCandidate(message, entry.event, messageIndex, stepIndex);
+              if (!candidate || score > candidate.score) candidate = { messageIndex, stepIndex, score };
+            }
+          }
+
+          if (candidate) {
+            const msgs = s.messages.map((message, messageIndex) => {
+              if (messageIndex !== candidate?.messageIndex || !message.timeline) return message;
+              const timeline = message.timeline.map((entry, stepIndex) => {
+                if (stepIndex !== candidate?.stepIndex || entry.type !== 'tool') return entry;
+                return {
+                  ...entry,
+                  event: {
+                    ...entry.event,
+                    invocationId,
+                    toolName: entry.event.toolName || toolName,
+                    canonicalName: entry.event.canonicalName || toolName,
+                    mcpToolName: entry.event.mcpToolName || toolName,
+                    isAcpUxTool: true,
+                    toolCategory: 'sub_agent',
+                    isFileOperation: false
+                  }
+                };
+              });
+              return { ...message, timeline };
+            });
+            applied = true;
+            stateChanged = true;
+            return { ...s, messages: msgs };
+          }
+
+          if (!allowRecovery) return s;
+          const msgs = [...s.messages];
+          for (let index = msgs.length - 1; index >= 0; index -= 1) {
+            if (msgs[index]?.role !== 'assistant') continue;
+            const timeline = [...(msgs[index].timeline || [])];
+            timeline.push(recoveredSubAgentToolStep(invocationId, toolName));
+            msgs[index] = { ...msgs[index], timeline };
+            applied = true;
+            stateChanged = true;
+            return { ...s, messages: msgs };
+          }
+
+          return s;
+        });
+        return stateChanged ? { sessions } : {};
+      });
+      return applied;
+    };
+
+    const replayPendingParentSubAgentStamps = () => {
+      if (isReplayingPendingSubAgentStamps || pendingParentSubAgentStamps.size === 0) return;
+      isReplayingPendingSubAgentStamps = true;
+      try {
+        for (const [parentUiId, stamps] of pendingParentSubAgentStamps.entries()) {
+          for (const stamp of stamps) {
+            applySubAgentInvocationToParent(parentUiId, stamp.invocationId, stamp.toolName, stamp.allowRecovery);
+          }
+        }
+      } finally {
+        isReplayingPendingSubAgentStamps = false;
+      }
+    };
+
+    const queuePendingParentSubAgentStamp = (parentUiId: string, invocationId: string, toolName: string, allowRecovery: boolean) => {
+      const existing = pendingParentSubAgentStamps.get(parentUiId) || [];
+      const existingIndex = existing.findIndex(stamp => stamp.invocationId === invocationId);
+      if (existingIndex === -1) {
+        pendingParentSubAgentStamps.set(parentUiId, [...existing, { invocationId, toolName, allowRecovery }]);
+        return;
+      }
+      if (allowRecovery && !existing[existingIndex].allowRecovery) {
+        const next = [...existing];
+        next[existingIndex] = { ...next[existingIndex], toolName, allowRecovery };
+        pendingParentSubAgentStamps.set(parentUiId, next);
+      }
+    };
+
+    const resolveParentUiId = (parentUiId?: string | null, parentAcpSessionId?: string | null) => {
+      if (parentUiId && parentUiId !== 'unknown') return parentUiId;
+      if (!parentAcpSessionId) return null;
+      return useSessionLifecycleStore.getState().sessions.find(s => s.acpSessionId === parentAcpSessionId)?.id || null;
+    };
+
+    const stampSubAgentInvocationOnParent = (
+      parentUiId: string | null | undefined,
+      invocationId: string,
+      toolName = ACP_UX_TOOL_NAMES.invokeSubagents,
+      options: { parentAcpSessionId?: string | null; allowRecovery?: boolean } = {}
+    ) => {
+      const resolvedParentUiId = resolveParentUiId(parentUiId, options.parentAcpSessionId);
+      if (!resolvedParentUiId || !invocationId) return;
+      const allowRecovery = options.allowRecovery !== false;
+      queuePendingParentSubAgentStamp(resolvedParentUiId, invocationId, toolName, allowRecovery);
+      applySubAgentInvocationToParent(resolvedParentUiId, invocationId, toolName, allowRecovery);
+    };
+
+    const unsubscribePendingSubAgentStamps = useSessionLifecycleStore.subscribe(() => {
+      replayPendingParentSubAgentStamps();
+    });
+
     type PendingSubAgentInput = {
       providerId: string;
       acpSessionId: string;
@@ -239,6 +433,10 @@ export function useChatManager(
       parentUiId: string;
       model: string;
       modelOptions: ChatSession['modelOptions'];
+    };
+
+    type SubAgentStoreInput = PendingSubAgentInput & {
+      invocationId: string;
     };
 
     const getProviderModelsForSubAgent = (providerId: string) => {
@@ -265,6 +463,17 @@ export function useChatManager(
       parentUiId,
       model: data.model || getFallbackSubAgentModel(data.providerId),
       modelOptions: getSubAgentModelOptions(data.providerId)
+    });
+
+    const buildSubAgentStoreEntry = (data: SubAgentStoreInput, parentSessionId: string) => ({
+      providerId: data.providerId,
+      acpSessionId: data.acpSessionId,
+      parentSessionId,
+      invocationId: data.invocationId,
+      index: data.index,
+      name: data.name,
+      prompt: data.prompt,
+      agent: data.agent
     });
 
     const buildLazySubAgentSession = (pending: PendingSubAgent): ChatSession => ({
@@ -343,6 +552,7 @@ export function useChatManager(
       if (!shouldProcessSessionStream(event?.sessionId)) return;
       onStreamEvent(event);
     });
+    socket.on('stream_resume_snapshot', applyStreamResumeSnapshot);
     socket.on('permission_request', (event: StreamEventData) => {
       if (!shouldProcessSessionStream(event?.sessionId)) return;
       // Check if this is a sub-agent permission
@@ -434,10 +644,14 @@ export function useChatManager(
     // 1-second stagger), so the UI clears stale sidebar sessions right away instead of
     // waiting for the first sub_agent_started event (fixes the "flash of old agents" bug).
     socket.on('sub_agents_starting', (data: { invocationId: string; parentAcpSessionId?: string | null; parentUiId: string | null; providerId: string; count: number; statusToolName?: string }) => {
-      const parentUiId = data.parentUiId || 'unknown';
+      const parentUiId = resolveParentUiId(data.parentUiId, data.parentAcpSessionId) || data.parentUiId || 'unknown';
       const parentSession = useSessionLifecycleStore.getState().sessions.find(s => s.id === parentUiId);
       const parentSessionId = data.parentAcpSessionId || parentSession?.acpSessionId || 'unknown';
 
+      stampSubAgentInvocationOnParent(data.parentUiId, data.invocationId, ACP_UX_TOOL_NAMES.invokeSubagents, {
+        parentAcpSessionId: data.parentAcpSessionId,
+        allowRecovery: true
+      });
       useSubAgentStore.getState().clearForParent(parentSessionId);
       useSubAgentStore.getState().clearInvocationsForParent(parentUiId);
       useSubAgentStore.getState().startInvocation({
@@ -464,38 +678,20 @@ export function useChatManager(
     });
 
     socket.on('sub_agent_started', (data: { providerId: string; acpSessionId: string; uiId: string; parentAcpSessionId?: string | null; parentUiId: string | null; index: number; name: string; prompt: string; agent: string; model?: string; invocationId: string }) => {
-      const parentUiId = data.parentUiId || 'unknown';
+      const parentUiId = resolveParentUiId(data.parentUiId, data.parentAcpSessionId) || data.parentUiId || 'unknown';
       const parentSession = useSessionLifecycleStore.getState().sessions.find(s => s.id === parentUiId);
       const parentSessionId = data.parentAcpSessionId || parentSession?.acpSessionId || 'unknown';
-      useSubAgentStore.getState().addAgent({ ...data, parentSessionId });
+      useSubAgentStore.getState().addAgent(buildSubAgentStoreEntry(data, parentSessionId));
       pendingSubAgents.set(data.acpSessionId, buildPendingSubAgent(data, parentSessionId, parentUiId));
 
-      // Stamp the invocationId onto the in-progress sub-agent start ToolStep
-      // on the first agent (index 0).  We defer to here rather than sub_agents_starting
-      // because the ToolStep is processed asynchronously through the stream queue/typewriter —
-      // by the time sub_agent_started[0] arrives (after at least one RPC roundtrip, 100ms+),
-      // the ToolStep is guaranteed to be in useSessionLifecycleStore.
+      // Stamp the invocationId onto the parent sub-agent ToolStep. Live starts and
+      // reconnect snapshots both use this so the orchestration panel can be linked
+      // even if the tab was closed before the first live sub_agent_started event.
       if (data.index === 0) {
-        useSessionLifecycleStore.setState(state => ({
-          sessions: state.sessions.map(s => {
-            if (s.id !== parentUiId) return s;
-            const msgs = [...s.messages];
-            const lastMsg = msgs[msgs.length - 1];
-            if (!lastMsg || lastMsg.role !== 'assistant' || !lastMsg.timeline) return s;
-            const timeline = lastMsg.timeline.map(entry => {
-              if (
-                entry.type === 'tool' &&
-                entry.event.status === 'in_progress' &&
-                isAcpUxSubAgentStartToolEvent(entry.event)
-              ) {
-                return { ...entry, event: { ...entry.event, invocationId: data.invocationId } };
-              }
-              return entry;
-            });
-            msgs[msgs.length - 1] = { ...lastMsg, timeline };
-            return { ...s, messages: msgs };
-          })
-        }));
+        stampSubAgentInvocationOnParent(data.parentUiId, data.invocationId, ACP_UX_TOOL_NAMES.invokeSubagents, {
+          parentAcpSessionId: data.parentAcpSessionId,
+          allowRecovery: true
+        });
       }
     });
 
@@ -503,25 +699,37 @@ export function useChatManager(
       providerId: string; acpSessionId: string; uiId: string;
       parentAcpSessionId?: string | null; parentUiId: string | null; invocationId: string; index: number;
       name: string; prompt: string; agent: string; model?: string; status: string;
+      invocationStatus?: string; totalCount?: number; completedCount?: number; statusToolName?: string;
     }) => {
-      const existing = useSubAgentStore.getState().agents.find(a => a.acpSessionId === data.acpSessionId);
-      if (existing) return;
-
-      const parentUiId = data.parentUiId || 'unknown';
+      const parentUiId = resolveParentUiId(data.parentUiId, data.parentAcpSessionId) || data.parentUiId || 'unknown';
       const parentSession = useSessionLifecycleStore.getState().sessions.find(s => s.id === parentUiId);
       const parentSessionId = data.parentAcpSessionId || parentSession?.acpSessionId || 'unknown';
+      const status = (data.invocationStatus || data.status) as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+      const agentStatus = data.status as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+      const allowRecovery = true;
 
+      stampSubAgentInvocationOnParent(data.parentUiId, data.invocationId, ACP_UX_TOOL_NAMES.invokeSubagents, {
+        parentAcpSessionId: data.parentAcpSessionId,
+        allowRecovery
+      });
       useSubAgentStore.getState().startInvocation({
         invocationId: data.invocationId,
         providerId: data.providerId,
         parentUiId,
         parentSessionId,
-        statusToolName: ACP_UX_TOOL_NAMES.checkSubagents,
-        totalCount: 1,
-        status: data.status as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled'
+        statusToolName: data.statusToolName || ACP_UX_TOOL_NAMES.checkSubagents,
+        totalCount: data.totalCount || 1,
+        status
       });
-      useSubAgentStore.getState().addAgent({ ...data, parentSessionId });
-      useSubAgentStore.getState().setStatus(data.acpSessionId, data.status as 'spawning' | 'prompting' | 'running' | 'waiting_permission' | 'cancelling' | 'completed' | 'failed' | 'cancelled');
+
+      const existing = useSubAgentStore.getState().agents.find(a => a.acpSessionId === data.acpSessionId);
+      if (existing) {
+        useSubAgentStore.getState().setStatus(data.acpSessionId, agentStatus);
+        return;
+      }
+
+      useSubAgentStore.getState().addAgent(buildSubAgentStoreEntry(data, parentSessionId));
+      useSubAgentStore.getState().setStatus(data.acpSessionId, agentStatus);
 
       const sidebarExists = useSessionLifecycleStore.getState().sessions.some(s => s.id === data.uiId);
       if (!sidebarExists) {
@@ -588,6 +796,7 @@ export function useChatManager(
       socket.off('thought');
       socket.off('token');
       socket.off('system_event');
+      socket.off('stream_resume_snapshot');
       socket.off('permission_request');
       socket.off('token_done');
       socket.off('hooks_status');
@@ -602,6 +811,7 @@ export function useChatManager(
       socket.off('sub_agent_status');
       socket.off('sub_agent_invocation_status');
       socket.off('sub_agent_completed');
+      unsubscribePendingSubAgentStamps();
     };
   }, [socket, setSessions, onStreamThought, onStreamToken, onStreamEvent, onStreamDone]);
 

@@ -57,6 +57,20 @@ describe('useSessionLifecycleStore', () => {
     expect(state.isUrlSyncReady).toBe(true);
   });
 
+  it('handleInitialLoad preserves active typing state from the backend session list', () => {
+    const sessions = [{ id: 's1', name: 'S1', isTyping: true, messages: [], acpSessionId: 'acp-1' }];
+    mockSocket.emit.mockImplementation((event: string, ...args: any[]) => {
+      const cb = args[args.length - 1];
+      if (event === 'load_sessions') cb({ sessions });
+    });
+
+    act(() => {
+      useSessionLifecycleStore.getState().handleInitialLoad(mockSocket, vi.fn());
+    });
+
+    expect(useSessionLifecycleStore.getState().sessions[0].isTyping).toBe(true);
+  });
+
   it('fetchStats updates session with stats', async () => {
     const acpId = 'a1';
     const stats = { usedTokens: 50 };
@@ -155,6 +169,72 @@ describe('useSessionLifecycleStore', () => {
     expect(session.messages[0].timeline).toHaveLength(1);
     expect(session.messages[0].timeline![0].type).toBe('tool');
     expect(session.acpSessionId).toBe('a-resumed');
+  });
+
+  it('hydrateSession preserves a persisted active assistant marker', () => {
+    const history = {
+      messages: [{
+        id: 'm1',
+        role: 'assistant',
+        content: 'Persisted',
+        isStreaming: true,
+        timeline: [
+          { type: 'thought', content: '_Thinking..._' },
+          { type: 'thought', content: 'useful thought' },
+          { type: 'text', content: 'Persisted' }
+        ]
+      }],
+      provider: 'p1',
+      acpSessionId: 'old-acp'
+    };
+
+    mockSocket.emit.mockImplementation((event: string, ...args: any[]) => {
+      const cb = args[args.length - 1];
+      if (event === 'get_session_history') cb({ session: history });
+      if (event === 'create_session') cb({ sessionId: 'a-resumed' });
+    });
+
+    act(() => {
+      useSessionLifecycleStore.setState({ sessions: [{ id: 's1', acpSessionId: 'old-acp' } as any] });
+      useSessionLifecycleStore.getState().hydrateSession(mockSocket, 's1');
+    });
+
+    const message = useSessionLifecycleStore.getState().sessions[0].messages[0];
+    expect(message.isStreaming).toBe(true);
+    expect(message.timeline?.some(step => step.type === 'thought' && step.content === '_Thinking..._')).toBe(false);
+    expect(message.timeline?.some(step => step.type === 'thought' && step.content === 'useful thought')).toBe(true);
+    expect(useSessionLifecycleStore.getState().sessions[0].isTyping).toBe(true);
+  });
+
+  it('hydrateSession restores awaiting permission state from unresolved permission steps', () => {
+    const history = {
+      messages: [{
+        id: 'm1',
+        role: 'assistant',
+        content: '',
+        isStreaming: true,
+        timeline: [
+          { type: 'permission', request: { id: 'perm-1', sessionId: 'old-acp', options: [] }, isCollapsed: false }
+        ]
+      }],
+      provider: 'p1',
+      acpSessionId: 'old-acp'
+    };
+
+    mockSocket.emit.mockImplementation((event: string, ...args: any[]) => {
+      const cb = args[args.length - 1];
+      if (event === 'get_session_history') cb({ session: history });
+      if (event === 'create_session') cb({ sessionId: 'a-resumed' });
+    });
+
+    act(() => {
+      useSessionLifecycleStore.setState({ sessions: [{ id: 's1', acpSessionId: 'old-acp' } as any] });
+      useSessionLifecycleStore.getState().hydrateSession(mockSocket, 's1');
+    });
+
+    const session = useSessionLifecycleStore.getState().sessions[0];
+    expect(session.isAwaitingPermission).toBe(true);
+    expect(session.isTyping).toBe(true);
   });
 
   it('hydrateSession hydrates context usage from existing session stats before history load', () => {

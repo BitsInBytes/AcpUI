@@ -37,6 +37,8 @@ vi.mock('../services/acpClient.js', () => ({
 
 vi.mock('../database.js', () => ({
   getSession: vi.fn(),
+  getSessionByAcpId: vi.fn().mockResolvedValue(null),
+  saveSession: vi.fn().mockResolvedValue(undefined),
   updateSessionName: vi.fn()
 }));
 

@@ -108,7 +108,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
           });
           set({
             sessions: res.sessions.map((s: ChatSession) => applyModelState(
-              { ...s, isTyping: false, isWarmingUp: false },
+              { ...s, isTyping: Boolean(s.isTyping), isWarmingUp: false },
               { currentModelId: s.currentModelId, modelOptions: s.modelOptions }
             )),
             sessionNotes: notesMap
@@ -203,7 +203,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
             } : s)
           }));
           if (acpId) get().fetchStats(socket, acpId);
-          socket.emit('watch_session', { sessionId: acpId });
+          socket.emit('watch_session', { providerId, sessionId: acpId });
           const updatedSession = get().sessions.find(s => s.id === uiId);
           if (updatedSession) socket.emit('save_snapshot', updatedSession);
         } else if (res && res.error === 'Daemon not ready') {
@@ -252,14 +252,35 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
       socket.emit('get_session_history', { uiId }, (res: SessionHistoryResponse) => {
         if (res && res.session) {
           const fullHistory = res.session;
-          const cleanedMessages = fullHistory.messages.map((m: Message) => ({
-             ...m, isStreaming: false,
-             timeline: m.timeline?.filter(step => step.type !== 'thought').map(step => step.type === 'tool' ? { ...step, isCollapsed: true } : step)
-          }));
+          let activeAssistantIndex = -1;
+          for (let i = fullHistory.messages.length - 1; i >= 0; i--) {
+            const message = fullHistory.messages[i];
+            if (message.role === 'assistant' && message.isStreaming) {
+              activeAssistantIndex = i;
+              break;
+            }
+          }
+          const cleanedMessages = fullHistory.messages.map((m: Message, index: number) => {
+            const isActiveAssistant = index === activeAssistantIndex;
+            return {
+              ...m,
+              isStreaming: isActiveAssistant,
+              timeline: m.timeline
+                ?.filter(step => step.type !== 'thought' || (isActiveAssistant && step.content !== '_Thinking..._'))
+                .map(step => step.type === 'tool'
+                  ? { ...step, isCollapsed: isActiveAssistant ? step.isCollapsed : true }
+                  : step)
+            };
+          });
+          const hasAwaitingPermission = cleanedMessages.some((message: Message) =>
+            message.timeline?.some(step => step.type === 'permission' && !step.response)
+          );
           set(state => ({
             sessions: state.sessions.map(s => s.id === uiId ? {
               ...s,
               messages: cleanedMessages,
+              isTyping: activeAssistantIndex !== -1,
+              isAwaitingPermission: hasAwaitingPermission,
               configOptions: mergeProviderConfigOptions(s.configOptions, fullHistory.configOptions),
               model: fullHistory.model || s.model,
               currentModelId: fullHistory.currentModelId ?? s.currentModelId,
@@ -273,19 +294,27 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>((set, get)
             if (acpRes && acpRes.sessionId) {
               const acpId = acpRes.sessionId;
               set(state => ({
-                sessions: state.sessions.map(s => s.id === uiId ? {
-                  ...s,
-                  acpSessionId: acpId,
-                  isTyping: false,
-                  isWarmingUp: false,
-                  model: acpRes.model || s.model,
-                  currentModelId: acpRes.currentModelId ?? s.currentModelId,
-                  modelOptions: mergeModelOptions(s.modelOptions, acpRes.modelOptions),
-                  configOptions: mergeProviderConfigOptions(s.configOptions, acpRes.configOptions)
-                } : s)
+                sessions: state.sessions.map(s => {
+                  if (s.id !== uiId) return s;
+                  const hasActiveStream = s.messages.some(message => message.role === 'assistant' && message.isStreaming);
+                  const hasOpenPermission = s.messages.some(message =>
+                    message.timeline?.some(step => step.type === 'permission' && !step.response)
+                  );
+                  return {
+                    ...s,
+                    acpSessionId: acpId,
+                    isTyping: hasActiveStream,
+                    isAwaitingPermission: hasOpenPermission,
+                    isWarmingUp: false,
+                    model: acpRes.model || s.model,
+                    currentModelId: acpRes.currentModelId ?? s.currentModelId,
+                    modelOptions: mergeModelOptions(s.modelOptions, acpRes.modelOptions),
+                    configOptions: mergeProviderConfigOptions(s.configOptions, acpRes.configOptions)
+                  };
+                })
               }));
               get().fetchStats(socket, acpId);
-              socket.emit('watch_session', { sessionId: acpId });
+              socket.emit('watch_session', { providerId: fullHistory.provider, sessionId: acpId });
             } else if (acpRes && acpRes.error === 'Daemon not ready') {
               setTimeout(attemptHydrate, 1000);
             } else {

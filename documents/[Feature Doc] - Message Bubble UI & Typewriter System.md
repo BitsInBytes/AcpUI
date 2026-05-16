@@ -10,6 +10,7 @@ This area is high-risk because correctness depends on per-session stream isolati
 
 ### What It Does
 - Queues `token`, `thought`, and `system_event` payloads per ACP session in `streamQueues[acpSessionId]`.
+- Reattaches to backend-persisted active assistant messages after browser reload through `stream_resume_snapshot` so existing content appears immediately and new chunks append to the same response bubble.
 - Drains each session queue through `processBuffer` in event, thought, and token phases.
 - Adapts typewriter speed by buffer size while keeping `Message.content` and `Message.timeline` synchronized.
 - Renders a single `Message.timeline` with `thought`, `tool`, `text`, and `permission` steps.
@@ -30,8 +31,9 @@ Architectural role: frontend runtime and rendering pipeline, backed by normalize
 
 ## How It Works - End-to-End Flow
 
-1. Backend normalizes ACP updates and emits stream events
+1. Backend normalizes ACP updates, persists progress, and emits stream events
 - File: `backend/services/acpUpdateHandler.js` (Function: `handleUpdate`)
+- File: `backend/services/sessionStreamPersistence.js` (Functions: `persistStreamEvent`, `finalizeStreamPersistence`)
 - File: `backend/services/permissionManager.js` (Class: `PermissionManager`, Methods: `handleRequest`, `respond`)
 - Socket events emitted: `token`, `thought`, `system_event`, `stats_push`, `permission_request`.
 
@@ -50,7 +52,7 @@ if (update.sessionUpdate === 'tool_call') {
 }
 ```
 
-`handleUpdate` delegates provider-specific update normalization to `providerModule.normalizeUpdate`, provider-specific tool display normalization to `providerModule.normalizeTool`, generic tool identity resolution to `resolveToolInvocation`, and handler enrichment to `toolRegistry.dispatch`.
+`handleUpdate` delegates provider-specific update normalization to `providerModule.normalizeUpdate`, provider-specific tool display normalization to `providerModule.normalizeTool`, generic tool identity resolution to `resolveToolInvocation`, and handler enrichment to `toolRegistry.dispatch`. After drain and stats-capture filtering, it persists normalized stream events through `sessionStreamPersistence` before emitting them to session rooms.
 
 2. Permission requests use a separate backend event
 - File: `backend/services/permissionManager.js` (Method: `handleRequest`)
@@ -67,15 +69,16 @@ io.to('session:' + sessionId).emit('permission_request', {
 });
 ```
 
-The frontend stores the selected permission option in the matching timeline step and emits `respond_permission` with `providerId`, request `id`, `optionId`, optional `toolCallId`, and `sessionId`.
+The backend persists pending permission requests into the active assistant timeline and re-emits pending permission snapshots on `watch_session` while the same backend process is waiting. The frontend stores the selected permission option in the matching timeline step and emits `respond_permission` with `providerId`, request `id`, `optionId`, optional `toolCallId`, and `sessionId`.
 
 3. Socket listeners route stream payloads into stores
 - File: `frontend/src/hooks/useChatManager.ts` (Hook: `useChatManager`)
 - Store actions: `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`.
-- Socket events listened to: `thought`, `token`, `system_event`, `permission_request`, `token_done`, `stats_push`.
+- Socket events listened to: `stream_resume_snapshot`, `thought`, `token`, `system_event`, `permission_request`, `token_done`, `stats_push`.
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Hook: useChatManager)
+socket.on('stream_resume_snapshot', applyStreamResumeSnapshot);
 socket.on('thought', onStreamThought);
 socket.on('token', wrappedOnStreamToken);
 socket.on('system_event', onStreamEvent);
@@ -84,7 +87,7 @@ socket.on('permission_request', (event: StreamEventData) => {
 });
 ```
 
-`permission_request` checks `useSubAgentStore` first. Sub-agent permissions are stored on the matching sub-agent entry; main-session permissions enter the message timeline through `onStreamEvent`.
+`applyStreamResumeSnapshot` merges the backend's latest persisted streaming assistant into the matching session and seeds `activeMsgIdByAcp`, `displayedContentByMsg`, and `settledLengthByMsg` before live chunks resume. `permission_request` checks `useSubAgentStore` first. Sub-agent permissions are stored on the matching sub-agent entry; main-session permissions enter the message timeline through `onStreamEvent`.
 
 4. Assistant placeholder creation anchors each ACP stream
 - File: `frontend/src/store/useStreamStore.ts` (Store action: `ensureAssistantMessage`)
@@ -98,7 +101,7 @@ set(state => ({
 }));
 ```
 
-The placeholder message has `role: 'assistant'`, empty `content`, empty `timeline`, `isStreaming: true`, and `turnStartTime`. Every stream mutation for that ACP session targets this active message ID.
+The placeholder message has `role: 'assistant'`, empty `content`, empty `timeline`, `isStreaming: true`, and `turnStartTime`. When history hydration already contains a backend-persisted streaming assistant, `ensureAssistantMessage` reuses that message ID and seeds `displayedContentByMsg` / `settledLengthByMsg` from its content or text timeline before accepting new chunks. Every stream mutation for that ACP session targets this active message ID.
 
 5. Tokens and thoughts enqueue per session
 - File: `frontend/src/store/useStreamStore.ts` (Store actions: `onStreamThought`, `onStreamToken`)
@@ -233,7 +236,7 @@ Token chunks update both `message.content` and the latest `text` timeline step. 
 - File: `frontend/src/store/useStreamStore.ts` (Store action: `onStreamDone`)
 - Socket events: `token_done`, `save_snapshot`.
 
-`onStreamDone` waits until the session queue is empty or times out after 10 seconds. It clears `isTyping` when compaction is not active, sets `isStreaming: false`, records `turnEndTime`, marks still-running tools as terminal states, emits `save_snapshot`, and triggers `fetchStats`.
+`onStreamDone` waits until the session queue is empty or times out after 10 seconds. If `activeMsgIdByAcp` is missing after a reload, it falls back to the latest hydrated streaming assistant and seeds the active message maps before finalizing. It clears `isTyping` when compaction is not active, sets `isStreaming: false`, records `turnEndTime`, marks still-running tools as terminal states, emits `save_snapshot`, and triggers `fetchStats`.
 
 14. Shell-run socket events patch the matching tool step
 - File: `frontend/src/hooks/useChatManager.ts` (Helpers: `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`)
@@ -262,7 +265,7 @@ Shell output routes by `runId` to `useShellRunStore.runs[runId]`. The message ti
 - File: `frontend/src/store/useSubAgentStore.ts` (Actions: `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent`)
 - File: `frontend/src/components/SubAgentPanel.tsx` (Component: `SubAgentPanel`, Prop: `invocationId`, Handler: `handleStop`)
 
-`sub_agent_started` stores agent metadata and stamps `invocationId` onto the in-progress `ux_invoke_subagents` or `ux_invoke_counsel` tool step. `AssistantMessage` finds those stamped timeline steps and passes each `invocationId` to a bottom-pinned `SubAgentPanel`, which filters visible agents to the invocation that created the panel. The start tools hide successful instructional output in the timeline; `ux_check_subagents` and `ux_abort_subagents` keep normal output rendering for status and results. Active invocation state also prevents automatic collapse of the orchestration step until every agent is terminal unless the user manually collapses it. The bottom-pinned panel stays open for live active agents, auto-collapses after live terminal completion unless the user manually toggles it, and renders already-terminal invocations collapsed immediately when terminal agent state hydrates during chat load.
+`sub_agent_started` stores agent metadata and stamps `invocationId` onto the best matching in-progress `ux_invoke_subagents` or `ux_invoke_counsel` tool step. Reconnect `sub_agent_snapshot` events also stamp the parent ToolStep, resolve the parent by UI ID or ACP session ID, refresh invocation metadata even when the agent is already known, and queue the stamp until parent history hydrates if the snapshot arrives while the parent session still has no messages. `AssistantMessage` finds those stamped timeline steps and passes each `invocationId` to a bottom-pinned `SubAgentPanel`, which filters visible agents to the invocation that created the panel. The start tools hide successful instructional output in the timeline; `ux_check_subagents` and `ux_abort_subagents` keep normal output rendering for status and results. Active invocation state also prevents automatic collapse of the orchestration step until every agent is terminal unless the user manually collapses it. The bottom-pinned panel stays open for live active agents, auto-collapses after live terminal completion unless the user manually toggles it, and renders already-terminal invocations collapsed immediately when terminal agent state hydrates during chat load.
 
 16. Message rendering flows through message-list components
 - File: `frontend/src/components/MessageList/MessageList.tsx` (Component: `MessageList`)
@@ -392,7 +395,7 @@ Rules:
 2. `ensureAssistantMessage` owns the mapping from `activeMsgIdByAcp[acpSessionId]` to the active assistant placeholder.
 3. `tool_update` and `tool_end` merge into the latest tool step whose `event.id` matches `StreamEventData.id`; shell events may also merge by `shellRunId`, tool-call ID, or active shell description title.
 4. Tool merges preserve sticky metadata fields when an update omits them.
-5. Shell-run output is owned by `useShellRunStore` when `SystemEvent.shellRunId` exists; generic tool-end output does not overwrite that transcript path.
+5. Shell-run output is owned by `useShellRunStore` while the run is live; terminal MCP `tool_end` output is retained on `SystemEvent.output` as a reload fallback for completed shell cards without overwriting the live transcript path.
 6. `message.content` and the latest `text` timeline step stay synchronized during token drains.
 7. Collapse UI reads `TimelineStep.isCollapsed` and preserves user toggles in `ChatMessage.manuallyToggled` while the component is mounted.
 8. Permission responses update the matching permission timeline step and emit `respond_permission` for the same ACP session.
@@ -538,18 +541,19 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Stream normalization | `backend/services/acpUpdateHandler.js` | `handleUpdate`, `providerModule.normalizeUpdate`, `providerModule.normalizeTool`, `providerModule.extractToolOutput`, `providerModule.extractFilePath`, `resolveToolInvocation`, `applyInvocationToEvent`, `toolRegistry.dispatch`, `toolCallState.upsert` | Normalizes ACP updates and emits stream/socket events consumed by the frontend timeline. |
-| Permission backend | `backend/services/permissionManager.js` | `PermissionManager.handleRequest`, `PermissionManager.respond`, `pendingPermissions`, socket event `permission_request`, socket event `respond_permission` | Emits permission requests and writes selected ACP permission outcomes back to the daemon transport. |
+| Stream persistence | `backend/services/sessionStreamPersistence.js` | `persistStreamEvent`, `flushStreamPersistence`, `finalizeStreamPersistence`, `mergeSnapshotWithPersisted` | Reduces normalized stream events into SQLite and protects persisted active assistant progress from stale snapshots. |
+| Permission backend | `backend/services/permissionManager.js` | `PermissionManager.handleRequest`, `PermissionManager.respond`, `pendingPermissions`, `getPendingPermissionForSession`, socket event `permission_request`, socket event `respond_permission` | Emits and persists permission requests, exposes pending snapshots on reconnect, and writes selected ACP permission outcomes back to the daemon transport. |
 | Stream controller | `backend/services/streamController.js` | `drainingSessions`, `statsCaptures`, `onChunk`, `waitForDrain`, `reset` | Supports update draining and silent stats capture paths used before UI stream emission. |
 
 ### Frontend Stores and Hooks
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
-| Socket wiring | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `wrappedOnStreamToken`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, `syncShellInputStateForSession`, `subAgentSystemHandler`, socket events `thought`, `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes socket events into stream, shell-run, sub-agent, notification, and session stores. |
-| Stream engine | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`, `shellRunPatch`, `isShellDescriptionTitle`, `isShellToolData`, `isTerminalToolStatus`, `isSameShellDescriptionTitle` | Owns stream queues, adaptive typewriter mutation, event merge logic, and active assistant message mapping. |
+| Socket wiring | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `applyStreamResumeSnapshot`, `stampSubAgentInvocationOnParent`, `wrappedOnStreamToken`, `shellEventStatus`, `shellRunSnapshotPatch`, `buildShellRunToolEvent`, `ensureShellRunToolStep`, `patchShellRunToolStep`, `syncShellInputStateForSession`, `subAgentSystemHandler`, socket events `stream_resume_snapshot`, `thought`, `token`, `system_event`, `permission_request`, `token_done`, `shell_run_*`, `sub_agent_*` | Routes reconnect snapshots and live socket events into stream, shell-run, sub-agent, notification, and session stores. |
+| Stream engine | `frontend/src/store/useStreamStore.ts` | `ensureAssistantMessage`, `onStreamThought`, `onStreamToken`, `onStreamEvent`, `onStreamDone`, `processBuffer`, `shellRunPatch`, `isShellDescriptionTitle`, `isShellToolData`, `isTerminalToolStatus`, `isSameShellDescriptionTitle` | Owns stream queues, hydrated assistant reattachment, adaptive typewriter mutation, event merge logic, and active assistant message mapping. |
 | Shell run state | `frontend/src/store/useShellRunStore.ts` | `ShellRunSnapshot`, `ShellRunSnapshot.needsInput`, `upsertSnapshot`, `markStarted`, `appendOutput`, `markExited`, `trimShellTranscript`, `pruneShellRuns` | Stores live shell transcripts and shell-run metadata by `runId`, including input-wait state. |
 | Permission response | `frontend/src/store/useChatStore.ts` | `handleRespondPermission`, socket event `respond_permission`, socket event `save_snapshot` | Updates permission timeline responses and emits ACP permission selections. |
-| Session state | `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId`, `setSessions`, `fetchStats` | Holds `ChatSession.messages` and active-session state used by message rendering. |
-| Sub-agent state | `frontend/src/store/useSubAgentStore.ts` | `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent` | Stores invocation state, sub-agent cards, tool steps, and permission state for `SubAgentPanel`. |
+| Session state | `frontend/src/store/useSessionLifecycleStore.ts` | `sessions`, `activeSessionId`, `setSessions`, `hydrateSession`, `fetchStats` | Holds `ChatSession.messages`, restores backend active-stream markers and unresolved permissions, and supplies active-session state used by message rendering. |
+| Sub-agent state | `frontend/src/store/useSubAgentStore.ts` | `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `addToolStep`, `updateToolStep`, `setPermission`, `completeAgent` | Stores invocation state, sub-agent cards, tool steps, partial snapshot status, and permission state for `SubAgentPanel`. |
 | AcpUI UX tool identity | `frontend/src/utils/acpUxTools.ts` | `ACP_UX_TOOL_NAMES`, `ACP_UX_RESULT_TYPES`, `isAcpUxShellToolEvent`, `isAcpUxSubAgentStartToolEvent`, `isAcpUxSubAgentToolName` | Centralizes frontend AcpUI UX tool-name and structured-result discriminators used by stream and renderer branches. |
 
 ### Frontend Components
@@ -630,14 +634,24 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 
 11. Sub-agent panels filter by invocation ID and active panels stay visible.
     - What goes wrong: a response bubble displays agents from another invocation, the panel stays attached to an early tool call and gets lost below later work, the live orchestration step collapses while agents are still running, or a completed historical panel flashes open before collapsing.
-    - Why it happens: `SubAgentPanel` filters by `invocationId`, `useChatManager` stamps that field onto the in-progress tool step, `AssistantMessage` pins matching panels at the response bottom, collapse policy checks `useSubAgentStore.isInvocationActive`, and `PinnedSubAgentPanel` separates observed live activity from already-terminal hydration.
-    - How to avoid it: keep `sub_agent_started` invocation stamping, keep `AssistantMessage.getPinnedSubAgentInvocationIds` aligned with sub-agent tool identities, preserve the active-invocation collapse guard, and keep terminal hydration collapsed until the user explicitly opens it.
+    - Why it happens: `SubAgentPanel` filters by `invocationId`, `useChatManager` stamps that field onto the parent tool step from live and reconnect events, keeps reconnect stamps replayable across parent history and `stream_resume_snapshot` hydration, `AssistantMessage` pins matching panels at the response bottom, collapse policy checks `useSubAgentStore.isInvocationActive`, and `PinnedSubAgentPanel` separates observed live activity from already-terminal hydration.
+    - How to avoid it: keep `sub_agents_starting`, `sub_agent_started`, and `sub_agent_snapshot` invocation stamping for both running and terminal snapshots, keep parent UI/ACP ID resolution and durable stamp replay, keep AssistantMessage pinned-panel discovery aligned with sub-agent tool identities, preserve the active-invocation collapse guard, and keep terminal hydration collapsed until the user explicitly opens it.
+
+12. Hydrated active assistants must be reused before creating placeholders.
+    - What goes wrong: reconnecting to a running prompt creates a second assistant bubble or finalizes nothing on `token_done`.
+    - Why it happens: `activeMsgIdByAcp` is process-local frontend state, while `isStreaming` comes from backend-persisted history after reload.
+    - How to avoid it: keep `hydrateSession` preserving the latest streaming assistant, keep `ensureAssistantMessage` seeding active message maps from that assistant, and keep `onStreamDone` using the hydrated streaming fallback.
 
 ---
 
 ## Unit Tests
 
 ### Backend stream and permission contracts
+- `backend/test/sessionStreamPersistence.test.js`
+  - `persists token progress into the active assistant message`
+  - `merges tool updates by id and preserves sticky fields`
+  - `finalizes the active assistant only on terminal prompt lifecycle`
+  - `protects richer persisted assistant content from stale snapshots`
 - `backend/test/acpUpdateHandler.test.js`
   - `handles agent_thought_chunk`
   - `handles tool_call start`
@@ -655,6 +669,7 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `marks running shell prompts as needing input and clears the marker on user input`
 - `backend/test/permissionManager.test.js`
   - `should track requests and emit to correct session room`
+  - `persists and exposes pending request snapshots`
   - `should correlate approval and send correct JSON-RPC result`
   - `should correlate rejection and send cancelled outcome`
   - `should support out-of-order responses across sessions`
@@ -670,11 +685,14 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `resolves tool identity from normalized event fields`
 - `frontend/src/test/useStreamStore.test.ts`
   - `ensureAssistantMessage creates a placeholder message`
+  - `ensureAssistantMessage reuses a hydrated streaming assistant`
+  - `onStreamToken appends to a hydrated streaming assistant without duplicating`
   - `onStreamToken queues text and triggers typewriter`
   - `onStreamToken injects RESPONSE_DIVIDER after tool processing`
   - `processBuffer drains queue into session messages with adaptive speed`
   - `processBuffer flushes large buffers immediately`
   - `onStreamEvent handles tool_start and collapses previous steps`
+  - `does not duplicate a hydrated permission request snapshot`
   - `hydrates queued shell tool_start from an existing shell snapshot`
   - `keeps active parallel shell tool starts expanded while later shell steps arrive`
   - `merges duplicate shell tool_start events by shellRunId`
@@ -682,12 +700,13 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `merges duplicate provider shell tool_start events before a shell run id is attached`
   - `merges shell tool_end events by shellRunId when tool ids differ`
   - `prefers MCP handler titles over longer raw provider titles`
-  - `preserves Shell V2 terminal output on tool_end by shellRunId`
+  - `persists Shell V2 terminal output on terminal tool_end by shellRunId`
   - `preserves Shell V2 description title over later command titles`
   - `keeps active sub-agent orchestration steps expanded when new timeline steps arrive`
   - `collapses inactive sub-agent orchestration steps when new timeline steps arrive`
   - `processBuffer removes Thinking placeholder when real thoughts or tokens arrive`
   - `onStreamDone marks message as finished and saves snapshot`
+  - `onStreamDone finalizes a hydrated streaming assistant without an active map`
 - `frontend/src/test/typewriter-adaptive.test.ts`
   - `should increase speed when buffer is large`
   - `should drip thoughts at adaptive speed`
@@ -699,6 +718,13 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
   - `concurrent tool events for different sessions are tracked independently`
 - `frontend/src/test/useChatManager.test.ts`
   - `handles "permission_request" for sub-agent`
+  - `applies stream resume snapshots and seeds active stream state`
+  - `stamps parent sub-agent tool steps from reconnect snapshots even when agent already exists`
+  - `replays reconnect sub-agent stamps after parent history hydrates`
+  - `keeps reconnect sub-agent stamps after stream resume refreshes the parent message`
+  - `recovers a parent sub-agent ToolStep from terminal reconnect snapshots`
+  - `resolves parent ui id from parent acp id for reconnect snapshots`
+  - `stamps only the best matching parent sub-agent tool step`
   - `handles Shell V2 socket events by explicit shellRunId`
   - `creates a Shell V2 tool step from shell lifecycle events when provider tool_start is missing`
   - `marks Shell V2 tool steps failed on non-zero shell exits`
@@ -851,6 +877,7 @@ File: `frontend/src/components/renderToolOutput.tsx` (Function: `renderToolOutpu
 ## Summary
 
 - Backend ACP updates become normalized `token`, `thought`, `system_event`, `stats_push`, and `permission_request` socket events.
+- `sessionStreamPersistence` reduces normalized stream events into SQLite, and `stream_resume_snapshot` lets reconnects render existing progress before live chunks resume.
 - `useChatManager` routes socket events into stream, shell-run, sub-agent, permission, and session stores.
 - `useStreamStore` owns per-ACP-session queues and drains them in event, thought, and token phases.
 - `TimelineStep` is the rendering contract for assistant thoughts, tools, text, and permissions.

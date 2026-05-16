@@ -102,6 +102,7 @@ describe('Exhaustive Database Coverage', () => {
       provider: 'provider-b'
     }));
     expect(await db.getSubAgentInvocationsForParent('provider-a', parentUiId)).toHaveLength(1);
+    expect(await db.getSubAgentInvocationsForParent('provider-a', null, `parent-acp-${suffix}`)).toHaveLength(1);
 
     await db.addSubAgentInvocationAgent({
       invocationId: providerAInvocationId,

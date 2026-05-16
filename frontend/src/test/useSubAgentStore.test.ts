@@ -89,6 +89,34 @@ describe('useSubAgentStore (Pure Logic)', () => {
     }
   });
 
+  it('keeps a partially hydrated invocation active until all expected agents are known', () => {
+    act(() => {
+      useSubAgentStore.getState().startInvocation({
+        invocationId: 'inv-partial',
+        providerId: 'p1',
+        parentUiId: 'parent-ui',
+        parentSessionId: 'parent-acp',
+        statusToolName: 'ux_check_subagents',
+        totalCount: 3,
+        status: 'running'
+      });
+      useSubAgentStore.getState().addAgent({
+        providerId: 'p1',
+        acpSessionId: 'a1',
+        parentSessionId: 'parent-acp',
+        invocationId: 'inv-partial',
+        index: 0,
+        name: 'Sub 1',
+        prompt: 'one',
+        agent: 'generalist'
+      });
+      useSubAgentStore.getState().completeAgent('a1');
+    });
+
+    expect(useSubAgentStore.getState().invocations[0].status).toBe('running');
+    expect(useSubAgentStore.getState().isInvocationActive('inv-partial')).toBe(true);
+  });
+
   it('updates permission state and active status for waiting agents', () => {
     act(() => {
       useSubAgentStore.getState().addAgent({

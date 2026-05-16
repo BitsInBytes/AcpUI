@@ -131,7 +131,7 @@ export const useChatStore = create<ChatState>((_set, get) => ({
       lifecycle.setActiveSessionId(res.newUiId!);
       lifecycle.fetchStats(socket, res.newAcpId);
       
-      socket.emit('watch_session', { sessionId: res.newAcpId });
+      socket.emit('watch_session', { providerId: original.provider, sessionId: res.newAcpId });
       
       setTimeout(() => {
         get().handleSubmit(socket, 'This is a conversation fork. You are now detached from the original session and acting as a new session with the existing history. If you are asked about work you did, only refer to work you did after this message. Acknowledge briefly.');

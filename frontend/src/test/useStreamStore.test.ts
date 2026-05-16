@@ -45,6 +45,47 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(useStreamStore.getState().activeMsgIdByAcp['a1']).toBe(session.messages[0].id);
   });
 
+  it('ensureAssistantMessage reuses a hydrated streaming assistant', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'a1',
+          provider: 'p1',
+          messages: [{ id: 'a-existing', role: 'assistant', content: 'Persisted text', isStreaming: true, timeline: [{ type: 'text', content: 'Persisted text' }] }]
+        } as any]
+      });
+      useStreamStore.getState().ensureAssistantMessage('a1');
+    });
+
+    const streamState = useStreamStore.getState();
+    const session = useSessionLifecycleStore.getState().sessions[0];
+    expect(session.messages).toHaveLength(1);
+    expect(streamState.activeMsgIdByAcp['a1']).toBe('a-existing');
+    expect(streamState.displayedContentByMsg['a-existing']).toBe('Persisted text');
+    expect(streamState.settledLengthByMsg['a-existing']).toBe('Persisted text'.length);
+  });
+
+  it('onStreamToken appends to a hydrated streaming assistant without duplicating', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'a1',
+          provider: 'p1',
+          messages: [{ id: 'a-existing', role: 'assistant', content: 'Persisted', isStreaming: true, timeline: [{ type: 'text', content: 'Persisted' }] }]
+        } as any]
+      });
+      useStreamStore.getState().onStreamToken({ sessionId: 'a1', text: 'x' });
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const session = useSessionLifecycleStore.getState().sessions[0];
+    expect(session.messages).toHaveLength(1);
+    expect(session.messages[0].content).toContain('Persisted');
+    expect(session.messages[0].content).toContain('x');
+  });
+
   it('onStreamToken queues text and triggers typewriter', () => {
     act(() => {
       useStreamStore.getState().onStreamToken({ sessionId: 'a1', text: 'Hello' });
@@ -128,6 +169,30 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(timeline[1].type).toBe('tool');
     expect((timeline[1] as any).event.id).toBe('t1');
     expect(timeline[1].isCollapsed).toBe(false); // Current tool open
+  });
+
+  it('does not duplicate a hydrated permission request snapshot', () => {
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'a1',
+          provider: 'p1',
+          messages: [{
+            id: 'a-existing',
+            role: 'assistant',
+            content: '',
+            isStreaming: true,
+            timeline: [{ type: 'permission', request: { id: 'perm-1', sessionId: 'a1', options: [] }, isCollapsed: false }]
+          }]
+        } as any]
+      });
+      useStreamStore.getState().onStreamEvent({ sessionId: 'a1', type: 'permission_request', id: 'perm-1', options: [] } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const timeline = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline!;
+    expect(timeline.filter(step => step.type === 'permission')).toHaveLength(1);
   });
 
   it('keeps active sub-agent orchestration steps expanded when new timeline steps arrive', () => {
@@ -591,7 +656,7 @@ describe('useStreamStore (Pure Logic)', () => {
     expect(tool.event._fallbackOutput).toBe('some progress');
   });
 
-  it('preserves Shell V2 terminal output on tool_end by shellRunId', () => {
+  it('persists Shell V2 terminal output on terminal tool_end by shellRunId', () => {
     act(() => {
       useStreamStore.getState().ensureAssistantMessage('a1');
       useStreamStore.getState().onStreamEvent({
@@ -615,7 +680,48 @@ describe('useStreamStore (Pure Logic)', () => {
 
     const tool = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline![0] as any;
     expect(tool.event.shellRunId).toBe('shell-run-1');
-    expect(tool.event.output).toBeUndefined();
+    expect(tool.event.shellState).toBe('exited');
+    expect(tool.event.shellNeedsInput).toBe(false);
+    expect(tool.event.output).toBe('final MCP result');
+  });
+
+  it('keeps existing Shell V2 output when terminal tool_end has blank output', () => {
+    act(() => {
+      useStreamStore.getState().ensureAssistantMessage('a1');
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_start',
+        id: 't1',
+        title: 'Run shell',
+        shellRunId: 'shell-run-1'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_update',
+        id: 't1',
+        status: 'in_progress',
+        shellRunId: 'shell-run-1',
+        output: '$ npm test\nPASS\n'
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+
+      useStreamStore.getState().onStreamEvent({
+        sessionId: 'a1',
+        type: 'tool_end',
+        id: 't1',
+        status: 'completed',
+        shellRunId: 'shell-run-1',
+        output: ''
+      } as any);
+      useStreamStore.getState().processBuffer(vi.fn());
+    });
+
+    const tool = useSessionLifecycleStore.getState().sessions[0].messages[0].timeline![0] as any;
+    expect(tool.event.status).toBe('completed');
+    expect(tool.event.shellState).toBe('exited');
+    expect(tool.event.output).toBe('$ npm test\nPASS\n');
   });
 
   it('preserves Shell V2 description title over later command titles', () => {
@@ -681,5 +787,28 @@ describe('useStreamStore (Pure Logic)', () => {
     const msg = useSessionLifecycleStore.getState().sessions[0].messages[0];
     expect(msg.isStreaming).toBe(false);
     expect(mockSocket.emit).toHaveBeenCalledWith('save_snapshot', expect.anything());
+  });
+
+  it('onStreamDone finalizes a hydrated streaming assistant without an active map', () => {
+    const mockSocket = { emit: vi.fn() } as any;
+    act(() => {
+      useSessionLifecycleStore.setState({
+        sessions: [{
+          id: 's1',
+          acpSessionId: 'a1',
+          provider: 'p1',
+          messages: [{ id: 'a-existing', role: 'assistant', content: 'Persisted', isStreaming: true, timeline: [{ type: 'text', content: 'Persisted' }] }]
+        } as any]
+      });
+      useStreamStore.getState().onStreamDone(mockSocket, { sessionId: 'a1' });
+    });
+
+    act(() => { vi.advanceTimersByTime(100); });
+
+    const msg = useSessionLifecycleStore.getState().sessions[0].messages[0];
+    expect(msg.id).toBe('a-existing');
+    expect(msg.isStreaming).toBe(false);
+    expect(useStreamStore.getState().activeMsgIdByAcp['a1']).toBe('a-existing');
+    expect(mockSocket.emit).toHaveBeenCalledWith('save_snapshot', expect.objectContaining({ id: 's1' }));
   });
 });

@@ -168,7 +168,7 @@ const newSession: ChatSession = {
 
 lifecycle.setSessions([...lifecycle.sessions, newSession]);
 lifecycle.setActiveSessionId(res.newUiId);
-socket.emit('watch_session', { sessionId: res.newAcpId });
+socket.emit('watch_session', { providerId: original.provider, sessionId: res.newAcpId });
 setTimeout(() => get().handleSubmit(socket, '<detached fork orientation prompt>'), 500);
 ```
 
@@ -455,7 +455,7 @@ File: `frontend/src/store/useChatStore.ts` (Store action: `handleForkSession`)
 |---|---|---|---|
 | `fork_session` | Frontend to backend | `{ uiId, messageIndex }` | Request a fork from the selected UI session at a UI message index. |
 | `fork_session` callback | Backend to frontend | `{ success, providerId, newUiId, newAcpId, currentModelId, modelOptions, configOptions }` | Register and select the local fork session. |
-| `watch_session` | Frontend to backend | `{ sessionId: newAcpId }` | Subscribe to stream events for the fork ACP session. |
+| `watch_session` | Frontend to backend | `{ providerId, sessionId: newAcpId }` | Subscribe to stream events and provider-scoped reconnect replay for the fork ACP session. |
 | `session_renamed` | Backend to frontend | `{ providerId, uiId, newName }` | Apply generated fork title. |
 | `merge_fork` | Frontend to backend | `{ uiId: forkUiId }` | Request merge-back for a fork UI session. |
 | `merge_fork` callback | Backend to frontend | `{ success, parentUiId }` or `{ error }` | Switch UI to parent or show failure state. |

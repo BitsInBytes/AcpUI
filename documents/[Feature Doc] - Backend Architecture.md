@@ -80,7 +80,7 @@ This architecture doc intentionally avoids duplicating feature-level code snippe
 7. **Update and tool normalization**
    Files: `backend/services/acpUpdateHandler.js`, `backend/services/tools/index.js`, `backend/services/tools/mcpExecutionRegistry.js`
 
-   Daemon `session/update` and `session/notification` payloads pass through provider normalization, stream routing, Tool System V2, provider extension emission, stats updates, and autosave scheduling.
+   Daemon `session/update` and `session/notification` payloads pass through provider normalization, stream routing, Tool System V2, provider extension emission, stats updates, and durable stream persistence.
 
 8. **MCP proxy and persistence**
    Files: `backend/routes/mcpApi.js`, `backend/mcp/mcpServer.js`, `backend/database.js`
@@ -128,7 +128,7 @@ flowchart LR
 | `watch_session`, `unwatch_session` | `backend/sockets/index.js` | Socket room membership for ACP-session-scoped stream events |
 | `load_sessions`, `create_session`, `save_snapshot`, `get_session_history`, `rehydrate_session`, `delete_session`, `fork_session`, `merge_fork`, `set_session_model`, `set_session_option` | `backend/sockets/sessionHandlers.js` | Session lifecycle and persistence workflows |
 | `prompt`, `cancel_prompt`, `respond_permission`, `set_mode` | `backend/sockets/promptHandlers.js` | User turn execution, cancellation, permission response, and mode changes |
-| `token`, `thought`, `system_event`, `stats_push`, `permission_request`, `token_done`, `merge_message` | `acpUpdateHandler`, `promptHandlers`, `permissionManager`, `sessionHandlers` | Stream output and timeline-driving events |
+| `token`, `thought`, `system_event`, `stream_resume_snapshot`, `stats_push`, `permission_request`, `token_done`, `merge_message` | `acpUpdateHandler`, `sessionStreamPersistence`, `promptHandlers`, `permissionManager`, `sessionHandlers` | Stream output, reconnect snapshots, and timeline-driving events |
 | `help_docs_list`, `help_docs_read` | `backend/sockets/helpDocsHandlers.js` | Read-only repository Markdown discovery and safe document reads |
 | `GET /api/mcp/tools`, `POST /api/mcp/tool-call` | `backend/routes/mcpApi.js` | Tool advertisement and internal MCP proxy execution |
 
@@ -144,6 +144,7 @@ Feature docs own the detailed payload contracts for each surface.
 | Provider config and branding | `providers/<provider>/provider.json`, optional `branding.json`, optional `user.json`, `providerLoader.js` | Runtime config, provider module hooks, protocol prefix, branding payloads |
 | MCP feature flags | `configuration/mcp.json`, `backend/services/mcpConfig.js` | Core and optional tool advertisement and handler registration |
 | Runtime session state | `AcpClient.sessionMetadata`, `StreamController` | Hot model/config state, buffers, drain/capture state, prompt lifecycle data |
+| Durable stream progress | `backend/services/sessionStreamPersistence.js`, `backend/database.js` | Normalized live tokens, thoughts, tools, permissions, terminal tool output, reconnect snapshots, active assistant finalization, and safe snapshot merge state |
 | Durable state | `backend/database.js` | Sessions, folders, canvas artifacts, stats, config options, model state, provider status, notes, sub-agent invocations |
 
 ---
@@ -161,8 +162,8 @@ Feature docs own the detailed payload contracts for each surface.
 | JSON-RPC transport | `backend/services/jsonRpcTransport.js` | `sendRequest`, `sendNotification`, `getPendingRequestContext`, `reset` | Request ids, response correlation, notifications |
 | Permission manager | `backend/services/permissionManager.js` | `handleRequest`, `respond`, `pendingPermissions` | Permission socket event and daemon response handling |
 | Stream controller | `backend/services/streamController.js` | `statsCaptures`, `drainingSessions`, `beginDraining`, `waitForDrainToFinish`, `onChunk` | Drain, capture, and stream silence tracking |
-| Socket gateway | `backend/sockets/index.js` | `registerSocketHandlers`, `buildBrandingPayload`, `emitCachedProviderStatuses` | Connection hydration and room membership |
-| Sessions | `backend/sockets/sessionHandlers.js`, `backend/services/sessionManager.js` | `registerSessionHandlers`, `getMcpServers`, `loadSessionIntoMemory`, `autoSaveTurn` | Session create/load/resume/persist workflows |
+| Socket gateway | `backend/sockets/index.js` | `registerSocketHandlers`, `buildBrandingPayload`, `emitCachedProviderStatuses`, `emitStreamResumeSnapshot`, `watch_session` | Connection hydration, room membership, and reconnect stream snapshots |
+| Sessions | `backend/sockets/sessionHandlers.js`, `backend/services/sessionManager.js`, `backend/services/sessionStreamPersistence.js` | `registerSessionHandlers`, `annotateLiveSessionState`, `flushActiveStream`, `getMcpServers`, `loadSessionIntoMemory`, `persistStreamEvent`, `flushStreamPersistence`, `getStreamResumeSnapshot`, `finalizeStreamPersistence` | Session create/load/resume, live-state annotation, stream progress persistence, reconnect snapshots, and safe snapshot merge workflows |
 | Prompts | `backend/sockets/promptHandlers.js` | `registerPromptHandlers`, `prompt`, `cancel_prompt`, `respond_permission` | Prompt send, cancellation, lifecycle hooks |
 | Help docs | `backend/sockets/helpDocsHandlers.js` | `registerHelpDocsHandlers`, `createHelpDocsHandlers`, `help_docs_list`, `help_docs_read` | Repository Markdown listing and read-only document content callbacks |
 | Updates and tools | `backend/services/acpUpdateHandler.js`, `backend/services/tools/index.js` | `handleUpdate`, `toolRegistry`, `toolCallState`, `mcpExecutionRegistry` | Normalization, timeline events, sticky tool metadata |
@@ -214,8 +215,8 @@ This doc lists only backbone tests. Feature docs list focused suites for their s
 | Server and config diagnostics | `backend/test/server.test.js`, `backend/test/jsonConfigDiagnostics.test.js` |
 | Provider runtime and ACP client | `backend/test/providerRuntimeManager.test.js`, `backend/test/acpClient.test.js`, `backend/test/acpClient-routing.test.js`, `backend/test/jsonRpcTransport.test.js` |
 | Socket hydration, session flow, and help docs | `backend/test/sockets-index.test.js`, `backend/test/sessionHandlers.test.js`, `backend/test/promptHandlers.test.js`, `backend/test/helpDocsHandlers.test.js` |
-| Updates, tools, and MCP | `backend/test/acpUpdateHandler.test.js`, `backend/test/toolInvocationResolver.test.js`, `backend/test/mcpApi.test.js`, `backend/test/mcpServer.test.js` |
-| Persistence | `backend/test/persistence.test.js`, `backend/test/sessionManager.test.js`, `backend/test/database-exhaustive.test.js` |
+| Updates, tools, and MCP | `backend/test/acpUpdateHandler.test.js`, `backend/test/toolInvocationResolver.test.js`, `backend/test/mcpApi.test.js`, `backend/test/mcpServer.test.js`, `backend/test/mcpExecutionRegistryPersistence.test.js` |
+| Persistence | `backend/test/persistence.test.js`, `backend/test/sessionManager.test.js`, `backend/test/sessionStreamPersistence.test.js`, `backend/test/database-exhaustive.test.js` |
 
 Run backend verification from `backend` with `npm run lint` and `npx vitest run`.
 

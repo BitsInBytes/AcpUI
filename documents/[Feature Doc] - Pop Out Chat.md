@@ -86,7 +86,9 @@ useEffect(() => {
     const oldSession = sessions.find(s => s.id === lastActiveSessionIdRef.current);
     const newSession = sessions.find(s => s.id === activeSessionId);
     if (oldSession?.acpSessionId && socket && !oldSession.isTyping) socket.emit('unwatch_session', { sessionId: oldSession.acpSessionId });
-    if (newSession?.acpSessionId && socket) socket.emit('watch_session', { sessionId: newSession.acpSessionId });
+    if (newSession?.acpSessionId && socket) {
+      socket.emit('watch_session', { providerId: newSession.provider, sessionId: newSession.acpSessionId });
+    }
     ...
   }
 
@@ -136,7 +138,7 @@ useEffect(() => {
 
       const session = mapped.find((s: ChatSession) => s.id === popoutSessionId);
       if (session?.acpSessionId) {
-        socket.emit('watch_session', { sessionId: session.acpSessionId });
+        socket.emit('watch_session', { providerId: session.provider, sessionId: session.acpSessionId });
         useSessionLifecycleStore.getState().hydrateSession(socket, popoutSessionId);
       }
       setReady(true);
@@ -159,8 +161,12 @@ Files:
 socket.on('watch_session', ({ providerId = null, sessionId }) => {
   if (sessionId) {
     socket.join(`session:${sessionId}`);
+    void emitStreamResumeSnapshot(socket, { providerId, sessionId })
+      .catch(err => writeLog(`[STREAM SNAPSHOT ERR] ${err.message}`));
     emitShellRunSnapshotsForSession(socket, { providerId, sessionId });
-    emitSubAgentSnapshotsForSession(socket, { providerId, sessionId });
+    void emitSubAgentSnapshotsForSession(socket, { providerId, sessionId })
+      .catch(err => writeLog(`[SUB-AGENT SNAPSHOT ERR] ${err.message}`));
+    emitPendingPermissionSnapshot(socket, { providerId, sessionId });
   }
 });
 
@@ -171,7 +177,7 @@ socket.on('unwatch_session', ({ sessionId }) => {
 });
 ```
 
-`watch_session` and `unwatch_session` operate on ACP session IDs and Socket.IO rooms named `session:{acpSessionId}`. `load_sessions` and `get_session_history` use the database-backed UI session records that connect UI IDs to ACP IDs.
+`watch_session` and `unwatch_session` operate on ACP session IDs and Socket.IO rooms named `session:{acpSessionId}`. The watch payload also carries `providerId` so reconnect replay can use the correct provider runtime for stream, shell, sub-agent, and pending-permission snapshots. `load_sessions` and `get_session_history` use the database-backed UI session records that connect UI IDs to ACP IDs.
 
 ### 7. `PopOutApp` renders the focused chat shell
 
@@ -301,11 +307,11 @@ flowchart LR
   Sidebar -->|openPopout UI session ID| MainOwnership
   MainOwnership -->|window.open /?popout=UI ID| PopoutRoot
   MainOwnership -->|clear activeSessionId when selected| MainSessionStore
-  MainSessionStore -->|watch_session / unwatch_session with ACP ID| Rooms
+  MainSessionStore -->|watch_session with provider + ACP ID / unwatch_session with ACP ID| Rooms
 
   PopoutRoot --> PopoutSessionStore
   PopoutSessionStore -->|load_sessions| SessionHandlers
-  PopoutSessionStore -->|watch_session with ACP ID| Rooms
+  PopoutSessionStore -->|watch_session with provider + ACP ID| Rooms
   PopoutSessionStore -->|hydrateSession -> get_session_history| SessionHandlers
   PopoutChat -->|canvas_load and canvas actions| CanvasHandlers
 
@@ -344,7 +350,7 @@ type OwnershipMessage =
 - `popoutWindows` stores opener-owned `Window` references, keyed by UI session ID.
 - `SessionItem` must call `isSessionPoppedOut(session.id)` before selecting a session from the sidebar.
 - `PopOutApp` must call `claimSession(popoutSessionId)` during initialization and `releaseSession(popoutSessionId)` during unload.
-- `PopOutApp` must use the UI session ID for Zustand state and `hydrateSession`, and the ACP session ID for `watch_session`.
+- `PopOutApp` must use the UI session ID for Zustand state and `hydrateSession`, and send provider ID plus ACP session ID to `watch_session`.
 - Main `App` must keep `setOwnershipChangeCallback` wired so sidebar state reflects BroadcastChannel messages.
 
 Breaking this contract causes one of three visible failures: the main window can select an active popped session, a closed pop-out can leave stale sidebar state, or a detached window can miss streaming updates because it joined the wrong socket room.
@@ -388,7 +394,7 @@ PopOutApp reads popout UI session ID
   -> backend sessionHandlers.js returns UI session records
   -> PopOutApp sets useSessionLifecycleStore.sessions and activeSessionId
   -> PopOutApp finds the matching UI session
-  -> socket.emit('watch_session', { sessionId: acpSessionId })
+  -> socket.emit('watch_session', { providerId, sessionId: acpSessionId })
   -> hydrateSession(socket, uiSessionId)
   -> socket.emit('get_session_history', { uiId })
   -> useSessionLifecycleStore updates messages, model state, config options, and ACP session state
@@ -453,7 +459,7 @@ PopOutApp reads popout UI session ID
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Session records | `backend/sockets/sessionHandlers.js` | Socket events `load_sessions`, `get_session_history`, `save_snapshot`, `set_session_model`, `set_session_option`, `merge_fork` | Provides UI session metadata and hydrated history for the pop-out. |
-| Socket rooms | `backend/sockets/index.js` | Socket events `watch_session`, `unwatch_session`, helpers `emitShellRunSnapshotsForSession`, `emitSubAgentSnapshotsForSession` | Joins/leaves `session:{acpSessionId}` rooms and replays shell/sub-agent snapshots. |
+| Socket rooms | `backend/sockets/index.js` | Socket events `watch_session`, `unwatch_session`, helpers `emitStreamResumeSnapshot`, `emitShellRunSnapshotsForSession`, `emitSubAgentSnapshotsForSession`, `emitPendingPermissionSnapshot` | Joins/leaves `session:{acpSessionId}` rooms and replays stream, shell, sub-agent, and pending-permission snapshots. |
 | Canvas persistence | `backend/sockets/canvasHandlers.js` | Socket events `canvas_load`, `canvas_save`, `canvas_delete`, `canvas_apply_to_file` | Loads and saves canvas artifacts used by `CanvasPane`. |
 
 ### Tests
@@ -468,7 +474,7 @@ PopOutApp reads popout UI session ID
 | Input | `frontend/src/test/ChatInput.test.tsx` | `automatically focuses the textarea when enabled`, `renders model selector and allows model change`, `submits on Enter key press`, slash command tests, send/cancel tests | Verifies core input behavior reused by `PopOutApp`. |
 | Input extended | `frontend/src/test/ChatInputExtended.test.tsx` | `renders textarea and updates store on change`, `triggers handleSubmit on Enter (without shift)`, `shows slash command dropdown when typing /`, `handles file upload trigger` | Verifies additional draft, submit, slash, and upload behavior. |
 | Main app rooms | `frontend/src/test/App.test.tsx` | `switches between sessions and emits watch events`, canvas resize tests | Verifies main-window watch/unwatch and canvas behavior used when the main active session changes. |
-| Backend rooms | `backend/test/sockets-index.test.js` | `watch_session joins the session room`, `unwatch_session leaves the session room`, snapshot tests | Verifies socket room operations used by main and detached windows. |
+| Backend rooms | `backend/test/sockets-index.test.js` | `watch_session joins the session room`, `watch_session emits shell run snapshots`, `watch_session emits a stream resume snapshot when active progress exists`, `watch_session emits pending permission snapshots`, `unwatch_session leaves the session room` | Verifies socket room operations and reconnect replay used by main and detached windows. |
 | Backend sessions | `backend/test/sessionHandlers.test.js` | `handles load_sessions with cleanup`, `handles get_session_history`, `handles save_snapshot`, model/config option tests | Verifies session metadata and history socket handlers. |
 | Backend canvas | `backend/test/canvasHandlers.test.js` | `canvas_load returns artifacts`, canvas error tests | Verifies canvas artifact loading used by split-screen pop-outs. |
 
@@ -587,6 +593,8 @@ The main and detached windows communicate through `BroadcastChannel`, so they mu
 - `backend/test/sockets-index.test.js`
   - `watch_session joins the session room`
   - `watch_session emits shell run snapshots`
+  - `watch_session emits a stream resume snapshot when active progress exists`
+  - `watch_session emits pending permission snapshots`
   - `unwatch_session leaves the session room`
   - `watch_session does nothing when sessionId is falsy`
   - `unwatch_session does nothing when sessionId is falsy`

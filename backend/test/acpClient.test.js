@@ -23,6 +23,8 @@ vi.mock('child_process', () => {
 
 vi.mock('../database.js', () => ({
   initDb: vi.fn().mockResolvedValue({}),
+  getSessionByAcpId: vi.fn().mockResolvedValue(null),
+  saveSession: vi.fn().mockResolvedValue({}),
   saveModelState: vi.fn().mockResolvedValue({}),
   saveConfigOptions: vi.fn().mockResolvedValue({})
 }));

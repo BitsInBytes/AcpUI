@@ -36,6 +36,7 @@ function normalizeInvocation(result, defaultTitleSource = 'provider') {
     category: result.category || {},
     filePath: result.filePath,
     output: result.output,
+    status: result.status,
     execution: result.execution
   };
 }
@@ -129,7 +130,6 @@ export function resolveToolInvocation({
     sessionId,
     toolCallId,
     phase: resolvedPhase,
-    status: update?.status,
     identity: mergedIdentity,
     input: {
       ...(cached?.input || {}),
@@ -154,6 +154,7 @@ export function resolveToolInvocation({
     },
     filePath: mcpInvocation.filePath || cached?.filePath || providerInvocation.filePath || event?.filePath,
     output: event?.output ?? mcpInvocation.output,
+    status: event?.status || mcpInvocation.status || cached?.status,
     raw: {
       providerInvocation,
       mcpExecution: mcpInvocation.execution
@@ -175,6 +176,8 @@ export function applyInvocationToEvent(event, invocation) {
     ...(identity.mcpToolName ? { mcpToolName: identity.mcpToolName } : {}),
     ...(isAcpUxTool ? { isAcpUxTool: true } : {}),
     ...(invocation.filePath ? { filePath: invocation.filePath } : {}),
+    ...(invocation.output !== undefined && event.output === undefined ? { output: invocation.output } : {}),
+    ...(invocation.status && !event.status ? { status: invocation.status } : {}),
     ...(invocation.display?.title ? { title: invocation.display.title } : {}),
     ...(invocation.display?.titleSource ? { titleSource: invocation.display.titleSource } : {}),
     ...category

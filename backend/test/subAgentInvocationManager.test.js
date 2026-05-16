@@ -38,14 +38,22 @@ describe('SubAgentInvocationManager', () => {
   let mockIo;
   let mockDb;
   let mockAcpClient;
+  let savedSessions;
 
   beforeEach(() => {
     vi.useFakeTimers();
     mockIo = { emit: vi.fn(), fetchSockets: vi.fn().mockResolvedValue([]) };
+    savedSessions = new Map();
     mockDb = {
-      getSessionByAcpId: vi.fn().mockResolvedValue({ id: 'parent-ui' }),
+      getSessionByAcpId: vi.fn().mockImplementation(async (...args) => {
+        const acpId = args.length === 2 ? args[1] : args[0];
+        if (acpId === 'parent-acp') return { id: 'parent-ui' };
+        return savedSessions.get(acpId) || null;
+      }),
       getAllSessions: vi.fn().mockResolvedValue([]),
-      saveSession: vi.fn().mockResolvedValue(),
+      saveSession: vi.fn().mockImplementation(async (session) => {
+        if (session?.acpSessionId) savedSessions.set(session.acpSessionId, JSON.parse(JSON.stringify(session)));
+      }),
       deleteSession: vi.fn().mockResolvedValue(),
       getActiveSubAgentInvocationForParent: vi.fn().mockResolvedValue(null),
       createSubAgentInvocation: vi.fn().mockResolvedValue(),
@@ -56,6 +64,9 @@ describe('SubAgentInvocationManager', () => {
       deleteSubAgentInvocationsForParent: vi.fn().mockResolvedValue()
     };
     mockAcpClient = {
+      providerId: 'provider-a',
+      getProviderId: vi.fn().mockReturnValue('provider-a'),
+      _sessionStreamPersistenceDb: mockDb,
       transport: {
         sendRequest: vi.fn().mockImplementation(async (method) => {
           if (method === 'session/new') return { sessionId: 'sub-acp-1' };
@@ -116,6 +127,22 @@ describe('SubAgentInvocationManager', () => {
     const status = await manager.getInvocationStatus({ providerId: 'provider-a', invocationId, waitTimeoutMs: 0 });
     expect(status.content[0].text).toContain('test response');
     expect(status.content[0].text).toContain('completed');
+  });
+
+  it('persists the sub-agent prompt and finalizes the child transcript', async () => {
+    const resultPromise = manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a'
+    });
+
+    await vi.runAllTimersAsync();
+    await resultPromise;
+    await flushMicrotasks();
+
+    const saved = savedSessions.get('sub-acp-1');
+    expect(saved.messages[0]).toEqual(expect.objectContaining({ role: 'user', content: 'do task' }));
+    expect(saved.messages[1]).toEqual(expect.objectContaining({ role: 'assistant', isStreaming: false }));
+    expect(saved.messages[1].timeline).not.toContainEqual(expect.objectContaining({ content: '_Thinking..._' }));
   });
 
   it('returns active status immediately with non-wait and abort instructions', async () => {
@@ -341,6 +368,40 @@ describe('SubAgentInvocationManager', () => {
     expect(result.content[0].text).toContain('already has sub-agents running');
     expect(result.content[0].text).toContain('inv-active');
     expect(mockAcpClient.transport.sendRequest).not.toHaveBeenCalledWith('session/new', expect.anything());
+  });
+
+  it('persists a parent invocation marker without a parent tool call id', async () => {
+    mockDb.getSessionByAcpId.mockImplementation(async (...args) => {
+      const acpId = args.length === 2 ? args[1] : args[0];
+      if (acpId === 'parent-acp') {
+        return {
+          id: 'parent-ui',
+          acpSessionId: 'parent-acp',
+          provider: 'provider-a',
+          messages: [{ id: 'assistant-1', role: 'assistant', content: '', timeline: [] }]
+        };
+      }
+      return savedSessions.get(acpId) || null;
+    });
+
+    const resultPromise = manager.runInvocation({
+      requests: [{ prompt: 'do task', name: 'agent 1' }],
+      providerId: 'provider-a',
+      parentAcpSessionId: 'parent-acp'
+    });
+
+    await vi.runAllTimersAsync();
+    await resultPromise;
+
+    const savedParent = savedSessions.get('parent-acp');
+    const marker = savedParent?.messages?.[0]?.timeline?.find(step => step.type === 'tool')?.event;
+    expect(marker).toEqual(expect.objectContaining({
+      id: expect.stringMatching(/^subagents-inv-12345-/),
+      invocationId: expect.stringMatching(/^inv-12345-/),
+      toolName: 'ux_invoke_subagents',
+      canonicalName: 'ux_invoke_subagents',
+      status: 'completed'
+    }));
   });
 
   it('cleans active idempotency state when invocation setup rejects', async () => {

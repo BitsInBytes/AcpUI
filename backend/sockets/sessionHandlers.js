@@ -12,6 +12,12 @@ import { runHooks } from '../services/hookRunner.js';
 import { generateForkTitle } from '../services/acpTitleGenerator.js';
 import { mergeConfigOptions } from '../services/configOptions.js';
 import {
+  flushStreamPersistence,
+  mergeJsonlMessagesPreservingIds,
+  mergeSnapshotWithPersisted,
+  shouldUseJsonlMessages
+} from '../services/sessionStreamPersistence.js';
+import {
   extractModelState,
   mergeModelOptions,
   modelOptionsFromProviderConfig,
@@ -74,6 +80,42 @@ function emitCachedContext(providerModule, sessionId) {
   }
 }
 
+function runtimeForSession(providerId, acpSessionId) {
+  const runtimes = providerRuntimeManager.getRuntimes?.() || [];
+  if (providerId) {
+    const runtime = runtimes.find(item => item.providerId === providerId);
+    if (runtime) return runtime;
+    return providerRuntimeManager.getRuntime(providerId);
+  }
+  return runtimes.find(item => item.client?.sessionMetadata?.has?.(acpSessionId))
+    || providerRuntimeManager.getRuntime?.(providerId);
+}
+
+async function flushActiveStream(providerId, acpSessionId) {
+  if (!acpSessionId) return;
+  try {
+    const runtime = runtimeForSession(providerId, acpSessionId);
+    if (runtime?.client) await flushStreamPersistence(runtime.client, acpSessionId);
+  } catch (err) {
+    writeLog(`[SESSION] Active stream flush skipped for ${acpSessionId}: ${err.message}`);
+  }
+}
+
+function annotateLiveSessionState(sessions = []) {
+  const runtimes = providerRuntimeManager.getRuntimes?.() || [];
+  return sessions.map(session => {
+    const runtime = runtimes.find(item => item.providerId === session.provider)
+      || runtimes.find(item => item.client?.sessionMetadata?.has?.(session.acpSessionId));
+    const meta = runtime?.client?.sessionMetadata?.get?.(session.acpSessionId);
+    const pendingPermission = runtime?.client?.permissions?.getPendingPermissionForSession?.(session.acpSessionId);
+    return {
+      ...session,
+      isTyping: Boolean(meta?.activePrompt),
+      isAwaitingPermission: Boolean(pendingPermission)
+    };
+  });
+}
+
 export default function registerSessionHandlers(io, socket) {
   socket.on('get_notes', async ({ sessionId }, callback) => {
     try {
@@ -114,7 +156,7 @@ export default function registerSessionHandlers(io, socket) {
       }
 
       const sessions = await db.getAllSessions(providerId, { providerAliases });
-      callback({ sessions });
+      callback({ sessions: annotateLiveSessionState(sessions) });
     } catch (err) {
       writeLog(`[DB ERR] load_sessions failed: ${err.message}`);
       callback({ error: err.message });
@@ -123,11 +165,13 @@ export default function registerSessionHandlers(io, socket) {
 
   socket.on('get_session_history', async ({ uiId }, callback) => {
     try {
-      const session = await db.getSession(uiId);
+      let session = await db.getSession(uiId);
       if (session?.acpSessionId) {
+        await flushActiveStream(session.provider, session.acpSessionId);
+        session = await db.getSession(uiId) || session;
         const jsonlMessages = await parseJsonlSession(session.acpSessionId, session.provider);
-        if (jsonlMessages && jsonlMessages.length > (session.messages?.length || 0)) {
-          session.messages = jsonlMessages;
+        if (shouldUseJsonlMessages(session.messages, jsonlMessages)) {
+          session.messages = mergeJsonlMessagesPreservingIds(session.messages, jsonlMessages);
           await db.saveSession(session);
         }
       }
@@ -161,7 +205,9 @@ export default function registerSessionHandlers(io, socket) {
     try {
       const provider = getProvider(session.provider || null);
       const providerId = provider.id;
-      await db.saveSession({ ...session, provider: providerId });
+      const incomingSession = { ...session, provider: providerId };
+      const existingSession = incomingSession.id ? await db.getSession(incomingSession.id) : null;
+      await db.saveSession(mergeSnapshotWithPersisted(existingSession, incomingSession));
     } catch (err) {
       writeLog(`[DB ERR] Failed to save snapshot: ${err.message}`);
     }

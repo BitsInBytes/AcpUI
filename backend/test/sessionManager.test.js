@@ -140,16 +140,17 @@ describe('sessionManager', () => {
       vi.useRealTimers();
     });
 
-    it('debounces auto-save', async () => {
+    it('does not force-complete a streaming assistant during progress saves', async () => {
       const sessionId = 'acp-1';
-      const session = { id: 's1', acpSessionId: sessionId, messages: [{ role: 'assistant', content: 'hi', isStreaming: true }], timeline: [{ role: 'user', content: 'hello' }] };
+      const session = { id: 's1', acpSessionId: sessionId, messages: [{ role: 'assistant', content: 'hi', isStreaming: true }] };
       db.getSessionByAcpId.mockResolvedValue(session);
-      
+
       sessionManager.autoSaveTurn(sessionId);
       expect(db.saveSession).not.toHaveBeenCalled();
-      
+
       await vi.advanceTimersByTimeAsync(6000);
-      expect(db.saveSession).toHaveBeenCalledWith(session);
+      expect(db.saveSession).not.toHaveBeenCalled();
+      expect(session.messages[0].isStreaming).toBe(true);
     });
 
     it('saves immediately on unmount', () => {

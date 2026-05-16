@@ -19,6 +19,7 @@ import { loadWorkspaces } from '../services/workspaceConfig.js';
 import { loadCommands } from '../services/commandsConfig.js';
 import { getProvider } from '../services/providerLoader.js';
 import { getLatestProviderStatusExtension, getLatestProviderStatusExtensions } from '../services/providerStatusMemory.js';
+import { getStreamResumeSnapshot } from '../services/sessionStreamPersistence.js';
 import { getDefaultProviderId, getProviderEntries } from '../services/providerRegistry.js';
 import { collectInvalidJsonConfigErrors, hasStartupBlockingJsonConfigError } from '../services/jsonConfigDiagnostics.js';
 import * as db from '../database.js';
@@ -37,6 +38,21 @@ function buildBrandingPayload(providerId) {
     protocolPrefix: providerConfig.protocolPrefix,
     supportsAgentSwitching: providerConfig.supportsAgentSwitching ?? false
   };
+}
+
+function runtimeForWatchedSession(providerId, sessionId) {
+  const runtimes = providerRuntimeManager.getRuntimes?.() || [];
+  if (providerId) return runtimes.find(runtime => runtime.providerId === providerId) || null;
+  return runtimes.find(runtime => runtime.client?.sessionMetadata?.has?.(sessionId))
+    || runtimes[0]
+    || null;
+}
+
+async function emitStreamResumeSnapshot(socket, { providerId = null, sessionId } = {}) {
+  const runtime = runtimeForWatchedSession(providerId, sessionId);
+  if (!runtime?.client) return;
+  const snapshot = await getStreamResumeSnapshot(runtime.client, sessionId);
+  if (snapshot) socket.emit('stream_resume_snapshot', snapshot);
 }
 
 function getProviderPayloads() {
@@ -70,6 +86,23 @@ function emitProviderStatusExtension(socket, extension, emittedProviderIds) {
   socket.emit('provider_extension', extension);
   if (providerId) emittedProviderIds.add(providerId);
   return true;
+}
+
+function emitPendingPermissionSnapshot(socket, { providerId = null, sessionId }) {
+  if (!sessionId) return;
+  const runtimes = typeof providerRuntimeManager.getRuntimes === 'function'
+    ? providerRuntimeManager.getRuntimes()
+    : [];
+  const candidates = [...runtimes, { providerId: acpClient.providerId || null, client: acpClient }];
+  const emittedRequestIds = new Set();
+
+  for (const runtime of candidates) {
+    if (providerId && runtime.providerId && runtime.providerId !== providerId) continue;
+    const payload = runtime.client?.permissions?.getPendingPermissionForSession?.(sessionId, runtime.providerId || providerId);
+    if (!payload || emittedRequestIds.has(payload.id)) continue;
+    emittedRequestIds.add(payload.id);
+    socket.emit('permission_request', payload);
+  }
 }
 
 function emitCachedProviderStatuses(socket, defaultProviderId) {
@@ -189,8 +222,12 @@ export default function registerSocketHandlers(io) {
     socket.on('watch_session', ({ providerId = null, sessionId }) => {
       if (sessionId) {
         socket.join(`session:${sessionId}`);
+        void emitStreamResumeSnapshot(socket, { providerId, sessionId })
+          .catch(err => writeLog(`[STREAM SNAPSHOT ERR] ${err.message}`));
         emitShellRunSnapshotsForSession(socket, { providerId, sessionId });
-        emitSubAgentSnapshotsForSession(socket, { providerId, sessionId });
+        void emitSubAgentSnapshotsForSession(socket, { providerId, sessionId })
+          .catch(err => writeLog(`[SUB-AGENT SNAPSHOT ERR] ${err.message}`));
+        emitPendingPermissionSnapshot(socket, { providerId, sessionId });
         writeLog(`[ROOMS] ${socket.id} watching session ${sessionId}`);
       }
     });

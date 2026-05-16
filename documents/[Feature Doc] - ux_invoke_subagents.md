@@ -108,7 +108,7 @@ export const subAgentToolHandler = {
 };
 ```
 
-`toolCallState.upsert` stores sticky metadata for the parent tool event, including canonical identity and any `toolSpecific.invocationId` that is applied later.
+`toolCallState.upsert` stores sticky metadata for the parent tool event, including canonical identity. When the invocation ID is allocated, `SubAgentInvocationManager.executeStartInvocation` emits and force-persists a parent `tool_update` containing `invocationId` and canonical sub-agent tool identity, so reconnect history can link the parent ToolStep to the bottom-pinned panel even if the browser missed live `sub_agent_started`. If the provider did not expose a parent tool-call ID, the manager writes a synthetic `subagents-<invocationId>` marker with terminal tool status; the sub-agent store still drives live/terminal panel state.
 
 ### 3. The Stdio Proxy Forwards MCP Context
 
@@ -184,6 +184,8 @@ return subAgentInvocationManager.runInvocation({
   model,
   providerId,
   parentAcpSessionId: acpSessionId,
+  parentToolCallId,
+  parentToolName: idempotencyToolName,
   idempotencyKey,
   abortSignal
 });
@@ -247,24 +249,27 @@ this.trackSubAgentParent(resolvedProviderId, subAcpId, parentAcpSessionId);
 this.bindMcpProxyFn(getMcpProxyIdFromServers(mcpServers), { providerId: resolvedProviderId, acpSessionId: subAcpId });
 ```
 
-The sub-agent is saved as a sidebar-capable session and as a row in `subagent_invocation_agents`. The UI ID is `sub-${subAcpId}`. `forkedFrom` stores the parent UI ID so Sidebar and FolderItem can render the nested tree, while the invocation-agent row stores status, result text, error text, and completion timestamps for `ux_check_subagents`.
+The sub-agent is saved as a sidebar-capable session and as a row in `subagent_invocation_agents`. The UI ID is `sub-${subAcpId}`. `forkedFrom` stores the parent UI ID so Sidebar and FolderItem can render the nested tree, while the invocation-agent row stores status, result text, error text, and completion timestamps for `ux_check_subagents`. The saved session starts with the sub-agent prompt as a user message plus a streaming assistant placeholder so backend stream persistence can append output even when no browser is watching.
 
 ```javascript
 // FILE: backend/mcp/subAgentInvocationManager.js (Method: spawnAgent)
 await this.db.saveSession({
   id: uiId,
   acpSessionId: subAcpId,
-  name: req.name || `Agent ${i + 1}: ${req.prompt.slice(0, 50)}`,
+  name: req.name || `Agent ${index + 1}: ${String(req.prompt || '').slice(0, 50)}`,
   model: resolvedModelKey || null,
-  messages: [],
+  messages: initialSubAgentMessages(req, this.now()),
   isPinned: false,
   isSubAgent: true,
   forkedFrom: parentUiId,
+  parentAcpSessionId,
   currentModelId: modelId || null,
   modelOptions: quickModelOptions,
   provider: resolvedProviderId,
 });
 ```
+
+`initialSubAgentMessages` serializes the request prompt into a user message and creates a streaming assistant message with `_Thinking..._`, `turnStartTime`, and an empty `content` field. `sessionStreamPersistence` then removes the placeholder when real thought, token, tool, or permission data arrives.
 
 If a model resolves, the manager sends `session/set_model`. It also seeds `acpClient.sessionMetadata` with `isSubAgent: true`, `agentName`, model state, counters, and response buffers.
 
@@ -306,7 +311,7 @@ File: `backend/mcp/acpCleanup.js` (Function: `cleanupAcpSession`)
 
 After all setup promises resolve, `executeStartInvocation` starts each prompt in the background and immediately returns an instructional MCP result containing the invocation ID and `ux_check_subagents` tool name.
 
-ACP update routing is the same as any session: message chunks emit `token`, thoughts emit `thought`, tool calls emit `system_event`, and permissions emit `permission_request`. The manager reads each response from `acpClient.sessionMetadata.get(subAcpId).lastResponseBuffer` when `session/prompt` completes, writes it to `subagent_invocation_agents.result_text`, and emits terminal status updates.
+ACP update routing is the same as any session: message chunks emit `token`, thoughts emit `thought`, tool calls emit `system_event`, and permissions emit `permission_request`. Normalized stream events also flow through `sessionStreamPersistence`, using the sub-agent session DB override so child transcripts progress while the UI is closed. When `session/prompt` completes, the manager finalizes stream persistence, reads the latest persisted assistant text with `lastResponseBuffer` as a fallback, writes it to `subagent_invocation_agents.result_text`, and emits terminal status updates.
 
 `ux_check_subagents` calls `getInvocationStatus`. It reads the SQL snapshot, waits until every agent is terminal or the configured timeout expires, then returns completed results plus failed, aborted, and still-running agents. Passing `waitForCompletion: false` returns the current snapshot immediately. The status tool title mirrors that input: waiting calls render as `Check Subagents: Waiting for agents to finish`, while immediate calls render as `Check Subagents: Quick status check`. Status-call aborts stop waiting but do not cancel the agents.
 
@@ -349,25 +354,41 @@ for (const inv of this.invocations.values()) {
 ### 11. Reconnect Hydration Emits Snapshots
 
 File: `backend/sockets/index.js` (Socket event: `watch_session`)
-File: `backend/sockets/subAgentHandlers.js` (Function: `emitSubAgentSnapshotsForSession`, Socket event: `sub_agent_snapshot`)
+File: `backend/sockets/subAgentHandlers.js` (Functions: `emitSubAgentSnapshotsForSession`, `emitDbBackedSubAgentSnapshots`, Socket event: `sub_agent_snapshot`)
 File: `backend/mcp/subAgentInvocationManager.js` (Method: `getSnapshotsForParent`)
+File: `backend/database.js` (Functions: `getSubAgentInvocationsForParent`, `getSubAgentInvocationWithAgents`)
 
-When a client watches a session, the backend emits snapshots for active sub-agents attached to that parent ACP session. Snapshot payloads include provider, ACP session, UI session, parent UI ID, invocation ID, display name, prompt, agent, model, and status.
+When a client watches a session, the backend emits snapshots for in-memory active sub-agents and DB-backed invocation rows attached to that parent ACP session. DB replay resolves rows by parent UI ID when the parent session row is available and falls back to `parent_acp_session_id` when only the watched ACP session is known. DB replay emits `sub_agent_invocation_status` before per-agent `sub_agent_snapshot` payloads so invocation-level counts/status are available even before all agent rows hydrate. Snapshot payloads include provider, ACP session, UI session, parent ACP/UI IDs, invocation ID, display name, prompt, agent, model, agent status, invocation status, total count, completed count, and status tool name. The socket joins each nonterminal child ACP room so live child stream chunks continue after reconnect, while terminal DB snapshots hydrate the panel without joining old rooms.
 
 ```javascript
-// FILE: backend/sockets/subAgentHandlers.js (Function: emitSubAgentSnapshotsForSession)
-const running = subAgentInvocationManager
-  .getSnapshotsForParent(sessionId)
-  .filter(s => !providerId || s.providerId === providerId);
-
+// FILE: backend/sockets/subAgentHandlers.js (Function: emitSubAgentSnapshot)
+if (acpSessionId && !TERMINAL_AGENT_STATUSES.has(entry.status)) {
+  socket.join(`session:${acpSessionId}`);
+}
 socket.emit('sub_agent_snapshot', {
-  providerId: entry.providerId,
-  acpSessionId: entry.acpId,
+  providerId: entry.providerId || entry.provider,
+  acpSessionId,
   uiId: entry.uiId,
+  parentAcpSessionId: entry.parentAcpSessionId,
   parentUiId: entry.parentUiId,
   invocationId: entry.invocationId,
   status: entry.status,
+  invocationStatus: entry.invocationStatus,
+  totalCount: entry.totalCount,
+  completedCount: entry.completedCount,
+  statusToolName: entry.statusToolName,
 });
+```
+
+```javascript
+// FILE: backend/sockets/subAgentHandlers.js (Function: emitDbBackedSubAgentSnapshots)
+const parentUiId = parentSession?.id || null;
+const invocations = await db.getSubAgentInvocationsForParent(resolvedProviderId, parentUiId, sessionId);
+for (const invocation of invocations || []) {
+  const snapshot = await db.getSubAgentInvocationWithAgents(resolvedProviderId, invocation.invocationId);
+  emitSubAgentInvocationSnapshot(socket, snapshot, { parentAcpSessionId: sessionId, parentUiId, providerId: resolvedProviderId });
+  for (const agentRecord of snapshot.agents || []) emitSubAgentSnapshot(socket, agentRecord, emittedKeys);
+}
 ```
 
 ### 12. Frontend Listeners Register Agents and Sidebar Sessions
@@ -378,7 +399,7 @@ File: `frontend/src/store/useSessionLifecycleStore.ts` (State: `sessions`)
 
 `sub_agents_starting` creates invocation-level store state, removes existing sub-agent sidebar sessions for the same parent UI ID, and emits `delete_session` for each removed session. This event is only emitted after the backend accepts the new invocation, so an active-invocation rejection does not clear the old sidebar agents.
 
-`sub_agent_started` adds the agent to `useSubAgentStore`, records a pending sidebar session in `pendingSubAgents`, derives fallback model display metadata from provider branding when the socket payload has no model, and stamps the batch `invocationId` onto the in-progress parent ToolStep when `index === 0`. `sub_agent_invocation_status` updates invocation-level status so the active ToolStep knows when it can collapse.
+`sub_agent_started` adds the agent to `useSubAgentStore`, records a pending sidebar session in `pendingSubAgents`, derives fallback model display metadata from provider branding when the socket payload has no model, resolves parent UI identity from `parentUiId` or `parentAcpSessionId`, and stamps the batch `invocationId` onto the best matching parent ToolStep when `index === 0`. Reconnect `sub_agent_snapshot` events use the same parent-stamp path for running and terminal agents, and `useChatManager` keeps each stamp replayable for the hook lifetime so a later parent `stream_resume_snapshot` or history hydration cannot erase the bottom-pinned panel link. `sub_agent_invocation_status` updates invocation-level status so the active ToolStep knows when it can collapse.
 
 ```typescript
 // FILE: frontend/src/hooks/useChatManager.ts (Socket event: sub_agent_started)
@@ -396,7 +417,7 @@ if (data.index === 0) {
 }
 ```
 
-`sub_agent_snapshot` re-registers active agents after reconnect and adds them to `pendingSubAgents` when their sidebar session is not already present.
+`sub_agent_snapshot` re-registers active or DB-backed agents after reconnect, stamps `invocationId` onto the parent orchestration ToolStep, starts or merges the invocation using `invocationStatus`, `totalCount`, and `statusToolName`, and adds the agent to `pendingSubAgents` when its sidebar session is not already present. If a reconnect snapshot arrives before parent message history, `useChatManager` queues the parent ToolStep stamp and replays it when `useSessionLifecycleStore.sessions` hydrates. Snapshot handling updates invocation metadata even when the agent row already exists, then skips only the duplicate `addAgent` call. `useSubAgentStore.startInvocation` preserves terminal invocation state and keeps a partially hydrated invocation active until the known agent count reaches `totalCount`.
 
 ### 13. Streams Materialize Sidebar Sessions Lazily
 
@@ -691,6 +712,29 @@ Backend `sub_agent_started` payload:
 }
 ```
 
+Backend `sub_agent_snapshot` payload:
+
+```json
+{
+  "providerId": "provider-id",
+  "acpSessionId": "sub-acp-id",
+  "uiId": "sub-sub-acp-id",
+  "parentAcpSessionId": "parent-acp-id",
+  "parentUiId": "parent-ui-id",
+  "invocationId": "inv-timestamp-token",
+  "index": 0,
+  "name": "Research",
+  "prompt": "Investigate the issue",
+  "agent": "agent-name",
+  "model": "model-id",
+  "status": "running",
+  "invocationStatus": "running",
+  "totalCount": 2,
+  "completedCount": 1,
+  "statusToolName": "ux_check_subagents"
+}
+```
+
 Frontend `SubAgentEntry` store shape:
 
 ```typescript
@@ -737,20 +781,20 @@ model/current_model_id/model_options_json = resolved model state
 | MCP route | `backend/routes/mcpApi.js` | `GET /tools`, `POST /tool-call`, `resolveToolContext`, `createToolCallAbortSignal` | Tool advertisement, proxy context resolution, abort propagation |
 | Stdio proxy | `backend/mcp/stdio-proxy.js` | `runProxy`, `backendFetch`, `CallToolRequestSchema` handler | ACP-facing MCP server process and backend forwarding |
 | Proxy bindings | `backend/mcp/mcpProxyRegistry.js` | `createMcpProxyBinding`, `bindMcpProxy`, `resolveMcpProxy`, `getMcpProxyIdFromServers` | Provider/session context for parent and sub-agent MCP tool calls |
-| Invocation manager | `backend/mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager`, `runInvocation`, `executeStartInvocation`, `spawnAgent`, `startAgentPrompt`, `getInvocationStatus`, `cancelInvocation`, `cancelAllForParent`, `getSnapshotsForParent` | Async start, prompt backgrounding, SQL-backed status, cancellation, reconnect snapshots, result polling |
+| Invocation manager | `backend/mcp/subAgentInvocationManager.js` | `SubAgentInvocationManager`, `runInvocation`, `executeStartInvocation`, `spawnAgent`, `startAgentPrompt`, `getInvocationStatus`, `cancelInvocation`, `cancelAllForParent`, `getSnapshotsForParent`, `initialSubAgentMessages` | Async start, parent ToolStep invocation persistence, prompt backgrounding, child transcript persistence/finalization, SQL-backed status, cancellation, reconnect snapshots, result polling |
 | Tool handler | `backend/services/tools/handlers/subAgentToolHandler.js` | `subAgentToolHandler.onStart` | Parent ACP session tracking and canonical event title |
 | Counsel handler | `backend/services/tools/handlers/counselToolHandler.js` | `counselToolHandler.onStart` | Parent ACP session tracking and canonical counsel event title |
 | Status handler | `backend/services/tools/handlers/subAgentStatusToolHandler.js` | `subAgentStatusToolHandler.onStart` | Applies canonical status and abort tool titles to Tool System events |
 | Status title helper | `backend/services/tools/acpUiToolTitles.js` | `subAgentCheckToolTitle` | Computes wait-vs-quick-check titles for `ux_check_subagents` from public input |
 | Tool registry | `backend/services/tools/index.js` | `toolRegistry.register`, `ACP_UX_TOOL_NAMES.invokeSubagents`, `ACP_UX_TOOL_NAMES.checkSubagents`, `ACP_UX_TOOL_NAMES.abortSubagents`, `ACP_UX_TOOL_NAMES.invokeCounsel`, `subAgentStatusToolHandler` | Registers tool-specific Tool System handlers |
-| MCP execution registry | `backend/services/tools/mcpExecutionRegistry.js` | `McpExecutionRegistry.begin`, `complete`, `fail`, `describeAcpUxToolExecution`, `publicMcpToolInput` | Sticky AcpUI MCP metadata and parent ToolStep updates |
+| MCP execution registry | `backend/services/tools/mcpExecutionRegistry.js` | `McpExecutionRegistry.begin`, `complete`, `fail`, `describeAcpUxToolExecution`, `publicMcpToolInput`, `invocationFromMcpExecution` | Sticky AcpUI MCP metadata, parent ToolStep updates, terminal output/status persistence, and invocation ID extraction |
 | Invocation resolver | `backend/services/tools/toolInvocationResolver.js` | `resolveToolInvocation`, `applyInvocationToEvent` | Merges provider identity, cached state, and MCP execution records |
 | ACP updates | `backend/services/acpUpdateHandler.js` | `handleUpdate`, ACP updates `tool_call`, `tool_call_update`, `agent_message_chunk`, `agent_thought_chunk` | Normalizes streams and emits frontend timeline events |
 | Prompt/socket cancellation | `backend/sockets/promptHandlers.js`, `backend/sockets/subAgentHandlers.js` | Socket events `cancel_prompt`, `cancel_subagents`, `respond_permission` | Cancels parent and sub-agent trees, stops active invocations, forwards permission responses |
 | Socket bootstrap | `backend/sockets/index.js` | Socket event `watch_session` | Joins rooms and emits sub-agent snapshots |
-| Snapshot socket | `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession`, Socket event `sub_agent_snapshot` | Reconnect hydration for active sub-agents |
-| Permission manager | `backend/services/permissionManager.js` | `handleRequest`, `respond` | Emits permission requests and writes ACP permission results |
-| Persistence | `backend/database.js` | `initDb`, `saveSession`, `getSessionByAcpId`, `createSubAgentInvocation`, `updateSubAgentInvocationStatus`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, Tables `sessions`, `subagent_invocations`, `subagent_invocation_agents` | Stores sidebar sessions, async invocation state, status counts, results, errors, and cleanup rows |
+| Snapshot socket | `backend/sockets/subAgentHandlers.js` | `emitSubAgentSnapshotsForSession`, `emitDbBackedSubAgentSnapshots`, Socket events `sub_agent_invocation_status`, `sub_agent_snapshot` | Reconnect hydration from in-memory active agents and DB-backed invocation rows by parent UI or ACP session; emits invocation status and joins nonterminal child rooms |
+| Permission manager | `backend/services/permissionManager.js` | `handleRequest`, `respond`, `getPendingPermissionForSession` | Emits and persists permission requests, exposes pending snapshots, and writes ACP permission results |
+| Persistence | `backend/database.js` | `initDb`, `saveSession`, `getSessionByAcpId`, `createSubAgentInvocation`, `getSubAgentInvocationsForParent`, `updateSubAgentInvocationStatus`, `getSubAgentInvocationWithAgents`, `deleteSubAgentInvocationsForParent`, Tables `sessions`, `subagent_invocations`, `subagent_invocation_agents` | Stores sidebar sessions, child transcripts, async invocation state, status counts, results, errors, snapshots, and cleanup rows |
 | Cleanup | `backend/mcp/acpCleanup.js` | `cleanupAcpSession` | Removes ephemeral ACP session files after completion or deletion |
 
 ### Frontend
@@ -758,7 +802,7 @@ model/current_model_id/model_options_json = resolved model state
 | Area | File | Anchors | Purpose |
 |---|---|---|---|
 | Socket dispatcher | `frontend/src/hooks/useChatManager.ts` | `useChatManager`, `pendingSubAgents`, Socket events `sub_agents_starting`, `sub_agent_started`, `sub_agent_snapshot`, `sub_agent_status`, `sub_agent_invocation_status`, `sub_agent_completed`, `permission_request`, `system_event`, `token` | Registers sub-agent lifecycle, permissions, lazy sidebar creation, and invocation routing |
-| Sub-agent store | `frontend/src/store/useSubAgentStore.ts` | `SubAgentInvocation`, `SubAgentEntry`, `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `completeAgent`, `addToolStep`, `updateToolStep`, `setPermission`, `clearPermission`, `clearForParent` | Invocation-level and agent-level orchestration-panel state independent from full chat timeline state |
+| Sub-agent store | `frontend/src/store/useSubAgentStore.ts` | `SubAgentInvocation`, `SubAgentEntry`, `startInvocation`, `setInvocationStatus`, `completeInvocation`, `isInvocationActive`, `addAgent`, `setStatus`, `completeAgent`, `addToolStep`, `updateToolStep`, `setPermission`, `clearPermission`, `clearForParent` | Invocation-level and agent-level orchestration-panel state, including partial snapshot status, independent from full chat timeline state |
 | Assistant rendering | `frontend/src/components/AssistantMessage.tsx` | `AssistantMessage`, `getPinnedSubAgentInvocationIds`, `SubAgentPanel` child | Pins sub-agent orchestration panels to the bottom of the assistant response bubble by `invocationId` |
 | Tool rendering | `frontend/src/components/ToolStep.tsx` | `ToolStep`, `getFilePathFromEvent` | Renders tool rows, suppresses successful sub-agent start output, and keeps status/abort output visible |
 | Panel rendering | `frontend/src/components/SubAgentPanel.tsx` | `SubAgentPanel`, `handlePermission`, `handleStop`, prop `invocationId` | Filters agents by invocation and renders invocation status, Stop, tool steps, and permission buttons |
@@ -787,7 +831,7 @@ model/current_model_id/model_options_json = resolved model state
 
 1. `invocationId` belongs on the parent ToolStep.
 
-   `AssistantMessage` finds sub-agent start tool steps by `invocationId` and passes that value to the bottom-pinned `SubAgentPanel`, which filters `useSubAgentStore.agents` to the correct batch. If `sub_agent_started` does not stamp the in-progress parent ToolStep, the panel returns `null` even when agents exist in the store.
+   `AssistantMessage` finds sub-agent start tool steps by `invocationId` and passes that value to the bottom-pinned `SubAgentPanel`, which filters `useSubAgentStore.agents` to the correct batch. The backend persists the parent ToolStep invocation ID when the invocation starts, and the frontend stamps it again from `sub_agents_starting`, `sub_agent_started`, and `sub_agent_snapshot`. If a reconnect snapshot arrives before parent history, the stamp is queued and replayed after messages hydrate. If these paths do not attach `invocationId`, the panel returns `null` even when agents exist in the store.
 
 2. Explicit MCP session context beats parent tracking.
 
@@ -835,7 +879,15 @@ model/current_model_id/model_options_json = resolved model state
 
 13. Completed invocation and idempotency memory is bounded.
 
-    `SubAgentInvocationManager` now prunes terminal in-memory invocation entries and completed idempotency entries by TTL and max-entry caps. Durable history remains in SQLite (`subagent_invocations`, `subagent_invocation_agents`) for status polling and reconnect behavior.
+    `SubAgentInvocationManager` prunes terminal in-memory invocation entries and completed idempotency entries by TTL and max-entry caps. Durable history remains in SQLite (`subagent_invocations`, `subagent_invocation_agents`) for status polling and reconnect behavior.
+
+14. Reconnect snapshots can arrive one agent at a time.
+
+    `sub_agent_invocation_status` and `sub_agent_snapshot` payloads include invocation-level `totalCount` and agent-level status. `useSubAgentStore` must keep the invocation active while fewer agents are known than `totalCount`, otherwise a partially hydrated multi-agent invocation can collapse as completed too early. DB replay must work by parent ACP session as well as parent UI ID, because refresh can watch the ACP session before the parent UI row has fully hydrated in the frontend. Terminal snapshots must still recover the parent invocation marker; otherwise a completed invocation can lose its bottom-pinned panel on refresh when the parent tool step was never persisted with `invocationId`.
+
+15. Child transcripts are persisted through stream persistence.
+
+    `spawnAgent` saves the child prompt and streaming assistant placeholder, and `startAgentPrompt` finalizes `sessionStreamPersistence` on success, cancellation, and error. Reading only `lastResponseBuffer` misses durable transcript recovery after the UI disconnects.
 
 ---
 
@@ -883,6 +935,7 @@ model/current_model_id/model_options_json = resolved model state
 
 - `backend/test/subAgentInvocationManager.test.js`
   - `starts asynchronously and returns completed results through the status call`
+  - `persists the sub-agent prompt and finalizes the child transcript`
   - `joins an active invocation when the idempotency key repeats`
   - `returns a cached result when a completed invocation key repeats`
   - `prunes completed invocation and idempotency entries after TTL while preserving active idempotency promises`
@@ -902,6 +955,8 @@ model/current_model_id/model_options_json = resolved model state
 
 - `backend/test/subAgentHandlers.test.js`
   - `emits sub_agent_snapshot for each running sub-agent matching parentAcpSessionId`
+  - `emits DB-backed invocation snapshots when in-memory snapshots are missing`
+  - `replays DB-backed invocation snapshots by parent ACP session when parent UI row is unavailable`
   - `does not emit when sessionId is null`
   - `registers cancel_subagents handler and resolves provider runtime before cancelling`
   - `ignores cancel_subagents without invocationId`
@@ -915,6 +970,9 @@ model/current_model_id/model_options_json = resolved model state
 
 - `backend/test/toolInvocationResolver.test.js`
   - `records sub-agent check title from waitForCompletion input`
+
+- `backend/test/mcpExecutionRegistryPersistence.test.js`
+  - `persists terminal MCP tool updates with invocation metadata`
 
 - `backend/test/toolRegistry.test.js`
   - `titles sub-agent status tools by canonical identity`
@@ -935,6 +993,11 @@ model/current_model_id/model_options_json = resolved model state
   - `handles "permission_request" for sub-agent`
   - `handles "sub_agents_starting" - clears old sidebar sessions immediately`
   - `handles "sub_agent_started" event and stamps invocationId on in-progress ToolStep at index 0`
+  - `replays reconnect sub-agent stamps after parent history hydrates`
+  - `keeps reconnect sub-agent stamps after stream resume refreshes the parent message`
+  - `recovers a parent sub-agent ToolStep from terminal reconnect snapshots`
+  - `resolves parent ui id from parent acp id for reconnect snapshots`
+  - `stamps only the best matching parent sub-agent tool step`
   - `handles "sub_agent_invocation_status" event`
   - `handles "sub_agent_status" with invocationId by updating agent and invocation state`
   - `moves waiting sub-agents back to running on token events`
@@ -946,6 +1009,7 @@ model/current_model_id/model_options_json = resolved model state
 
 - `frontend/src/test/useSubAgentStore.test.ts`
   - `tracks invocation lifecycle and derives status from agents`
+  - `keeps a partially hydrated invocation active until all expected agents are known`
   - `updates permission state and active status for waiting agents`
   - `deduplicates agents and invocations by identifier`
   - `clears invocations by parent ui id or parent session id`
@@ -1022,7 +1086,7 @@ model/current_model_id/model_options_json = resolved model state
 
 1. Missing MCP tool: check `configuration/mcp.json`, `isSubagentsMcpEnabled`, `GET /api/mcp/tools`, and `coreMcpToolDefinitions`.
 2. Parent ToolStep has a generic title or no panel: check `mcpExecutionRegistry.begin`, `resolveToolInvocation`, `subAgentToolHandler.onStart`, and `ToolStep` `canonicalName || toolName` handling.
-3. Panel renders empty: check that `sub_agent_started` includes `invocationId`, `useSubAgentStore.addAgent` stores it, and `useChatManager` stamps it onto the in-progress parent ToolStep.
+3. Panel renders empty: check that `sub_agent_started` / `sub_agent_snapshot` include `invocationId`, `useSubAgentStore.addAgent` stores it, `useChatManager` resolves the parent from either UI or ACP ID, and pending stamps replay after parent history hydrates.
 4. Sidebar entry is missing: check `pendingSubAgents`, then verify a `token` or `system_event` arrived for the sub-agent ACP session.
 5. Tool steps show in the sidebar but not the panel: check the second `system_event` handler in `useChatManager` and the `useSubAgentStore.addToolStep` / `updateToolStep` actions.
 6. Permission prompt appears in the main timeline: check whether the permission event `sessionId` matches a registered `SubAgentEntry.acpSessionId`.
@@ -1040,10 +1104,11 @@ model/current_model_id/model_options_json = resolved model state
 - `ux_abort_subagents` aborts active agents for an invocation and returns the same status/result payload shape without waiting.
 - `ux_invoke_counsel` maps configured counsel roles into the same async sub-agent invocation pipeline.
 - `mcpExecutionRegistry` and `toolCallState` preserve canonical AcpUI MCP identity for the parent ToolStep.
-- `SubAgentInvocationManager` owns async start, model selection, SQL registry persistence, socket lifecycle, background prompt execution, status polling, idempotency, snapshots, and cancellation.
+- `SubAgentInvocationManager` owns async start, model selection, SQL registry persistence, child transcript persistence, socket lifecycle, background prompt execution, status polling, idempotency, snapshots, and cancellation.
 - Sub-agent sessions inherit the parent provider and are linked through `parentAcpSessionId` for transport/cancellation and `forkedFrom = parentUiId` for sidebar nesting.
-- `invocationId` is the critical rendering contract that ties a parent ToolStep, the bottom-pinned `SubAgentPanel`, and status calls to the exact batch of agents they reference.
+- `invocationId` is the critical rendering contract that ties a parent ToolStep, the bottom-pinned `SubAgentPanel`, and status calls to the exact batch of agents they reference; it is persisted on invocation start and stamped again from reconnect snapshots.
 - Sidebar chat sessions are created lazily on the first token or tool event and are read-only once selected.
 - Permission requests from sub-agents render in `SubAgentPanel` and are answered through the provider runtime's permission manager.
+- Reconnect hydration combines in-memory active snapshots with DB-backed invocation rows, looks up DB rows by parent UI or ACP session, emits invocation counts/status metadata, and joins only nonterminal child rooms.
 - Active orchestration ToolSteps stay expanded until every agent is terminal unless the user manually collapses them; bottom-pinned panels stay open for observed live activity and load already-terminal invocations collapsed; the panel Stop action emits `cancel_subagents`.
 - Changing this feature requires updating backend MCP tests, manager tests, socket tests, frontend hook tests, store tests, and component rendering tests that cover the same contract.

@@ -141,11 +141,27 @@ function fallbackRunFromEvent(event: SystemEvent): ShellRunSnapshot | null {
   };
 }
 
+function isTerminalToolEvent(event: SystemEvent) {
+  const status = String(event.status || '');
+  return status === 'completed' || status === 'failed' || status === 'cancelled' || event.shellState === 'exited';
+}
+
+function coerceRunForTerminalEvent(run: ShellRunSnapshot | null | undefined, event: SystemEvent): ShellRunSnapshot | null {
+  if (!run) return null;
+  if (!isTerminalToolEvent(event) || run.status === 'exited') return run;
+  return {
+    ...run,
+    status: 'exited',
+    reason: run.reason || (event.status === 'completed' ? 'completed' : event.status || 'completed'),
+    needsInput: false
+  };
+}
+
 const ShellToolTerminal: React.FC<ShellToolTerminalProps> = ({ event }) => {
   const socket = useSystemStore(state => state.socket);
   const storedRun = useShellRunStore(state => event.shellRunId ? state.runs[event.shellRunId] : undefined);
   const fallbackRun = useMemo(() => fallbackRunFromEvent(event), [event]);
-  const run = storedRun || fallbackRun;
+  const run = useMemo(() => coerceRunForTerminalEvent(storedRun || fallbackRun, event), [storedRun, fallbackRun, event]);
 
   const isActiveSession = useSessionLifecycleStore(state => {
     if (!state.activeSessionId) return false;

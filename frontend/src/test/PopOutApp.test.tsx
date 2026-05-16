@@ -181,7 +181,7 @@ describe('PopOutApp', () => {
         if (event === 'load_sessions') {
           const cb = args[0];
           cb({
-            sessions: [{ id: 'pop-1', name: 'Chat', messages: [], model: 'balanced', acpSessionId: 'acp-pop' }]
+            sessions: [{ id: 'pop-1', name: 'Chat', messages: [], model: 'balanced', provider: 'p1', acpSessionId: 'acp-pop' }]
           });
         }
       })
@@ -194,7 +194,7 @@ describe('PopOutApp', () => {
         vi.runAllTimers(); 
     });
 
-    expect(socketToReturn.emit).toHaveBeenCalledWith('watch_session', { sessionId: 'acp-pop' });
+    expect(socketToReturn.emit).toHaveBeenCalledWith('watch_session', { providerId: 'p1', sessionId: 'acp-pop' });
     expect(hydrateSession).toHaveBeenCalled();
 
     vi.useRealTimers();

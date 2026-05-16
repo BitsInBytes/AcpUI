@@ -65,8 +65,8 @@ describe('App Component', () => {
       useSystemStore.setState({ socket: mockSocket as any, connected: true, isEngineReady: true, invalidJsonConfigs: [] });
       useSessionLifecycleStore.setState({ 
         sessions: [
-          { id: 's1', name: 'Chat 1', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, acpSessionId: 'a1' },
-          { id: 's2', name: 'Chat 2', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, acpSessionId: 'a2' }
+          { id: 's1', name: 'Chat 1', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, acpSessionId: 'a1', provider: 'p1' },
+          { id: 's2', name: 'Chat 2', messages: [], model: 'balanced', isTyping: false, isWarmingUp: false, acpSessionId: 'a2', provider: 'p2' }
         ],
         activeSessionId: 's1',
         checkPendingPrompts: vi.fn() 
@@ -117,14 +117,14 @@ describe('App Component', () => {
     render(<App />);
     
     // Initial render should have watched a1
-    expect(mockSocket.emit).toHaveBeenCalledWith('watch_session', { sessionId: 'a1' });
+    expect(mockSocket.emit).toHaveBeenCalledWith('watch_session', { providerId: 'p1', sessionId: 'a1' });
 
     await act(async () => {
       useSessionLifecycleStore.getState().setActiveSessionId('s2');
     });
 
     expect(mockSocket.emit).toHaveBeenCalledWith('unwatch_session', { sessionId: 'a1' });
-    expect(mockSocket.emit).toHaveBeenCalledWith('watch_session', { sessionId: 'a2' });
+    expect(mockSocket.emit).toHaveBeenCalledWith('watch_session', { providerId: 'p2', sessionId: 'a2' });
   });
 
   it('toggles sidebar when clicking bubble', () => {

@@ -80,7 +80,7 @@ function PopOutApp() {
       }
 
       if (session.acpSessionId) {
-        socket.emit('watch_session', { sessionId: session.acpSessionId });
+        socket.emit('watch_session', { providerId: session.provider, sessionId: session.acpSessionId });
       }
       hydrateSession(socket, popoutSessionId);
       setStatus('ready');

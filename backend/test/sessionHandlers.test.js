@@ -119,7 +119,8 @@ vi.mock('../services/providerRuntimeManager.js', () => ({
       providerId: id || 'provider-a',
       provider: { id: id || 'provider-a', config: { branding: {}, models: { default: 'test-balanced', flagship: 'test-flagship' } } }
     })),
-    getClient: vi.fn().mockReturnValue(mockAcpClient)
+    getClient: vi.fn().mockReturnValue(mockAcpClient),
+    getRuntimes: vi.fn().mockReturnValue([])
   }
 }));
 
@@ -172,6 +173,24 @@ describe('Session Handlers', () => {
     expect(mockDb.deleteSession).toHaveBeenCalledWith('2');
   });
 
+  it('annotates active runtime sessions during load_sessions', async () => {
+    const callback = vi.fn();
+    mockDb.getAllSessions.mockResolvedValue([
+      { id: 'ui-active', acpSessionId: 'acp-active', name: 'Active', messages: [], provider: 'provider-a' }
+    ]);
+    providerRuntimeManager.getRuntimes.mockReturnValue([{ providerId: 'provider-a', client: {
+      sessionMetadata: new Map([['acp-active', { activePrompt: true }]]),
+      permissions: { getPendingPermissionForSession: vi.fn().mockReturnValue(null) }
+    } }]);
+
+    const handler = mockSocket.listeners('load_sessions')[0];
+    await handler(callback);
+
+    expect(callback).toHaveBeenCalledWith({
+      sessions: [expect.objectContaining({ id: 'ui-active', isTyping: true, isAwaitingPermission: false })]
+    });
+  });
+
   it('handles get_session_history', async () => {
     const callback = vi.fn();
     const session = { id: 'ui-1', acpSessionId: 'acp-1', messages: [], provider: 'provider-a' };
@@ -179,6 +198,22 @@ describe('Session Handlers', () => {
     const handler = mockSocket.listeners('get_session_history')[0];
     await handler({ uiId: 'ui-1' }, callback);
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ session }));
+  });
+
+  it('re-reads session history after forcing an active stream flush', async () => {
+    const callback = vi.fn();
+    const stale = { id: 'ui-1', acpSessionId: 'acp-1', messages: [{ id: 'a1', role: 'assistant', content: 'old', isStreaming: true }], provider: 'provider-a' };
+    const flushed = { ...stale, messages: [{ id: 'a1', role: 'assistant', content: 'fresh', isStreaming: true }] };
+    mockDb.getSession.mockResolvedValueOnce(stale).mockResolvedValueOnce(flushed);
+    mockDb.getSessionByAcpId.mockResolvedValue(flushed);
+    const { parseJsonlSession } = await import('../services/jsonlParser.js');
+    parseJsonlSession.mockResolvedValue(null);
+
+    const handler = mockSocket.listeners('get_session_history')[0];
+    await handler({ uiId: 'ui-1' }, callback);
+
+    expect(mockDb.getSession).toHaveBeenCalledTimes(2);
+    expect(callback).toHaveBeenCalledWith({ session: flushed });
   });
 
   it('handles rehydrate_session', async () => {
@@ -623,6 +658,57 @@ describe('Session Handlers', () => {
     const handler = mockSocket.listeners('get_session_history')[0];
     await handler({ uiId: 'ui-1' }, callback);
     expect(mockDb.saveSession).toHaveBeenCalled();
+  });
+
+  it('repairs same-length low-quality assistant history from JSONL', async () => {
+    const callback = vi.fn();
+    const session = {
+      id: 'ui-1',
+      acpSessionId: 'acp-1',
+      provider: 'provider-a',
+      messages: [
+        { id: 'u1', role: 'user', content: 'hello' },
+        { id: 'a1', role: 'assistant', content: '', timeline: [{ type: 'thought', content: '_Thinking..._' }] }
+      ]
+    };
+    mockDb.getSession.mockResolvedValue(session);
+    const { parseJsonlSession } = await import('../services/jsonlParser.js');
+    parseJsonlSession.mockResolvedValue([
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'real answer', timeline: [{ type: 'text', content: 'real answer' }] }
+    ]);
+    const handler = mockSocket.listeners('get_session_history')[0];
+    await handler({ uiId: 'ui-1' }, callback);
+    expect(mockDb.saveSession).toHaveBeenCalledWith(expect.objectContaining({
+      messages: expect.arrayContaining([expect.objectContaining({ id: 'a1', content: 'real answer' })])
+    }));
+  });
+
+  it('protects richer DB stream progress from a stale save_snapshot', async () => {
+    const existing = {
+      id: 'ui-1',
+      acpSessionId: 'acp-1',
+      provider: 'provider-a',
+      messages: [
+        { id: 'u1', role: 'user', content: 'hello' },
+        { id: 'a1', role: 'assistant', content: 'real answer', isStreaming: true, timeline: [{ type: 'text', content: 'real answer' }] }
+      ]
+    };
+    const incoming = {
+      id: 'ui-1',
+      acpSessionId: 'acp-1',
+      provider: 'provider-a',
+      messages: [
+        { id: 'u1', role: 'user', content: 'hello' },
+        { id: 'a1', role: 'assistant', content: '', isStreaming: false, timeline: [{ type: 'thought', content: '_Thinking..._' }] }
+      ]
+    };
+    mockDb.getSession.mockResolvedValue(existing);
+    const handler = mockSocket.listeners('save_snapshot')[0];
+    await handler(incoming);
+    expect(mockDb.saveSession).toHaveBeenCalledWith(expect.objectContaining({
+      messages: expect.arrayContaining([expect.objectContaining({ id: 'a1', content: 'real answer', isStreaming: false })])
+    }));
   });
 
   it('handles delete_session with cascading child sessions', async () => {

@@ -91,7 +91,7 @@ This feature matters because it is the frontend boundary that creates `prompt` s
 
     File: `backend/sockets/promptHandlers.js` (Socket event: `prompt`, ACP request: `session/prompt`)
 
-    The handler appends the text prompt or array prompt parts after attachment parts, prepends `meta.spawnContext` on the first prompt when present, resets response buffers, calls `providerModule.onPromptStarted(sessionId)`, sends ACP `session/prompt`, uses response `usage.totalTokens` only as a stats fallback when no context-window total is known, and emits `token_done` plus `autoSaveTurn` when the stream controller has no pending stats capture. Errors emit formatted `token` and `token_done` events with `error: true`.
+    The handler appends the text prompt or array prompt parts after attachment parts, prepends `meta.spawnContext` on the first prompt when present, resets response buffers, marks the runtime prompt active, calls `providerModule.onPromptStarted(sessionId)`, sends ACP `session/prompt`, and uses response `usage.totalTokens` only as a stats fallback when no context-window total is known. When the stream controller has no pending stats capture, it emits `token_done` and calls `finalizeStreamPersistence`; errors emit formatted `token` and `token_done` events with `error: true` and finalize the persisted active assistant with the error text.
 
 13. Footer model and session option controls update session state.
 
